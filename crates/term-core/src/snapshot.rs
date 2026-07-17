@@ -12,17 +12,50 @@ pub struct GridSnapshot {
     pub cols: u16,
     pub rows: u16,
     pub cursor: Cursor,
-    /// Row-major, length == `cols * rows`.
+    /// Scrollback viewport offset (0 == live) — a side-channel field (SD5).
+    pub view_offset: usize,
+    /// Whether the viewport is at the live bottom / oldest retained row (D2).
+    pub at_bottom: bool,
+    pub at_top: bool,
+    /// Row-major, length == `cols * rows`. Composed from history + live for the
+    /// current `view_offset`.
     cells: Vec<Cell>,
 }
 
 impl GridSnapshot {
     pub fn from_grid(grid: &Grid) -> Self {
+        let cols = grid.cols();
+        let rows = grid.rows();
+        let offset = grid.view_offset();
+        let hist = grid.history_len();
+
+        let mut cells = Vec::with_capacity(cols as usize * rows as usize);
+        for row in 0..rows {
+            // Global row index over [history .. history+rows); offset scrolls up.
+            let global = hist as isize - offset as isize + row as isize;
+            for col in 0..cols {
+                let cell = if global >= 0 && (global as usize) < hist {
+                    grid.history_row(global as usize)
+                        .and_then(|r| r.get(col as usize).copied())
+                        .unwrap_or_else(|| grid.blank_cell())
+                } else {
+                    let live_row = (global - hist as isize).max(0) as u16;
+                    grid.cell(col, live_row)
+                        .copied()
+                        .unwrap_or_else(|| grid.blank_cell())
+                };
+                cells.push(cell);
+            }
+        }
+
         GridSnapshot {
-            cols: grid.cols(),
-            rows: grid.rows(),
+            cols,
+            rows,
             cursor: grid.cursor(),
-            cells: grid.cells().to_vec(),
+            view_offset: offset,
+            at_bottom: grid.at_bottom(),
+            at_top: grid.at_top(),
+            cells,
         }
     }
 

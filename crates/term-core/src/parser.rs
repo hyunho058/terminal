@@ -76,14 +76,16 @@ impl Perform for Performer<'_> {
         }
     }
 
-    fn csi_dispatch(
-        &mut self,
-        params: &Params,
-        _intermediates: &[u8],
-        _ignore: bool,
-        action: char,
-    ) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         let first = params.iter().next().and_then(|p| p.first().copied());
+        // Private modes (`CSI ? ... h/l`) — alt-screen enter/leave (D5, owned by
+        // scrollback; image-paste adds its own arms as an ordered extension).
+        if intermediates.first() == Some(&b'?') && matches!(action, 'h' | 'l') {
+            if matches!(first, Some(1049) | Some(1047) | Some(47)) {
+                self.grid.set_alt_screen(action == 'h');
+            }
+            return;
+        }
         match action {
             // CUP / HVP — cursor position (1-based row;col → 0-based).
             'H' | 'f' => {

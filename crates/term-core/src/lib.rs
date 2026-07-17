@@ -17,11 +17,13 @@ pub mod error;
 pub mod grid;
 pub mod parser;
 pub mod pty;
+pub mod scrollback;
 pub mod snapshot;
 
 pub use error::{Error, Result};
 pub use grid::{Cell, Color, Cursor, Grid};
 pub use pty::Pty;
+pub use scrollback::History;
 pub use snapshot::GridSnapshot;
 
 use parser::Processor;
@@ -62,5 +64,47 @@ impl Terminal {
 
     pub fn dimensions(&self) -> (u16, u16) {
         (self.grid.cols(), self.grid.rows())
+    }
+
+    // --- Scrollback viewport controls (D2/D4) — display-only, never write the PTY ---
+
+    /// Scroll the viewport up `n` lines into retained history.
+    pub fn scroll_up(&mut self, n: usize) {
+        self.grid.scroll_up(n);
+    }
+
+    /// Scroll the viewport back down `n` lines toward the live view.
+    pub fn scroll_down(&mut self, n: usize) {
+        self.grid.scroll_down(n);
+    }
+
+    /// Jump the viewport to the live bottom.
+    pub fn scroll_to_bottom(&mut self) {
+        self.grid.scroll_to_bottom();
+    }
+
+    /// Current scrollback offset (0 == live bottom).
+    pub fn view_offset(&self) -> usize {
+        self.grid.view_offset()
+    }
+
+    /// Whether the viewport is pinned to the live bottom.
+    pub fn at_bottom(&self) -> bool {
+        self.grid.at_bottom()
+    }
+
+    /// Whether the viewport is at the oldest retained row.
+    pub fn at_top(&self) -> bool {
+        self.grid.at_top()
+    }
+
+    /// Number of rows currently retained in scrollback history.
+    pub fn history_len(&self) -> usize {
+        self.grid.history_len()
+    }
+
+    /// Whether the alternate screen is active (`?1049h`).
+    pub fn alt_screen(&self) -> bool {
+        self.grid.alt_screen()
     }
 }
