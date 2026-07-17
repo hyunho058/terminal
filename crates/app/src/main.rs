@@ -10,6 +10,7 @@
 mod input;
 mod seam;
 mod session;
+mod settings;
 mod tabs;
 mod terminal_app;
 

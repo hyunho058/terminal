@@ -8,6 +8,7 @@ description = "Shared config, error, and logging utilities (no GPU/UI dependenci
 
 [dependencies]
 directories = "6.0.0"
+notify = "8.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 toml = "1.1.3"

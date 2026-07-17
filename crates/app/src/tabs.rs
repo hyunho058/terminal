@@ -121,6 +121,13 @@ impl Tabs {
         }
     }
 
+    /// Re-theme every tab's default cell colors live (settings feature, R3.3).
+    pub fn set_default_colors_all(&mut self, fg: Color, bg: Color) {
+        for s in &mut self.sessions {
+            s.terminal.set_default_colors(fg, bg);
+        }
+    }
+
     /// Titles for the tab bar model (D6/D7) — the session title, or `Tab N`
     /// fallback. (cwd-basename titles need a `term_core::Pty::child_pid()`
     /// accessor, which is outside `tabs`' declared surface — a documented

@@ -62,6 +62,11 @@ impl Terminal {
         self.grid.resize(cols, rows);
     }
 
+    /// Re-theme default cell colors live (settings feature).
+    pub fn set_default_colors(&mut self, fg: Color, bg: Color) {
+        self.grid.set_default_colors(fg, bg);
+    }
+
     pub fn dimensions(&self) -> (u16, u16) {
         (self.grid.cols(), self.grid.rows())
     }

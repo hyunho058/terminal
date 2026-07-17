@@ -25,6 +25,9 @@ pub enum CommonError {
         #[source]
         source: toml::de::Error,
     },
+
+    #[error("config watcher: {0}")]
+    Watch(String),
 }
 
 pub type Result<T> = std::result::Result<T, CommonError>;

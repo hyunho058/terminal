@@ -147,8 +147,12 @@ pub struct Renderer {
     bg_bind_group: wgpu::BindGroup,
     glyph_uniform_buf: wgpu::Buffer,
     glyph_bind_group: wgpu::BindGroup,
+    /// Kept so `apply_config` can rebuild the glyph bind group against a fresh atlas.
+    glyph_bgl: wgpu::BindGroupLayout,
     atlas: Atlas,
     font: Arc<Vec<u8>>,
+    /// Needed to re-derive cell size / ppem when the config changes live.
+    scale_factor: f64,
     cell_size: (f32, f32),
     /// Physical px reserved above the grid (e.g. a tab bar). Grid + glyphs are
     /// shifted down by this, and `grid_size` reports the rows that fit below it.
@@ -334,8 +338,10 @@ impl Renderer {
             bg_bind_group,
             glyph_uniform_buf,
             glyph_bind_group,
+            glyph_bgl,
             atlas,
             font,
+            scale_factor,
             cell_size,
             top_inset: 0.0,
             ppem,
@@ -380,6 +386,47 @@ impl Renderer {
     /// Current top inset in physical px.
     pub fn top_inset(&self) -> f32 {
         self.top_inset
+    }
+
+    /// Apply a new [`Config`] live (settings feature, D4): re-derive cell metrics,
+    /// ppem, theme colors, and ligature state, and rebuild the glyph atlas at the
+    /// new size (invalidating the glyph cache — R3.2) without reconstructing the
+    /// renderer. After this the caller should re-fit the grid to the new
+    /// [`grid_size`] and redraw. Font *family* swaps are not applied (the renderer
+    /// resolves a fixed font set — a documented first-cut limit).
+    ///
+    /// [`grid_size`]: Renderer::grid_size
+    pub fn apply_config(&mut self, cfg: &Config) {
+        self.cell_size = cell_size_px(cfg, self.scale_factor);
+        self.ppem = cfg.font.size_pt * self.scale_factor as f32;
+        self.ligatures = cfg.font.ligatures;
+        self.bg_default = cfg.theme.background;
+        self.clear = to_wgpu_color(cfg.theme.background);
+
+        // Rebuild the atlas at the new ppem so glyphs re-rasterize (size + ligature
+        // changes need fresh coverage), then re-point the glyph bind group at it.
+        if let Some(atlas) = Atlas::new(&self.device, self.font.clone(), 0, self.ppem) {
+            self.atlas = atlas;
+            self.glyph_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("glyph-bg"),
+                layout: &self.glyph_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.glyph_uniform_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(self.atlas.view()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(self.atlas.sampler()),
+                    },
+                ],
+            });
+        }
+        self.write_uniforms();
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {

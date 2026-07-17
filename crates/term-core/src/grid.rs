@@ -153,6 +153,27 @@ impl Grid {
         self.pen_bg = self.default_bg;
     }
 
+    /// Re-theme the grid's default colors live (settings feature): new cells use
+    /// the new fg/bg, and existing cells still carrying the *old* defaults (e.g.
+    /// blanks) are recolored so a live theme change repaints cleanly. Cells with
+    /// explicit SGR colours matching an old default also shift — an accepted
+    /// first-cut approximation.
+    pub fn set_default_colors(&mut self, fg: Color, bg: Color) {
+        let (old_fg, old_bg) = (self.default_fg, self.default_bg);
+        for cell in &mut self.cells {
+            if cell.fg == old_fg {
+                cell.fg = fg;
+            }
+            if cell.bg == old_bg {
+                cell.bg = bg;
+            }
+        }
+        self.default_fg = fg;
+        self.default_bg = bg;
+        self.pen_fg = fg;
+        self.pen_bg = bg;
+    }
+
     /// Print a character at the cursor, advancing (and wrapping) it.
     pub fn print(&mut self, ch: char) {
         if self.cursor.col >= self.cols {

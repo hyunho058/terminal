@@ -8,9 +8,11 @@
 //! Input dispatch order per key (R3.3/R4): visible overlays → registered input
 //! handlers → tab chords → default `encode_key` to the active shell.
 
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
 use common::config::Config;
+use common::watch::ConfigWatcher;
 use renderer::tab_bar::{self, TabBar, TabBarModel, TabModelHandle};
 use renderer::Renderer;
 use term_core::Color;
@@ -25,10 +27,14 @@ use crate::seam::{AppCtx, Handled, InputHandler, InputRouter, KeyInput, Overlay,
 use crate::session::{Session, TabId};
 use crate::tabs::Tabs;
 
-/// Custom event: PTY output is available for a specific tab (D2 — tagged wake).
+/// Custom event: something happened off the UI thread that needs a wake.
 #[derive(Debug, Clone, Copy)]
 pub enum UserEvent {
+    /// PTY output is available for a specific tab (D2 — tagged wake).
     PtyOutput(TabId),
+    /// The config file changed; a fresh `Config` is waiting on the channel
+    /// (settings feature — background file-watch, not a key event).
+    ConfigReloaded,
 }
 
 /// Top-level app. `inner` is populated on `resumed`.
@@ -80,6 +86,10 @@ struct Running {
     router: InputRouter,
     overlays: OverlayHost,
     mods: ModifiersState,
+    /// Fresh configs delivered by the background watcher (settings feature).
+    config_rx: Receiver<Config>,
+    /// Kept alive so the watch thread keeps running; dropping it stops watching.
+    _config_watcher: Option<ConfigWatcher>,
 }
 
 impl App {
@@ -123,6 +133,26 @@ impl App {
         let first = Session::spawn(TabId(0), cols, rows, fg, bg, self.proxy.clone())?;
         let tabs = Tabs::new(first, fg, bg, self.proxy.clone());
 
+        // Live-config watcher (settings feature): on a valid change it sends the
+        // fresh Config and wakes the loop with UserEvent::ConfigReloaded.
+        let (config_tx, config_rx) = mpsc::channel::<Config>();
+        let config_watcher = match Config::path() {
+            Ok(path) => {
+                let proxy = self.proxy.clone();
+                ConfigWatcher::spawn(path, move |cfg| {
+                    if config_tx.send(cfg).is_ok() {
+                        let _ = proxy.send_event(UserEvent::ConfigReloaded);
+                    }
+                })
+                .map_err(|e| tracing::warn!("config watcher disabled: {e}"))
+                .ok()
+            }
+            Err(e) => {
+                tracing::warn!("config path unavailable, live settings off: {e}");
+                None
+            }
+        };
+
         tracing::info!(cols, rows, "terminal started: zsh spawned, grid ready");
         let mut running = Running {
             window,
@@ -132,6 +162,8 @@ impl App {
             router,
             overlays,
             mods: ModifiersState::empty(),
+            config_rx,
+            _config_watcher: config_watcher,
         };
         running.sync_tab_model();
         running.window.request_redraw();
@@ -231,12 +263,26 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        let UserEvent::PtyOutput(id) = event;
-        // Advance the originating tab's grid; only redraw if it is active (R1.2).
-        let is_active = inner.tabs.is_active(id);
-        if let Some(session) = inner.tabs.by_id_mut(id) {
-            if session.drain() && is_active {
-                inner.window.request_redraw();
+        match event {
+            UserEvent::PtyOutput(id) => {
+                // Advance the originating tab's grid; redraw only if active (R1.2).
+                let is_active = inner.tabs.is_active(id);
+                if let Some(session) = inner.tabs.by_id_mut(id) {
+                    if session.drain() && is_active {
+                        inner.window.request_redraw();
+                    }
+                }
+            }
+            UserEvent::ConfigReloaded => {
+                // Drain to the newest config (coalesce rapid saves), then apply.
+                let mut latest = None;
+                while let Ok(cfg) = inner.config_rx.try_recv() {
+                    latest = Some(cfg);
+                }
+                if let Some(cfg) = latest {
+                    crate::settings::apply(&cfg, &mut inner.renderer, &mut inner.tabs);
+                    inner.window.request_redraw();
+                }
             }
         }
     }
