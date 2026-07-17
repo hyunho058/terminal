@@ -12,6 +12,7 @@
 
 pub mod atlas;
 pub mod glyph;
+pub mod tab_bar;
 
 use std::sync::Arc;
 
@@ -116,6 +117,8 @@ pub struct FrameCtx<'a> {
     pub cell: [f32; 2],
     /// Physical px reserved above the grid (the tab bar paints this top band).
     pub top_inset: f32,
+    /// Render-target format — a layer needs it to build its own pipelines.
+    pub format: wgpu::TextureFormat,
     pub snapshot: &'a GridSnapshot,
     pub atlas: &'a mut Atlas,
 }
@@ -515,6 +518,7 @@ impl Renderer {
                 viewport,
                 cell,
                 top_inset: self.top_inset,
+                format: self.config.format,
                 snapshot,
                 atlas: &mut self.atlas,
             };
@@ -907,6 +911,7 @@ mod tests {
             viewport: [64.0, 64.0],
             cell: [12.0, 24.0],
             top_inset: 0.0,
+            format: wgpu::TextureFormat::Rgba8Unorm,
             snapshot: &snap,
             atlas: &mut atlas,
         };

@@ -7,6 +7,10 @@
 //! to the UI thread over a channel; an `EventLoopProxy` wakes the event loop so
 //! the render happens on the winit thread (C6 — no free-running loop).
 
+mod input;
+mod seam;
+mod session;
+mod tabs;
 mod terminal_app;
 
 use winit::event_loop::{ControlFlow, EventLoop};

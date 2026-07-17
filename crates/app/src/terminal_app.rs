@@ -1,40 +1,46 @@
-//! The winit `ApplicationHandler` — THE vertical-slice exemplar (T3).
+//! The winit `ApplicationHandler` — the tabbed vertical slice (T3).
 //!
-//! This is the one flow an agent copies to build every future feature. It shows,
-//! end to end:
-//!   1. window + GPU surface creation (`resumed`)
-//!   2. spawning zsh in a PTY and reading it on a background thread (D7)
-//!   3. waking the UI thread via `EventLoopProxy` on new output (C6)
-//!   4. feeding bytes through `term-core` and drawing the snapshot (`renderer`)
-//!   5. keyboard input → PTY, and window resize → grid/PTY/renderer (T8)
-//!   6. graceful teardown: dropping `Running` closes the PTY and the reader ends.
+//! Owns the event loop and wires everything: N independent [`Session`]s as tabs,
+//! a registered tab-bar [`DrawLayer`] painting the reserved top inset, tab chords
+//! (D5), and the SD4 registration seam ([`InputRouter`]/[`OverlayHost`]) that
+//! later features extend without editing this file.
+//!
+//! Input dispatch order per key (R3.3/R4): visible overlays → registered input
+//! handlers → tab chords → default `encode_key` to the active shell.
 
-use std::io::{Read, Write};
-use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 
 use common::config::Config;
+use renderer::tab_bar::{self, TabBar, TabBarModel, TabModelHandle};
 use renderer::Renderer;
-use term_core::{Color, Pty, Terminal};
+use term_core::Color;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
 
-/// Custom event used only to wake the event loop when PTY output is available.
+use crate::input::{encode_key, tab_action, TabAction};
+use crate::seam::{AppCtx, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayHost};
+use crate::session::{Session, TabId};
+use crate::tabs::Tabs;
+
+/// Custom event: PTY output is available for a specific tab (D2 — tagged wake).
 #[derive(Debug, Clone, Copy)]
 pub enum UserEvent {
-    PtyOutput,
+    PtyOutput(TabId),
 }
 
-/// Top-level app. `inner` is populated on `resumed` (the winit lifecycle point
-/// where a window/surface may be created).
+/// Top-level app. `inner` is populated on `resumed`.
 pub struct App {
     cfg: Config,
     proxy: EventLoopProxy<UserEvent>,
     inner: Option<Running>,
+    /// SD4 seam: features register handlers/overlays here (from `main.rs`, in
+    /// their own module) *before* `run_app` — never by editing this file (C1).
+    /// Consumed into the live registries on `resumed`.
+    pending_handlers: Vec<Box<dyn InputHandler>>,
+    pending_overlays: Vec<Box<dyn Overlay>>,
 }
 
 impl App {
@@ -43,23 +49,44 @@ impl App {
             cfg,
             proxy,
             inner: None,
+            pending_handlers: Vec::new(),
+            pending_overlays: Vec::new(),
         }
+    }
+
+    /// Register an input handler (SD4/R3.3) — the seam entry a sibling feature
+    /// (e.g. image-paste's Cmd+V) calls from `main.rs` instead of editing the
+    /// event loop. No in-tree consumer yet (first: image-paste).
+    #[allow(dead_code)]
+    pub fn register_handler(&mut self, handler: Box<dyn InputHandler>) {
+        self.pending_handlers.push(handler);
+    }
+
+    /// Register an overlay (SD4/R4) — its `on_key` runs before default input and
+    /// its `DrawLayer` is drawn above the grid (ai-monitor/settings). No in-tree
+    /// consumer yet.
+    #[allow(dead_code)]
+    pub fn register_overlay(&mut self, overlay: Box<dyn Overlay>) {
+        self.pending_overlays.push(overlay);
     }
 }
 
-/// Everything that only exists once we have a window + GPU + shell.
+/// Everything that only exists once we have a window + GPU + shells.
 struct Running {
     window: Arc<Window>,
     renderer: Renderer,
-    terminal: Terminal,
-    pty: Pty,
-    writer: Box<dyn Write + Send>,
-    rx: Receiver<Vec<u8>>,
-    _reader: JoinHandle<()>,
+    tabs: Tabs,
+    tab_model: TabModelHandle,
+    router: InputRouter,
+    overlays: OverlayHost,
+    mods: ModifiersState,
 }
 
 impl App {
-    fn start(&mut self, event_loop: &ActiveEventLoop) -> anyhow_lite::Result<Running> {
+    fn start(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+    ) -> crate::session::anyhow_lite::Result<Running> {
         let attrs = Window::default_attributes()
             .with_title("mac-terminal")
             .with_inner_size(winit::dpi::LogicalSize::new(900.0, 540.0));
@@ -67,53 +94,122 @@ impl App {
 
         let size = window.inner_size();
         let scale = window.scale_factor();
-        let renderer = Renderer::new(window.clone(), size.width, size.height, scale, &self.cfg)
+        let mut renderer = Renderer::new(window.clone(), size.width, size.height, scale, &self.cfg)
             .map_err(err)?;
 
+        // Reserve the tab-bar band up top, then register the layer (SD3/R2).
+        let bar_h = tab_bar::height_px(renderer.cell_size().1);
+        renderer.set_top_inset(bar_h);
+        let (bar, tab_model) = TabBar::new();
+        renderer.add_layer(Box::new(bar));
+
+        // Drain the SD4 seam registrations into the live registries. Each
+        // overlay also contributes a DrawLayer drawn above the grid (R4.1).
+        let mut router = InputRouter::default();
+        for h in self.pending_handlers.drain(..) {
+            router.register(h);
+        }
+        let mut overlays = OverlayHost::default();
+        for o in self.pending_overlays.drain(..) {
+            renderer.add_layer(o.layer());
+            overlays.register(o);
+        }
+
+        // grid_size() now reports rows *below* the inset (R2.2).
         let (cols, rows) = renderer.grid_size();
-        let terminal = Terminal::new(
-            cols,
-            rows,
-            Color(self.cfg.theme.foreground),
-            Color(self.cfg.theme.background),
-        );
+        let fg = Color(self.cfg.theme.foreground);
+        let bg = Color(self.cfg.theme.background);
 
-        let pty = Pty::spawn(cols, rows).map_err(err)?;
-        let writer = pty.writer().map_err(err)?;
-        let mut reader = pty.reader().map_err(err)?;
-
-        // PTY reader thread: read → channel → wake the UI thread (D7, C6).
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        let proxy = self.proxy.clone();
-        let reader_thread = std::thread::Builder::new()
-            .name("pty-reader".into())
-            .spawn(move || {
-                let mut buf = [0u8; 8192];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break, // EOF or shell exited
-                        Ok(n) => {
-                            if tx.send(buf[..n].to_vec()).is_err() {
-                                break;
-                            }
-                            let _ = proxy.send_event(UserEvent::PtyOutput);
-                        }
-                    }
-                }
-            })
-            .map_err(err)?;
+        let first = Session::spawn(TabId(0), cols, rows, fg, bg, self.proxy.clone())?;
+        let tabs = Tabs::new(first, fg, bg, self.proxy.clone());
 
         tracing::info!(cols, rows, "terminal started: zsh spawned, grid ready");
-        window.request_redraw();
-        Ok(Running {
+        let mut running = Running {
             window,
             renderer,
-            terminal,
-            pty,
-            writer,
-            rx,
-            _reader: reader_thread,
-        })
+            tabs,
+            tab_model,
+            router,
+            overlays,
+            mods: ModifiersState::empty(),
+        };
+        running.sync_tab_model();
+        running.window.request_redraw();
+        Ok(running)
+    }
+}
+
+impl Running {
+    /// Push the current tab titles + active index into the tab-bar layer (D6).
+    fn sync_tab_model(&mut self) {
+        self.tab_model.set(TabBarModel {
+            titles: self.tabs.titles(),
+            active: self.tabs.active_index(),
+        });
+    }
+
+    /// Handle a tab chord (R3.2). Returns false if the app should exit (last tab
+    /// closed).
+    fn do_tab_action(&mut self, action: TabAction) -> bool {
+        match action {
+            TabAction::New => {
+                let (cols, rows) = self.renderer.grid_size();
+                if let Err(e) = self.tabs.open(cols, rows) {
+                    tracing::warn!("open tab failed: {e}");
+                }
+            }
+            TabAction::CloseActive => {
+                if !self.tabs.close_active() {
+                    return false; // last tab → exit
+                }
+            }
+            TabAction::Next => self.tabs.next(),
+            TabAction::Prev => self.tabs.prev(),
+            TabAction::Jump(i) => self.tabs.jump(i),
+        }
+        self.sync_tab_model();
+        self.window.request_redraw();
+        true
+    }
+
+    /// Dispatch a key through the seam, then default input (R3.3/R4). Returns
+    /// false if the app should exit.
+    fn on_key(&mut self, input: KeyInput) -> bool {
+        // 1) Visible overlays first (R4.1/R4.2).
+        {
+            let active = self.tabs.active_index();
+            let count = self.tabs.len();
+            let mut ctx = AppCtx::new(&mut self.tabs.active_mut().writer, count, active);
+            if self.overlays.dispatch(&input, &mut ctx) == Handled::Consumed {
+                if ctx.redraw_requested() {
+                    self.window.request_redraw();
+                }
+                return true;
+            }
+        }
+        // 2) Registered input handlers before default (R3.3).
+        {
+            let active = self.tabs.active_index();
+            let count = self.tabs.len();
+            let mut ctx = AppCtx::new(&mut self.tabs.active_mut().writer, count, active);
+            if self.router.dispatch(&input, &mut ctx) == Handled::Consumed {
+                if ctx.redraw_requested() {
+                    self.window.request_redraw();
+                }
+                return true;
+            }
+        }
+        // 3) Tab chords, intercepted before the shell (D5/R3.2).
+        if let Some(action) = tab_action(&input.key, &input.mods) {
+            return self.do_tab_action(action);
+        }
+        // 4) Default: encode to the active shell only (R3.1).
+        if let Some(bytes) = encode_key(&input.key, input.text.as_deref()) {
+            if let Err(e) = self.tabs.active_mut().write(&bytes) {
+                tracing::warn!("pty write failed: {e}");
+            }
+        }
+        true
     }
 }
 
@@ -131,17 +227,17 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        let mut got = false;
-        while let Ok(bytes) = inner.rx.try_recv() {
-            inner.terminal.advance(&bytes);
-            got = true;
-        }
-        if got {
-            inner.window.request_redraw();
+        let UserEvent::PtyOutput(id) = event;
+        // Advance the originating tab's grid; only redraw if it is active (R1.2).
+        let is_active = inner.tabs.is_active(id);
+        if let Some(session) = inner.tabs.by_id_mut(id) {
+            if session.drain() && is_active {
+                inner.window.request_redraw();
+            }
         }
     }
 
@@ -152,32 +248,32 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
 
+            WindowEvent::ModifiersChanged(m) => {
+                inner.mods = m.state();
+            }
+
             WindowEvent::Resized(size) => {
                 inner.renderer.resize(size.width, size.height);
                 let (cols, rows) = inner.renderer.grid_size();
-                inner.terminal.resize(cols, rows);
-                if let Err(e) = inner.pty.resize(cols, rows) {
-                    tracing::warn!("pty resize failed: {e}");
-                }
+                inner.tabs.resize_all(cols, rows); // background tabs too (R5.1)
                 inner.window.request_redraw();
             }
 
             WindowEvent::KeyboardInput {
                 event: key_event, ..
             } if key_event.state == ElementState::Pressed => {
-                if let Some(bytes) = encode_key(&key_event.logical_key, key_event.text.as_deref()) {
-                    if let Err(e) = inner
-                        .writer
-                        .write_all(&bytes)
-                        .and_then(|_| inner.writer.flush())
-                    {
-                        tracing::warn!("pty write failed: {e}");
-                    }
+                let input = KeyInput {
+                    key: key_event.logical_key.clone(),
+                    text: key_event.text.as_ref().map(|t| t.to_string()),
+                    mods: inner.mods,
+                };
+                if !inner.on_key(input) {
+                    event_loop.exit();
                 }
             }
 
             WindowEvent::RedrawRequested => {
-                let snapshot = inner.terminal.snapshot();
+                let snapshot = inner.tabs.active().terminal.snapshot();
                 if let Err(e) = inner.renderer.render(&snapshot) {
                     tracing::warn!("render failed: {e}");
                 }
@@ -186,25 +282,6 @@ impl ApplicationHandler<UserEvent> for App {
             _ => {}
         }
     }
-}
-
-/// Translate a key press into the bytes a shell expects. Named keys first, then
-/// fall back to the event's text (covers letters, symbols, and IME output).
-fn encode_key(logical: &Key, text: Option<&str>) -> Option<Vec<u8>> {
-    match logical {
-        Key::Named(NamedKey::Enter) => Some(vec![b'\r']),
-        Key::Named(NamedKey::Backspace) => Some(vec![0x7f]),
-        Key::Named(NamedKey::Tab) => Some(vec![b'\t']),
-        Key::Named(NamedKey::Escape) => Some(vec![0x1b]),
-        Key::Named(NamedKey::Space) => Some(vec![b' ']),
-        _ => text.map(|t| t.as_bytes().to_vec()),
-    }
-}
-
-/// Minimal error plumbing so `start` can use `?` across heterogeneous errors
-/// without pulling in the full `anyhow` crate.
-mod anyhow_lite {
-    pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 fn err<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
