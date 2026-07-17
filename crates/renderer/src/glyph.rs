@@ -45,15 +45,29 @@ impl GlyphRasterizer {
         })
     }
 
+    /// Map a character to its glyph id (0 == `.notdef`).
+    pub fn glyph_id(&self, ch: char) -> u16 {
+        FontRef::from_index(&self.data, self.index)
+            .unwrap()
+            .charmap()
+            .map(ch)
+    }
+
     /// Rasterize a single character. Returns `None` for `.notdef` or an empty
     /// (e.g. whitespace) outline.
     pub fn rasterize(&mut self, ch: char) -> Option<GlyphBitmap> {
-        // Safe to unwrap: validated in `new`.
-        let font = FontRef::from_index(&self.data, self.index).unwrap();
-        let glyph_id = font.charmap().map(ch);
+        let glyph_id = self.glyph_id(ch);
         if glyph_id == 0 {
             return None;
         }
+        self.rasterize_glyph(glyph_id)
+    }
+
+    /// Rasterize a specific glyph id (post-shaping). Returns `None` for an empty
+    /// outline (e.g. a space glyph).
+    pub fn rasterize_glyph(&mut self, glyph_id: u16) -> Option<GlyphBitmap> {
+        // Safe to unwrap: validated in `new`.
+        let font = FontRef::from_index(&self.data, self.index).unwrap();
         let mut scaler = self
             .context
             .builder(font)
