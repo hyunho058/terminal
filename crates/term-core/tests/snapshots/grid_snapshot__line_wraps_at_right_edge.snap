@@ -1,0 +1,7 @@
+---
+source: crates/term-core/tests/grid_snapshot.rs
+assertion_line: 70
+expression: t.snapshot().to_text()
+---
+abc
+d

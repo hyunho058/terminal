@@ -1,0 +1,7 @@
+---
+source: crates/term-core/tests/grid_snapshot.rs
+assertion_line: 35
+expression: t.snapshot().to_text()
+---
+
+  X

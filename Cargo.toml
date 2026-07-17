@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/term-core",
+    "crates/renderer",
+    "crates/app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+
+# Internal crates — reference by workspace path so the dependency direction
+# (common <- term-core <- renderer <- app) is declared in one place.
+[workspace.dependencies]
+common = { path = "crates/common" }
+term-core = { path = "crates/term-core" }
+renderer = { path = "crates/renderer" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

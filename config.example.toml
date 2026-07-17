@@ -1,0 +1,23 @@
+# mac-terminal configuration.
+#
+# Copy to ~/.config/mac-terminal/config.toml and edit. Every field is optional;
+# omitted fields fall back to the defaults shown here. Unknown keys are rejected
+# (deny_unknown_fields), so a typo fails loudly rather than being ignored.
+
+[font]
+# Family resolved by the macOS font stack.
+family = "Menlo"
+# Point size (scaled by the display's backing factor at render time).
+size_pt = 14.0
+# Programming ligatures (e.g. `!=`, `=>`). Applied during swash shaping.
+ligatures = true
+
+[theme]
+# Colors are packed 0xRRGGBB integers written in hex.
+background = 0x0F1419
+foreground = 0xE6E1CF
+
+[grid]
+# Initial grid hint. The actual grid is fit to the window on launch/resize.
+columns = 100
+rows = 30

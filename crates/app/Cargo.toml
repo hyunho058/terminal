@@ -1,0 +1,21 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "macOS terminal binary: winit event loop wiring term-core + renderer + config."
+default-run = "app"
+
+[[bin]]
+name = "app"
+path = "src/main.rs"
+
+[dependencies]
+common.workspace = true
+pollster = "1.0.1"
+renderer.workspace = true
+term-core.workspace = true
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+winit = "0.30.13"
