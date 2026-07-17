@@ -81,13 +81,16 @@ struct GlyphInstance {
 struct BgUniforms {
     viewport: [f32; 2],
     cell: [f32; 2],
+    top_inset: f32,
+    _pad: [f32; 3],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GlyphUniforms {
     viewport: [f32; 2],
-    _pad: [f32; 2],
+    top_inset: f32,
+    _pad: f32,
 }
 
 const QUAD: [Vertex; 6] = [
@@ -111,6 +114,8 @@ pub struct FrameCtx<'a> {
     pub viewport: [f32; 2],
     /// Cell size in physical px.
     pub cell: [f32; 2],
+    /// Physical px reserved above the grid (the tab bar paints this top band).
+    pub top_inset: f32,
     pub snapshot: &'a GridSnapshot,
     pub atlas: &'a mut Atlas,
 }
@@ -142,6 +147,9 @@ pub struct Renderer {
     atlas: Atlas,
     font: Arc<Vec<u8>>,
     cell_size: (f32, f32),
+    /// Physical px reserved above the grid (e.g. a tab bar). Grid + glyphs are
+    /// shifted down by this, and `grid_size` reports the rows that fit below it.
+    top_inset: f32,
     ppem: f32,
     ligatures: bool,
     bg_default: u32,
@@ -204,6 +212,8 @@ impl Renderer {
         let bg_uniforms = BgUniforms {
             viewport: [config.width as f32, config.height as f32],
             cell: [cell_size.0, cell_size.1],
+            top_inset: 0.0,
+            _pad: [0.0; 3],
         };
         let bg_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("bg-uniforms"),
@@ -239,7 +249,8 @@ impl Renderer {
         });
         let glyph_uniforms = GlyphUniforms {
             viewport: [config.width as f32, config.height as f32],
-            _pad: [0.0, 0.0],
+            top_inset: 0.0,
+            _pad: 0.0,
         };
         let glyph_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("glyph-uniforms"),
@@ -323,6 +334,7 @@ impl Renderer {
             atlas,
             font,
             cell_size,
+            top_inset: 0.0,
             ppem,
             ligatures: cfg.font.ligatures,
             bg_default: cfg.theme.background,
@@ -342,19 +354,40 @@ impl Renderer {
     }
 
     pub fn grid_size(&self) -> (u16, u16) {
-        let cols = (self.config.width as f32 / self.cell_size.0)
-            .floor()
-            .max(1.0) as u16;
-        let rows = (self.config.height as f32 / self.cell_size.1)
-            .floor()
-            .max(1.0) as u16;
-        (cols, rows)
+        grid_dims(
+            self.config.width as f32,
+            self.config.height as f32,
+            self.cell_size,
+            self.top_inset,
+        )
+    }
+
+    /// Reserve `px` physical pixels above the grid (e.g. for a tab bar). The
+    /// terminal grid + glyphs draw below this band, and [`grid_size`] reports the
+    /// rows that fit under it. A registered `DrawLayer` (the tab bar) paints the
+    /// band, reading the same value from [`FrameCtx::top_inset`]. Set to `0.0` to
+    /// clear. (Unblocks `tabs` R2.2/D3 — decision ①A.)
+    ///
+    /// [`grid_size`]: Renderer::grid_size
+    pub fn set_top_inset(&mut self, px: f32) {
+        self.top_inset = px.max(0.0);
+        self.write_uniforms();
+    }
+
+    /// Current top inset in physical px.
+    pub fn top_inset(&self) -> f32 {
+        self.top_inset
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
         self.surface.configure(&self.device, &self.config);
+        self.write_uniforms();
+    }
+
+    /// Push the current viewport / cell / top-inset into both uniform buffers.
+    fn write_uniforms(&mut self) {
         let vp = [self.config.width as f32, self.config.height as f32];
         self.queue.write_buffer(
             &self.bg_uniform_buf,
@@ -362,6 +395,8 @@ impl Renderer {
             bytemuck::bytes_of(&BgUniforms {
                 viewport: vp,
                 cell: [self.cell_size.0, self.cell_size.1],
+                top_inset: self.top_inset,
+                _pad: [0.0; 3],
             }),
         );
         self.queue.write_buffer(
@@ -369,7 +404,8 @@ impl Renderer {
             0,
             bytemuck::bytes_of(&GlyphUniforms {
                 viewport: vp,
-                _pad: [0.0, 0.0],
+                top_inset: self.top_inset,
+                _pad: 0.0,
             }),
         );
     }
@@ -478,6 +514,7 @@ impl Renderer {
                 view,
                 viewport,
                 cell,
+                top_inset: self.top_inset,
                 snapshot,
                 atlas: &mut self.atlas,
             };
@@ -659,6 +696,16 @@ fn cell_size_px(cfg: &Config, scale_factor: f64) -> (f32, f32) {
     ((px * 0.6).round().max(1.0), (px * 1.2).round().max(1.0))
 }
 
+/// Cols × rows that fit a framebuffer, reserving `top_inset` px above the grid
+/// (e.g. a tab bar). Only the height below the inset holds rows. Kept as a free
+/// function so the inset arithmetic is unit-testable without a GPU surface.
+fn grid_dims(width: f32, height: f32, cell: (f32, f32), top_inset: f32) -> (u16, u16) {
+    let cols = (width / cell.0).floor().max(1.0) as u16;
+    let usable_h = (height - top_inset).max(0.0);
+    let rows = (usable_h / cell.1).floor().max(1.0) as u16;
+    (cols, rows)
+}
+
 fn to_wgpu_color(packed: u32) -> wgpu::Color {
     let [r, g, b] = term_core::Color(packed).to_linear_f32();
     wgpu::Color {
@@ -693,6 +740,28 @@ mod tests {
     fn cell_size_scales_with_dpi() {
         let cfg = Config::default();
         assert!(cell_size_px(&cfg, 2.0).0 > cell_size_px(&cfg, 1.0).0);
+    }
+
+    #[test]
+    fn top_inset_reserves_rows_for_the_tab_bar() {
+        // 800px tall, 20px cells → 40 rows with no inset.
+        let (_, rows0) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0);
+        assert_eq!(rows0, 40);
+        // A 40px tab bar (2 rows) reserves the top band → 38 rows below it.
+        let (cols, rows1) = grid_dims(1200.0, 800.0, (10.0, 20.0), 40.0);
+        assert_eq!(rows1, 38, "grid rows shrink by the inset, not the cols");
+        assert_eq!(cols, 120, "inset never affects column count");
+        // A pathological inset taller than the window still yields ≥1 row.
+        let (_, rows2) = grid_dims(1200.0, 800.0, (10.0, 20.0), 10_000.0);
+        assert_eq!(rows2, 1);
+    }
+
+    #[test]
+    fn uniform_blocks_are_16_byte_aligned() {
+        // WGSL uniform structs must be a multiple of 16 bytes; the Rust mirrors
+        // (with top_inset) must match or the shader reads garbage.
+        assert_eq!(std::mem::size_of::<BgUniforms>(), 32);
+        assert_eq!(std::mem::size_of::<GlyphUniforms>(), 16);
     }
 
     #[test]
@@ -837,6 +906,7 @@ mod tests {
             view: &view,
             viewport: [64.0, 64.0],
             cell: [12.0, 24.0],
+            top_inset: 0.0,
             snapshot: &snap,
             atlas: &mut atlas,
         };

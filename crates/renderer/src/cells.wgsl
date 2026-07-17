@@ -8,6 +8,8 @@
 struct Uniforms {
     viewport: vec2<f32>, // framebuffer size in physical pixels
     cell: vec2<f32>,     // cell size in physical pixels
+    top_inset: f32,      // px reserved above the grid (e.g. tab bar) — grid shifts down
+    _pad: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -28,7 +30,7 @@ fn vs_main(in: VsIn) -> VsOut {
     let px = (in.grid_pos + in.corner) * u.cell;
     let clip = vec2<f32>(
         px.x / u.viewport.x * 2.0 - 1.0,
-        1.0 - px.y / u.viewport.y * 2.0,
+        1.0 - (px.y + u.top_inset) / u.viewport.y * 2.0,
     );
     var out: VsOut;
     out.pos = vec4<f32>(clip, 0.0, 1.0);
