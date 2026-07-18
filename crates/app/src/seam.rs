@@ -18,6 +18,7 @@
 #![allow(dead_code)]
 
 use std::io::Write;
+use std::path::PathBuf;
 
 use renderer::DrawLayer;
 use winit::keyboard::{Key, ModifiersState};
@@ -49,15 +50,23 @@ pub struct AppCtx<'a> {
     pub tab_count: usize,
     /// Active tab index.
     pub active: usize,
+    /// The active tab's live working directory (ai-monitor log resolution).
+    pub active_cwd: Option<PathBuf>,
     redraw: bool,
 }
 
 impl<'a> AppCtx<'a> {
-    pub fn new(writer: &'a mut dyn Write, tab_count: usize, active: usize) -> Self {
+    pub fn new(
+        writer: &'a mut dyn Write,
+        tab_count: usize,
+        active: usize,
+        active_cwd: Option<PathBuf>,
+    ) -> Self {
         AppCtx {
             writer,
             tab_count,
             active,
+            active_cwd,
             redraw: false,
         }
     }
@@ -89,6 +98,15 @@ pub trait Overlay {
     fn on_key(&mut self, input: &KeyInput, ctx: &mut AppCtx) -> Handled;
     /// The overlay's draw layer, registered with the renderer.
     fn layer(&self) -> Box<dyn DrawLayer>;
+    /// Drain any background work (e.g. a log-tail channel) into the overlay's
+    /// draw model. Called when a `UserEvent` signals the overlay has pending data.
+    /// Returns true if something changed (→ redraw). Default: nothing to do.
+    fn poll(&mut self) -> bool {
+        false
+    }
+    /// The active tab changed; re-point anything cwd-derived (ai-monitor R3.1).
+    /// Default: no-op.
+    fn on_active_changed(&mut self, _cwd: Option<PathBuf>) {}
 }
 
 /// Ordered list of input handlers, consulted before default tab input (R3.3).
@@ -146,6 +164,22 @@ impl OverlayHost {
     pub fn layers(&self) -> Vec<Box<dyn DrawLayer>> {
         self.overlays.iter().map(|o| o.layer()).collect()
     }
+
+    /// Drain background work for every overlay; returns true if any changed (R1.3).
+    pub fn poll_all(&mut self) -> bool {
+        let mut changed = false;
+        for o in &mut self.overlays {
+            changed |= o.poll();
+        }
+        changed
+    }
+
+    /// Tell every overlay the active tab changed (ai-monitor re-point, R3.1).
+    pub fn notify_active_changed(&mut self, cwd: Option<PathBuf>) {
+        for o in &mut self.overlays {
+            o.on_active_changed(cwd.clone());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -179,7 +213,7 @@ mod tests {
         router.register(Box::new(Fixed(Handled::Consumed, true)));
         // This second handler must NOT run once the first consumes.
         router.register(Box::new(Fixed(Handled::Passthrough, true)));
-        let mut ctx = AppCtx::new(&mut buf, 1, 0);
+        let mut ctx = AppCtx::new(&mut buf, 1, 0, None);
         assert_eq!(router.dispatch(&key("v"), &mut ctx), Handled::Consumed);
         assert_eq!(buf, b"X", "only the first handler ran");
     }
@@ -189,7 +223,7 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         let mut router = InputRouter::default();
         router.register(Box::new(Fixed(Handled::Passthrough, false)));
-        let mut ctx = AppCtx::new(&mut buf, 1, 0);
+        let mut ctx = AppCtx::new(&mut buf, 1, 0, None);
         assert_eq!(router.dispatch(&key("a"), &mut ctx), Handled::Passthrough);
     }
 
@@ -229,7 +263,7 @@ mod tests {
             vis: true,
             verdict: Handled::Consumed,
         }));
-        let mut ctx = AppCtx::new(&mut buf, 1, 0);
+        let mut ctx = AppCtx::new(&mut buf, 1, 0, None);
         assert_eq!(
             host.dispatch(&key("k"), &mut ctx),
             Handled::Consumed,
@@ -251,7 +285,7 @@ mod tests {
             vis: true,
             verdict: Handled::Passthrough, // visible but declines
         }));
-        let mut ctx = AppCtx::new(&mut buf, 1, 0);
+        let mut ctx = AppCtx::new(&mut buf, 1, 0, None);
         assert_eq!(
             host.dispatch(&key("j"), &mut ctx),
             Handled::Passthrough,

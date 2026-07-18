@@ -35,6 +35,9 @@ pub enum UserEvent {
     /// The config file changed; a fresh `Config` is waiting on the channel
     /// (settings feature — background file-watch, not a key event).
     ConfigReloaded,
+    /// A registered overlay has pending background work (e.g. ai-monitor's log
+    /// tail); the loop should `poll` the overlays and redraw.
+    OverlayPending,
 }
 
 /// Top-level app. `inner` is populated on `resumed`.
@@ -200,6 +203,9 @@ impl Running {
             TabAction::Jump(i) => self.tabs.jump(i),
         }
         self.sync_tab_model();
+        // Re-point cwd-derived overlays (ai-monitor) at the new active tab (R3.1).
+        let cwd = self.tabs.active_cwd();
+        self.overlays.notify_active_changed(cwd);
         self.window.request_redraw();
         true
     }
@@ -211,7 +217,8 @@ impl Running {
         {
             let active = self.tabs.active_index();
             let count = self.tabs.len();
-            let mut ctx = AppCtx::new(&mut self.tabs.active_mut().writer, count, active);
+            let cwd = self.tabs.active_cwd();
+            let mut ctx = AppCtx::new(&mut self.tabs.active_mut().writer, count, active, cwd);
             if self.overlays.dispatch(&input, &mut ctx) == Handled::Consumed {
                 if ctx.redraw_requested() {
                     self.window.request_redraw();
@@ -223,7 +230,8 @@ impl Running {
         {
             let active = self.tabs.active_index();
             let count = self.tabs.len();
-            let mut ctx = AppCtx::new(&mut self.tabs.active_mut().writer, count, active);
+            let cwd = self.tabs.active_cwd();
+            let mut ctx = AppCtx::new(&mut self.tabs.active_mut().writer, count, active, cwd);
             if self.router.dispatch(&input, &mut ctx) == Handled::Consumed {
                 if ctx.redraw_requested() {
                     self.window.request_redraw();
@@ -281,6 +289,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if let Some(cfg) = latest {
                     crate::settings::apply(&cfg, &mut inner.renderer, &mut inner.tabs);
+                    inner.window.request_redraw();
+                }
+            }
+            UserEvent::OverlayPending => {
+                // An overlay (ai-monitor) tailed new data — fold it in + redraw (R1.3).
+                if inner.overlays.poll_all() {
                     inner.window.request_redraw();
                 }
             }

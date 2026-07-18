@@ -4,6 +4,8 @@
 //! The index arithmetic (which tab is active after a wrap/close) is factored into
 //! pure free functions so it is unit-tested without spawning a shell.
 
+use std::path::PathBuf;
+
 use term_core::Color;
 use winit::event_loop::EventLoopProxy;
 
@@ -138,13 +140,19 @@ impl Tabs {
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                if s.title().is_empty() {
-                    format!("Tab {}", i + 1)
-                } else {
-                    s.title().to_string()
-                }
+                // Prefer the live cwd basename (R6.1); fall back to `Tab N`.
+                s.cwd()
+                    .as_deref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("Tab {}", i + 1))
             })
             .collect()
+    }
+
+    /// The active tab's live working directory (ai-monitor log resolution).
+    pub fn active_cwd(&self) -> Option<PathBuf> {
+        self.active().cwd()
     }
 }
 

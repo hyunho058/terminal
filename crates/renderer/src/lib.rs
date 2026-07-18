@@ -12,6 +12,7 @@
 
 pub mod atlas;
 pub mod glyph;
+pub mod overlay_layer;
 pub mod tab_bar;
 
 use std::sync::Arc;

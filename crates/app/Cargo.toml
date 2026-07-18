@@ -12,7 +12,9 @@ name = "app"
 path = "src/main.rs"
 
 [dependencies]
+ai-monitor = { version = "0.1.0", path = "../ai-monitor" }
 common.workspace = true
+libc = "0.2.186"
 pollster = "1.0.1"
 renderer.workspace = true
 term-core.workspace = true

@@ -19,7 +19,6 @@ pub const SHELL: &str = "/bin/zsh";
 /// master and signals the child.
 pub struct Pty {
     master: Box<dyn portable_pty::MasterPty + Send>,
-    #[allow(dead_code)]
     child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
@@ -56,6 +55,13 @@ impl Pty {
     /// Take the single writer for sending input to the shell.
     pub fn writer(&self) -> Result<Box<dyn Write + Send>> {
         self.master.take_writer().map_err(Error::pty)
+    }
+
+    /// The OS process id of the shell child, if still known. Lets the app query
+    /// the live working directory (e.g. for tab titles / ai-monitor log
+    /// resolution) via `proc_pidinfo`. Read-only observation.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.process_id()
     }
 
     /// Inform the kernel of a new window size so the shell reflows.

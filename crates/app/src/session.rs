@@ -5,6 +5,7 @@
 //! the right grid and only redraws when the *active* tab produced output.
 
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 
@@ -100,8 +101,17 @@ impl Session {
         Ok(())
     }
 
-    /// The tab title (D7 fallback `Tab N` until cwd titles land — see note in
-    /// `tabs.rs`). Empty string means "use the fallback".
+    /// The shell's live working directory, via the child pid + `proc_pidinfo`
+    /// (macOS). Follows `cd`, so it drives per-tab log resolution (ai-monitor R1.1/
+    /// R3.1) and cwd-basename tab titles (R6.1). `None` if the pid/cwd is
+    /// unavailable.
+    pub fn cwd(&self) -> Option<PathBuf> {
+        cwd_of_pid(self.pty.child_pid()?)
+    }
+
+    /// An explicit tab title override (e.g. a future OSC-2 title). Unused now that
+    /// titles derive from the live cwd; kept as the override hook with `set_title`.
+    #[allow(dead_code)]
     pub fn title(&self) -> &str {
         &self.title
     }
@@ -124,4 +134,52 @@ fn err<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
     e: E,
 ) -> Box<dyn std::error::Error + Send + Sync> {
     e.into()
+}
+
+/// The current working directory of process `pid` via macOS `proc_pidinfo`
+/// (`PROC_PIDVNODEPATHINFO`). Read-only. `None` on any failure (dead pid,
+/// permission, empty path) — callers degrade gracefully.
+fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if n < size {
+        return None; // error or short read
+    }
+    // pvi_cdir.vip_path is a fixed 1024-byte, NUL-terminated C path.
+    let raw = &info.pvi_cdir.vip_path;
+    let bytes = unsafe {
+        std::slice::from_raw_parts(raw.as_ptr() as *const u8, std::mem::size_of_val(raw))
+    };
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(0);
+    if end == 0 {
+        return None;
+    }
+    std::str::from_utf8(&bytes[..end]).ok().map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Validate the `proc_pidinfo` struct layout: our own pid must resolve to our
+    /// own cwd. A wrong offset/size would yield garbage or `None`.
+    #[test]
+    fn cwd_of_pid_resolves_current_process() {
+        let got = cwd_of_pid(std::process::id()).expect("own cwd is resolvable");
+        let expected = std::env::current_dir().unwrap();
+        assert_eq!(
+            got.canonicalize().unwrap(),
+            expected.canonicalize().unwrap(),
+            "proc_pidinfo cwd matches std::env::current_dir"
+        );
+    }
 }

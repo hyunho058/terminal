@@ -8,6 +8,7 @@
 //! the render happens on the winit thread (C6 — no free-running loop).
 
 mod input;
+mod overlay;
 mod seam;
 mod session;
 mod settings;
@@ -16,6 +17,7 @@ mod terminal_app;
 
 use winit::event_loop::{ControlFlow, EventLoop};
 
+use overlay::AiMonitorOverlay;
 use terminal_app::{App, UserEvent};
 
 fn main() {
@@ -33,7 +35,10 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let proxy = event_loop.create_proxy();
-    let mut app = App::new(cfg, proxy);
+    let mut app = App::new(cfg, proxy.clone());
+    // Register feature extensions through the SD4 seam (no terminal_app edits):
+    // ai-monitor's Cmd+Shift+M overlay.
+    app.register_overlay(Box::new(AiMonitorOverlay::new(proxy)));
 
     if let Err(e) = event_loop.run_app(&mut app) {
         tracing::error!("event loop exited with error: {e}");
