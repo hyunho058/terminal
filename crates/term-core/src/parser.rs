@@ -191,12 +191,14 @@ impl Perform for Performer<'_> {
                 self.grid
                     .move_to(col.saturating_sub(1), row.saturating_sub(1));
             }
-            // ED — erase display (only the "all" variant handled at baseline).
-            'J' => {
-                if matches!(first, None | Some(0) | Some(2)) {
-                    self.grid.clear();
-                }
-            }
+            // ED — erase display. 0/none = cursor→end (what a shell sends to redraw
+            // its prompt — must NOT wipe scrollback), 1 = start→cursor, 2/3 = all.
+            'J' => match first {
+                None | Some(0) => self.grid.clear_from_cursor(),
+                Some(1) => self.grid.clear_to_cursor(),
+                Some(2) | Some(3) => self.grid.clear(),
+                _ => {}
+            },
             // EL — erase line from cursor.
             'K' => self.grid.clear_line_from_cursor(),
             // SGR — select graphic rendition (colors).
@@ -283,5 +285,54 @@ mod tests {
         let mut p = Processor::new();
         p.advance(&mut g, b"\x1b[2;3HX"); // CUP row2,col3 then 'X'
         assert_eq!(g.cell(2, 1).unwrap().ch, 'X');
+    }
+
+    fn row_text(g: &Grid, r: u16) -> String {
+        (0..g.cols())
+            .map(|c| g.cell(c, r).unwrap().ch)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn ed0_erases_below_cursor_only_and_keeps_scrollback() {
+        // Regression: `ESC[J` (ED0) is what a shell sends (`\r ESC[J`) to redraw its
+        // prompt after command output. It must clear only cursor→end, NOT the whole
+        // screen — otherwise every prompt wipes the command's output.
+        let mut g = Grid::new(10, 5, Color(0xFFFFFF), Color(0));
+        let mut p = Processor::new();
+        p.advance(&mut g, b"aaa\r\nbbb\r\nccc\r\n"); // rows 0..2 filled; cursor at row 3
+        p.advance(&mut g, b"\x1b[J"); // ED0 at row 3
+        assert_eq!(row_text(&g, 0), "aaa", "rows above the cursor survive ED0");
+        assert_eq!(row_text(&g, 1), "bbb");
+        assert_eq!(row_text(&g, 2), "ccc");
+        // The shell then writes its prompt on the cleared line — not at row 0.
+        p.advance(&mut g, b"% ");
+        assert_eq!(row_text(&g, 3), "%");
+        assert_eq!(row_text(&g, 0), "aaa", "prompt redraw did not home the cursor");
+    }
+
+    #[test]
+    fn ed1_erases_up_to_cursor() {
+        let mut g = Grid::new(10, 3, Color(0xFFFFFF), Color(0));
+        let mut p = Processor::new();
+        p.advance(&mut g, b"aaa\r\nbbb\r\ncc"); // cursor mid-row-2
+        p.advance(&mut g, b"\x1b[1J"); // start→cursor
+        assert_eq!(row_text(&g, 0), "", "row above the cursor is erased");
+        assert_eq!(row_text(&g, 1), "");
+        // Row 2 up to and including the cursor cell is erased; the tail survives.
+        assert_eq!(g.cell(0, 2).unwrap().ch, ' ');
+    }
+
+    #[test]
+    fn ed2_clears_the_whole_display() {
+        let mut g = Grid::new(10, 3, Color(0xFFFFFF), Color(0));
+        let mut p = Processor::new();
+        p.advance(&mut g, b"x\r\ny\r\nz");
+        p.advance(&mut g, b"\x1b[2J");
+        let any_ink = (0..g.rows())
+            .any(|r| (0..g.cols()).any(|c| g.cell(c, r).unwrap().ch != ' '));
+        assert!(!any_ink, "ED2 blanks the entire grid");
     }
 }

@@ -323,6 +323,24 @@ impl Grid {
         }
     }
 
+    /// Erase from the cursor (inclusive) to the end of the display (CSI 0J).
+    /// Does NOT move the cursor or touch rows above it — this is the erase a shell
+    /// sends (`\r ESC[J`) when redrawing its prompt, so it must preserve scrollback.
+    pub fn clear_from_cursor(&mut self) {
+        let start = self.index(self.cursor.col, self.cursor.row);
+        for cell in &mut self.cells[start..] {
+            *cell = Cell::blank(self.default_fg, self.default_bg);
+        }
+    }
+
+    /// Erase from the start of the display to the cursor (inclusive) (CSI 1J).
+    pub fn clear_to_cursor(&mut self) {
+        let end = (self.index(self.cursor.col, self.cursor.row) + 1).min(self.cells.len());
+        for cell in &mut self.cells[..end] {
+            *cell = Cell::blank(self.default_fg, self.default_bg);
+        }
+    }
+
     /// Resize the grid, preserving overlapping content, and clamp the cursor.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         let cols = cols.max(1);
