@@ -1,0 +1,18 @@
+[package]
+name = "renderer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "wgpu/Metal cell renderer. Consumes a term-core GridSnapshot; window-agnostic (no winit)."
+
+[dependencies]
+bytemuck = { version = "1.25.1", features = ["derive"] }
+common.workspace = true
+pollster = "1.0.1"
+raw-window-handle = "0.6.2"
+swash = "0.2.9"
+term-core.workspace = true
+thiserror = "2.0.18"
+tracing = "0.1.44"
+wgpu = "30.0.0"

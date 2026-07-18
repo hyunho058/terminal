@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# macOS
+.DS_Store
+
+# Local editor / tool state
+.claude/settings.local.json
+
+# insta pending snapshots
+**/*.snap.new

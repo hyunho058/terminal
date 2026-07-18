@@ -1,0 +1,16 @@
+[package]
+name = "common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared config, error, and logging utilities (no GPU/UI dependencies)."
+
+[dependencies]
+directories = "6.0.0"
+notify = "8.2.0"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+toml = "1.1.3"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }

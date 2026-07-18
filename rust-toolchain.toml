@@ -1,0 +1,6 @@
+[toolchain]
+# `stable` currently resolves to 1.95.0. Pin to a concrete version if you need
+# byte-for-byte reproducibility across machines.
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = ["aarch64-apple-darwin"]

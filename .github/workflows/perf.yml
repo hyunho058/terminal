@@ -1,0 +1,49 @@
+name: Perf
+
+# Performance gate — SEPARATE from ci.yml (D4/C3/R3.2): timing noise must never
+# fail the functional checks. Runs the Criterion benches on a macOS runner and
+# compares each group's measured median against the committed absolute thresholds
+# in docs/performance.md (D5/C4/R3.4).
+#
+# STATUS: this workflow is drafted but NOT yet green — the benches are not yet
+# registered as [[bench]] targets (needs a bench-owning workspace member, a
+# parked decision), and the `frame` group needs a headless Renderer constructor.
+# It is wired to be advisory until docs/performance.md is CONFIRMED (see the
+# `confirmed` flag in that file's JSON block); make it a required, merge-blocking
+# check (R3.3) only after the numbers are confirmed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # Docs-only PRs still run perf cheaply; that's fine — the gate reads docs.
+    paths-ignore: []
+
+jobs:
+  perf:
+    runs-on: macos-14 # Apple Silicon — matches the pinned machine class.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: rustup show # honors rust-toolchain.toml
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-perf-${{ hashFiles('**/Cargo.lock') }}
+
+      # Runs the three registered Criterion groups in the `perf` crate; produces
+      # target/criterion/<group>/new/estimates.json for the comparison step.
+      - name: Run benches
+        run: cargo bench -p perf
+
+      - name: Compare medians to committed thresholds
+        run: python3 benches/perf_compare.py
+
+  # NOTE: to enforce R3.3, add this job's name to the branch protection required
+  # checks for `main`. Keep it OUT of ci.yml (R3.2).
