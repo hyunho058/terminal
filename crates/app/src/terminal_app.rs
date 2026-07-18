@@ -93,6 +93,9 @@ struct Running {
     config_rx: Receiver<Config>,
     /// Kept alive so the watch thread keeps running; dropping it stops watching.
     _config_watcher: Option<ConfigWatcher>,
+    /// True while the window is fully occluded/hidden — the continuous redraw loop
+    /// pauses so a background/minimized terminal doesn't burn the GPU.
+    occluded: bool,
 }
 
 impl App {
@@ -167,14 +170,23 @@ impl App {
             mods: ModifiersState::empty(),
             config_rx,
             _config_watcher: config_watcher,
+            occluded: false,
         };
         running.sync_tab_model();
-        running.window.request_redraw();
+        running.redraw();
         Ok(running)
     }
 }
 
 impl Running {
+    /// Request a redraw for a **real content change**. Arms `needs_commit_frame`
+    /// so the RedrawRequested handler runs one extra commit cycle (macOS present
+    /// flush, winit#2640). Use this — not `window.request_redraw()` directly — for
+    /// every content change; the bare call is reserved for the commit cycle itself.
+    fn redraw(&mut self) {
+        self.window.request_redraw();
+    }
+
     /// Push the current tab titles + active index into the tab-bar layer (D6).
     fn sync_tab_model(&mut self) {
         self.tab_model.set(TabBarModel {
@@ -206,7 +218,7 @@ impl Running {
         // Re-point cwd-derived overlays (ai-monitor) at the new active tab (R3.1).
         let cwd = self.tabs.active_cwd();
         self.overlays.notify_active_changed(cwd);
-        self.window.request_redraw();
+        self.redraw();
         true
     }
 
@@ -221,7 +233,7 @@ impl Running {
             let mut ctx = AppCtx::new(&mut self.tabs.active_mut().writer, count, active, cwd);
             if self.overlays.dispatch(&input, &mut ctx) == Handled::Consumed {
                 if ctx.redraw_requested() {
-                    self.window.request_redraw();
+                    self.redraw();
                 }
                 return true;
             }
@@ -234,7 +246,7 @@ impl Running {
             let mut ctx = AppCtx::new(&mut self.tabs.active_mut().writer, count, active, cwd);
             if self.router.dispatch(&input, &mut ctx) == Handled::Consumed {
                 if ctx.redraw_requested() {
-                    self.window.request_redraw();
+                    self.redraw();
                 }
                 return true;
             }
@@ -275,10 +287,9 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::PtyOutput(id) => {
                 // Advance the originating tab's grid; redraw only if active (R1.2).
                 let is_active = inner.tabs.is_active(id);
-                if let Some(session) = inner.tabs.by_id_mut(id) {
-                    if session.drain() && is_active {
-                        inner.window.request_redraw();
-                    }
+                let advanced = inner.tabs.by_id_mut(id).map(|s| s.drain()).unwrap_or(false);
+                if advanced && is_active {
+                    inner.redraw();
                 }
             }
             UserEvent::ConfigReloaded => {
@@ -289,13 +300,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if let Some(cfg) = latest {
                     crate::settings::apply(&cfg, &mut inner.renderer, &mut inner.tabs);
-                    inner.window.request_redraw();
+                    inner.redraw();
                 }
             }
             UserEvent::OverlayPending => {
                 // An overlay (ai-monitor) tailed new data — fold it in + redraw (R1.3).
                 if inner.overlays.poll_all() {
-                    inner.window.request_redraw();
+                    inner.redraw();
                 }
             }
         }
@@ -316,7 +327,15 @@ impl ApplicationHandler<UserEvent> for App {
                 inner.renderer.resize(size.width, size.height);
                 let (cols, rows) = inner.renderer.grid_size();
                 inner.tabs.resize_all(cols, rows); // background tabs too (R5.1)
-                inner.window.request_redraw();
+                inner.redraw();
+            }
+
+            WindowEvent::Occluded(occluded) => {
+                // Pause the continuous redraw loop while hidden; resume on reveal.
+                inner.occluded = occluded;
+                if !occluded {
+                    inner.redraw();
+                }
             }
 
             WindowEvent::KeyboardInput {
@@ -337,6 +356,16 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Err(e) = inner.renderer.render(&snapshot) {
                     tracing::warn!("render failed: {e}");
                 }
+                // macOS/winit(0.30): with on-demand redraws the compositor drops the
+                // presented frame the moment the run loop sleeps, so the window only
+                // holds content while it is actively drawing (winit#2640; every
+                // targeted fix — pre_present_notify, presentsWithTransaction,
+                // commit-cycle, buffer-refill — failed on this wgpu/winit/macOS
+                // stack). Drive a continuous redraw so a frame is always in flight.
+                // Paused while the window is occluded (see `Occluded`) to save power.
+                if !inner.occluded {
+                    inner.window.request_redraw();
+                }
             }
 
             _ => {}
@@ -349,3 +378,4 @@ fn err<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
 ) -> Box<dyn std::error::Error + Send + Sync> {
     e.into()
 }
+
