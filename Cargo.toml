@@ -6,6 +6,7 @@ members = [
     "crates/ai-monitor",
     "crates/renderer",
     "crates/app",
+    "crates/perf",
 ]
 
 [workspace.package]

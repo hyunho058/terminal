@@ -138,7 +138,8 @@ pub trait DrawLayer {
 
 /// GPU state for drawing the cell grid.
 pub struct Renderer {
-    surface: wgpu::Surface<'static>,
+    /// `None` for a headless renderer (benchmarks/tests draw to an offscreen view).
+    surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -200,6 +201,66 @@ impl Renderer {
         surface.configure(&device, &config);
         tracing::info!(format = ?config.format, width = config.width, height = config.height, "surface configured");
 
+        Self::assemble(
+            device,
+            queue,
+            config,
+            Some(surface),
+            font,
+            scale_factor,
+            cfg,
+        )
+    }
+
+    /// Build a headless renderer (no window/surface) for benchmarks and tests:
+    /// same GPU pipelines drawing to a caller-supplied offscreen view via
+    /// [`draw_to`](Renderer::draw_to). `render` is a no-op headlessly.
+    pub fn new_headless(
+        width: u32,
+        height: u32,
+        scale_factor: f64,
+        cfg: &Config,
+    ) -> Result<Renderer> {
+        let font = load_font()?;
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            ..Default::default()
+        }))?;
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("term-device-headless"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                ..Default::default()
+            }))?;
+        // Offscreen target format matching the on-screen sRGB path.
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            width: width.max(1),
+            height: height.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            view_formats: vec![],
+        };
+        Self::assemble(device, queue, config, None, font, scale_factor, cfg)
+    }
+
+    /// Shared GPU assembly for both the windowed and headless constructors.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        config: wgpu::SurfaceConfiguration,
+        surface: Option<wgpu::Surface<'static>>,
+        font: Arc<Vec<u8>>,
+        scale_factor: f64,
+        cfg: &Config,
+    ) -> Result<Renderer> {
         let cell_size = cell_size_px(cfg, scale_factor);
         let ppem = cfg.font.size_pt * scale_factor as f32;
         let clear = to_wgpu_color(cfg.theme.background);
@@ -364,6 +425,16 @@ impl Renderer {
         self.cell_size
     }
 
+    /// The GPU device (headless benches/tests create their own offscreen target).
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// The render-target texture format (offscreen targets must match it).
+    pub fn surface_format(&self) -> wgpu::TextureFormat {
+        self.config.format
+    }
+
     pub fn grid_size(&self) -> (u16, u16) {
         grid_dims(
             self.config.width as f32,
@@ -434,7 +505,9 @@ impl Renderer {
     pub fn resize(&mut self, width: u32, height: u32) {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
-        self.surface.configure(&self.device, &self.config);
+        if let Some(surface) = &self.surface {
+            surface.configure(&self.device, &self.config);
+        }
         self.write_uniforms();
     }
 
@@ -462,13 +535,20 @@ impl Renderer {
         );
     }
 
-    /// Draw one frame from a grid snapshot.
+    /// Draw one frame from a grid snapshot. No-op headlessly (no surface).
     pub fn render(&mut self, snapshot: &GridSnapshot) -> Result<()> {
-        let frame = match self.surface.get_current_texture() {
+        if self.surface.is_none() {
+            return Ok(());
+        }
+        // Borrow ends after the match (frame is owned), freeing self for draw_to.
+        let frame = match self.surface.as_ref().unwrap().get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
+                self.surface
+                    .as_ref()
+                    .unwrap()
+                    .configure(&self.device, &self.config);
                 return Ok(());
             }
             wgpu::CurrentSurfaceTexture::Timeout => return Err(RendererError::Frame("timeout")),

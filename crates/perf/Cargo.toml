@@ -1,0 +1,33 @@
+[package]
+name = "perf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Bench-owning crate (performance-harness): registers the workspace-root
+# `benches/` Criterion sources so `cargo bench` can run them. Kept as a thin
+# member so the bench sources stay under `benches/**` (the feature's surface).
+
+[dev-dependencies]
+criterion = "0.5"
+common = { workspace = true }
+term-core = { workspace = true }
+renderer = { workspace = true }
+wgpu = "30"
+
+[[bench]]
+name = "input_to_grid"
+path = "../../benches/input_to_grid.rs"
+harness = false
+
+[[bench]]
+name = "scroll_100k"
+path = "../../benches/scroll_100k.rs"
+harness = false
+
+[[bench]]
+name = "frame"
+path = "../../benches/frame.rs"
+harness = false
