@@ -5,6 +5,7 @@
 //! renderer depends on `term-core` only for this shape, nothing mutable.
 
 use crate::grid::{Cell, Color, Cursor, Grid};
+use crate::image::Placement;
 
 /// An immutable, cheaply-clonable view of the visible grid at one instant.
 #[derive(Clone, Debug, PartialEq)]
@@ -20,6 +21,10 @@ pub struct GridSnapshot {
     /// Row-major, length == `cols * rows`. Composed from history + live for the
     /// current `view_offset`.
     cells: Vec<Cell>,
+    /// Inline image placements at their live-view cell coords (image-paste SD5).
+    /// Populated only at the live bottom; empty while scrolled into history (a
+    /// first cut — images render in the live view).
+    pub images: Vec<Placement>,
 }
 
 impl GridSnapshot {
@@ -48,6 +53,13 @@ impl GridSnapshot {
             }
         }
 
+        // Images show in the live view only (empty when scrolled into history).
+        let images = if offset == 0 {
+            grid.images().placements().to_vec()
+        } else {
+            Vec::new()
+        };
+
         GridSnapshot {
             cols,
             rows,
@@ -56,6 +68,7 @@ impl GridSnapshot {
             at_bottom: grid.at_bottom(),
             at_top: grid.at_top(),
             cells,
+            images,
         }
     }
 

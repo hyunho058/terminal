@@ -7,6 +7,7 @@
 //! to the UI thread over a channel; an `EventLoopProxy` wakes the event loop so
 //! the render happens on the winit thread (C6 — no free-running loop).
 
+mod clipboard;
 mod input;
 mod overlay;
 mod seam;
@@ -17,6 +18,7 @@ mod terminal_app;
 
 use winit::event_loop::{ControlFlow, EventLoop};
 
+use clipboard::{ClipboardHandler, ImagePresenter};
 use overlay::AiMonitorOverlay;
 use terminal_app::{App, UserEvent};
 
@@ -37,8 +39,11 @@ fn main() {
     let proxy = event_loop.create_proxy();
     let mut app = App::new(cfg, proxy.clone());
     // Register feature extensions through the SD4 seam (no terminal_app edits):
-    // ai-monitor's Cmd+Shift+M overlay.
+    // ai-monitor's Cmd+Shift+M overlay, image-paste's Cmd+V handler + inline-image
+    // presenter (its DrawLayer draws snapshot images).
     app.register_overlay(Box::new(AiMonitorOverlay::new(proxy)));
+    app.register_overlay(Box::new(ImagePresenter));
+    app.register_handler(Box::new(ClipboardHandler::new()));
 
     if let Err(e) = event_loop.run_app(&mut app) {
         tracing::error!("event loop exited with error: {e}");

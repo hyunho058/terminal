@@ -4,6 +4,7 @@
 //! cell control" surface the project exists to own — deliberately GPU-free so it
 //! can be unit-tested headlessly.
 
+use crate::image::{Decoded, ImageLayer};
 use crate::scrollback::{History, DEFAULT_HISTORY_LIMIT};
 
 /// A packed `0xRRGGBB` color. UI-agnostic: the renderer converts to whatever the
@@ -93,6 +94,8 @@ pub struct Grid {
     view_offset: usize,
     /// True while an alternate screen (tmux/vim, `?1049h`) is active (D5).
     alt_screen: bool,
+    /// Inline-image placements anchored to cells (image-paste D2, SD5).
+    images: ImageLayer,
 }
 
 impl Grid {
@@ -111,6 +114,7 @@ impl Grid {
             history: History::new(DEFAULT_HISTORY_LIMIT),
             view_offset: 0,
             alt_screen: false,
+            images: ImageLayer::new(),
         }
     }
 
@@ -230,6 +234,8 @@ impl Grid {
             if self.view_offset > 0 {
                 self.view_offset = (self.view_offset + 1).min(self.history.len());
             }
+            // Image placements scroll up with primary content (R1.2).
+            self.images.scroll_up_one();
         }
         self.cells.copy_within(row_len.., 0);
         let start = (self.rows as usize - 1) * row_len;
@@ -293,7 +299,19 @@ impl Grid {
         for cell in &mut self.cells {
             *cell = Cell::blank(self.default_fg, self.default_bg);
         }
+        self.images.clear();
         self.cursor = Cursor::default();
+    }
+
+    /// Place a decoded inline image at the cursor cell (image-paste R1.1, SD5).
+    /// Returns the placement id. Never writes any cell (images are a side channel).
+    pub fn place_image(&mut self, decoded: Decoded) -> u32 {
+        self.images.place(decoded, self.cursor.col, self.cursor.row)
+    }
+
+    /// The current image placements (read by snapshot composition).
+    pub fn images(&self) -> &ImageLayer {
+        &self.images
     }
 
     /// Erase from the cursor to end of the current line (CSI K).

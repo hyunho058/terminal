@@ -15,6 +15,7 @@
 
 pub mod error;
 pub mod grid;
+pub mod image;
 pub mod parser;
 pub mod pty;
 pub mod scrollback;
@@ -22,6 +23,7 @@ pub mod snapshot;
 
 pub use error::{Error, Result};
 pub use grid::{Cell, Color, Cursor, Grid};
+pub use image::{Decoded, ImageLayer, Placement};
 pub use pty::Pty;
 pub use scrollback::History;
 pub use snapshot::GridSnapshot;

@@ -12,6 +12,7 @@
 
 pub mod atlas;
 pub mod glyph;
+pub mod image_layer;
 pub mod overlay_layer;
 pub mod tab_bar;
 
