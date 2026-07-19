@@ -6,6 +6,11 @@
 > `perf.yml` gate reads (D5/C4), but the gate stays **advisory** until a human
 > confirms the committed numbers here and flips the marker. See the park entry
 > for `performance-harness` in `build_order.md`.
+>
+> **Update:** the idle-CPU debt from PR #2 (a full grid re-shape every frame while
+> idle) has been fixed — the renderer skips re-shape on an unchanged snapshot. The
+> *threshold numbers* below are still provisional (G1 stays open); only the idle
+> re-shape hot path changed, not the committed targets.
 
 ## Machine class
 

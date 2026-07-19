@@ -8,7 +8,7 @@
 
 use vte::{Params, Parser, Perform};
 
-use crate::grid::{Color, Grid};
+use crate::grid::{CellAttrs, Color, Grid};
 use crate::image::parse_graphics_apc;
 
 /// Where the APC pre-scanner is in the byte stream.
@@ -139,20 +139,102 @@ struct Performer<'a> {
 }
 
 impl Performer<'_> {
+    /// SGR — select graphic rendition. Handles the 16 base colors, 256-color
+    /// (`38;5;n` / `48;5;n`), truecolor (`38;2;r;g;b` / `48;2;…`, both the
+    /// semicolon and colon-subparam forms), the text attributes
+    /// bold/dim/italic/underline/reverse (set 1/2/3/4/7, clear 22/23/24/27), and
+    /// per-channel default reset (39/49). Unknown codes are ignored without
+    /// disturbing the surrounding parameters.
     fn handle_sgr(&mut self, params: &Params) {
         if params.is_empty() {
             self.grid.reset_pen();
             return;
         }
-        for p in params.iter() {
+        // A single iterator drives both the main loop and the extended-color
+        // consumption of following params, so `38;5;n` / `38;2;r;g;b` read their
+        // trailing params rather than being treated as independent codes.
+        let mut iter = params.iter();
+        while let Some(p) = iter.next() {
             match p.first().copied().unwrap_or(0) {
                 0 => self.grid.reset_pen(),
-                30..=37 => self.grid.set_pen(Some(ansi_16(p[0] as u8 - 30)), None),
-                40..=47 => self.grid.set_pen(None, Some(ansi_16(p[0] as u8 - 40))),
-                90..=97 => self.grid.set_pen(Some(ansi_16(p[0] as u8 - 90 + 8)), None),
-                100..=107 => self.grid.set_pen(None, Some(ansi_16(p[0] as u8 - 100 + 8))),
+                1 => self.grid.set_pen_attrs(CellAttrs::BOLD),
+                2 => self.grid.set_pen_attrs(CellAttrs::DIM),
+                3 => self.grid.set_pen_attrs(CellAttrs::ITALIC),
+                4 => self.grid.set_pen_attrs(CellAttrs::UNDERLINE),
+                7 => self.grid.set_pen_attrs(CellAttrs::REVERSE),
+                // 22 = normal intensity: clears BOTH bold and dim.
+                22 => self
+                    .grid
+                    .clear_pen_attrs(CellAttrs(CellAttrs::BOLD.0 | CellAttrs::DIM.0)),
+                23 => self.grid.clear_pen_attrs(CellAttrs::ITALIC),
+                24 => self.grid.clear_pen_attrs(CellAttrs::UNDERLINE),
+                27 => self.grid.clear_pen_attrs(CellAttrs::REVERSE),
+                c @ 30..=37 => self.grid.set_pen(Some(ansi_16((c - 30) as u8)), None),
+                38 => {
+                    if let Some(color) = resolve_ext_color(p, &mut iter) {
+                        self.grid.set_pen(Some(color), None);
+                    }
+                }
+                39 => self.grid.reset_pen_fg(),
+                c @ 40..=47 => self.grid.set_pen(None, Some(ansi_16((c - 40) as u8))),
+                48 => {
+                    if let Some(color) = resolve_ext_color(p, &mut iter) {
+                        self.grid.set_pen(None, Some(color));
+                    }
+                }
+                49 => self.grid.reset_pen_bg(),
+                c @ 90..=97 => self.grid.set_pen(Some(ansi_16((c - 90 + 8) as u8)), None),
+                c @ 100..=107 => self.grid.set_pen(None, Some(ansi_16((c - 100 + 8) as u8))),
                 _ => {}
             }
+        }
+    }
+}
+
+/// Clamp a `u16` SGR parameter to a color byte (values should be 0..=255).
+fn to_u8(v: u16) -> u8 {
+    v.min(255) as u8
+}
+
+/// Resolve a `38`/`48` extended-color directive to a [`Color`]. `p` is the param
+/// that carried the `38`/`48`; `rest` is the remaining param iterator (consumed for
+/// the semicolon form). Returns `None` for an unsupported selector or a truncated
+/// sequence, leaving the pen unchanged (R7.2).
+fn resolve_ext_color<'a>(p: &[u16], rest: &mut impl Iterator<Item = &'a [u16]>) -> Option<Color> {
+    if p.len() > 1 {
+        // Colon-subparam form: the whole directive is ONE param.
+        //   38:5:n            → p = [38, 5, n]
+        //   38:2:r:g:b        → p = [38, 2, r, g, b]
+        //   38:2::r:g:b       → p = [38, 2, 0, r, g, b]  (empty T.416 color-space id)
+        match p.get(1).copied() {
+            // `38:5:n` — index at subparam 2; a bare `38:5` (no index) is malformed.
+            Some(5) if p.len() >= 3 => Some(ansi_256(to_u8(p[2]))),
+            // Take the LAST three subparams as r,g,b so the optional color-space-id
+            // slot in the `:2:` form is skipped (never the first three).
+            Some(2) if p.len() >= 5 => {
+                let n = p.len();
+                Some(Color::rgb(
+                    to_u8(p[n - 3]),
+                    to_u8(p[n - 2]),
+                    to_u8(p[n - 1]),
+                ))
+            }
+            _ => None,
+        }
+    } else {
+        // Semicolon form: the selector and values arrive as following params.
+        match rest.next().and_then(|q| q.first().copied()) {
+            Some(5) => rest
+                .next()
+                .and_then(|q| q.first().copied())
+                .map(|i| ansi_256(to_u8(i))),
+            Some(2) => {
+                let r = rest.next().and_then(|q| q.first().copied())?;
+                let g = rest.next().and_then(|q| q.first().copied())?;
+                let b = rest.next().and_then(|q| q.first().copied())?;
+                Some(Color::rgb(to_u8(r), to_u8(g), to_u8(b)))
+            }
+            _ => None,
         }
     }
 }
@@ -191,6 +273,41 @@ impl Perform for Performer<'_> {
                 self.grid
                     .move_to(col.saturating_sub(1), row.saturating_sub(1));
             }
+            // CUU / CUD / CUF / CUB — relative cursor moves. Param defaults to 1,
+            // and 0 is treated as 1. zsh emits these to reposition across wrapped
+            // rows while redrawing an edited line; dropping them desyncs the cursor
+            // and overwrites the prompt (the bug this fixes). move_to clamps to grid.
+            'A' => {
+                let n = first.unwrap_or(1).max(1);
+                let cur = self.grid.cursor();
+                self.grid.move_to(cur.col, cur.row.saturating_sub(n));
+            }
+            'B' => {
+                let n = first.unwrap_or(1).max(1);
+                let cur = self.grid.cursor();
+                self.grid.move_to(cur.col, cur.row.saturating_add(n));
+            }
+            'C' => {
+                let n = first.unwrap_or(1).max(1);
+                let cur = self.grid.cursor();
+                self.grid.move_to(cur.col.saturating_add(n), cur.row);
+            }
+            'D' => {
+                let n = first.unwrap_or(1).max(1);
+                let cur = self.grid.cursor();
+                self.grid.move_to(cur.col.saturating_sub(n), cur.row);
+            }
+            // CHA / VPA — absolute column / row (1-based → 0-based).
+            'G' => {
+                let col = first.unwrap_or(1).max(1).saturating_sub(1);
+                let cur = self.grid.cursor();
+                self.grid.move_to(col, cur.row);
+            }
+            'd' => {
+                let row = first.unwrap_or(1).max(1).saturating_sub(1);
+                let cur = self.grid.cursor();
+                self.grid.move_to(cur.col, row);
+            }
             // ED — erase display. 0/none = cursor→end (what a shell sends to redraw
             // its prompt — must NOT wipe scrollback), 1 = start→cursor, 2/3 = all.
             'J' => match first {
@@ -217,9 +334,34 @@ fn ansi_16(index: u8) -> Color {
     Color(PALETTE[(index & 0x0F) as usize])
 }
 
+/// xterm 256-color palette: `0..=15` delegate to [`ansi_16`], `16..=231` are the
+/// 6×6×6 RGB cube, and `232..=255` are the 24-step grayscale ramp.
+fn ansi_256(n: u8) -> Color {
+    match n {
+        0..=15 => ansi_16(n),
+        16..=231 => {
+            // Cube component levels: 0, then 95,135,175,215,255 (55 + c*40).
+            let i = n - 16;
+            let level = |c: u8| -> u8 {
+                if c == 0 {
+                    0
+                } else {
+                    55 + c * 40
+                }
+            };
+            Color::rgb(level(i / 36), level((i % 36) / 6), level(i % 6))
+        }
+        232..=255 => {
+            let g = 8 + (n - 232) * 10; // 8, 18, …, 238
+            Color::rgb(g, g, g)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grid::Cell;
     use base64::Engine;
 
     /// Build a Kitty transmit-and-display APC (`ESC _ G … ; b64 ESC \`).
@@ -310,7 +452,11 @@ mod tests {
         // The shell then writes its prompt on the cleared line — not at row 0.
         p.advance(&mut g, b"% ");
         assert_eq!(row_text(&g, 3), "%");
-        assert_eq!(row_text(&g, 0), "aaa", "prompt redraw did not home the cursor");
+        assert_eq!(
+            row_text(&g, 0),
+            "aaa",
+            "prompt redraw did not home the cursor"
+        );
     }
 
     #[test]
@@ -331,8 +477,190 @@ mod tests {
         let mut p = Processor::new();
         p.advance(&mut g, b"x\r\ny\r\nz");
         p.advance(&mut g, b"\x1b[2J");
-        let any_ink = (0..g.rows())
-            .any(|r| (0..g.cols()).any(|c| g.cell(c, r).unwrap().ch != ' '));
+        let any_ink = (0..g.rows()).any(|r| (0..g.cols()).any(|c| g.cell(c, r).unwrap().ch != ' '));
         assert!(!any_ink, "ED2 blanks the entire grid");
+    }
+
+    // --- SGR color + attributes (vt-color-attrs) ---
+
+    fn sgr_cell(seq: &[u8]) -> Cell {
+        let mut g = Grid::new(4, 1, Color(0xFFFFFF), Color(0));
+        let mut p = Processor::new();
+        p.advance(&mut g, seq);
+        p.advance(&mut g, b"X");
+        *g.cell(0, 0).unwrap()
+    }
+
+    #[test]
+    fn sgr_256_color_fg_and_bg() {
+        // R1.1/R1.2: 38;5;n and 48;5;n resolve through the xterm 256 palette.
+        assert_eq!(sgr_cell(b"\x1b[38;5;196m").fg, ansi_256(196));
+        assert_eq!(sgr_cell(b"\x1b[48;5;21m").bg, ansi_256(21));
+    }
+
+    #[test]
+    fn sgr_256_ramp_bands() {
+        // R1.3: 0-15 delegate to ansi_16; 16-231 the 6x6x6 cube; 232-255 grayscale.
+        assert_eq!(ansi_256(7), ansi_16(7));
+        assert_eq!(ansi_256(16), Color::rgb(0, 0, 0));
+        assert_eq!(ansi_256(231), Color::rgb(255, 255, 255));
+        assert_eq!(ansi_256(232), Color::rgb(8, 8, 8));
+        assert_eq!(ansi_256(255), Color::rgb(238, 238, 238));
+    }
+
+    #[test]
+    fn sgr_truecolor_semicolon() {
+        // R2.1/R2.2: 38;2;r;g;b and 48;2;r;g;b.
+        assert_eq!(
+            sgr_cell(b"\x1b[38;2;255;128;0m").fg,
+            Color::rgb(255, 128, 0)
+        );
+        assert_eq!(sgr_cell(b"\x1b[48;2;0;40;80m").bg, Color::rgb(0, 40, 80));
+    }
+
+    #[test]
+    fn sgr_truecolor_colon_skips_colorspace_slot() {
+        // R2.3: the colon `:2:` form carries a T.416 color-space-id slot that must
+        // be skipped — the LAST three subparams are r,g,b, not the first three.
+        assert_eq!(
+            sgr_cell(b"\x1b[38:2::255:128:0m").fg,
+            Color::rgb(255, 128, 0)
+        );
+        // Colon indexed form has no such slot.
+        assert_eq!(sgr_cell(b"\x1b[38:5:196m").fg, ansi_256(196));
+    }
+
+    #[test]
+    fn sgr_attributes_set_and_clear() {
+        // R3.1: set bits.
+        let c = sgr_cell(b"\x1b[1;4;7m");
+        assert!(c.attrs.contains(CellAttrs::BOLD));
+        assert!(c.attrs.contains(CellAttrs::UNDERLINE));
+        assert!(c.attrs.contains(CellAttrs::REVERSE));
+        // R3.2: 22 clears BOTH bold and dim; 24 underline; 27 reverse — others kept.
+        let mut g = Grid::new(4, 1, Color(0xFFFFFF), Color(0));
+        let mut p = Processor::new();
+        p.advance(&mut g, b"\x1b[1;2;3;4;7m"); // bold dim italic underline reverse
+        p.advance(&mut g, b"\x1b[22m"); // clear bold + dim
+        p.advance(&mut g, b"A");
+        let a = *g.cell(0, 0).unwrap();
+        assert!(!a.attrs.contains(CellAttrs::BOLD));
+        assert!(!a.attrs.contains(CellAttrs::DIM));
+        assert!(a.attrs.contains(CellAttrs::ITALIC));
+        assert!(a.attrs.contains(CellAttrs::UNDERLINE));
+        assert!(a.attrs.contains(CellAttrs::REVERSE));
+    }
+
+    #[test]
+    fn sgr_default_reset_39_49_are_per_channel() {
+        // R4.1/R4.2: 39 resets only fg, 49 only bg; other pen state is untouched.
+        let mut g = Grid::new(4, 1, Color(0xFFFFFF), Color(0));
+        let mut p = Processor::new();
+        p.advance(&mut g, b"\x1b[38;5;196;48;5;21;1m"); // fg, bg, bold
+        p.advance(&mut g, b"\x1b[39m"); // reset fg only
+        p.advance(&mut g, b"A");
+        let a = *g.cell(0, 0).unwrap();
+        assert_eq!(a.fg, Color(0xFFFFFF), "39 restores default fg");
+        assert_eq!(a.bg, ansi_256(21), "39 leaves bg");
+        assert!(a.attrs.contains(CellAttrs::BOLD), "39 leaves attrs");
+        p.advance(&mut g, b"\x1b[49m"); // reset bg only
+        p.advance(&mut g, b"B");
+        let b = *g.cell(1, 0).unwrap();
+        assert_eq!(b.bg, Color(0), "49 restores default bg");
+        assert!(b.attrs.contains(CellAttrs::BOLD), "49 leaves attrs");
+    }
+
+    #[test]
+    fn sgr_unknown_and_truncated_are_safe() {
+        // R7.1: an unsupported code (9 strikethrough) is skipped without eating the
+        // surrounding params — 38;5;196 still applies and 1 (bold) still sets.
+        let c = sgr_cell(b"\x1b[38;5;196;9;1m");
+        assert_eq!(c.fg, ansi_256(196));
+        assert!(c.attrs.contains(CellAttrs::BOLD));
+        // R7.2: truncated extended-color sequences do not panic and leave the pen.
+        assert_eq!(sgr_cell(b"\x1b[38;5m").fg, Color(0xFFFFFF));
+        assert_eq!(sgr_cell(b"\x1b[38;2;255m").fg, Color(0xFFFFFF));
+    }
+
+    #[test]
+    fn cell_partial_eq_includes_attrs() {
+        // R6.1/R6.2: Cell's derived PartialEq covers attrs, so an attribute-only
+        // change is unequal — the basis idle-cpu's snapshot cache relies on.
+        let plain = sgr_cell(b"");
+        let bold = sgr_cell(b"\x1b[1m");
+        assert_ne!(
+            plain, bold,
+            "attribute-only difference must compare unequal"
+        );
+        assert_eq!(plain.ch, bold.ch);
+        assert_eq!(plain.fg, bold.fg);
+    }
+
+    // --- relative CSI cursor moves (csi-cursor-moves) ---
+
+    fn cur(g: &Grid) -> (u16, u16) {
+        (g.cursor().col, g.cursor().row)
+    }
+
+    #[test]
+    fn csi_relative_and_absolute_cursor_moves() {
+        let mut g = Grid::new(20, 10, Color(0xFFFFFF), Color(0));
+        let mut p = Processor::new();
+        p.advance(&mut g, b"\x1b[6;6H"); // CUP → (col5, row5)
+        assert_eq!(cur(&g), (5, 5));
+        p.advance(&mut g, b"\x1b[2A"); // CUU 2 → row 3
+        assert_eq!(cur(&g), (5, 3));
+        p.advance(&mut g, b"\x1b[B"); // CUD default 1 → row 4
+        assert_eq!(cur(&g), (5, 4));
+        p.advance(&mut g, b"\x1b[3C"); // CUF 3 → col 8
+        assert_eq!(cur(&g), (8, 4));
+        p.advance(&mut g, b"\x1b[D"); // CUB default 1 → col 7
+        assert_eq!(cur(&g), (7, 4));
+        p.advance(&mut g, b"\x1b[G"); // CHA no param → col 0
+        assert_eq!(cur(&g), (0, 4));
+        p.advance(&mut g, b"\x1b[10G"); // CHA col 10 (1-based) → col 9
+        assert_eq!(cur(&g), (9, 4));
+        p.advance(&mut g, b"\x1b[d"); // VPA row 1 → row 0
+        assert_eq!(cur(&g), (9, 0));
+    }
+
+    #[test]
+    fn csi_cursor_moves_clamp_and_treat_zero_as_one() {
+        let mut g = Grid::new(20, 10, Color(0xFFFFFF), Color(0));
+        let mut p = Processor::new();
+        p.advance(&mut g, b"\x1b[6;6H\x1b[0D"); // CUB with 0 == 1: col5 → col4
+        assert_eq!(cur(&g), (4, 5));
+        p.advance(&mut g, b"\x1b[99A"); // clamp top
+        assert_eq!(g.cursor().row, 0);
+        p.advance(&mut g, b"\x1b[99C"); // clamp right (cols-1 = 19)
+        assert_eq!(g.cursor().col, 19);
+        p.advance(&mut g, b"\x1b[99B"); // clamp bottom (rows-1 = 9)
+        assert_eq!(g.cursor().row, 9);
+    }
+
+    #[test]
+    fn prompt_row_survives_wrapped_edit() {
+        // Reproduces the reported bug: a wrapped line, then zsh moves the cursor UP
+        // (CSI A) to the prompt row to redraw + erase. Before the fix CSI A was
+        // dropped, the cursor stayed on the wrapped row, and the erase hit the wrong
+        // row. Now CSI A actually moves to row 0 and only the intended region clears.
+        let mut g = Grid::new(8, 4, Color(0xFFFFFF), Color(0)); // 8 cols → wraps
+        let mut p = Processor::new();
+        p.advance(&mut g, b"ab> cdefghij"); // row0="ab> cdef", row1="ghij", cursor (col4,row1)
+        assert_eq!(row_text(&g, 0), "ab> cdef");
+        assert_eq!(row_text(&g, 1), "ghij");
+        assert_eq!(cur(&g), (4, 1));
+
+        p.advance(&mut g, b"\x1b[A"); // CUU → the fix: cursor moves to row 0
+        assert_eq!(g.cursor().row, 0, "CSI A must move the cursor up (the bug)");
+        p.advance(&mut g, b"\x1b[5G"); // CHA col 5 (1-based) → col 4
+        p.advance(&mut g, b"\x1b[K"); // erase row0 from col4 to end
+
+        // The prompt "ab> " (cols 0-3) is intact; only cols 4-7 were cleared.
+        assert_eq!(g.cell(0, 0).unwrap().ch, 'a');
+        assert_eq!(g.cell(1, 0).unwrap().ch, 'b');
+        assert_eq!(g.cell(2, 0).unwrap().ch, '>');
+        assert_eq!(g.cell(4, 0).unwrap().ch, ' ');
+        assert_eq!(row_text(&g, 0), "ab>");
     }
 }

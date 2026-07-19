@@ -11,6 +11,7 @@
 //! implicit z=0 layer, and registered layers draw after it in `z_order`.
 
 pub mod atlas;
+pub mod cursor_layer;
 pub mod glyph;
 pub mod image_layer;
 pub mod overlay_layer;
@@ -18,12 +19,12 @@ pub mod tab_bar;
 
 use std::sync::Arc;
 
-use atlas::Atlas;
+use atlas::{Atlas, GlyphKey};
 use bytemuck::{Pod, Zeroable};
 use common::config::Config;
 use swash::shape::ShapeContext;
 use swash::FontRef;
-use term_core::GridSnapshot;
+use term_core::{Cell, CellAttrs, GridSnapshot};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
@@ -165,6 +166,22 @@ pub struct Renderer {
     bg_default: u32,
     clear: wgpu::Color,
     layers: Vec<Box<dyn DrawLayer>>,
+    /// Idle-CPU cache (D5): the last snapshot whose instances are resident in
+    /// `bg_vbuf`/`glyph_vbuf`. When the next `draw_to` snapshot `==` this, the
+    /// instance builders are skipped and the resident buffers re-presented. Reset
+    /// to `None` by `apply_config`/`resize` (D5 cache-invalidation caveat, R1.4) so
+    /// a content-equal snapshot can never re-present stale theme/font/size buffers.
+    last_snapshot: Option<GridSnapshot>,
+    /// Resident per-cell instance buffers (D6) — reused across frames instead of a
+    /// `create_buffer_init` every frame; grown on a cache miss that overflows them.
+    bg_vbuf: Option<wgpu::Buffer>,
+    glyph_vbuf: Option<wgpu::Buffer>,
+    bg_count: u32,
+    glyph_count: u32,
+    /// Observability: number of cache **misses** (frames that actually re-shaped).
+    /// Idle frames re-present without incrementing it — the signal the idle-CPU
+    /// gate reads (R1.1/R1.4).
+    reshape_count: u64,
 }
 
 impl Renderer {
@@ -412,6 +429,12 @@ impl Renderer {
             bg_default: cfg.theme.background,
             clear,
             layers: Vec::new(),
+            last_snapshot: None,
+            bg_vbuf: None,
+            glyph_vbuf: None,
+            bg_count: 0,
+            glyph_count: 0,
+            reshape_count: 0,
         })
     }
 
@@ -499,6 +522,9 @@ impl Renderer {
                 ],
             });
         }
+        // Theme/font/atlas/cell-metrics changed → force the next frame to re-shape,
+        // else a content-equal snapshot would re-present stale-theme buffers (R1.4).
+        self.last_snapshot = None;
         self.write_uniforms();
     }
 
@@ -508,7 +534,17 @@ impl Renderer {
         if let Some(surface) = &self.surface {
             surface.configure(&self.device, &self.config);
         }
+        // Viewport dims changed → force a re-shape so a content-equal snapshot does
+        // not re-present buffers built for the old size (R1.4).
+        self.last_snapshot = None;
         self.write_uniforms();
+    }
+
+    /// Number of cache **misses** so far — frames that actually re-shaped the grid.
+    /// A steady idle terminal holds this constant while still presenting a frame
+    /// every redraw; the idle-CPU gate reads it to prove re-shape is skipped (R1).
+    pub fn reshape_count(&self) -> u64 {
+        self.reshape_count
     }
 
     /// Push the current viewport / cell / top-inset into both uniform buffers.
@@ -568,30 +604,41 @@ impl Renderer {
     /// Draw one frame to an arbitrary target view (surface or offscreen). Split
     /// out so the [`DrawLayer`] seam is headless-testable without a surface.
     pub fn draw_to(&mut self, view: &wgpu::TextureView, snapshot: &GridSnapshot) {
-        let bg = build_bg_instances(snapshot, self.bg_default);
-        let glyphs = build_glyph_instances(
-            &mut self.atlas,
-            &self.queue,
-            &self.font,
-            self.ligatures,
-            self.cell_size,
-            self.ppem,
-            snapshot,
-        );
-        let bg_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("bg-instances"),
-                contents: bytemuck::cast_slice(&bg),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        let glyph_buf = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("glyph-instances"),
-                contents: bytemuck::cast_slice(&glyphs),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
+        // Idle-CPU cache (D5/D6): re-shape the grid only when the snapshot changed.
+        // On a hit the resident `bg_vbuf`/`glyph_vbuf` (built for the cached
+        // snapshot) are re-presented as-is — no instance building, no allocation.
+        // On a miss, rebuild, upload into the resident buffers (growing them if
+        // needed), and store the snapshot. `GridSnapshot`'s derived `PartialEq` is
+        // the equality basis (SD2); `Cell`'s attributes are part of it, so an
+        // attribute-only change is a miss.
+        if self.last_snapshot.as_ref() != Some(snapshot) {
+            let bg = build_bg_instances(snapshot, self.bg_default);
+            let glyphs = build_glyph_instances(
+                &mut self.atlas,
+                &self.queue,
+                &self.font,
+                self.ligatures,
+                self.cell_size,
+                self.ppem,
+                snapshot,
+            );
+            self.bg_count = upload_resident(
+                &self.device,
+                &self.queue,
+                &mut self.bg_vbuf,
+                &bg,
+                "bg-instances",
+            );
+            self.glyph_count = upload_resident(
+                &self.device,
+                &self.queue,
+                &mut self.glyph_vbuf,
+                &glyphs,
+                "glyph-instances",
+            );
+            self.last_snapshot = Some(snapshot.clone());
+            self.reshape_count += 1;
+        }
 
         let mut encoder = self
             .device
@@ -617,19 +664,19 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if !bg.is_empty() {
+            if let (true, Some(bg_buf)) = (self.bg_count > 0, self.bg_vbuf.as_ref()) {
                 pass.set_pipeline(&self.bg_pipeline);
                 pass.set_bind_group(0, &self.bg_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
                 pass.set_vertex_buffer(1, bg_buf.slice(..));
-                pass.draw(0..QUAD.len() as u32, 0..bg.len() as u32);
+                pass.draw(0..QUAD.len() as u32, 0..self.bg_count);
             }
-            if !glyphs.is_empty() {
+            if let (true, Some(glyph_buf)) = (self.glyph_count > 0, self.glyph_vbuf.as_ref()) {
                 pass.set_pipeline(&self.glyph_pipeline);
                 pass.set_bind_group(0, &self.glyph_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.quad_vbuf.slice(..));
                 pass.set_vertex_buffer(1, glyph_buf.slice(..));
-                pass.draw(0..QUAD.len() as u32, 0..glyphs.len() as u32);
+                pass.draw(0..QUAD.len() as u32, 0..self.glyph_count);
             }
         }
 
@@ -661,16 +708,52 @@ impl Renderer {
     }
 }
 
+/// Upload `data` into a resident vertex buffer (D6), reusing it across frames and
+/// growing it only when the byte size exceeds the current capacity. Returns the
+/// instance count to draw. An empty slice leaves the buffer untouched and returns
+/// 0 (the caller skips the draw), so no zero-size buffer is ever allocated.
+fn upload_resident<T: Pod>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buf: &mut Option<wgpu::Buffer>,
+    data: &[T],
+    label: &str,
+) -> u32 {
+    let needed = std::mem::size_of_val(data) as u64;
+    if needed == 0 {
+        return 0;
+    }
+    let fits = buf.as_ref().map(|b| b.size() >= needed).unwrap_or(false);
+    if !fits {
+        *buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: needed,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+    }
+    queue.write_buffer(buf.as_ref().unwrap(), 0, bytemuck::cast_slice(data));
+    data.len() as u32
+}
+
 /// One bg quad per cell whose background differs from the theme default.
 fn build_bg_instances(snapshot: &GridSnapshot, bg_default: u32) -> Vec<BgInstance> {
     let mut out = Vec::new();
     for row in 0..snapshot.rows {
         for col in 0..snapshot.cols {
             if let Some(cell) = snapshot.cell(col, row) {
-                if cell.bg.0 != bg_default {
+                // REVERSE swaps fg/bg at draw time; the default-bg skip is evaluated
+                // on the EFFECTIVE (post-swap) background so a reversed cell whose
+                // logical fg differs from the default still emits its quad (R5.1).
+                let eff_bg = if cell.attrs.contains(CellAttrs::REVERSE) {
+                    cell.fg
+                } else {
+                    cell.bg
+                };
+                if eff_bg.0 != bg_default {
                     out.push(BgInstance {
                         grid_pos: [col as f32, row as f32],
-                        color: cell.bg.to_linear_f32(),
+                        color: eff_bg.to_linear_f32(),
                         _pad: 0.0,
                     });
                 }
@@ -678,6 +761,27 @@ fn build_bg_instances(snapshot: &GridSnapshot, bg_default: u32) -> Vec<BgInstanc
         }
     }
     out
+}
+
+/// Fraction a DIM cell's foreground is mixed toward its background.
+const DIM_MIX: f32 = 0.45;
+
+/// The linear-light glyph color for a cell, applying REVERSE (fg/bg swap) and DIM
+/// (mix toward the background) — the color both its glyphs and its underline use.
+fn glyph_color(cell: &Cell) -> [f32; 3] {
+    let (fg, bg) = if cell.attrs.contains(CellAttrs::REVERSE) {
+        (cell.bg, cell.fg)
+    } else {
+        (cell.fg, cell.bg)
+    };
+    let mut c = fg.to_linear_f32();
+    if cell.attrs.contains(CellAttrs::DIM) {
+        let b = bg.to_linear_f32();
+        for i in 0..3 {
+            c[i] = c[i] * (1.0 - DIM_MIX) + b[i] * DIM_MIX;
+        }
+    }
+    c
 }
 
 /// Shape each row (ligature-aware per `ligatures`) and emit one textured quad per
@@ -704,10 +808,17 @@ fn build_glyph_instances(
     let mut shape_ctx = ShapeContext::new();
     for row in 0..snapshot.rows {
         // Build the row string + a byte→col map so a cluster resolves to its lead cell.
+        // Skip the trailing spacer of a double-width char: its leader's glyph already
+        // spans both cells, so the next real glyph lands 2 columns over (positioning
+        // is by column, so wide chars are 2 cells apart with no overlap).
         let mut line = String::new();
         let mut byte_col: Vec<u16> = Vec::new();
         for col in 0..snapshot.cols {
-            let ch_at = snapshot.cell(col, row).map(|c| c.ch).unwrap_or(' ');
+            let cell = snapshot.cell(col, row);
+            if cell.map(Cell::is_continuation).unwrap_or(false) {
+                continue;
+            }
+            let ch_at = cell.map(|c| c.ch).unwrap_or(' ');
             let before = line.len();
             line.push(ch_at);
             for _ in before..line.len() {
@@ -726,13 +837,24 @@ fn build_glyph_instances(
         shaper.shape_with(|cluster| {
             let src = cluster.source.start as usize;
             let col = byte_col.get(src).copied().unwrap_or(0);
-            let color = snapshot
-                .cell(col, row)
-                .map(|c| c.fg.to_linear_f32())
-                .unwrap_or([1.0; 3]);
+            // Style comes from the cluster's lead cell (D11): color (reverse/dim)
+            // and the bold/italic that select a synthesized, separately-cached glyph.
+            let (color, bold, italic) = match snapshot.cell(col, row) {
+                Some(c) => (
+                    glyph_color(c),
+                    c.attrs.contains(CellAttrs::BOLD),
+                    c.attrs.contains(CellAttrs::ITALIC),
+                ),
+                None => ([1.0; 3], false, false),
+            };
             let mut pen = col as f32 * cw;
             for g in cluster.glyphs {
-                if let Some(entry) = atlas.get_or_insert(queue, g.id) {
+                let key = GlyphKey {
+                    id: g.id,
+                    bold,
+                    italic,
+                };
+                if let Some(entry) = atlas.get_or_insert_styled(queue, key) {
                     out.push(GlyphInstance {
                         pos: [pen + g.x + entry.left, baseline - entry.top],
                         size: [entry.px_w, entry.px_h],
@@ -745,6 +867,34 @@ fn build_glyph_instances(
                 pen += g.advance;
             }
         });
+    }
+
+    // Underline pass (R5.3): a solid rule below the baseline of each UNDERLINE
+    // cell, drawn in the glyph pass via the atlas's opaque solid entry. Kept
+    // separate so it doesn't borrow `atlas` inside the shaping closure.
+    let thickness = (ch * 0.06).max(1.0);
+    for row in 0..snapshot.rows {
+        let underline_y = row as f32 * ch + ascent + (ch * 0.08).max(1.0);
+        for col in 0..snapshot.cols {
+            let Some(cell) = snapshot.cell(col, row) else {
+                continue;
+            };
+            if !cell.attrs.contains(CellAttrs::UNDERLINE) {
+                continue;
+            }
+            let e = atlas.solid_entry(queue);
+            // Sample the block center so linear filtering never picks up a
+            // neighboring non-opaque texel — a constant 255 coverage → solid fill.
+            let uv = [(e.uv0[0] + e.uv1[0]) * 0.5, (e.uv0[1] + e.uv1[1]) * 0.5];
+            out.push(GlyphInstance {
+                pos: [col as f32 * cw, underline_y],
+                size: [cw, thickness],
+                uv0: uv,
+                uv1: uv,
+                color: glyph_color(cell),
+                _pad: 0.0,
+            });
+        }
     }
     out
 }
@@ -1066,6 +1216,74 @@ mod tests {
         assert!(
             atlas.generation() >= 1,
             "atlas should have evicted at least once"
+        );
+    }
+
+    #[test]
+    fn draw_to_skips_reshape_on_unchanged_snapshot() {
+        // R1.1/R1.2/R1.4: draw_to re-shapes only when the snapshot changes. An
+        // equal snapshot (incl. a value-equal clone) is a cache hit — no reshape;
+        // a changed snapshot or a resize forces a miss. `reshape_count` is the
+        // idle-CPU signal (idle frames re-present without incrementing it).
+        let cfg = Config::default();
+        let Ok(mut r) = Renderer::new_headless(256, 128, 1.0, &cfg) else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        let target = r.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen"),
+            size: wgpu::Extent3d {
+                width: 256,
+                height: 128,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: r.surface_format(),
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut t = term_core::Terminal::new(8, 2, term_core::Color(0xFFFFFF), term_core::Color(0));
+        t.advance(b"hello");
+        let snap = t.snapshot();
+
+        assert_eq!(r.reshape_count(), 0);
+        r.draw_to(&view, &snap);
+        assert_eq!(r.reshape_count(), 1, "first draw is a miss");
+        r.draw_to(&view, &snap); // equal snapshot → hit
+        assert_eq!(r.reshape_count(), 1, "unchanged snapshot must not re-shape");
+        r.draw_to(&view, &snap.clone()); // value-equal clone → still a hit
+        assert_eq!(
+            r.reshape_count(),
+            1,
+            "value-equal snapshot must not re-shape"
+        );
+
+        t.advance(b" world");
+        let snap2 = t.snapshot();
+        r.draw_to(&view, &snap2); // changed → miss
+        assert_eq!(r.reshape_count(), 2, "changed snapshot must re-shape");
+        r.draw_to(&view, &snap2); // hit again
+        assert_eq!(r.reshape_count(), 2);
+
+        // R1.4: a resize forces a miss even for a content-equal snapshot.
+        r.resize(320, 160);
+        r.draw_to(&view, &snap2);
+        assert_eq!(r.reshape_count(), 3, "resize must invalidate the cache");
+        r.draw_to(&view, &snap2); // settled → hit again
+        assert_eq!(r.reshape_count(), 3);
+
+        // R1.4: apply_config (theme/font/atlas change) also invalidates, so a
+        // content-equal snapshot re-shapes rather than re-presenting stale buffers.
+        r.apply_config(&cfg);
+        r.draw_to(&view, &snap2);
+        assert_eq!(
+            r.reshape_count(),
+            4,
+            "apply_config must invalidate the cache"
         );
     }
 }

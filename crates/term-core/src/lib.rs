@@ -22,7 +22,7 @@ pub mod scrollback;
 pub mod snapshot;
 
 pub use error::{Error, Result};
-pub use grid::{Cell, Color, Cursor, Grid};
+pub use grid::{Cell, CellAttrs, Color, Cursor, Grid};
 pub use image::{Decoded, ImageLayer, Placement};
 pub use pty::Pty;
 pub use scrollback::History;

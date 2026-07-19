@@ -11,6 +11,26 @@ use std::sync::Arc;
 
 use crate::glyph::{GlyphBitmap, GlyphRasterizer};
 
+/// Cache key for a rasterized glyph: the glyph id plus its synthesized style, so
+/// a bold/italic variant of a glyph caches separately from the regular one (D10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GlyphKey {
+    pub id: u16,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+impl GlyphKey {
+    /// The regular (unstyled) key for a glyph id.
+    pub fn plain(id: u16) -> Self {
+        GlyphKey {
+            id,
+            bold: false,
+            italic: false,
+        }
+    }
+}
+
 /// A packed glyph: its atlas UV rect plus pixel size and pen bearings (D6).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GlyphEntry {
@@ -33,12 +53,16 @@ pub struct Atlas {
     view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     rasterizer: GlyphRasterizer,
-    cache: HashMap<u16, Option<GlyphEntry>>,
+    cache: HashMap<GlyphKey, Option<GlyphEntry>>,
     shelf_x: u32,
     shelf_y: u32,
     shelf_h: u32,
     /// Bumped whenever the atlas is cleared (bounded eviction).
     generation: u64,
+    /// A packed 2×2 fully-opaque coverage block + the generation it was packed in,
+    /// reused for underline rules (a solid fill in the glyph pass). Re-reserved
+    /// lazily after an eviction bumps the generation.
+    solid: Option<(GlyphEntry, u64)>,
 }
 
 impl Atlas {
@@ -80,6 +104,7 @@ impl Atlas {
             shelf_y: 0,
             shelf_h: 0,
             generation: 0,
+            solid: None,
         })
     }
 
@@ -98,15 +123,53 @@ impl Atlas {
         self.rasterizer.glyph_id(ch)
     }
 
-    /// Get a glyph's atlas entry, rasterizing + uploading it on first request.
+    /// Get a glyph's atlas entry in the regular style. Backward-compatible entry
+    /// point kept for callers that don't carry style (e.g. sibling `DrawLayer`s).
     /// `None` = the glyph has no visible outline (e.g. a space).
     pub fn get_or_insert(&mut self, queue: &wgpu::Queue, glyph_id: u16) -> Option<GlyphEntry> {
-        if let Some(cached) = self.cache.get(&glyph_id) {
+        self.get_or_insert_styled(queue, GlyphKey::plain(glyph_id))
+    }
+
+    /// Get a glyph's atlas entry for a specific style (D10), rasterizing +
+    /// uploading it on first request. Bold/italic variants cache separately from
+    /// the regular glyph via the [`GlyphKey`].
+    pub fn get_or_insert_styled(
+        &mut self,
+        queue: &wgpu::Queue,
+        key: GlyphKey,
+    ) -> Option<GlyphEntry> {
+        if let Some(cached) = self.cache.get(&key) {
             return *cached;
         }
-        let bmp = self.rasterizer.rasterize_glyph(glyph_id);
+        let bmp = self
+            .rasterizer
+            .rasterize_glyph_styled(key.id, key.bold, key.italic);
         let entry = bmp.and_then(|bmp| self.pack(queue, &bmp));
-        self.cache.insert(glyph_id, entry);
+        self.cache.insert(key, entry);
+        entry
+    }
+
+    /// A packed fully-opaque entry used to draw solid rules (underline) in the
+    /// glyph pass. Its UV rect samples constant 255 coverage, so a quad using it
+    /// renders as a solid fill in the instance color. Re-reserved after eviction.
+    pub fn solid_entry(&mut self, queue: &wgpu::Queue) -> GlyphEntry {
+        if let Some((entry, gen)) = self.solid {
+            if gen == self.generation {
+                return entry;
+            }
+        }
+        let bmp = GlyphBitmap {
+            width: 2,
+            height: 2,
+            left: 0,
+            top: 0,
+            coverage: vec![255u8; 4],
+        };
+        // A 2×2 block always fits (possibly after one eviction inside `pack`).
+        let entry = self
+            .pack(queue, &bmp)
+            .expect("a 2x2 solid block must fit the atlas");
+        self.solid = Some((entry, self.generation));
         entry
     }
 

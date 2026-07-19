@@ -13,9 +13,11 @@ use std::sync::Arc;
 
 use common::config::Config;
 use common::watch::ConfigWatcher;
+use renderer::cursor_layer::CursorLayer;
 use renderer::tab_bar::{self, TabBar, TabBarModel, TabModelHandle};
 use renderer::Renderer;
 use term_core::Color;
+use term_core::GridSnapshot;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
@@ -96,6 +98,15 @@ struct Running {
     /// True while the window is fully occluded/hidden — the continuous redraw loop
     /// pauses so a background/minimized terminal doesn't burn the GPU.
     occluded: bool,
+    /// Idle-CPU (D7): the last snapshot handed to the renderer, reused on idle
+    /// frames so the continuous redraw doesn't re-clone the whole grid each frame.
+    last_snapshot: Option<GridSnapshot>,
+    /// Set by `redraw()` (the "real content change" entry point) and cleared after
+    /// a fresh snapshot is taken. The self-perpetuating continuous
+    /// `window.request_redraw()` in `RedrawRequested` deliberately does NOT set it,
+    /// so an idle frame reuses `last_snapshot`. Marks stale on PTY advance, tab
+    /// switch, resize, config reload, and overlay/router redraws.
+    snapshot_dirty: bool,
 }
 
 impl App {
@@ -118,6 +129,9 @@ impl App {
         renderer.set_top_inset(bar_h);
         let (bar, tab_model) = TabBar::new();
         renderer.add_layer(Box::new(bar));
+        // Blinking block cursor, above the glyphs (a DrawLayer so it blinks off the
+        // continuous-redraw loop, unaffected by the idle-CPU snapshot cache).
+        renderer.add_layer(Box::new(CursorLayer::new()));
 
         // Drain the SD4 seam registrations into the live registries. Each
         // overlay also contributes a DrawLayer drawn above the grid (R4.1).
@@ -171,6 +185,8 @@ impl App {
             config_rx,
             _config_watcher: config_watcher,
             occluded: false,
+            last_snapshot: None,
+            snapshot_dirty: true,
         };
         running.sync_tab_model();
         running.redraw();
@@ -179,11 +195,17 @@ impl App {
 }
 
 impl Running {
-    /// Request a redraw for a **real content change**. Arms `needs_commit_frame`
-    /// so the RedrawRequested handler runs one extra commit cycle (macOS present
-    /// flush, winit#2640). Use this — not `window.request_redraw()` directly — for
-    /// every content change; the bare call is reserved for the commit cycle itself.
+    /// Request a redraw for a **real content change**. Marks the cached snapshot
+    /// stale (`snapshot_dirty`) so `RedrawRequested` re-clones the grid on the next
+    /// frame (D7). Use this — not `window.request_redraw()` directly — for every
+    /// content change; the bare call is reserved for the idle continuous frame,
+    /// which must NOT re-snapshot.
     fn redraw(&mut self) {
+        // A real content change: the cached snapshot is now stale, so the next
+        // RedrawRequested re-snapshots (D7). The continuous redraw at the tail of
+        // RedrawRequested calls `window.request_redraw()` directly (not this), so it
+        // does NOT mark stale — idle frames reuse the cached snapshot.
+        self.snapshot_dirty = true;
         self.window.request_redraw();
     }
 
@@ -352,9 +374,19 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::RedrawRequested => {
-                let snapshot = inner.tabs.active().terminal.snapshot();
-                if let Err(e) = inner.renderer.render(&snapshot) {
-                    tracing::warn!("render failed: {e}");
+                // Re-clone the grid only on a real content change (D7). On an idle
+                // continuous frame `snapshot_dirty` is false, so we reuse the cached
+                // snapshot — the renderer then sees an equal snapshot and skips the
+                // re-shape too (D5). A fresh snapshot is taken on the first frame and
+                // whenever `redraw()` marked the cache stale.
+                if inner.snapshot_dirty || inner.last_snapshot.is_none() {
+                    inner.last_snapshot = Some(inner.tabs.active().terminal.snapshot());
+                    inner.snapshot_dirty = false;
+                }
+                if let Some(snapshot) = inner.last_snapshot.as_ref() {
+                    if let Err(e) = inner.renderer.render(snapshot) {
+                        tracing::warn!("render failed: {e}");
+                    }
                 }
                 // macOS/winit(0.30): with on-demand redraws the compositor drops the
                 // presented frame the moment the run loop sleeps, so the window only
@@ -378,4 +410,3 @@ fn err<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
 ) -> Box<dyn std::error::Error + Send + Sync> {
     e.into()
 }
-
