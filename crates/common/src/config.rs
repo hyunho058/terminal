@@ -53,7 +53,11 @@ impl Default for FontConfig {
         Self {
             family: "Menlo".to_string(),
             size_pt: 14.0,
-            ligatures: true,
+            // Off by default: Menlo's typographic f-ligatures (fi, fl, …) collapse
+            // into one glyph the renderer draws only at the lead cell, leaving a
+            // "ghost space" on the monospace grid (`first` → `fi rst`). Programming
+            // ligatures stay available via an explicit `font.ligatures = true`.
+            ligatures: false,
         }
     }
 }
@@ -130,5 +134,22 @@ mod tests {
         // Untouched fields fall back to defaults.
         assert_eq!(c.font.family, FontConfig::default().family);
         assert_eq!(c.grid.rows, GridConfig::default().rows);
+    }
+
+    #[test]
+    fn ligatures_default_off() {
+        // Regression: Menlo's typographic `fi` ligature breaks the monospace grid
+        // (ghost space: `first` → `fi rst`), so ligatures default OFF.
+        assert!(!FontConfig::default().ligatures);
+        assert!(!Config::default().font.ligatures);
+        // An omitted key falls back to the (now false) default via serde.
+        let omitted: Config = toml::from_str("[font]\nsize_pt = 14.0\n").unwrap();
+        assert!(!omitted.font.ligatures, "omitted key → default false");
+        // But an EXPLICIT opt-in is still honored — the default flip must not override it.
+        let explicit: Config = toml::from_str("[font]\nligatures = true\n").unwrap();
+        assert!(
+            explicit.font.ligatures,
+            "explicit `ligatures = true` still enables"
+        );
     }
 }

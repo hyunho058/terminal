@@ -264,6 +264,15 @@ impl Perform for Performer<'_> {
             }
             return;
         }
+        // Private-marker CSIs (`>`/`<`/`=` — e.g. XTMODKEYS `CSI > 4 ; 2 m`) share
+        // their final byte with real commands (`m` with SGR), but we implement none
+        // of them. Ignore any such sequence rather than misparsing it as SGR — the
+        // bug this fixes: `CSI > 4 ; 2 m` set UNDERLINE (4) + DIM (2) permanently,
+        // painting the whole screen underlined. Same early-return shape as the `?`
+        // private-mode guard above.
+        if matches!(intermediates.first(), Some(&(b'>' | b'<' | b'='))) {
+            return;
+        }
         match action {
             // CUP / HVP — cursor position (1-based row;col → 0-based).
             'H' | 'f' => {
@@ -549,6 +558,40 @@ mod tests {
         assert!(a.attrs.contains(CellAttrs::ITALIC));
         assert!(a.attrs.contains(CellAttrs::UNDERLINE));
         assert!(a.attrs.contains(CellAttrs::REVERSE));
+    }
+
+    #[test]
+    fn sgr_private_intermediates_are_ignored() {
+        // Regression: XTMODKEYS `CSI > 4 ; 2 m` must NOT be parsed as SGR 4;2
+        // (underline + dim). The `>` (and `<`/`=`) private-marker byte means "not
+        // SGR"; the csi_dispatch guard drops it. Without the guard, underline latched
+        // on for the whole screen. `sgr_cell` prints "X" AFTER the sequence.
+        let a = sgr_cell(b"\x1b[>4;2m");
+        assert!(
+            !a.attrs.contains(CellAttrs::UNDERLINE),
+            "`>` (XTMODKEYS) must not set underline"
+        );
+        assert!(
+            !a.attrs.contains(CellAttrs::DIM),
+            "`>` (XTMODKEYS) must not set dim"
+        );
+        assert!(
+            !sgr_cell(b"\x1b[=4m").attrs.contains(CellAttrs::UNDERLINE),
+            "`=` marker ignored"
+        );
+        assert!(
+            !sgr_cell(b"\x1b[<4m").attrs.contains(CellAttrs::UNDERLINE),
+            "`<` marker ignored"
+        );
+        // Positive controls — the guard must not over-suppress real SGR.
+        assert!(
+            sgr_cell(b"\x1b[4m").attrs.contains(CellAttrs::UNDERLINE),
+            "plain SGR 4 still underlines"
+        );
+        let m = sgr_cell(b"\x1b[1;4;7m");
+        assert!(m.attrs.contains(CellAttrs::BOLD));
+        assert!(m.attrs.contains(CellAttrs::UNDERLINE));
+        assert!(m.attrs.contains(CellAttrs::REVERSE));
     }
 
     #[test]
