@@ -7,7 +7,15 @@
 //! shaping (config `font.ligatures`) plugs in here via `swash::shape`.
 
 use swash::scale::{Render, ScaleContext, Source};
+use swash::zeno::{Angle, Transform};
 use swash::FontRef;
+
+/// Synthetic-italic slant applied via a shear transform when no italic face is
+/// available (about 14°, the common oblique angle).
+const ITALIC_SKEW_DEGREES: f32 = 14.0;
+/// Synthetic-bold strength as a fraction of the em size (embolden is applied to
+/// the outline before rasterization when no bold face is available).
+const BOLD_EMBOLDEN_FRAC: f32 = 0.04;
 
 /// A rasterized glyph: alpha coverage plus placement offsets, in pixels.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,9 +71,21 @@ impl GlyphRasterizer {
         self.rasterize_glyph(glyph_id)
     }
 
-    /// Rasterize a specific glyph id (post-shaping). Returns `None` for an empty
-    /// outline (e.g. a space glyph).
+    /// Rasterize a specific glyph id (post-shaping) in the regular style. Returns
+    /// `None` for an empty outline (e.g. a space glyph).
     pub fn rasterize_glyph(&mut self, glyph_id: u16) -> Option<GlyphBitmap> {
+        self.rasterize_glyph_styled(glyph_id, false, false)
+    }
+
+    /// Rasterize a glyph id with synthetic bold/italic. `bold` emboldens the
+    /// outline; `italic` applies a shear — both via `swash` synthesis, so no
+    /// separate font face is required (SD3). Regular = `(false, false)`.
+    pub fn rasterize_glyph_styled(
+        &mut self,
+        glyph_id: u16,
+        bold: bool,
+        italic: bool,
+    ) -> Option<GlyphBitmap> {
         // Safe to unwrap: validated in `new`.
         let font = FontRef::from_index(&self.data, self.index).unwrap();
         let mut scaler = self
@@ -74,7 +94,17 @@ impl GlyphRasterizer {
             .size(self.ppem)
             .hint(true)
             .build();
-        let image = Render::new(&[Source::Outline]).render(&mut scaler, glyph_id)?;
+        let mut render = Render::new(&[Source::Outline]);
+        if bold {
+            render.embolden(self.ppem * BOLD_EMBOLDEN_FRAC);
+        }
+        if italic {
+            render.transform(Some(Transform::skew(
+                Angle::from_degrees(ITALIC_SKEW_DEGREES),
+                Angle::from_degrees(0.0),
+            )));
+        }
+        let image = render.render(&mut scaler, glyph_id)?;
         if image.placement.width == 0 || image.placement.height == 0 {
             return None;
         }

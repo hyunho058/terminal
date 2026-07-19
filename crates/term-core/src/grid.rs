@@ -50,17 +50,57 @@ impl Color {
     }
 }
 
-/// One terminal cell: a glyph plus foreground/background color.
+/// Packed text attributes set by SGR (bold/dim/italic/underline/reverse). A `u8`
+/// bitset kept **inside** [`Cell`] with a derived `PartialEq` so an attribute-only
+/// change still makes two [`GridSnapshot`]s compare unequal — the equality basis
+/// the renderer's idle-CPU cache depends on (see `specs/idle-cpu` SD2).
+///
+/// [`GridSnapshot`]: crate::GridSnapshot
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct CellAttrs(pub u8);
+
+impl CellAttrs {
+    pub const NONE: CellAttrs = CellAttrs(0);
+    pub const BOLD: CellAttrs = CellAttrs(1 << 0);
+    pub const DIM: CellAttrs = CellAttrs(1 << 1);
+    pub const ITALIC: CellAttrs = CellAttrs(1 << 2);
+    pub const UNDERLINE: CellAttrs = CellAttrs(1 << 3);
+    pub const REVERSE: CellAttrs = CellAttrs(1 << 4);
+
+    /// True if every bit in `other` is set.
+    pub const fn contains(self, other: CellAttrs) -> bool {
+        self.0 & other.0 == other.0
+    }
+    /// Set the bits in `other`.
+    pub fn insert(&mut self, other: CellAttrs) {
+        self.0 |= other.0;
+    }
+    /// Clear the bits in `other`.
+    pub fn remove(&mut self, other: CellAttrs) {
+        self.0 &= !other.0;
+    }
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// One terminal cell: a glyph, fg/bg color, and text attributes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Cell {
     pub ch: char,
     pub fg: Color,
     pub bg: Color,
+    pub attrs: CellAttrs,
 }
 
 impl Cell {
     pub fn blank(fg: Color, bg: Color) -> Self {
-        Cell { ch: ' ', fg, bg }
+        Cell {
+            ch: ' ',
+            fg,
+            bg,
+            attrs: CellAttrs::NONE,
+        }
     }
 
     pub fn is_blank(&self) -> bool {
@@ -88,6 +128,8 @@ pub struct Grid {
     /// Active pen for newly printed cells (set by SGR).
     pen_fg: Color,
     pen_bg: Color,
+    /// Active text attributes for newly printed cells (set by SGR 1/2/3/4/7).
+    pen_attrs: CellAttrs,
     /// Retained scrolled-off primary-screen rows (D1).
     history: History,
     /// Rows scrolled up from the live view (0 == bottom/live) (D2).
@@ -111,6 +153,7 @@ impl Grid {
             default_bg: bg,
             pen_fg: fg,
             pen_bg: bg,
+            pen_attrs: CellAttrs::NONE,
             history: History::new(DEFAULT_HISTORY_LIMIT),
             view_offset: 0,
             alt_screen: false,
@@ -151,10 +194,31 @@ impl Grid {
         }
     }
 
-    /// Reset the pen to the configured defaults (SGR 0).
+    /// Reset the pen to the configured defaults and clear all attributes (SGR 0).
     pub fn reset_pen(&mut self) {
         self.pen_fg = self.default_fg;
         self.pen_bg = self.default_bg;
+        self.pen_attrs = CellAttrs::NONE;
+    }
+
+    /// Reset only the foreground to the configured default (SGR 39).
+    pub fn reset_pen_fg(&mut self) {
+        self.pen_fg = self.default_fg;
+    }
+
+    /// Reset only the background to the configured default (SGR 49).
+    pub fn reset_pen_bg(&mut self) {
+        self.pen_bg = self.default_bg;
+    }
+
+    /// Set the given attribute bits in the active pen (SGR 1/2/3/4/7).
+    pub fn set_pen_attrs(&mut self, attrs: CellAttrs) {
+        self.pen_attrs.insert(attrs);
+    }
+
+    /// Clear the given attribute bits in the active pen (SGR 22/23/24/27).
+    pub fn clear_pen_attrs(&mut self, attrs: CellAttrs) {
+        self.pen_attrs.remove(attrs);
     }
 
     /// Re-theme the grid's default colors live (settings feature): new cells use
@@ -189,6 +253,7 @@ impl Grid {
             ch,
             fg: self.pen_fg,
             bg: self.pen_bg,
+            attrs: self.pen_attrs,
         };
         self.cursor.col += 1;
     }

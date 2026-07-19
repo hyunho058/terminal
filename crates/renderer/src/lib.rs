@@ -18,12 +18,12 @@ pub mod tab_bar;
 
 use std::sync::Arc;
 
-use atlas::Atlas;
+use atlas::{Atlas, GlyphKey};
 use bytemuck::{Pod, Zeroable};
 use common::config::Config;
 use swash::shape::ShapeContext;
 use swash::FontRef;
-use term_core::GridSnapshot;
+use term_core::{Cell, CellAttrs, GridSnapshot};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
@@ -741,10 +741,18 @@ fn build_bg_instances(snapshot: &GridSnapshot, bg_default: u32) -> Vec<BgInstanc
     for row in 0..snapshot.rows {
         for col in 0..snapshot.cols {
             if let Some(cell) = snapshot.cell(col, row) {
-                if cell.bg.0 != bg_default {
+                // REVERSE swaps fg/bg at draw time; the default-bg skip is evaluated
+                // on the EFFECTIVE (post-swap) background so a reversed cell whose
+                // logical fg differs from the default still emits its quad (R5.1).
+                let eff_bg = if cell.attrs.contains(CellAttrs::REVERSE) {
+                    cell.fg
+                } else {
+                    cell.bg
+                };
+                if eff_bg.0 != bg_default {
                     out.push(BgInstance {
                         grid_pos: [col as f32, row as f32],
-                        color: cell.bg.to_linear_f32(),
+                        color: eff_bg.to_linear_f32(),
                         _pad: 0.0,
                     });
                 }
@@ -752,6 +760,27 @@ fn build_bg_instances(snapshot: &GridSnapshot, bg_default: u32) -> Vec<BgInstanc
         }
     }
     out
+}
+
+/// Fraction a DIM cell's foreground is mixed toward its background.
+const DIM_MIX: f32 = 0.45;
+
+/// The linear-light glyph color for a cell, applying REVERSE (fg/bg swap) and DIM
+/// (mix toward the background) — the color both its glyphs and its underline use.
+fn glyph_color(cell: &Cell) -> [f32; 3] {
+    let (fg, bg) = if cell.attrs.contains(CellAttrs::REVERSE) {
+        (cell.bg, cell.fg)
+    } else {
+        (cell.fg, cell.bg)
+    };
+    let mut c = fg.to_linear_f32();
+    if cell.attrs.contains(CellAttrs::DIM) {
+        let b = bg.to_linear_f32();
+        for i in 0..3 {
+            c[i] = c[i] * (1.0 - DIM_MIX) + b[i] * DIM_MIX;
+        }
+    }
+    c
 }
 
 /// Shape each row (ligature-aware per `ligatures`) and emit one textured quad per
@@ -800,13 +829,24 @@ fn build_glyph_instances(
         shaper.shape_with(|cluster| {
             let src = cluster.source.start as usize;
             let col = byte_col.get(src).copied().unwrap_or(0);
-            let color = snapshot
-                .cell(col, row)
-                .map(|c| c.fg.to_linear_f32())
-                .unwrap_or([1.0; 3]);
+            // Style comes from the cluster's lead cell (D11): color (reverse/dim)
+            // and the bold/italic that select a synthesized, separately-cached glyph.
+            let (color, bold, italic) = match snapshot.cell(col, row) {
+                Some(c) => (
+                    glyph_color(c),
+                    c.attrs.contains(CellAttrs::BOLD),
+                    c.attrs.contains(CellAttrs::ITALIC),
+                ),
+                None => ([1.0; 3], false, false),
+            };
             let mut pen = col as f32 * cw;
             for g in cluster.glyphs {
-                if let Some(entry) = atlas.get_or_insert(queue, g.id) {
+                let key = GlyphKey {
+                    id: g.id,
+                    bold,
+                    italic,
+                };
+                if let Some(entry) = atlas.get_or_insert_styled(queue, key) {
                     out.push(GlyphInstance {
                         pos: [pen + g.x + entry.left, baseline - entry.top],
                         size: [entry.px_w, entry.px_h],
@@ -819,6 +859,34 @@ fn build_glyph_instances(
                 pen += g.advance;
             }
         });
+    }
+
+    // Underline pass (R5.3): a solid rule below the baseline of each UNDERLINE
+    // cell, drawn in the glyph pass via the atlas's opaque solid entry. Kept
+    // separate so it doesn't borrow `atlas` inside the shaping closure.
+    let thickness = (ch * 0.06).max(1.0);
+    for row in 0..snapshot.rows {
+        let underline_y = row as f32 * ch + ascent + (ch * 0.08).max(1.0);
+        for col in 0..snapshot.cols {
+            let Some(cell) = snapshot.cell(col, row) else {
+                continue;
+            };
+            if !cell.attrs.contains(CellAttrs::UNDERLINE) {
+                continue;
+            }
+            let e = atlas.solid_entry(queue);
+            // Sample the block center so linear filtering never picks up a
+            // neighboring non-opaque texel — a constant 255 coverage → solid fill.
+            let uv = [(e.uv0[0] + e.uv1[0]) * 0.5, (e.uv0[1] + e.uv1[1]) * 0.5];
+            out.push(GlyphInstance {
+                pos: [col as f32 * cw, underline_y],
+                size: [cw, thickness],
+                uv0: uv,
+                uv1: uv,
+                color: glyph_color(cell),
+                _pad: 0.0,
+            });
+        }
     }
     out
 }

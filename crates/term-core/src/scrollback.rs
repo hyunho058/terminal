@@ -63,6 +63,7 @@ mod tests {
             ch,
             fg: Color(0),
             bg: Color(0),
+            attrs: crate::grid::CellAttrs::NONE,
         }]
     }
 
