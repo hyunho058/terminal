@@ -91,7 +91,13 @@ impl GridSnapshot {
         for row in 0..self.rows {
             let mut line = String::with_capacity(self.cols as usize);
             for col in 0..self.cols {
-                line.push(self.cell(col, row).map(|c| c.ch).unwrap_or(' '));
+                match self.cell(col, row) {
+                    // Skip the trailing spacer of a double-width char (the leader
+                    // already carries the glyph) so copied text is `한글`, not `한 글`.
+                    Some(c) if c.is_continuation() => {}
+                    Some(c) => line.push(c.ch),
+                    None => line.push(' '),
+                }
             }
             out.push_str(line.trim_end());
             out.push('\n');

@@ -11,6 +11,7 @@
 //! implicit z=0 layer, and registered layers draw after it in `z_order`.
 
 pub mod atlas;
+pub mod cursor_layer;
 pub mod glyph;
 pub mod image_layer;
 pub mod overlay_layer;
@@ -807,10 +808,17 @@ fn build_glyph_instances(
     let mut shape_ctx = ShapeContext::new();
     for row in 0..snapshot.rows {
         // Build the row string + a byte→col map so a cluster resolves to its lead cell.
+        // Skip the trailing spacer of a double-width char: its leader's glyph already
+        // spans both cells, so the next real glyph lands 2 columns over (positioning
+        // is by column, so wide chars are 2 cells apart with no overlap).
         let mut line = String::new();
         let mut byte_col: Vec<u16> = Vec::new();
         for col in 0..snapshot.cols {
-            let ch_at = snapshot.cell(col, row).map(|c| c.ch).unwrap_or(' ');
+            let cell = snapshot.cell(col, row);
+            if cell.map(Cell::is_continuation).unwrap_or(false) {
+                continue;
+            }
+            let ch_at = cell.map(|c| c.ch).unwrap_or(' ');
             let before = line.len();
             line.push(ch_at);
             for _ in before..line.len() {

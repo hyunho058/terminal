@@ -4,6 +4,8 @@
 //! cell control" surface the project exists to own — deliberately GPU-free so it
 //! can be unit-tested headlessly.
 
+use unicode_width::UnicodeWidthChar;
+
 use crate::image::{Decoded, ImageLayer};
 use crate::scrollback::{History, DEFAULT_HISTORY_LIMIT};
 
@@ -94,6 +96,11 @@ pub struct Cell {
 }
 
 impl Cell {
+    /// Sentinel char for the trailing cell of a double-width character (a leader
+    /// occupies this + the next cell). Never produced by `print` of a real char —
+    /// `vte` routes NUL to `execute`, not `print`.
+    pub const CONTINUATION: char = '\0';
+
     pub fn blank(fg: Color, bg: Color) -> Self {
         Cell {
             ch: ' ',
@@ -105,6 +112,13 @@ impl Cell {
 
     pub fn is_blank(&self) -> bool {
         self.ch == ' '
+    }
+
+    /// True if this is the trailing spacer cell of a double-width character. The
+    /// renderer draws no glyph for it (the wide leader's glyph already spans both
+    /// cells) and `to_text` skips it.
+    pub fn is_continuation(&self) -> bool {
+        self.ch == Cell::CONTINUATION
     }
 }
 
@@ -242,20 +256,40 @@ impl Grid {
         self.pen_bg = bg;
     }
 
-    /// Print a character at the cursor, advancing (and wrapping) it.
+    /// Print a character at the cursor, advancing by its **display width** and
+    /// wrapping. A double-width char (한글/CJK/emoji) occupies two cells — a leader
+    /// plus a `Cell::CONTINUATION` spacer carrying the same colors — and advances
+    /// the cursor by 2, so the column model matches the shell (a mismatch is what
+    /// let backspace erase the prompt). Zero-width chars (combining marks) are
+    /// dropped — a first-cut limitation.
     pub fn print(&mut self, ch: char) {
-        if self.cursor.col >= self.cols {
+        let w = match ch.width() {
+            Some(0) | None => return,
+            Some(w) => w as u16,
+        };
+        // Wrap first if the glyph would not fit on the current line (a wide char
+        // never straddles the right margin).
+        if self.cursor.col + w > self.cols {
             self.line_feed();
             self.cursor.col = 0;
         }
         let idx = self.index(self.cursor.col, self.cursor.row);
-        self.cells[idx] = Cell {
+        let cell = Cell {
             ch,
             fg: self.pen_fg,
             bg: self.pen_bg,
             attrs: self.pen_attrs,
         };
-        self.cursor.col += 1;
+        self.cells[idx] = cell;
+        // Trailing spacer for a double-width char (guarded against a <2-col grid).
+        if w == 2 && self.cursor.col + 1 < self.cols {
+            let idx2 = self.index(self.cursor.col + 1, self.cursor.row);
+            self.cells[idx2] = Cell {
+                ch: Cell::CONTINUATION,
+                ..cell
+            };
+        }
+        self.cursor.col += w;
     }
 
     pub fn carriage_return(&mut self) {
@@ -428,5 +462,91 @@ impl Grid {
     /// Iterate cells in row-major order. Used to build a [`crate::GridSnapshot`].
     pub fn cells(&self) -> &[Cell] {
         &self.cells
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::Processor;
+
+    fn grid(cols: u16, rows: u16) -> Grid {
+        Grid::new(cols, rows, Color(0xFFFFFF), Color(0))
+    }
+
+    fn row_text(g: &Grid, r: u16) -> String {
+        let s: String = (0..g.cols())
+            .map(|c| g.cell(c, r).unwrap().ch)
+            .filter(|&ch| ch != Cell::CONTINUATION)
+            .collect();
+        s.trim_end().to_string()
+    }
+
+    #[test]
+    fn wide_char_occupies_two_cells_and_advances_two() {
+        let mut g = grid(20, 3);
+        let mut p = Processor::new();
+        p.advance(&mut g, "한글".as_bytes());
+        assert_eq!(
+            g.cursor().col,
+            4,
+            "two double-width chars advance 4 columns"
+        );
+        assert_eq!(g.cell(0, 0).unwrap().ch, '한');
+        assert!(g.cell(1, 0).unwrap().is_continuation(), "leader spacer");
+        assert_eq!(g.cell(2, 0).unwrap().ch, '글');
+        assert!(g.cell(3, 0).unwrap().is_continuation());
+    }
+
+    #[test]
+    fn wide_char_wraps_rather_than_splitting_the_margin() {
+        let mut g = grid(4, 3);
+        let mut p = Processor::new();
+        p.advance(&mut g, "aaa한".as_bytes()); // 3 narrow fill cols 0-2; 한 can't fit in col3
+        assert_eq!(row_text(&g, 0), "aaa");
+        assert_eq!(
+            g.cell(0, 1).unwrap().ch,
+            '한',
+            "wide char wrapped to next row"
+        );
+        assert_eq!(g.cursor().row, 1);
+        assert_eq!(g.cursor().col, 2);
+    }
+
+    #[test]
+    fn korean_backspace_does_not_erase_the_prompt() {
+        // The reported bug: zsh erases a wide char with `\b\b  \b\b` (back 2, two
+        // spaces, back 2). With correct width tracking our cursor matches zsh's, so
+        // the erases land on the typed chars, not the prompt.
+        let mut g = grid(40, 3);
+        let mut p = Processor::new();
+        p.advance(&mut g, b"PP> "); // prompt cols 0-3
+        p.advance(&mut g, "한글".as_bytes()); // cols 4-7, cursor col 8
+        assert_eq!(g.cursor().col, 8);
+        p.advance(&mut g, b"\x08\x08  \x08\x08"); // erase 글
+        p.advance(&mut g, b"\x08\x08  \x08\x08"); // erase 한
+        assert_eq!(
+            g.cursor().col,
+            4,
+            "cursor back at the prompt end, not inside it"
+        );
+        assert_eq!(g.cell(0, 0).unwrap().ch, 'P');
+        assert_eq!(g.cell(1, 0).unwrap().ch, 'P');
+        assert_eq!(g.cell(2, 0).unwrap().ch, '>');
+        assert_eq!(g.cell(3, 0).unwrap().ch, ' ');
+        assert_eq!(row_text(&g, 0), "PP>", "prompt intact, typed text cleared");
+    }
+
+    #[test]
+    fn to_text_skips_wide_continuation() {
+        let mut g = grid(20, 2);
+        let mut p = Processor::new();
+        p.advance(&mut g, "한글".as_bytes());
+        let text = crate::snapshot::GridSnapshot::from_grid(&g).to_text();
+        assert_eq!(
+            text.lines().next().unwrap(),
+            "한글",
+            "no spacer/NUL in copied text"
+        );
     }
 }

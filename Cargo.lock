@@ -2496,6 +2496,7 @@ dependencies = [
  "portable-pty",
  "thiserror 2.0.18",
  "tracing",
+ "unicode-width",
  "vte",
 ]
 
