@@ -44,7 +44,13 @@ zsh ──PTY──> reader thread ──mpsc──> [wake] winit loop
 
 ## Deferred / known gaps
 
-- **G1** Performance numbers unconfirmed — CI checks build/test, not fps/latency.
-- **G2** Inline-image protocol undecided (iTerm2 vs Kitty vs custom).
-- **G3** Glyph atlas: `swash` rasterizes today; wiring the atlas into the shader
-  (replacing block-font cells) is the first render feature.
+- **G1** Performance *numbers* still unconfirmed — CI checks build/test, not
+  fps/latency; committing the thresholds remains a human decision. (The idle-CPU
+  debt from PR #2 — a full re-shape every frame at idle — has since been fixed: the
+  renderer skips re-shape on an unchanged snapshot, re-presenting cached buffers.)
+- **G2** ~~Inline-image protocol undecided~~ — **resolved**: the Kitty graphics-APC
+  protocol shipped (`term-core::image::parse_graphics_apc`).
+- **G3** ~~Glyph atlas not yet wired into the shader~~ — **resolved**: glyphs render
+  through the swash atlas (`build_glyph_instances` feeds `renderer::atlas::Atlas`),
+  with 256-color/truecolor and bold/dim/italic/underline/reverse; block-font is no
+  longer the rendering path.

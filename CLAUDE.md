@@ -36,9 +36,10 @@ adding features. `crates/term-core/tests/grid_snapshot.rs` is the test exemplar
 - **Build/test/lint:** `cargo build`, `cargo test --workspace`, `cargo clippy
   --workspace --all-targets -- -D warnings`. Toolchain pinned in `rust-toolchain.toml`.
 - **Errors:** per-crate `Error` enums via `thiserror`; no `unwrap()` outside tests.
-- **Rendering scope:** the current renderer draws non-blank cells as colored
-  blocks (block-font). Real glyphs = the swash atlas in `renderer/src/glyph.rs`,
-  the first feature to build via `/specify`.
+- **Rendering scope:** the renderer draws real glyphs via the swash atlas
+  (`renderer/src/glyph.rs` + `renderer/src/atlas.rs`), with per-cell fg/bg,
+  256-color/truecolor, and bold/dim/italic/underline/reverse attributes. (The
+  original block-font placeholder has been replaced.)
 - Solo project — no commit/branch conventions enforced.
 
 ## Project skills

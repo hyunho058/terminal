@@ -31,5 +31,9 @@ Inferred from `requirements-interview-outputs/mac-terminal/insights.md`.
 
 ## Deferred (features via `/specify`, not scaffold)
 
-Inline image paste (iTerm2/Kitty/custom protocol — undecided), ai-monitor overlay,
-settings UI, full scrollback, 256-color/truecolor SGR, glyph atlas rendering.
+All of the original scaffold-deferred features have since shipped: inline image
+paste (Kitty graphics-APC protocol), the ai-monitor overlay, live settings (TOML
+config reload — a graphical panel remains a non-goal), full scrollback,
+256-color/truecolor + bold/dim/italic/underline/reverse SGR, and glyph atlas
+rendering. No scaffold-deferred features remain; new work is scoped via `/specify`
+per feature.
