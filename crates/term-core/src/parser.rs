@@ -273,6 +273,41 @@ impl Perform for Performer<'_> {
                 self.grid
                     .move_to(col.saturating_sub(1), row.saturating_sub(1));
             }
+            // CUU / CUD / CUF / CUB — relative cursor moves. Param defaults to 1,
+            // and 0 is treated as 1. zsh emits these to reposition across wrapped
+            // rows while redrawing an edited line; dropping them desyncs the cursor
+            // and overwrites the prompt (the bug this fixes). move_to clamps to grid.
+            'A' => {
+                let n = first.unwrap_or(1).max(1);
+                let cur = self.grid.cursor();
+                self.grid.move_to(cur.col, cur.row.saturating_sub(n));
+            }
+            'B' => {
+                let n = first.unwrap_or(1).max(1);
+                let cur = self.grid.cursor();
+                self.grid.move_to(cur.col, cur.row.saturating_add(n));
+            }
+            'C' => {
+                let n = first.unwrap_or(1).max(1);
+                let cur = self.grid.cursor();
+                self.grid.move_to(cur.col.saturating_add(n), cur.row);
+            }
+            'D' => {
+                let n = first.unwrap_or(1).max(1);
+                let cur = self.grid.cursor();
+                self.grid.move_to(cur.col.saturating_sub(n), cur.row);
+            }
+            // CHA / VPA — absolute column / row (1-based → 0-based).
+            'G' => {
+                let col = first.unwrap_or(1).max(1).saturating_sub(1);
+                let cur = self.grid.cursor();
+                self.grid.move_to(col, cur.row);
+            }
+            'd' => {
+                let row = first.unwrap_or(1).max(1).saturating_sub(1);
+                let cur = self.grid.cursor();
+                self.grid.move_to(cur.col, row);
+            }
             // ED — erase display. 0/none = cursor→end (what a shell sends to redraw
             // its prompt — must NOT wipe scrollback), 1 = start→cursor, 2/3 = all.
             'J' => match first {
@@ -559,5 +594,73 @@ mod tests {
         );
         assert_eq!(plain.ch, bold.ch);
         assert_eq!(plain.fg, bold.fg);
+    }
+
+    // --- relative CSI cursor moves (csi-cursor-moves) ---
+
+    fn cur(g: &Grid) -> (u16, u16) {
+        (g.cursor().col, g.cursor().row)
+    }
+
+    #[test]
+    fn csi_relative_and_absolute_cursor_moves() {
+        let mut g = Grid::new(20, 10, Color(0xFFFFFF), Color(0));
+        let mut p = Processor::new();
+        p.advance(&mut g, b"\x1b[6;6H"); // CUP → (col5, row5)
+        assert_eq!(cur(&g), (5, 5));
+        p.advance(&mut g, b"\x1b[2A"); // CUU 2 → row 3
+        assert_eq!(cur(&g), (5, 3));
+        p.advance(&mut g, b"\x1b[B"); // CUD default 1 → row 4
+        assert_eq!(cur(&g), (5, 4));
+        p.advance(&mut g, b"\x1b[3C"); // CUF 3 → col 8
+        assert_eq!(cur(&g), (8, 4));
+        p.advance(&mut g, b"\x1b[D"); // CUB default 1 → col 7
+        assert_eq!(cur(&g), (7, 4));
+        p.advance(&mut g, b"\x1b[G"); // CHA no param → col 0
+        assert_eq!(cur(&g), (0, 4));
+        p.advance(&mut g, b"\x1b[10G"); // CHA col 10 (1-based) → col 9
+        assert_eq!(cur(&g), (9, 4));
+        p.advance(&mut g, b"\x1b[d"); // VPA row 1 → row 0
+        assert_eq!(cur(&g), (9, 0));
+    }
+
+    #[test]
+    fn csi_cursor_moves_clamp_and_treat_zero_as_one() {
+        let mut g = Grid::new(20, 10, Color(0xFFFFFF), Color(0));
+        let mut p = Processor::new();
+        p.advance(&mut g, b"\x1b[6;6H\x1b[0D"); // CUB with 0 == 1: col5 → col4
+        assert_eq!(cur(&g), (4, 5));
+        p.advance(&mut g, b"\x1b[99A"); // clamp top
+        assert_eq!(g.cursor().row, 0);
+        p.advance(&mut g, b"\x1b[99C"); // clamp right (cols-1 = 19)
+        assert_eq!(g.cursor().col, 19);
+        p.advance(&mut g, b"\x1b[99B"); // clamp bottom (rows-1 = 9)
+        assert_eq!(g.cursor().row, 9);
+    }
+
+    #[test]
+    fn prompt_row_survives_wrapped_edit() {
+        // Reproduces the reported bug: a wrapped line, then zsh moves the cursor UP
+        // (CSI A) to the prompt row to redraw + erase. Before the fix CSI A was
+        // dropped, the cursor stayed on the wrapped row, and the erase hit the wrong
+        // row. Now CSI A actually moves to row 0 and only the intended region clears.
+        let mut g = Grid::new(8, 4, Color(0xFFFFFF), Color(0)); // 8 cols → wraps
+        let mut p = Processor::new();
+        p.advance(&mut g, b"ab> cdefghij"); // row0="ab> cdef", row1="ghij", cursor (col4,row1)
+        assert_eq!(row_text(&g, 0), "ab> cdef");
+        assert_eq!(row_text(&g, 1), "ghij");
+        assert_eq!(cur(&g), (4, 1));
+
+        p.advance(&mut g, b"\x1b[A"); // CUU → the fix: cursor moves to row 0
+        assert_eq!(g.cursor().row, 0, "CSI A must move the cursor up (the bug)");
+        p.advance(&mut g, b"\x1b[5G"); // CHA col 5 (1-based) → col 4
+        p.advance(&mut g, b"\x1b[K"); // erase row0 from col4 to end
+
+        // The prompt "ab> " (cols 0-3) is intact; only cols 4-7 were cleared.
+        assert_eq!(g.cell(0, 0).unwrap().ch, 'a');
+        assert_eq!(g.cell(1, 0).unwrap().ch, 'b');
+        assert_eq!(g.cell(2, 0).unwrap().ch, '>');
+        assert_eq!(g.cell(4, 0).unwrap().ch, ' ');
+        assert_eq!(row_text(&g, 0), "ab>");
     }
 }
