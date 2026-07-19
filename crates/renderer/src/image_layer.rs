@@ -236,16 +236,20 @@ impl DrawLayer for ImageLayer {
         );
 
         // Upload any not-yet-cached placement; refresh its rect each frame (it may
-        // have scrolled). Cell rect is offset down by the tab-bar inset.
+        // have scrolled). Cell rect is offset right by the left tab-sidebar inset
+        // and down by any top inset, matching the grid glyphs.
         let mut live = std::collections::HashSet::new();
         for p in &ctx.snapshot.images {
             live.insert(p.id);
-            let rect = [
-                p.col as f32 * cw,
-                ctx.top_inset + p.row as f32 * ch,
-                p.cols as f32 * cw,
-                p.rows as f32 * ch,
-            ];
+            let rect = tile_rect(
+                p.col,
+                p.row,
+                p.cols,
+                p.rows,
+                [cw, ch],
+                ctx.top_inset,
+                ctx.left_inset,
+            );
             let instances = ctx
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -356,6 +360,28 @@ impl DrawLayer for ImageLayer {
     }
 }
 
+/// Pure geometry for an image placement: the px rect of a tile anchored at cell
+/// `(col, row)` spanning `cols × rows` cells. Shifted right by `left_inset` (the
+/// left tab sidebar) and down by `top_inset`, matching the bg/glyph shaders — this
+/// layer's own shader applies no inset, so it is baked in here. Split out so
+/// positioning is unit-testable without a GPU `FrameCtx`.
+fn tile_rect(
+    col: u16,
+    row: u16,
+    cols: u16,
+    rows: u16,
+    cell: [f32; 2],
+    top_inset: f32,
+    left_inset: f32,
+) -> [f32; 4] {
+    [
+        col as f32 * cell[0] + left_inset,
+        row as f32 * cell[1] + top_inset,
+        cols as f32 * cell[0],
+        rows as f32 * cell[1],
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,5 +391,20 @@ mod tests {
         let l = ImageLayer::new();
         assert!(l.z_order() > super::super::tab_bar::TAB_BAR_Z);
         assert!(l.z_order() < super::super::overlay_layer::OVERLAY_Z);
+    }
+
+    #[test]
+    fn tile_rect_shifts_with_left_inset() {
+        // An image at cell (5, 2) spanning 3x2 cells of 10x20 px. The sidebar
+        // shifts it right by left_inset exactly as it shifts the grid glyphs;
+        // size is unaffected by either inset.
+        let r = tile_rect(5, 2, 3, 2, [10.0, 20.0], 30.0, 140.0);
+        assert_eq!(r, [190.0, 70.0, 30.0, 40.0]); // x=5*10+140, y=2*20+30, w=3*10, h=2*20
+                                                  // With no insets it reduces to the bare cell position (regression guard:
+                                                  // pre-fix this layer omitted left_inset and drew images left of the grid).
+        assert_eq!(
+            tile_rect(5, 2, 3, 2, [10.0, 20.0], 0.0, 0.0),
+            [50.0, 40.0, 30.0, 40.0]
+        );
     }
 }
