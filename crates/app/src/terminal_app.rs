@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use common::config::Config;
 use common::watch::ConfigWatcher;
+use renderer::cursor_layer::CursorLayer;
 use renderer::tab_bar::{self, TabBar, TabBarModel, TabModelHandle};
 use renderer::Renderer;
 use term_core::Color;
@@ -128,6 +129,9 @@ impl App {
         renderer.set_top_inset(bar_h);
         let (bar, tab_model) = TabBar::new();
         renderer.add_layer(Box::new(bar));
+        // Blinking block cursor, above the glyphs (a DrawLayer so it blinks off the
+        // continuous-redraw loop, unaffected by the idle-CPU snapshot cache).
+        renderer.add_layer(Box::new(CursorLayer::new()));
 
         // Drain the SD4 seam registrations into the live registries. Each
         // overlay also contributes a DrawLayer drawn above the grid (R4.1).
