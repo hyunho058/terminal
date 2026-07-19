@@ -22,9 +22,10 @@ use crate::tabs::Tabs;
 /// Apply a reloaded config to the live renderer + tabs.
 pub fn apply(cfg: &Config, renderer: &mut Renderer, tabs: &mut Tabs) {
     renderer.apply_config(cfg);
-    // Font size may have changed the cell height → keep the tab-bar band in step
-    // before reading grid_size (so the reserved strip matches the new metrics).
-    renderer.set_top_inset(tab_bar::height_px(renderer.cell_size().1));
+    // Font size may have changed the cell width → keep the left tab sidebar in
+    // step before reading grid_size (so the reserved band matches the new metrics
+    // and the drawn sidebar width). Reserves the LEFT inset, never a top band.
+    renderer.set_left_inset(tab_bar::width_px(renderer.cell_size().0));
     // Cell metrics may have changed (font size) → re-fit every tab (R3.1).
     let (cols, rows) = renderer.grid_size();
     tabs.resize_all(cols, rows);

@@ -3,6 +3,7 @@
 //! Both are pure functions over winit's logical `Key` + `ModifiersState`, so the
 //! chord table is unit-tested without a window.
 
+use renderer::tab_bar;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 /// A tab-management action triggered by a Cmd chord (D5). Intercepted before
@@ -38,6 +39,24 @@ pub fn tab_action(key: &Key, mods: &ModifiersState) -> Option<TabAction> {
         '1'..='9' => Some(TabAction::Jump(c as usize - '1' as usize)),
         _ => None,
     }
+}
+
+/// Translate a left-mouse press into the tab it targets in the left sidebar, or
+/// `None` if the press is outside the sidebar / below the last tab. This is the
+/// pointer analogue of [`tab_action`] (raw device input → a tab intent): it casts
+/// winit's `f64` physical cursor to `f32`, derives the per-tab slot height from
+/// the cell metrics, and delegates the floor/bounds *geometry* to
+/// [`tab_bar::tab_at`] — so the hit-test math lives in exactly one place (SD2),
+/// the same functions the sidebar draws with. `sidebar_w` is the renderer's live
+/// `left_inset`; `count` is the number of open tabs.
+pub fn tab_target(
+    cursor: (f64, f64),
+    cell: (f32, f32),
+    sidebar_w: f32,
+    count: usize,
+) -> Option<usize> {
+    let tab_h = tab_bar::tab_height_px(cell.1);
+    tab_bar::tab_at(cursor.0 as f32, cursor.1 as f32, sidebar_w, tab_h, count)
 }
 
 /// Translate a key press into the bytes a shell expects. Named keys first, then
@@ -98,5 +117,22 @@ mod tests {
             Some(vec![0x7f])
         );
         assert_eq!(encode_key(&ch("a"), Some("a")), Some(b"a".to_vec()));
+    }
+
+    #[test]
+    fn tab_target_maps_click_to_tab_and_delegates_geometry() {
+        // cell (8, 20) → tab_h = tab_height_px(20) = 30; sidebar 160px, 3 tabs.
+        // A click at y=65 (slot 2), x=40 (inside the band) hits tab 2.
+        assert_eq!(tab_target((40.0, 65.0), (8.0, 20.0), 160.0, 3), Some(2));
+        // A click past the sidebar width is not a tab click.
+        assert_eq!(tab_target((200.0, 65.0), (8.0, 20.0), 160.0, 3), None);
+        // With no tabs there is never a target.
+        assert_eq!(tab_target((40.0, 10.0), (8.0, 20.0), 160.0, 0), None);
+        // The result is exactly the tab_bar geometry (SD2 — one source of truth):
+        // tab_target casts the f64 cursor and derives tab_h, then delegates.
+        assert_eq!(
+            tab_target((40.0, 65.0), (8.0, 20.0), 160.0, 3),
+            tab_bar::tab_at(40.0, 65.0, 160.0, tab_bar::tab_height_px(20.0), 3),
+        );
     }
 }

@@ -19,12 +19,12 @@ use renderer::Renderer;
 use term_core::Color;
 use term_core::GridSnapshot;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
 
-use crate::input::{encode_key, tab_action, TabAction};
+use crate::input::{encode_key, tab_action, tab_target, TabAction};
 use crate::seam::{AppCtx, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayHost};
 use crate::session::{Session, TabId};
 use crate::tabs::Tabs;
@@ -91,6 +91,9 @@ struct Running {
     router: InputRouter,
     overlays: OverlayHost,
     mods: ModifiersState,
+    /// Latest cursor position in physical px (raw winit `f64`), updated on
+    /// `CursorMoved` and read on a left-button press to hit-test the tab sidebar.
+    last_cursor: (f64, f64),
     /// Fresh configs delivered by the background watcher (settings feature).
     config_rx: Receiver<Config>,
     /// Kept alive so the watch thread keeps running; dropping it stops watching.
@@ -124,9 +127,10 @@ impl App {
         let mut renderer = Renderer::new(window.clone(), size.width, size.height, scale, &self.cfg)
             .map_err(err)?;
 
-        // Reserve the tab-bar band up top, then register the layer (SD3/R2).
-        let bar_h = tab_bar::height_px(renderer.cell_size().1);
-        renderer.set_top_inset(bar_h);
+        // Reserve the vertical tab-sidebar band on the left, then register the
+        // layer (SD3/R2). The grid narrows by this width (top inset stays 0).
+        let bar_w = tab_bar::width_px(renderer.cell_size().0);
+        renderer.set_left_inset(bar_w);
         let (bar, tab_model) = TabBar::new();
         renderer.add_layer(Box::new(bar));
         // Blinking block cursor, above the glyphs (a DrawLayer so it blinks off the
@@ -182,6 +186,7 @@ impl App {
             router,
             overlays,
             mods: ModifiersState::empty(),
+            last_cursor: (0.0, 0.0),
             config_rx,
             _config_watcher: config_watcher,
             occluded: false,
@@ -343,6 +348,31 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::ModifiersChanged(m) => {
                 inner.mods = m.state();
+            }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                // Track the raw physical cursor; the f64→f32 cast happens in
+                // `tab_target` at press time (R2.1).
+                inner.last_cursor = (position.x, position.y);
+            }
+
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                // A left-click inside the left sidebar switches to that tab (R2).
+                // The hit-test geometry lives in tab_bar (SD2); a press outside the
+                // sidebar (or below the last tab) returns None → no-op. On a hit,
+                // reuse the exact chord-switch path via `do_tab_action(Jump)`.
+                if let Some(i) = tab_target(
+                    inner.last_cursor,
+                    inner.renderer.cell_size(),
+                    inner.renderer.left_inset(),
+                    inner.tabs.len(),
+                ) {
+                    inner.do_tab_action(TabAction::Jump(i));
+                }
             }
 
             WindowEvent::Resized(size) => {
