@@ -5,7 +5,7 @@
 struct Uniforms {
     viewport: vec2<f32>, // framebuffer size in physical px
     top_inset: f32,      // px reserved above the grid (e.g. tab bar) — glyphs shift down
-    _pad: f32,
+    left_inset: f32,     // px reserved left of the grid (e.g. sidebar) — glyphs shift right
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -31,7 +31,7 @@ struct VsOut {
 fn vs_main(in: VsIn) -> VsOut {
     let px = in.pos + in.corner * in.size;
     let clip = vec2<f32>(
-        px.x / u.viewport.x * 2.0 - 1.0,
+        (px.x + u.left_inset) / u.viewport.x * 2.0 - 1.0,
         1.0 - (px.y + u.top_inset) / u.viewport.y * 2.0,
     );
     var out: VsOut;

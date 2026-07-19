@@ -86,7 +86,8 @@ struct BgUniforms {
     viewport: [f32; 2],
     cell: [f32; 2],
     top_inset: f32,
-    _pad: [f32; 3],
+    left_inset: f32,
+    _pad: [f32; 2],
 }
 
 #[repr(C)]
@@ -94,7 +95,7 @@ struct BgUniforms {
 struct GlyphUniforms {
     viewport: [f32; 2],
     top_inset: f32,
-    _pad: f32,
+    left_inset: f32,
 }
 
 const QUAD: [Vertex; 6] = [
@@ -120,6 +121,9 @@ pub struct FrameCtx<'a> {
     pub cell: [f32; 2],
     /// Physical px reserved above the grid (the tab bar paints this top band).
     pub top_inset: f32,
+    /// Physical px reserved left of the grid (the vertical tab sidebar paints
+    /// this left band). Grid + glyphs shift right by this.
+    pub left_inset: f32,
     /// Render-target format — a layer needs it to build its own pipelines.
     pub format: wgpu::TextureFormat,
     pub snapshot: &'a GridSnapshot,
@@ -161,6 +165,10 @@ pub struct Renderer {
     /// Physical px reserved above the grid (e.g. a tab bar). Grid + glyphs are
     /// shifted down by this, and `grid_size` reports the rows that fit below it.
     top_inset: f32,
+    /// Physical px reserved left of the grid (e.g. a vertical tab sidebar). The
+    /// grid and glyphs are shifted right by this, and `grid_size` reports the
+    /// columns that fit beside it. Orthogonal to `top_inset` (rows vs cols).
+    left_inset: f32,
     ppem: f32,
     ligatures: bool,
     bg_default: u32,
@@ -300,7 +308,8 @@ impl Renderer {
             viewport: [config.width as f32, config.height as f32],
             cell: [cell_size.0, cell_size.1],
             top_inset: 0.0,
-            _pad: [0.0; 3],
+            left_inset: 0.0,
+            _pad: [0.0; 2],
         };
         let bg_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("bg-uniforms"),
@@ -337,7 +346,7 @@ impl Renderer {
         let glyph_uniforms = GlyphUniforms {
             viewport: [config.width as f32, config.height as f32],
             top_inset: 0.0,
-            _pad: 0.0,
+            left_inset: 0.0,
         };
         let glyph_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("glyph-uniforms"),
@@ -424,6 +433,7 @@ impl Renderer {
             scale_factor,
             cell_size,
             top_inset: 0.0,
+            left_inset: 0.0,
             ppem,
             ligatures: cfg.font.ligatures,
             bg_default: cfg.theme.background,
@@ -464,6 +474,7 @@ impl Renderer {
             self.config.height as f32,
             self.cell_size,
             self.top_inset,
+            self.left_inset,
         )
     }
 
@@ -482,6 +493,26 @@ impl Renderer {
     /// Current top inset in physical px.
     pub fn top_inset(&self) -> f32 {
         self.top_inset
+    }
+
+    /// Reserve `px` physical pixels to the left of the grid (e.g. for a vertical
+    /// tab sidebar). The terminal grid + glyphs draw to the right of this band,
+    /// and [`grid_size`] reports the columns that fit beside it. A registered
+    /// `DrawLayer` (the sidebar) paints the band, reading the same value from
+    /// [`FrameCtx::left_inset`]. Set to `0.0` to clear. The exact structural twin
+    /// of [`set_top_inset`] (rows→cols); like it, this writes only the uniforms —
+    /// per-cell instance buffers are in cell coords, so no re-shape is needed.
+    ///
+    /// [`grid_size`]: Renderer::grid_size
+    /// [`set_top_inset`]: Renderer::set_top_inset
+    pub fn set_left_inset(&mut self, px: f32) {
+        self.left_inset = px.max(0.0);
+        self.write_uniforms();
+    }
+
+    /// Current left inset in physical px.
+    pub fn left_inset(&self) -> f32 {
+        self.left_inset
     }
 
     /// Apply a new [`Config`] live (settings feature, D4): re-derive cell metrics,
@@ -557,7 +588,8 @@ impl Renderer {
                 viewport: vp,
                 cell: [self.cell_size.0, self.cell_size.1],
                 top_inset: self.top_inset,
-                _pad: [0.0; 3],
+                left_inset: self.left_inset,
+                _pad: [0.0; 2],
             }),
         );
         self.queue.write_buffer(
@@ -566,7 +598,7 @@ impl Renderer {
             bytemuck::bytes_of(&GlyphUniforms {
                 viewport: vp,
                 top_inset: self.top_inset,
-                _pad: 0.0,
+                left_inset: self.left_inset,
             }),
         );
     }
@@ -694,6 +726,7 @@ impl Renderer {
                 viewport,
                 cell,
                 top_inset: self.top_inset,
+                left_inset: self.left_inset,
                 format: self.config.format,
                 snapshot,
                 atlas: &mut self.atlas,
@@ -980,10 +1013,20 @@ fn cell_size_px(cfg: &Config, scale_factor: f64) -> (f32, f32) {
 }
 
 /// Cols × rows that fit a framebuffer, reserving `top_inset` px above the grid
-/// (e.g. a tab bar). Only the height below the inset holds rows. Kept as a free
-/// function so the inset arithmetic is unit-testable without a GPU surface.
-fn grid_dims(width: f32, height: f32, cell: (f32, f32), top_inset: f32) -> (u16, u16) {
-    let cols = (width / cell.0).floor().max(1.0) as u16;
+/// (e.g. a tab bar) and `left_inset` px to its left (e.g. a vertical tab
+/// sidebar). Only the height below the top inset holds rows; only the width to
+/// the right of the left inset holds cols. Kept as a free function so the inset
+/// arithmetic is unit-testable without a GPU surface. Both floors at ≥1 so a
+/// pathological inset larger than the window still yields a drawable grid.
+fn grid_dims(
+    width: f32,
+    height: f32,
+    cell: (f32, f32),
+    top_inset: f32,
+    left_inset: f32,
+) -> (u16, u16) {
+    let usable_w = (width - left_inset).max(0.0);
+    let cols = (usable_w / cell.0).floor().max(1.0) as u16;
     let usable_h = (height - top_inset).max(0.0);
     let rows = (usable_h / cell.1).floor().max(1.0) as u16;
     (cols, rows)
@@ -1028,23 +1071,85 @@ mod tests {
     #[test]
     fn top_inset_reserves_rows_for_the_tab_bar() {
         // 800px tall, 20px cells → 40 rows with no inset.
-        let (_, rows0) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0);
+        let (_, rows0) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0, 0.0);
         assert_eq!(rows0, 40);
         // A 40px tab bar (2 rows) reserves the top band → 38 rows below it.
-        let (cols, rows1) = grid_dims(1200.0, 800.0, (10.0, 20.0), 40.0);
+        let (cols, rows1) = grid_dims(1200.0, 800.0, (10.0, 20.0), 40.0, 0.0);
         assert_eq!(rows1, 38, "grid rows shrink by the inset, not the cols");
-        assert_eq!(cols, 120, "inset never affects column count");
+        assert_eq!(cols, 120, "top inset never affects column count");
         // A pathological inset taller than the window still yields ≥1 row.
-        let (_, rows2) = grid_dims(1200.0, 800.0, (10.0, 20.0), 10_000.0);
+        let (_, rows2) = grid_dims(1200.0, 800.0, (10.0, 20.0), 10_000.0, 0.0);
         assert_eq!(rows2, 1);
+    }
+
+    #[test]
+    fn left_inset_reserves_cols_for_the_sidebar() {
+        // 1200px wide, 10px cells → 120 cols with no inset.
+        let (cols0, _) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0, 0.0);
+        assert_eq!(cols0, 120);
+        // A 200px sidebar (20 cols) reserves the left band → 100 cols beside it,
+        // rows unchanged (R1.1).
+        let (cols1, rows1) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0, 200.0);
+        assert_eq!(cols1, 100, "grid cols shrink by the left inset");
+        assert_eq!(rows1, 40, "left inset never affects row count");
+        // A pathological inset wider than the window still yields ≥1 col (R1.2).
+        let (cols2, _) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0, 10_000.0);
+        assert_eq!(cols2, 1);
+        // Zero-inset invariance (R4.1): left_inset == 0.0 reproduces the no-inset
+        // column count exactly.
+        let (cols_z, rows_z) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0, 0.0);
+        assert_eq!((cols_z, rows_z), (120, 40));
+        // Both insets compose independently (cols from left, rows from top).
+        let (cols_b, rows_b) = grid_dims(1200.0, 800.0, (10.0, 20.0), 40.0, 200.0);
+        assert_eq!((cols_b, rows_b), (100, 38));
     }
 
     #[test]
     fn uniform_blocks_are_16_byte_aligned() {
         // WGSL uniform structs must be a multiple of 16 bytes; the Rust mirrors
-        // (with top_inset) must match or the shader reads garbage.
+        // (with top_inset + left_inset) must match or the shader reads garbage.
         assert_eq!(std::mem::size_of::<BgUniforms>(), 32);
         assert_eq!(std::mem::size_of::<GlyphUniforms>(), 16);
+        // Pin the field OFFSETS the WGSL structs are hand-mirrored against
+        // (cells.wgsl / glyph.wgsl): a transposed field would still sum to
+        // 32/16 above but read garbage, so machine-check the Rust layout here.
+        assert_eq!(std::mem::offset_of!(BgUniforms, top_inset), 16);
+        assert_eq!(std::mem::offset_of!(BgUniforms, left_inset), 20);
+        assert_eq!(std::mem::offset_of!(GlyphUniforms, top_inset), 8);
+        assert_eq!(std::mem::offset_of!(GlyphUniforms, left_inset), 12);
+    }
+
+    #[test]
+    fn set_left_inset_clamps_and_narrows_grid() {
+        // R2.1: set_left_inset clamps negatives to 0; a positive inset shrinks
+        // the reported column count (rows unchanged). Needs a GPU (new_headless).
+        if headless().is_none() {
+            eprintln!("skipping: no GPU");
+            return;
+        }
+        let cfg = Config::default();
+        let Ok(mut r) = Renderer::new_headless(1200, 800, 1.0, &cfg) else {
+            eprintln!("skipping: headless renderer unavailable");
+            return;
+        };
+        let (cols0, rows0) = r.grid_size();
+        assert_eq!(r.left_inset(), 0.0, "default left inset is 0");
+
+        // A negative inset clamps to 0 → geometry unchanged (R2.1 clamp).
+        r.set_left_inset(-5.0);
+        assert_eq!(r.left_inset(), 0.0, "negative inset clamps to 0.0");
+        assert_eq!(
+            r.grid_size(),
+            (cols0, rows0),
+            "clamped-to-0 inset changes nothing"
+        );
+
+        // A one-cell-wide inset drops exactly one column, rows unchanged.
+        let cw = r.cell_size().0;
+        r.set_left_inset(cw);
+        let (cols1, rows1) = r.grid_size();
+        assert_eq!(cols1, cols0 - 1, "a one-cell left inset drops one column");
+        assert_eq!(rows1, rows0, "left inset never changes rows");
     }
 
     #[test]
@@ -1190,6 +1295,7 @@ mod tests {
             viewport: [64.0, 64.0],
             cell: [12.0, 24.0],
             top_inset: 0.0,
+            left_inset: 0.0,
             format: wgpu::TextureFormat::Rgba8Unorm,
             snapshot: &snap,
             atlas: &mut atlas,
