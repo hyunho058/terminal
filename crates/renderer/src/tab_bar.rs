@@ -1,10 +1,17 @@
 //! The tab bar as a registered [`DrawLayer`] (D3/SD3, R2/R6).
 //!
-//! Draws a strip in the reserved top inset (see [`crate::Renderer::set_top_inset`]):
-//! a background band, a highlight behind the active tab, and each tab's title
-//! text via the shared glyph [`crate::atlas::Atlas`]. This lives entirely in its
-//! own module and registers through `Renderer::add_layer` — the central renderer
-//! is never edited to add it (SD3).
+//! Draws a vertical **left sidebar** in the reserved left inset (see
+//! [`crate::Renderer::set_left_inset`]): a full-height background band, tabs
+//! stacked top→bottom in fixed-height slots, a highlight behind the active tab,
+//! a right-edge border, and each tab's title text via the shared glyph
+//! [`crate::atlas::Atlas`]. This lives entirely in its own module and registers
+//! through `Renderer::add_layer` — the central renderer is never edited to add
+//! it (SD3).
+//!
+//! The sidebar geometry ([`width_px`], [`tab_height_px`], [`slot_y`], [`tab_at`])
+//! is exposed as pure free functions so the app's click hit-test consumes the
+//! SAME math the layer draws with (SD2): `slot_y` is the forward slot placement
+//! the draw path uses and `tab_at` is its exact inverse.
 //!
 //! Data flows one way (D6/SD2): the app writes a [`TabBarModel`] into a shared
 //! handle each frame; this layer only *reads* it. The renderer never reaches into
@@ -54,18 +61,55 @@ const BORDER: u32 = 0x0A0D11;
 const ACTIVE_FG: u32 = 0xE6E1CF;
 const INACTIVE_FG: u32 = 0x8A93A0;
 
-/// Horizontal padding inside each tab segment, in px.
+/// Horizontal padding inside each tab slot (before the title text), in px.
 const PAD_X: f32 = 8.0;
-/// Bottom border thickness separating the strip from the grid, in px.
-const BORDER_H: f32 = 1.0;
+/// Right-edge border thickness separating the sidebar from the grid, in px.
+/// (The `BORDER` constant above is the border *color*, not a thickness.)
+const BORDER_W: f32 = 1.0;
 
 /// The z-order of the tab bar (above the terminal glyph pass = 0, below overlays).
 pub const TAB_BAR_Z: i32 = 10;
 
-/// Suggested strip height for a given cell height (app sets the inset to this,
-/// the layer draws to `ctx.top_inset` — one formula keeps them in lockstep).
-pub fn height_px(cell_h: f32) -> f32 {
+/// Suggested sidebar **width** for a given cell width — the value the app feeds
+/// to [`crate::Renderer::set_left_inset`]. ~14 columns wide so a title still has
+/// room after [`PAD_X`] (D7/SD2 — one formula keeps the reserved band and the
+/// drawn sidebar in lockstep).
+pub fn width_px(cell_w: f32) -> f32 {
+    (cell_w * 14.0).round().max(1.0)
+}
+
+/// Per-tab vertical **slot height** — the stride between stacked tabs.
+pub fn tab_height_px(cell_h: f32) -> f32 {
     (cell_h * 1.5).round().max(1.0)
+}
+
+/// Legacy top-strip height helper. Retained (delegating to [`tab_height_px`])
+/// only so the app keeps compiling until it migrates from the old top inset to
+/// [`width_px`]/[`set_left_inset`] in the `tab-click-switch` feature.
+///
+/// [`set_left_inset`]: crate::Renderer::set_left_inset
+pub fn height_px(cell_h: f32) -> f32 {
+    tab_height_px(cell_h)
+}
+
+/// The top y (px) of tab `index`'s slot — the shared **forward** placement the
+/// draw path uses. [`tab_at`] is its exact inverse: slots have no top pad or
+/// inter-slot gap, so `slot_y(i)` and `floor(y / tab_h)` round-trip (SD2).
+pub fn slot_y(index: usize, tab_h: f32) -> f32 {
+    index as f32 * tab_h
+}
+
+/// Hit-test: the tab index at physical point `(x, y)` in a sidebar of width
+/// `sidebar_w` with per-tab slot height `tab_h`, or `None` if the point is
+/// outside the band (`x` outside `[0, sidebar_w)` or `y < 0`) or below the last
+/// of `count` tabs. The exact inverse of [`slot_y`] (SD2) — the app's
+/// click-to-switch routes through this so drawing and hit-testing never diverge.
+pub fn tab_at(x: f32, y: f32, sidebar_w: f32, tab_h: f32, count: usize) -> Option<usize> {
+    if x < 0.0 || x >= sidebar_w || y < 0.0 || tab_h <= 0.0 {
+        return None;
+    }
+    let i = (y / tab_h).floor() as usize;
+    (i < count).then_some(i)
 }
 
 #[repr(C)]
@@ -308,46 +352,45 @@ impl TabBar {
         });
     }
 
-    /// Build the strip/highlight/border rects for the current model + geometry.
-    fn rects(&self, model: &TabBarModel, vw: f32, h: f32) -> Vec<RectInstance> {
+    /// Build the sidebar strip / active-slot highlight / right-edge border rects
+    /// for the current model + geometry. `w` = sidebar width, `vh` = viewport
+    /// height, `tab_h` = per-slot height.
+    fn rects(&self, model: &TabBarModel, w: f32, vh: f32, tab_h: f32) -> Vec<RectInstance> {
         let mut out = vec![RectInstance {
-            rect: [0.0, 0.0, vw, h],
+            rect: [0.0, 0.0, w, vh],
             color: linear(STRIP_BG, 1.0),
         }];
-        let n = model.titles.len().max(1);
-        let tabw = vw / n as f32;
         if model.active < model.titles.len() {
             out.push(RectInstance {
-                rect: [model.active as f32 * tabw, 0.0, tabw, h],
+                rect: [0.0, slot_y(model.active, tab_h), w, tab_h],
                 color: linear(ACTIVE_BG, 1.0),
             });
         }
-        // Bottom border separating the strip from the grid.
+        // Right-edge border separating the sidebar from the grid.
         out.push(RectInstance {
-            rect: [0.0, h - BORDER_H, vw, BORDER_H],
+            rect: [w - BORDER_W, 0.0, BORDER_W, vh],
             color: linear(BORDER, 1.0),
         });
         out
     }
 
-    /// Lay out each tab's title as textured glyph quads (left-to-right, monospace
-    /// advance, vertically centered, truncated to its segment).
+    /// Lay out each tab's title as textured glyph quads — stacked top→bottom, one
+    /// title per slot, drawn left-to-right (monospace advance) indented by
+    /// [`PAD_X`], vertically centered within its slot, and truncated to the
+    /// sidebar width `w`.
     fn text(
         &self,
         ctx: &mut FrameCtx<'_>,
         model: &TabBarModel,
-        vw: f32,
-        h: f32,
+        w: f32,
+        tab_h: f32,
     ) -> Vec<TextInstance> {
         let (cw, ch) = (ctx.cell[0], ctx.cell[1]);
         if cw <= 0.0 || model.titles.is_empty() {
             return Vec::new();
         }
-        let tabw = vw / model.titles.len() as f32;
-        let max_chars = (((tabw - 2.0 * PAD_X) / cw).floor() as i32).max(0) as usize;
+        let max_chars = (((w - 2.0 * PAD_X) / cw).floor() as i32).max(0) as usize;
         let ascent = ch * 0.8;
-        let text_top = ((h - ch) * 0.5).max(0.0);
-        let baseline = text_top + ascent;
 
         let mut out = Vec::new();
         for (i, title) in model.titles.iter().enumerate() {
@@ -357,7 +400,10 @@ impl TabBar {
                 INACTIVE_FG
             };
             let color = linear(fg, 1.0);
-            let mut pen = i as f32 * tabw + PAD_X;
+            // Vertically center the title within its own slot (not the whole strip).
+            let text_top = slot_y(i, tab_h) + ((tab_h - ch) * 0.5).max(0.0);
+            let baseline = text_top + ascent;
+            let mut pen = PAD_X;
             for c in truncate(title, max_chars).chars() {
                 let gid = ctx.atlas.glyph_id(c);
                 if let Some(e) = ctx.atlas.get_or_insert(ctx.queue, gid) {
@@ -381,16 +427,17 @@ impl DrawLayer for TabBar {
     }
 
     fn record(&mut self, ctx: &mut FrameCtx<'_>) {
-        let h = ctx.top_inset;
-        if h <= 0.0 {
-            return; // no reserved band → nothing to draw
+        let w = ctx.left_inset;
+        if w <= 0.0 {
+            return; // no reserved left band → nothing to draw
         }
         self.ensure_gpu(ctx);
         let model = self.model.snapshot();
-        let vw = ctx.viewport[0];
+        let vh = ctx.viewport[1];
+        let tab_h = tab_height_px(ctx.cell[1]);
 
-        let rects = self.rects(&model, vw, h);
-        let texts = self.text(ctx, &model, vw, h);
+        let rects = self.rects(&model, w, vh, tab_h);
+        let texts = self.text(ctx, &model, w, tab_h);
 
         let gpu = self.gpu.as_ref().expect("gpu built in ensure_gpu");
         ctx.queue.write_buffer(
@@ -554,20 +601,22 @@ mod tests {
     }
 
     #[test]
-    fn rects_include_strip_highlight_and_border() {
+    fn rects_are_vertical_strip_highlight_and_right_border() {
         let (bar, _h) = TabBar::new();
         let model = TabBarModel {
-            titles: vec!["one".into(), "two".into()],
-            active: 1,
+            titles: vec!["one".into(), "two".into(), "three".into()],
+            active: 2,
         };
-        let rects = bar.rects(&model, 800.0, 30.0);
-        // strip + active highlight + border.
+        // sidebar width 160, viewport height 540, slot height 30.
+        let rects = bar.rects(&model, 160.0, 540.0, 30.0);
+        // strip + active highlight + right border.
         assert_eq!(rects.len(), 3);
-        // strip spans full width.
-        assert_eq!(rects[0].rect, [0.0, 0.0, 800.0, 30.0]);
-        // highlight sits over the 2nd tab (x = 400 for a 2-tab / 800px bar).
-        assert_eq!(rects[1].rect[0], 400.0);
-        assert_eq!(rects[1].rect[2], 400.0);
+        // strip spans the full sidebar height.
+        assert_eq!(rects[0].rect, [0.0, 0.0, 160.0, 540.0]);
+        // highlight sits over slot 2: y = slot_y(2, 30) = 60, full width, one slot tall.
+        assert_eq!(rects[1].rect, [0.0, 60.0, 160.0, 30.0]);
+        // border is a vertical line on the right edge (thickness BORDER_W, full height).
+        assert_eq!(rects[2].rect, [160.0 - BORDER_W, 0.0, BORDER_W, 540.0]);
     }
 
     #[test]
@@ -577,15 +626,52 @@ mod tests {
             titles: vec!["only".into()],
             active: 5, // stale index
         };
-        let rects = bar.rects(&model, 400.0, 30.0);
-        // strip + border only (no highlight for the out-of-range active tab).
+        let rects = bar.rects(&model, 160.0, 540.0, 30.0);
+        // strip + right border only (no highlight for the out-of-range active tab).
         assert_eq!(rects.len(), 2);
     }
 
     #[test]
-    fn height_scales_with_cell() {
-        assert!(height_px(20.0) > height_px(10.0));
-        assert!(height_px(20.0) >= 1.0);
+    fn width_and_height_scale_with_cell_and_leave_title_room() {
+        assert!(width_px(20.0) > width_px(10.0));
+        assert!(width_px(8.0) >= 1.0);
+        assert!(tab_height_px(20.0) > tab_height_px(10.0));
+        assert!(tab_height_px(20.0) >= 1.0);
+        // height_px is retained and equals tab_height_px (legacy delegate).
+        assert_eq!(height_px(20.0), tab_height_px(20.0));
+        // The sidebar leaves room for >= 8 chars after PAD_X for a typical cell (R3.1).
+        let cw = 8.0;
+        let max_chars = ((width_px(cw) - 2.0 * PAD_X) / cw).floor() as i32;
+        assert!(
+            max_chars >= 8,
+            "sidebar must fit >= 8 chars, got {max_chars}"
+        );
+    }
+
+    #[test]
+    fn tab_at_hits_slots_and_rejects_outside() {
+        // inside slot 2 (y in [60, 90)), x within the band → Some(2).
+        assert_eq!(tab_at(40.0, 65.0, 160.0, 30.0, 3), Some(2));
+        // x past the sidebar width.
+        assert_eq!(tab_at(200.0, 65.0, 160.0, 30.0, 3), None);
+        // y below the last slot (only 3 tabs → slots 0..90).
+        assert_eq!(tab_at(40.0, 500.0, 160.0, 30.0, 3), None);
+        // y above the strip (negative) must not cast to slot 0.
+        assert_eq!(tab_at(40.0, -5.0, 160.0, 30.0, 3), None);
+        // x left of the band (negative).
+        assert_eq!(tab_at(-1.0, 10.0, 160.0, 30.0, 3), None);
+        // no tabs → never a hit.
+        assert_eq!(tab_at(40.0, 10.0, 160.0, 30.0, 0), None);
+    }
+
+    #[test]
+    fn slot_y_and_tab_at_are_exact_inverses() {
+        // R3.4: a click at the vertical center of each drawn slot returns that slot.
+        let (w, tab_h, n) = (160.0, 30.0, 3usize);
+        for i in 0..n {
+            let y = slot_y(i, tab_h) + tab_h * 0.5;
+            assert_eq!(tab_at(80.0, y, w, tab_h, n), Some(i), "slot {i} round-trip");
+        }
     }
 
     #[test]

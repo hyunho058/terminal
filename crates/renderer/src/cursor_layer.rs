@@ -216,6 +216,7 @@ impl CursorLayer {
             snap.rows,
             ctx.cell,
             ctx.top_inset,
+            ctx.left_inset,
             rgb,
         )
     }
@@ -235,12 +236,15 @@ fn block_rect(
     rows: u16,
     cell: [f32; 2],
     top_inset: f32,
+    left_inset: f32,
     rgb: [f32; 3],
 ) -> Option<RectInstance> {
     if !visible || !at_bottom || col >= cols || row >= rows {
         return None;
     }
-    let x = col as f32 * cell[0];
+    // Shift right by left_inset (the sidebar band) and down by top_inset, matching
+    // the bg/glyph shaders — else the cursor lands left of its glyph.
+    let x = col as f32 * cell[0] + left_inset;
     let y = row as f32 * cell[1] + top_inset;
     Some(RectInstance {
         rect: [x, y, cell[0], cell[1]],
@@ -321,7 +325,8 @@ mod tests {
 
     #[test]
     fn block_rect_positions_at_the_cursor_cell() {
-        // Visible + live + in-bounds → a quad at (col·cw, row·ch + top_inset).
+        // Visible + live + in-bounds → a quad at
+        // (col·cw + left_inset, row·ch + top_inset).
         let r = block_rect(
             true,
             true,
@@ -330,12 +335,31 @@ mod tests {
             80,
             24,
             [10.0, 20.0],
-            30.0,
+            30.0, // top_inset
+            40.0, // left_inset (the sidebar band)
             [1.0, 0.5, 0.0],
         )
         .expect("should draw");
-        assert_eq!(r.rect, [20.0, 90.0, 10.0, 20.0]); // x=2*10, y=3*20+30, w=cw, h=ch
+        // x = 2*10 + 40 (left_inset), y = 3*20 + 30 (top_inset), w=cw, h=ch.
+        assert_eq!(r.rect, [60.0, 90.0, 10.0, 20.0]);
         assert_eq!(r.color, [1.0, 0.5, 0.0, CURSOR_ALPHA]);
+    }
+
+    #[test]
+    fn block_rect_shifts_with_left_inset() {
+        // Regression: the sidebar shifts the grid right by left_inset, so the
+        // cursor at column `col` must land at `col*cw + left_inset` — not at
+        // `col*cw` (which put it in the middle of the prompt). With left_inset=0
+        // it reduces to the bare column position.
+        let cell = [10.0, 20.0];
+        let rgb = [0.8, 0.8, 0.8];
+        let at = |left_inset| {
+            block_rect(true, true, 5, 0, 80, 24, cell, 0.0, left_inset, rgb)
+                .expect("draws")
+                .rect[0]
+        };
+        assert_eq!(at(0.0), 50.0, "no inset → bare column x");
+        assert_eq!(at(140.0), 190.0, "x shifts right by exactly left_inset");
     }
 
     #[test]
@@ -343,12 +367,12 @@ mod tests {
         let cell = [10.0, 20.0];
         let rgb = [0.8, 0.8, 0.8];
         // blinked off
-        assert!(block_rect(false, true, 0, 0, 80, 24, cell, 0.0, rgb).is_none());
+        assert!(block_rect(false, true, 0, 0, 80, 24, cell, 0.0, 0.0, rgb).is_none());
         // scrolled back into history
-        assert!(block_rect(true, false, 0, 0, 80, 24, cell, 0.0, rgb).is_none());
+        assert!(block_rect(true, false, 0, 0, 80, 24, cell, 0.0, 0.0, rgb).is_none());
         // cursor parked past the last column (col == cols) pending wrap
-        assert!(block_rect(true, true, 80, 0, 80, 24, cell, 0.0, rgb).is_none());
+        assert!(block_rect(true, true, 80, 0, 80, 24, cell, 0.0, 0.0, rgb).is_none());
         // row out of bounds
-        assert!(block_rect(true, true, 0, 24, 80, 24, cell, 0.0, rgb).is_none());
+        assert!(block_rect(true, true, 0, 24, 80, 24, cell, 0.0, 0.0, rgb).is_none());
     }
 }
