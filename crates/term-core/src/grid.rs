@@ -150,6 +150,12 @@ pub struct Grid {
     view_offset: usize,
     /// True while an alternate screen (tmux/vim, `?1049h`) is active (D5).
     alt_screen: bool,
+    /// DECCKM — application cursor key mode (`?1h`/`?1l`). Read by the app to pick
+    /// the SS3 (`ESC O A`) over the CSI (`ESC [ A`) arrow encoding
+    /// (arrow-key-input D10). Terminal *mode* state, like `alt_screen`; it lives
+    /// here for the same reason and is deliberately absent from `GridSnapshot`
+    /// (the renderer never reads it — D2).
+    app_cursor_keys: bool,
     /// Inline-image placements anchored to cells (image-paste D2, SD5).
     images: ImageLayer,
 }
@@ -171,6 +177,7 @@ impl Grid {
             history: History::new(DEFAULT_HISTORY_LIMIT),
             view_offset: 0,
             alt_screen: false,
+            app_cursor_keys: false,
             images: ImageLayer::new(),
         }
     }
@@ -381,6 +388,16 @@ impl Grid {
     }
     pub fn alt_screen(&self) -> bool {
         self.alt_screen
+    }
+
+    /// Set/clear DECCKM — application cursor key mode (`?1h`/`?1l`, and cleared by
+    /// RIS). Deliberately survives `resize`, `clear`, and alt-screen switching: it
+    /// is a keyboard-input mode, not screen content (arrow-key-input R1.5).
+    pub fn set_app_cursor_keys(&mut self, on: bool) {
+        self.app_cursor_keys = on;
+    }
+    pub fn app_cursor_keys(&self) -> bool {
+        self.app_cursor_keys
     }
 
     /// Read a retained history row (0 == oldest). Used by snapshot composition.

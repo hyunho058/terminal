@@ -114,4 +114,14 @@ impl Terminal {
     pub fn alt_screen(&self) -> bool {
         self.grid.alt_screen()
     }
+
+    /// Whether DECCKM — application cursor key mode (`?1h`) — is active.
+    ///
+    /// The app reads this to choose the SS3 arrow encoding (`ESC O A`) over the
+    /// normal CSI one (`ESC [ A`). It is exposed as an accessor rather than a
+    /// [`GridSnapshot`] field because the renderer never reads it (arrow-key-input
+    /// D2); the snapshot is the *renderer* contract.
+    pub fn app_cursor_keys(&self) -> bool {
+        self.grid.app_cursor_keys()
+    }
 }

@@ -254,13 +254,41 @@ impl Perform for Performer<'_> {
         }
     }
 
+    /// Bare ESC sequences (no CSI/OSC introducer). Exactly one is implemented:
+    /// RIS (`ESC c`), and only far enough to undo DECCKM (arrow-key-input D9) —
+    /// that is the recovery path D3 relies on, since nothing else clears the flag
+    /// once a TUI dies without sending `?1l` and `reset`/`tput reset` sends RIS.
+    ///
+    /// It is deliberately **not** a full RIS. `Grid::clear()` also drops every
+    /// inline image placement, and `alt_screen` here is a history-preserving
+    /// switch rather than a second buffer — so clearing on RIS would turn two
+    /// harmless bytes (a `cat`ted binary is enough) into a new destructive
+    /// primitive. The minimal form buys the recovery and none of the fallout.
+    ///
+    /// The `intermediates.is_empty()` guard exists because other escapes end in
+    /// the same final byte (`ESC ( c` selects a charset); only a bare `ESC c` is
+    /// RIS. Every other sequence stays a no-op on purpose — `ESC =` / `ESC >`
+    /// (DECKPAM/DECKPNM) really do arrive here, since vim sends them via terminfo
+    /// `smkx`/`rmkx`, and DECNKM is a declared non-goal.
+    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        if intermediates.is_empty() && byte == b'c' {
+            self.grid.set_app_cursor_keys(false);
+        }
+    }
+
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         let first = params.iter().next().and_then(|p| p.first().copied());
         // Private modes (`CSI ? ... h/l`) — alt-screen enter/leave (D5, owned by
         // scrollback; image-paste adds its own arms as an ordered extension).
         if intermediates.first() == Some(&b'?') && matches!(action, 'h' | 'l') {
-            if matches!(first, Some(1049) | Some(1047) | Some(47)) {
-                self.grid.set_alt_screen(action == 'h');
+            match first {
+                Some(1049) | Some(1047) | Some(47) => self.grid.set_alt_screen(action == 'h'),
+                // DECCKM — application cursor key mode. Only flips the flag the app
+                // reads when encoding arrows (arrow-key-input D3/D10); nothing about
+                // the grid changes. Every other private mode (e.g. `?2004`
+                // bracketed paste, which zsh sends on every prompt) stays ignored.
+                Some(1) => self.grid.set_app_cursor_keys(action == 'h'),
+                _ => {}
             }
             return;
         }
