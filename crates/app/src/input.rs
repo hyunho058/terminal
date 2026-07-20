@@ -73,6 +73,24 @@ pub fn encode_key(logical: &Key, text: Option<&str>) -> Option<Vec<u8>> {
     }
 }
 
+/// Should this keypress be dropped because an IME composition is in flight (D8)?
+///
+/// True **only** for character-producing keys while composing (R6.3) — the jamo
+/// that belong to the IME, not the shell. Named keys (Enter/Backspace/Tab/Escape/
+/// arrows) always pass through (R6.4): winit's macOS `doCommandBySelector`
+/// deliberately forwards them during `Preedit` (`forward_key_to_app = true`), so
+/// an over-broad gate would kill cursor movement mid-composition. With
+/// `composing == false` nothing is ever suppressed (R6.5) — the ASCII path is
+/// untouched.
+///
+/// This is **defense-in-depth**, not the primary mechanism: winit 0.30.13 already
+/// withholds `KeyboardInput` while `had_ime_input` is set and already swallows the
+/// Korean IME's double-send. The gate exists so a future winit regression shows up
+/// as a dropped jamo rather than doubled text.
+pub fn suppress_key(composing: bool, key: &Key) -> bool {
+    composing && matches!(key, Key::Character(_) | Key::Dead(_))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +135,43 @@ mod tests {
             Some(vec![0x7f])
         );
         assert_eq!(encode_key(&ch("a"), Some("a")), Some(b"a".to_vec()));
+    }
+
+    #[test]
+    fn composing_suppresses_character_keys() {
+        // R6.3: a jamo typed mid-composition belongs to the IME, not the shell.
+        assert!(suppress_key(true, &ch("ㅎ")));
+        assert!(suppress_key(true, &ch("a")));
+        // Dead keys (accent composition) are character-producing too (D8).
+        assert!(suppress_key(true, &Key::Dead(Some('`'))));
+    }
+
+    #[test]
+    fn composing_lets_named_keys_through() {
+        // R6.4: winit's doCommandBySelector forwards these during Preedit — the
+        // gate must not eat cursor movement / editing keys mid-composition.
+        for named in [
+            NamedKey::ArrowLeft,
+            NamedKey::ArrowRight,
+            NamedKey::Enter,
+            NamedKey::Backspace,
+            NamedKey::Tab,
+            NamedKey::Escape,
+        ] {
+            assert!(
+                !suppress_key(true, &Key::Named(named)),
+                "{named:?} must reach the shell while composing"
+            );
+        }
+    }
+
+    #[test]
+    fn not_composing_suppresses_nothing() {
+        // R6.5: the ASCII path is bit-for-bit unchanged when no IME is active.
+        assert!(!suppress_key(false, &ch("a")));
+        assert!(!suppress_key(false, &ch("ㅎ")));
+        assert!(!suppress_key(false, &Key::Dead(Some('`'))));
+        assert!(!suppress_key(false, &Key::Named(NamedKey::Enter)));
     }
 
     #[test]

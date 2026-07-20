@@ -7,20 +7,23 @@
 //!   state, and rebuilds the glyph atlas (R0.1/R3.2),
 //! - the grid re-fits to the new [`Renderer::grid_size`] and every tab's PTY is
 //!   resized (R3.1),
-//! - each tab's default cell colors are re-themed (R3.3).
+//! - each tab's default cell colors are re-themed (R3.3),
+//! - the inline IME preedit layer is re-themed (hangul-ime R7.5): its colors ride
+//!   on the shared handle rather than `FrameCtx`, so nothing else would update them.
 //!
 //! Registered through the app owner's config-reload wake (the SD4 seam covers key
 //! events; a background file-change is delivered as `UserEvent::ConfigReloaded`).
 
 use common::config::Config;
+use renderer::preedit_layer::PreeditHandle;
 use renderer::tab_bar;
 use renderer::Renderer;
 use term_core::Color;
 
 use crate::tabs::Tabs;
 
-/// Apply a reloaded config to the live renderer + tabs.
-pub fn apply(cfg: &Config, renderer: &mut Renderer, tabs: &mut Tabs) {
+/// Apply a reloaded config to the live renderer + tabs + preedit layer.
+pub fn apply(cfg: &Config, renderer: &mut Renderer, tabs: &mut Tabs, preedit: &PreeditHandle) {
     renderer.apply_config(cfg);
     // Font size may have changed the cell width → keep the left tab sidebar in
     // step before reading grid_size (so the reserved band matches the new metrics
@@ -31,4 +34,43 @@ pub fn apply(cfg: &Config, renderer: &mut Renderer, tabs: &mut Tabs) {
     tabs.resize_all(cols, rows);
     // Re-theme default cell colors so new output uses the new theme (R3.3).
     tabs.set_default_colors_all(Color(cfg.theme.foreground), Color(cfg.theme.background));
+    // Re-theme the inline IME composition (hangul-ime R7.5/D14). The preedit paints
+    // an opaque theme-background fill under its glyphs; leaving it on the old theme
+    // would stamp a stale-colored block over the newly themed grid.
+    let (bg, fg) = preedit_theme(cfg);
+    preedit.set_theme(bg, fg);
+}
+
+/// The preedit layer's `(bg, fg)` for a config (R7.5/D14).
+///
+/// Split out so the mapping is testable without a GPU or a PTY: `set_theme`'s two
+/// arguments are the same type, so a transposition compiles cleanly and would paint
+/// foreground-colored blocks over background-colored glyphs — invisible text that no
+/// other test in the workspace would catch.
+fn preedit_theme(cfg: &Config) -> (u32, u32) {
+    (cfg.theme.background, cfg.theme.foreground)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R7.5: the preedit rides the reloaded theme, background first.
+    #[test]
+    fn preedit_theme_is_background_then_foreground() {
+        let mut cfg = Config::default();
+        cfg.theme.background = 0x11_22_33;
+        cfg.theme.foreground = 0xAA_BB_CC;
+        assert_eq!(preedit_theme(&cfg), (0x11_22_33, 0xAA_BB_CC));
+    }
+
+    /// A theme whose fg and bg differ must not collapse — guards the transposition
+    /// directly (equal values would make the swap undetectable).
+    #[test]
+    fn preedit_theme_does_not_transpose() {
+        let cfg = Config::default();
+        let (bg, fg) = preedit_theme(&cfg);
+        assert_eq!(bg, cfg.theme.background, "fill uses the theme background");
+        assert_eq!(fg, cfg.theme.foreground, "glyphs use the theme foreground");
+    }
 }

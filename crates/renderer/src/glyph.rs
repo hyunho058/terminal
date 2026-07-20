@@ -10,6 +10,8 @@ use swash::scale::{Render, ScaleContext, Source};
 use swash::zeno::{Angle, Transform};
 use swash::FontRef;
 
+use crate::font_set::FontData;
+
 /// Synthetic-italic slant applied via a shear transform when no italic face is
 /// available (about 14°, the common oblique angle).
 const ITALIC_SKEW_DEGREES: f32 = 14.0;
@@ -29,21 +31,26 @@ pub struct GlyphBitmap {
     pub coverage: Vec<u8>,
 }
 
-/// Owns font bytes and a scale context, rasterizing chars on demand.
+/// Shares one face's mapped font bytes and owns a scale context, rasterizing
+/// glyphs of that face on demand.
 ///
-/// The `FontRef` borrows the byte buffer, so we store the bytes and rebuild the
-/// `FontRef` per call rather than self-referencing.
+/// The `FontRef` borrows the byte buffer, so we hold the [`FontData`] handle and
+/// rebuild the `FontRef` per call rather than self-referencing. The handle is a
+/// refcount over an mmap, never a copy: the atlas builds one rasterizer *per
+/// face* (D7), and the Hangul face measures 55 MB — copying it per face, on every
+/// `Atlas::new` (which `apply_config` re-runs whenever the config watcher changes
+/// ppem), is the deep copy D7/R3.2 exists to delete.
 pub struct GlyphRasterizer {
-    data: Vec<u8>,
+    data: FontData,
     index: usize,
     ppem: f32,
     context: ScaleContext,
 }
 
 impl GlyphRasterizer {
-    /// Build a rasterizer from font-collection bytes. Returns `None` if the
+    /// Build a rasterizer over a face's mapped bytes. Returns `None` if the
     /// bytes are not a valid font at `index`.
-    pub fn new(data: Vec<u8>, index: usize, ppem: f32) -> Option<Self> {
+    pub fn new(data: FontData, index: usize, ppem: f32) -> Option<Self> {
         FontRef::from_index(&data, index)?;
         Some(GlyphRasterizer {
             data,
@@ -122,18 +129,35 @@ impl GlyphRasterizer {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
+    use crate::font_set::FontSet;
+
+    /// A [`FontData`] handle over arbitrary bytes, with no file involved: an
+    /// anonymous mapping, written once and frozen. Lets the invalid-bytes case be
+    /// tested now that the constructor takes a mapping rather than a `Vec`.
+    fn mapped(bytes: &[u8]) -> FontData {
+        let mut map = memmap2::MmapOptions::new()
+            .len(bytes.len())
+            .map_anon()
+            .expect("an anonymous mapping");
+        map.copy_from_slice(bytes);
+        Arc::new(map.make_read_only().expect("freeze the mapping"))
+    }
+
     #[test]
     fn rejects_invalid_font_bytes() {
-        assert!(GlyphRasterizer::new(vec![0, 1, 2, 3], 0, 14.0).is_none());
+        assert!(GlyphRasterizer::new(mapped(&[0, 1, 2, 3]), 0, 14.0).is_none());
     }
 
     #[test]
     #[ignore = "depends on a system font path; run with --ignored"]
     fn rasterizes_a_letter() {
-        let bytes = std::fs::read("/System/Library/Fonts/Menlo.ttc")
-            .or_else(|_| std::fs::read("/System/Library/Fonts/SFNSMono.ttf"))
-            .expect("a monospace system font");
-        let mut r = GlyphRasterizer::new(bytes, 0, 32.0).expect("valid font");
+        // Goes through `FontSet` so the primary face's bytes are shared, not read
+        // into a `Vec` — the same zero-copy path production uses (D7/R3.2).
+        let set = FontSet::load().expect("a monospace system font");
+        let face = set.faces().first().cloned().expect("a primary face");
+        let mut r = GlyphRasterizer::new(face.data, face.index, 32.0).expect("valid font");
         let g = r.rasterize('A').expect("glyph A");
         assert!(g.width > 0 && g.height > 0);
         assert_eq!(g.coverage.len(), (g.width * g.height) as usize);

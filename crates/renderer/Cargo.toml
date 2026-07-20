@@ -9,10 +9,16 @@ description = "wgpu/Metal cell renderer. Consumes a term-core GridSnapshot; wind
 [dependencies]
 bytemuck = { version = "1.25.1", features = ["derive"] }
 common.workspace = true
+memmap2 = "0.9.11"
 pollster = "1.0.1"
 raw-window-handle = "0.6.2"
 swash = "0.2.9"
 term-core.workspace = true
 thiserror = "2.0.18"
 tracing = "0.1.44"
+# Pinned to the SAME version term-core declares (crates/term-core/Cargo.toml) so
+# cargo unifies them and the width rules cannot fork between engine and renderer
+# (D10). Not promoted to [workspace.dependencies]: the root table only declares
+# the three path deps.
+unicode-width = "0.2.0"
 wgpu = "30.0.0"

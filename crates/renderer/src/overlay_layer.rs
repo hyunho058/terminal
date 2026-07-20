@@ -4,6 +4,10 @@
 //! text lines) into a shared handle each time its data changes; this layer draws
 //! a dimmed panel over the grid with the lines when visible. Renderer-owned and
 //! app-state-free (SD2) — it only reads plain data the app hands down.
+//!
+//! Text layout is **not** duplicated here (D10/R5.4): [`truncate_cols`] and
+//! [`layout_line`] are the same helpers the tab bar draws with, so font fallback
+//! and the wide-char advance stay one rule instead of two that drift apart.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -11,6 +15,7 @@ use std::rc::Rc;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
+use crate::tab_bar::{layout_line, truncate_cols};
 use crate::{DrawLayer, FrameCtx};
 
 /// Plain data the overlay renders (D6-style one-way flow).
@@ -244,6 +249,10 @@ impl OverlayLayer {
     }
 
     /// Lay out the last-N lines as glyph quads inside the panel rect.
+    ///
+    /// Clipping and advance are **column**-based (R5.2/R5.3/R5.4): an overlay line
+    /// containing Hangul spends 2 columns per char, so the shared helpers keep it
+    /// inside the panel instead of overlapping glyphs and running off the edge.
     fn text(&self, ctx: &mut FrameCtx<'_>, lines: &[String], panel: [f32; 4]) -> Vec<TextInstance> {
         let (cw, ch) = (ctx.cell[0], ctx.cell[1]);
         if cw <= 0.0 {
@@ -251,7 +260,8 @@ impl OverlayLayer {
         }
         let line_h = ch * 1.15;
         let max_lines = (((panel[3] - 2.0 * PAD) / line_h).floor() as i32).max(0) as usize;
-        let max_chars = (((panel[2] - 2.0 * PAD) / cw).floor() as i32).max(1) as usize;
+        // A **column** budget, not a char count (R5.3) — see `truncate_cols`.
+        let max_cols = (((panel[2] - 2.0 * PAD) / cw).floor() as i32).max(1) as usize;
         let ascent = ch * 0.8;
         let color = linear(TEXT_FG, 1.0);
         // Show the last `max_lines` (newest at the bottom).
@@ -259,19 +269,15 @@ impl OverlayLayer {
         let mut out = Vec::new();
         for (row, line) in lines[start..].iter().enumerate() {
             let base_y = panel[1] + PAD + row as f32 * line_h + ascent;
-            let mut pen = panel[0] + PAD;
-            for c in line.chars().take(max_chars) {
-                let gid = ctx.atlas.glyph_id(c);
-                if let Some(e) = ctx.atlas.get_or_insert(ctx.queue, gid) {
-                    out.push(TextInstance {
-                        rect: [pen + e.left, base_y - e.top, e.px_w, e.px_h],
-                        uv0: e.uv0,
-                        uv1: e.uv1,
-                        color,
-                    });
-                }
-                pen += cw;
-            }
+            let fitted = truncate_cols(line, max_cols);
+            layout_line(ctx, &fitted, panel[0] + PAD, cw, |pen, e| {
+                out.push(TextInstance {
+                    rect: [pen + e.left, base_y - e.top, e.px_w, e.px_h],
+                    uv0: e.uv0,
+                    uv1: e.uv1,
+                    color,
+                });
+            });
         }
         out
     }
@@ -451,6 +457,19 @@ mod tests {
         });
         assert!(h.snapshot().visible);
         assert_eq!(h.snapshot().lines.len(), 2);
+    }
+
+    #[test]
+    fn shares_the_tab_bar_text_rules() {
+        // R5.4: the overlay clips and advances with the *same* helpers the tab bar
+        // draws with — one rule, not two copies that can drift. Asserting them
+        // through this module's own imports is what pins that sharing.
+        assert_eq!(truncate_cols("한글abc", 5), "한글a");
+        let cw = 8.0;
+        let xs: Vec<f32> = crate::tab_bar::pen_layout("프a", PAD, cw)
+            .map(|(_, x)| x)
+            .collect();
+        assert_eq!(xs, vec![PAD, PAD + 2.0 * cw]);
     }
 
     #[test]

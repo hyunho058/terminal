@@ -5,26 +5,44 @@
 //! (D5), and the SD4 registration seam ([`InputRouter`]/[`OverlayHost`]) that
 //! later features extend without editing this file.
 //!
-//! Input dispatch order per key (R3.3/R4): visible overlays → registered input
-//! handlers → tab chords → default `encode_key` to the active shell.
+//! Input dispatch order per key (R3.3/R4): composing gate (R6.3) → visible
+//! overlays → registered input handlers → tab chords → default `encode_key` to
+//! the active shell.
+//!
+//! IME (R6): the window allows IME (R6.1) so macOS composes 한글 before we ever
+//! see it; `WindowEvent::Ime` carries the composition (`Preedit`) and its result
+//! (`Commit`), and `suppress_key` keeps composing jamo out of the shell.
+//!
+//! IME cancellation + commit routing (R8/D11): a composition is owned by the tab
+//! it started in (`composing_tab`), so a `Commit` that arrives after a tab switch
+//! lands in *that* tab, never in whichever tab is active now. Switching tabs or
+//! losing focus clears the preedit inline and cancels the OS composition with
+//! `NSTextInputContext::discardMarkedText` — `set_ime_allowed(false)` does **not**
+//! do that (it only clears winit's own `marked_text` ivar).
 
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
 use common::config::Config;
 use common::watch::ConfigWatcher;
+use objc2_app_kit::NSView;
 use renderer::cursor_layer::CursorLayer;
+use renderer::preedit_layer::{PreeditHandle, PreeditLayer};
 use renderer::tab_bar::{self, TabBar, TabBarModel, TabModelHandle};
 use renderer::Renderer;
 use term_core::Color;
 use term_core::GridSnapshot;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, Ime, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
+// winit 0.30 re-exports raw-window-handle 0.6 (`rwh_06`, a default feature), so
+// reaching the `NSView` needs no new dependency on `app` (D11).
+use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
-use crate::input::{encode_key, tab_action, tab_target, TabAction};
+use crate::input::{encode_key, suppress_key, tab_action, tab_target, TabAction};
 use crate::seam::{AppCtx, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayHost};
 use crate::session::{Session, TabId};
 use crate::tabs::Tabs;
@@ -110,6 +128,30 @@ struct Running {
     /// so an idle frame reuses `last_snapshot`. Marks stale on PTY advance, tab
     /// switch, resize, config reload, and overlay/router redraws.
     snapshot_dirty: bool,
+    /// True while an IME composition is in flight (D8). Set from a non-empty
+    /// `Ime::Preedit`, cleared by the empty `Preedit`, `Commit`, and — critically
+    /// — `Ime::Disabled` (R6.7): a 한↔영 input-source switch can skip the empty
+    /// `Preedit` entirely, and a stuck `true` would swallow every character key
+    /// forever.
+    composing: bool,
+    /// The in-flight composition text (e.g. `"하"` while typing `ㅎ`+`ㅏ`). Held
+    /// here so the loop owns exactly one copy of the composition state.
+    preedit: String,
+    /// Which tab **owns** the in-flight composition (R8/D11). Set from the first
+    /// non-empty `Ime::Preedit`, cleared on `Commit`/empty `Preedit`/`Disabled`.
+    /// `Ime::Commit` routes by this id instead of "whoever is active now": a
+    /// Cmd+T mid-composition is an *internal* switch (no `resignFirstResponder`),
+    /// so macOS keeps its marked text and the commit would otherwise land in the
+    /// new tab's shell — silent cross-tab data corruption (R8.3). `None` means the
+    /// text never went through a composition, and goes to the active tab (R8.5).
+    composing_tab: Option<TabId>,
+    /// Write end of the [`PreeditLayer`]'s shared model (D9/R7.1) — the only way
+    /// the composition reaches the screen. It deliberately never touches
+    /// `term-core`: these characters have not been written to the PTY, so putting
+    /// them in the grid would pollute the snapshot and the scrollback with text
+    /// the shell never received. The handle also carries the theme colors, since
+    /// `FrameCtx` has none (D14/R7.5).
+    preedit_handle: PreeditHandle,
 }
 
 impl App {
@@ -121,6 +163,12 @@ impl App {
             .with_title("mac-terminal")
             .with_inner_size(winit::dpi::LogicalSize::new(900.0, 540.0));
         let window = Arc::new(event_loop.create_window(attrs)?);
+        // Let macOS run the input method (R6.1). Without this winit's `key_down`
+        // never calls `interpretKeyEvents` (view.rs:466-468), so a Korean IME never
+        // gets to compose and only raw jamo reach the shell. Turning it on also
+        // makes winit withhold the duplicate `KeyboardInput` for composing/committing
+        // keys (view.rs:479-496); ASCII, which never marks text, is unaffected.
+        window.set_ime_allowed(true);
 
         let size = window.inner_size();
         let scale = window.scale_factor();
@@ -136,6 +184,13 @@ impl App {
         // Blinking block cursor, above the glyphs (a DrawLayer so it blinks off the
         // continuous-redraw loop, unaffected by the idle-CPU snapshot cache).
         renderer.add_layer(Box::new(CursorLayer::new()));
+        // Inline IME composition, above the cursor block (D18/R7.3): the 0.5-alpha
+        // cursor would otherwise wash out the first composing cell. Seed the theme
+        // colors now — the layer reads them from the handle, not from `FrameCtx`,
+        // which carries no color (D14/R7.5).
+        let (preedit_layer, preedit_handle) = PreeditLayer::new();
+        preedit_handle.set_theme(self.cfg.theme.background, self.cfg.theme.foreground);
+        renderer.add_layer(Box::new(preedit_layer));
 
         // Drain the SD4 seam registrations into the live registries. Each
         // overlay also contributes a DrawLayer drawn above the grid (R4.1).
@@ -192,6 +247,10 @@ impl App {
             occluded: false,
             last_snapshot: None,
             snapshot_dirty: true,
+            composing: false,
+            preedit: String::new(),
+            composing_tab: None,
+            preedit_handle,
         };
         running.sync_tab_model();
         running.redraw();
@@ -214,6 +273,199 @@ impl Running {
         self.window.request_redraw();
     }
 
+    /// Handle one `WindowEvent::Ime` (R6.2/R6.6/R6.7, D12). All four variants are
+    /// handled explicitly — falling into `_ => {}` for `Disabled` is exactly the
+    /// deadlock R6.7 guards against.
+    fn on_ime(&mut self, ime: Ime) {
+        match ime {
+            // The IME finished a syllable: those bytes are the user's text (R6.2).
+            // winit queues an empty `Preedit` immediately before every `Commit`
+            // (view.rs:411-414), so `composing` is already false here for the plain
+            // ASCII path; clear it anyway so the state can never outlive a commit.
+            Ime::Commit(text) => {
+                // Route by tab identity, not by "whoever is active now" (R8/D11):
+                // the composition belongs to the tab it started in. Deliberately
+                // *not* a one-shot "discard the next commit" guard — a guard that
+                // misfires eats a character that has no other path to the PTY
+                // (`had_ime_input` suppresses the duplicate `KeyboardInput`,
+                // view.rs:478-489).
+                //
+                // This read is only meaningful because ownership deliberately
+                // OUTLIVES the empty `Preedit` that winit queues immediately before
+                // every `Commit` (view.rs:412-413). Clearing the owner there — as
+                // the first cut did — made this whole routing inert: `composing_tab`
+                // was always `None` by the time we got here, so every commit fell to
+                // the active tab and `Tab`/`Drop` were dead code. Ownership is
+                // released *here*, after the bytes have been placed, and by
+                // `Ime::Disabled` / the start of a new composition.
+                if !text.is_empty() {
+                    let composing_tab = self.composing_tab;
+                    let target =
+                        commit_target(composing_tab, |id| self.tabs.by_id_mut(id).is_some());
+                    match target {
+                        // The composing tab is still open — write there (R8.3).
+                        CommitTarget::Tab(id) => match self.tabs.by_id_mut(id) {
+                            Some(session) => {
+                                if let Err(e) = session.write(text.as_bytes()) {
+                                    tracing::warn!("pty write failed: {e}");
+                                }
+                            }
+                            // Unreachable: `commit_target` only yields `Tab` when
+                            // the probe said it exists. Never panic on it.
+                            None => tracing::warn!(tab = id.0, "commit target vanished"),
+                        },
+                        // Plain, non-composed text — the active tab, as always.
+                        // This branch is what guarantees no character is ever
+                        // lost (R8.5).
+                        CommitTarget::Active => {
+                            if let Err(e) = self.tabs.active_mut().write(text.as_bytes()) {
+                                tracing::warn!("pty write failed: {e}");
+                            }
+                        }
+                        // The tab that owned the composition was closed: those
+                        // bytes have no owner, so drop them silently (R8.4).
+                        CommitTarget::Drop => {
+                            tracing::debug!("ime commit dropped: composing tab closed");
+                        }
+                    }
+                }
+                // The bytes are placed: release ownership so the next composition
+                // starts clean (R8/D11).
+                self.set_preedit(String::new());
+                self.composing_tab = None;
+            }
+            // Composition in flight. Empty text is winit's synthetic clear signal
+            // (view.rs:345), so `!is_empty()` is exactly the composing predicate (R6.6).
+            Ime::Preedit(text, _cursor) => {
+                self.set_preedit(text);
+            }
+            // Nothing to do: `set_ime_allowed(true)` already put us in the state
+            // this announces. Logged so an IME trace is readable end to end.
+            Ime::Enabled => tracing::debug!("ime enabled"),
+            // Input-source switch (한↔영) can land here with no preceding empty
+            // `Preedit` (view.rs:446-452) — clearing here is what keeps `composing`
+            // from sticking true and swallowing every later character key (R6.7/D12).
+            Ime::Disabled => {
+                tracing::debug!("ime disabled");
+                self.set_preedit(String::new());
+                // The IME is gone, so no `Commit` is coming for this composition —
+                // release ownership too, or it would leak into the next one (D11).
+                self.composing_tab = None;
+            }
+        }
+    }
+
+    /// Single writer for the composition state: keeps `composing`, `preedit` and
+    /// `composing_tab` in lockstep, repositions the candidate window, and redraws
+    /// (R6.6/R6.8/R8).
+    fn set_preedit(&mut self, text: String) {
+        // The transition itself lives in `next_composition_state` so it can be
+        // table-tested without a window or an IME (R6.6/R6.7/D11/D12).
+        let (composing, owner) = next_composition_state(
+            &text,
+            self.composing,
+            self.composing_tab,
+            self.tabs.active().id,
+        );
+        self.composing = composing;
+        self.composing_tab = owner;
+        self.preedit = text;
+        // Push it to the renderer's preedit layer so the composition shows inline
+        // at the cursor (R7.1/D9). The layer is re-recorded every frame, so this
+        // lands on screen even though the grid snapshot has not moved — the
+        // composition never enters `term-core`.
+        self.preedit_handle.set_text(self.preedit.clone());
+        self.update_ime_cursor_area();
+        // A composition change is a real content change, not an idle frame, so use
+        // `redraw()` (which marks the snapshot cache stale), never the bare
+        // `window.request_redraw()`.
+        self.redraw();
+    }
+
+    /// Park the macOS candidate / Hanja-conversion window on the terminal cursor
+    /// cell (R6.8/D19). **Physical px only**: `cell_size()` already folds in the
+    /// scale factor and the insets are documented physical, while winit's macOS
+    /// impl divides by the scale itself (window_delegate.rs:1553-1561) — handing it
+    /// a `LogicalPosition` would place the window at 2× the offset on any Retina Mac.
+    ///
+    /// Only called while a composition is live. winit's macOS `set_ime_cursor_area`
+    /// does `self.inputContext().expect("input context")` (view.rs:901), which
+    /// **panics** when the view is not the first responder — exactly the state
+    /// `Focused(false)` puts us in, and the very `None` that the sibling
+    /// [`discard_marked_text`](Self::discard_marked_text) defends against. There is
+    /// also nothing to position when no candidate window is up.
+    fn update_ime_cursor_area(&mut self) {
+        if !self.composing {
+            return;
+        }
+        let (cw, ch) = self.renderer.cell_size();
+        // The cached snapshot is the cursor the user is looking at; before the
+        // first frame there is none, so fall back to the grid origin.
+        let cursor = self
+            .last_snapshot
+            .as_ref()
+            .map(|s| s.cursor)
+            .unwrap_or_default();
+        let x = self.renderer.left_inset() + cursor.col as f32 * cw;
+        let y = self.renderer.top_inset() + cursor.row as f32 * ch;
+        self.window
+            .set_ime_cursor_area(PhysicalPosition::new(x, y), PhysicalSize::new(cw, ch));
+    }
+
+    /// Abandon an in-flight composition on an *internal* focus change — a tab
+    /// switch or a window focus loss (R8.1/R8.2/D11). No-op when not composing.
+    ///
+    /// Order matters: our own state is cleared **inline, here**, not by waiting
+    /// for the `Ime::Disabled` that the D12 path handles — winit `queue_event`s
+    /// its IME events and dispatches them later, so `composing`/`preedit` would
+    /// still be dirty during the switch itself.
+    /// Ownership (`composing_tab`) deliberately **survives** the cancel. If the IME
+    /// server ignores our `discardMarkedText` — or had already queued the commit —
+    /// the stray `Ime::Commit` still lands in the tab the composition began in
+    /// (R8.3) rather than leaking into the tab the user just switched to. It is
+    /// released by that commit, by `Ime::Disabled`, or by the next composition.
+    fn cancel_composition(&mut self) {
+        if !self.composing {
+            return;
+        }
+        // Clears `composing`, `preedit` and the preedit layer, and redraws — the
+        // composing text must leave the screen now (R8.1). `composing_tab` is kept
+        // on purpose; see the doc comment above.
+        self.set_preedit(String::new());
+        self.discard_marked_text();
+    }
+
+    /// Cancel the composition the *OS* is holding (R8.2/D11).
+    ///
+    /// `set_ime_allowed(false)` does not do this: in winit 0.30.13 it only clears
+    /// winit's own `marked_text` ivar and queues `Ime::Disabled` (view.rs:880-896);
+    /// `inputContext.discardMarkedText()` is called only from `unmarkText`
+    /// (view.rs:342-343). So the IME server's composition — and its candidate
+    /// window — would survive. Call AppKit directly instead.
+    fn discard_marked_text(&self) {
+        let handle = match self.window.window_handle() {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!("no window handle; ime composition not discarded: {e}");
+                return;
+            }
+        };
+        let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+            tracing::warn!("window handle is not AppKit; ime composition not discarded");
+            return;
+        };
+        // SAFETY: `ns_view` comes straight from winit's live `NSView` for this
+        // window, which outlives the borrow (we hold the `Window` in `self`), and
+        // this runs on the winit event loop — i.e. the main thread, as every
+        // `NSView` method requires.
+        let view: &NSView = unsafe { appkit.ns_view.cast::<NSView>().as_ref() };
+        match view.inputContext() {
+            Some(ctx) => ctx.discardMarkedText(),
+            // No input context (window not key / no responder): nothing is marked.
+            None => tracing::debug!("no NSTextInputContext; nothing to discard"),
+        }
+    }
+
     /// Push the current tab titles + active index into the tab-bar layer (D6).
     fn sync_tab_model(&mut self) {
         self.tab_model.set(TabBarModel {
@@ -225,6 +477,10 @@ impl Running {
     /// Handle a tab chord (R3.2). Returns false if the app should exit (last tab
     /// closed).
     fn do_tab_action(&mut self, action: TabAction) -> bool {
+        // A tab switch abandons any in-flight composition (R8.1/R8.2): Cmd+T is a
+        // Named key + modifier, so it sails straight through the composing gate
+        // (R6.3) and is reachable by keyboard, not just by a sidebar click.
+        self.cancel_composition();
         match action {
             TabAction::New => {
                 let (cols, rows) = self.renderer.grid_size();
@@ -326,7 +582,12 @@ impl ApplicationHandler<UserEvent> for App {
                     latest = Some(cfg);
                 }
                 if let Some(cfg) = latest {
-                    crate::settings::apply(&cfg, &mut inner.renderer, &mut inner.tabs);
+                    crate::settings::apply(
+                        &cfg,
+                        &mut inner.renderer,
+                        &mut inner.tabs,
+                        &inner.preedit_handle,
+                    );
                     inner.redraw();
                 }
             }
@@ -390,9 +651,25 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
+            WindowEvent::Ime(ime) => inner.on_ime(ime),
+
+            WindowEvent::Focused(false) => {
+                // Losing the window abandons the composition too (R8.1/R8.2): the
+                // preedit is drawn by *our* layer, so leaving it on screen would
+                // show text the shell never received.
+                inner.cancel_composition();
+            }
+
             WindowEvent::KeyboardInput {
                 event: key_event, ..
             } if key_event.state == ElementState::Pressed => {
+                // Composing gate, ahead of the whole dispatch chain (R6.3/D8):
+                // a character key mid-composition belongs to the IME and must never
+                // reach `encode_key`. Named keys still pass (R6.4) — winit forwards
+                // arrows/Enter during `Preedit` on purpose.
+                if suppress_key(inner.composing, &key_event.logical_key) {
+                    return;
+                }
                 let input = KeyInput {
                     key: key_event.logical_key.clone(),
                     text: key_event.text.as_ref().map(|t| t.to_string()),
@@ -425,6 +702,14 @@ impl ApplicationHandler<UserEvent> for App {
                 // commit-cycle, buffer-refill — failed on this wgpu/winit/macOS
                 // stack). Drive a continuous redraw so a frame is always in flight.
                 // Paused while the window is occluded (see `Occluded`) to save power.
+                //
+                // LOAD-BEARING beyond winit#2640 (D17): the renderer's atlas-eviction
+                // cache invalidation (`renderer::Renderer::draw_to` clears
+                // `last_snapshot` when the atlas `generation` bumps) never requests a
+                // frame itself — it relies on this continuous redraw to actually
+                // repaint. Reverting to on-demand redraws silently reopens a permanent
+                // stale-glyph corruption path; pair any such change with an explicit
+                // redraw request from the renderer.
                 if !inner.occluded {
                     inner.window.request_redraw();
                 }
@@ -439,4 +724,223 @@ fn err<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
     e: E,
 ) -> Box<dyn std::error::Error + Send + Sync> {
     e.into()
+}
+
+/// Where an `Ime::Commit`'s bytes go (R8/D11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitTarget {
+    /// The tab that owns the composition, which is still open (R8.3).
+    Tab(TabId),
+    /// No composition was in flight — the active tab, as always (R8.5).
+    Active,
+    /// The owning tab is gone; the bytes have nowhere to land (R8.4).
+    Drop,
+}
+
+/// The commit-routing decision, factored out of the event loop so it is testable
+/// without a window or a PTY (R8.3/R8.4/R8.5).
+///
+/// `tab_exists` is `FnMut` only because the sole id probe on [`Tabs`] is
+/// `by_id_mut`, whose `&mut` borrow makes the caller's closure `FnMut`.
+fn commit_target(
+    composing_tab: Option<TabId>,
+    mut tab_exists: impl FnMut(TabId) -> bool,
+) -> CommitTarget {
+    match composing_tab {
+        Some(id) if tab_exists(id) => CommitTarget::Tab(id),
+        Some(_) => CommitTarget::Drop,
+        None => CommitTarget::Active,
+    }
+}
+
+/// The composition-state transition, factored out of [`Running::set_preedit`] so the
+/// state machine is testable without a window or an IME (R6.6/R6.7/D11/D12).
+///
+/// Returns the new `(composing, composing_tab)` for an incoming preedit `text`.
+///
+/// **The two outputs deliberately do not clear together.**
+///
+/// - `composing` — the [`suppress_key`](crate::input::suppress_key) gate. Empty text
+///   is winit's synthetic clear signal (view.rs:345), so "empty ⇒ `false`" is what
+///   keeps the gate from sticking `true` and swallowing every later character key
+///   (R6.7/D12 — the deadlock guard).
+/// - `composing_tab` — the commit *owner*, which must **outlive** that clear. winit
+///   queues `Ime::Preedit("")` immediately before every `Ime::Commit`
+///   (view.rs:412-413); clearing the owner on the empty preedit (the first cut) left
+///   it `None` at every commit, making the tab-identity routing inert. Ownership is
+///   released by the `Commit` arm once the bytes are placed, by `Ime::Disabled`, and
+///   by the start of a *new* composition — never by the empty preedit.
+///
+/// `was_composing` distinguishes "continuing this composition" (keep the first owner,
+/// so a mid-composition tab switch cannot re-point it) from "starting a new one"
+/// (adopt the currently-active tab).
+fn next_composition_state(
+    text: &str,
+    was_composing: bool,
+    prev_owner: Option<TabId>,
+    active: TabId,
+) -> (bool, Option<TabId>) {
+    if text.is_empty() {
+        // Gate off, ownership preserved for the `Commit` that winit queues next.
+        (false, prev_owner)
+    } else if was_composing {
+        // Same composition continuing — the first owner wins.
+        (true, prev_owner.or(Some(active)))
+    } else {
+        // A new composition begins here; it belongs to the tab that is active now.
+        (true, Some(active))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R6.6: a non-empty preedit composes; winit's synthetic empty one clears the
+    /// gate — but NOT the ownership (see `ownership_survives_the_pre_commit_preedit`).
+    #[test]
+    fn preedit_toggles_composing() {
+        let a = TabId(1);
+        let (composing, owner) = next_composition_state("한", false, None, a);
+        assert!(composing, "non-empty preedit composes");
+        assert_eq!(owner, Some(a), "first preedit records its tab");
+
+        let (composing, owner) = next_composition_state("", composing, owner, a);
+        assert!(!composing, "empty preedit clears the suppress_key gate");
+        assert_eq!(owner, Some(a), "but ownership is still held for the commit");
+    }
+
+    /// **The regression this whole amendment exists for (D11/R8.3).**
+    ///
+    /// winit queues `Ime::Preedit("")` immediately before every `Ime::Commit`
+    /// (view.rs:412-413). The first implementation cleared `composing_tab` on that
+    /// empty preedit, so by the time the `Commit` arm read it, it was always `None`
+    /// — every commit fell through to the active tab and `CommitTarget::Tab`/`Drop`
+    /// were unreachable. This pins the ordering that made the routing inert.
+    #[test]
+    fn ownership_survives_the_pre_commit_preedit() {
+        let a = TabId(4);
+        // Compose in tab a.
+        let (composing, owner) = next_composition_state("한", false, None, a);
+        assert_eq!(owner, Some(a));
+        // winit's synthetic clear, queued right before the Commit.
+        let (composing, owner) = next_composition_state("", composing, owner, a);
+        assert!(!composing);
+        // The Commit arm reads this: it MUST still name the originating tab, or the
+        // tab-identity routing degenerates to "whoever is active now".
+        assert_eq!(
+            owner,
+            Some(a),
+            "commit routing would be inert if this were None"
+        );
+        assert_eq!(
+            commit_target(owner, |id| id == a),
+            CommitTarget::Tab(a),
+            "routing must reach the Tab arm in the real event order"
+        );
+    }
+
+    /// R6.7/D12: an input-source switch (한↔영) delivers `Ime::Disabled` with no
+    /// preceding empty `Preedit`. That path feeds `""` through this transition, so
+    /// `composing` must not stick `true` — if it did, `suppress_key` would swallow
+    /// every character key from then on (a permanent deadlock).
+    #[test]
+    fn disabled_clears_composing_without_a_preceding_empty_preedit() {
+        let a = TabId(3);
+        // Mid-composition, then straight to the Disabled path.
+        let (composing, owner) = next_composition_state("하", false, None, a);
+        assert!(composing);
+        let (composing, _owner) = next_composition_state("", composing, owner, a);
+        assert!(!composing, "no deadlock: the gate is released");
+        // The `Ime::Disabled` arm additionally nulls ownership; a fresh composition
+        // afterwards adopts the active tab either way.
+        let (composing, owner) = next_composition_state("가", false, None, a);
+        assert!(composing);
+        assert_eq!(owner, Some(a));
+    }
+
+    /// D11: ownership sticks to the tab the composition *began* in — a later
+    /// preedit of the SAME composition must not re-point it at whatever tab is
+    /// active now.
+    #[test]
+    fn ownership_keeps_the_first_tab() {
+        let (a, b) = (TabId(1), TabId(2));
+        let (composing, owner) = next_composition_state("ㅎ", false, None, a);
+        assert_eq!(owner, Some(a));
+        // Same composition continues while tab b is somehow active.
+        let (composing, owner) = next_composition_state("하", composing, owner, b);
+        assert!(composing);
+        assert_eq!(owner, Some(a), "still owned by the tab it started in");
+    }
+
+    /// A *new* composition adopts the tab that is active when it starts — otherwise
+    /// a stale owner from a cancelled composition would capture it.
+    #[test]
+    fn a_new_composition_adopts_the_active_tab() {
+        let (a, b) = (TabId(1), TabId(2));
+        // Stale ownership left over from a cancelled composition in tab a.
+        let stale = Some(a);
+        // A brand-new composition starts while tab b is active (was_composing false).
+        let (composing, owner) = next_composition_state("ㄱ", false, stale, b);
+        assert!(composing);
+        assert_eq!(owner, Some(b), "new composition belongs to the active tab");
+    }
+
+    /// The full sequence R6.6 → R6.7 states, table-driven: each step's text and the
+    /// expected `(composing, owner)` after it. Models the real winit event order,
+    /// including the empty `Preedit` that precedes a `Commit`.
+    #[test]
+    fn composition_sequence_never_deadlocks() {
+        let a = TabId(5);
+        // (text, want_composing, want_owner) — owner threads through.
+        let steps: &[(&str, bool, Option<TabId>)] = &[
+            ("ㅎ", true, Some(a)), // compose
+            ("하", true, Some(a)), // continue
+            ("한", true, Some(a)), // continue
+            ("", false, Some(a)),  // winit's pre-commit clear: gate off, owner kept
+            ("ㄱ", true, Some(a)), // compose again (owner still a — same tab)
+            ("", false, Some(a)),  // clear again
+            ("", false, Some(a)),  // idempotent
+            ("a", true, Some(a)),  // still able to compose afterwards
+        ];
+        let mut owner = None;
+        let mut composing = false;
+        for (text, want_composing, want_owner) in steps {
+            let (next_composing, next) = next_composition_state(text, composing, owner, a);
+            assert_eq!(next_composing, *want_composing, "composing after {text:?}");
+            assert_eq!(next, *want_owner, "owner after {text:?}");
+            owner = next;
+            composing = next_composing;
+        }
+    }
+
+    /// R8.3: a commit that began in tab A goes to tab A, even after switching to B.
+    #[test]
+    fn commit_routes_to_the_composing_tab() {
+        let a = TabId(7);
+        assert_eq!(
+            commit_target(Some(a), |id| id == a || id == TabId(9)),
+            CommitTarget::Tab(a)
+        );
+    }
+
+    /// R8.4: the composing tab was closed → the bytes are dropped, not misdelivered.
+    #[test]
+    fn commit_is_dropped_when_the_composing_tab_is_gone() {
+        assert_eq!(
+            commit_target(Some(TabId(7)), |id| id == TabId(9)),
+            CommitTarget::Drop
+        );
+    }
+
+    /// R8.5: no composition in flight → the active tab. This is the branch that
+    /// guarantees plain (non-composed) characters are never lost.
+    #[test]
+    fn plain_commit_goes_to_the_active_tab() {
+        // The probe must not even be consulted when there is no owner.
+        assert_eq!(
+            commit_target(None, |_| unreachable!("no owner: existence is irrelevant")),
+            CommitTarget::Active
+        );
+    }
 }
