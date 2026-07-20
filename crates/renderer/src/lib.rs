@@ -12,28 +12,24 @@
 
 pub mod atlas;
 pub mod cursor_layer;
+pub mod font_set;
 pub mod glyph;
 pub mod image_layer;
 pub mod overlay_layer;
+pub mod preedit_layer;
 pub mod tab_bar;
-
-use std::sync::Arc;
 
 use atlas::{Atlas, GlyphKey};
 use bytemuck::{Pod, Zeroable};
 use common::config::Config;
+use font_set::FONT_CANDIDATES;
 use swash::shape::ShapeContext;
 use swash::FontRef;
 use term_core::{Cell, CellAttrs, GridSnapshot};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
-/// Candidate macOS monospace fonts (macOS-only — SD1). Family→path resolution is
-/// a later enhancement; v1 uses the first that loads.
-const FONT_CANDIDATES: &[&str] = &[
-    "/System/Library/Fonts/Menlo.ttc",
-    "/System/Library/Fonts/SFNSMono.ttf",
-];
+pub use font_set::{FontData, FontFace, FontSet};
 
 #[derive(Debug, Error)]
 pub enum RendererError {
@@ -158,7 +154,10 @@ pub struct Renderer {
     /// Kept so `apply_config` can rebuild the glyph bind group against a fresh atlas.
     glyph_bgl: wgpu::BindGroupLayout,
     atlas: Atlas,
-    font: Arc<Vec<u8>>,
+    /// The ordered fallback chain (D1): `faces()[0]` is the primary Latin face,
+    /// later faces cover what it does not (Hangul today). Owned here; the atlas
+    /// and the shaper share the same mapped bytes through `FontData` clones.
+    fonts: FontSet,
     /// Needed to re-derive cell size / ppem when the config changes live.
     scale_factor: f64,
     cell_size: (f32, f32),
@@ -200,7 +199,7 @@ impl Renderer {
         scale_factor: f64,
         cfg: &Config,
     ) -> Result<Renderer> {
-        let font = load_font()?;
+        let fonts = FontSet::load()?;
 
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(window)?;
@@ -231,7 +230,7 @@ impl Renderer {
             queue,
             config,
             Some(surface),
-            font,
+            fonts,
             scale_factor,
             cfg,
         )
@@ -246,7 +245,7 @@ impl Renderer {
         scale_factor: f64,
         cfg: &Config,
     ) -> Result<Renderer> {
-        let font = load_font()?;
+        let fonts = FontSet::load()?;
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -272,7 +271,7 @@ impl Renderer {
             color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
         };
-        Self::assemble(device, queue, config, None, font, scale_factor, cfg)
+        Self::assemble(device, queue, config, None, fonts, scale_factor, cfg)
     }
 
     /// Shared GPU assembly for both the windowed and headless constructors.
@@ -282,7 +281,7 @@ impl Renderer {
         queue: wgpu::Queue,
         config: wgpu::SurfaceConfiguration,
         surface: Option<wgpu::Surface<'static>>,
-        font: Arc<Vec<u8>>,
+        fonts: FontSet,
         scale_factor: f64,
         cfg: &Config,
     ) -> Result<Renderer> {
@@ -290,7 +289,9 @@ impl Renderer {
         let ppem = cfg.font.size_pt * scale_factor as f32;
         let clear = to_wgpu_color(cfg.theme.background);
 
-        let atlas = Atlas::new(&device, font.clone(), 0, ppem)
+        // One rasterizer per face of the chain, all sharing the mapped bytes (D7):
+        // no face's font file is ever copied into the heap here (R3.2).
+        let atlas = Atlas::new(&device, &fonts, ppem)
             .ok_or_else(|| RendererError::NoFont(FONT_CANDIDATES.join(", ")))?;
 
         let quad_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -429,7 +430,7 @@ impl Renderer {
             glyph_bind_group,
             glyph_bgl,
             atlas,
-            font,
+            fonts,
             scale_factor,
             cell_size,
             top_inset: 0.0,
@@ -532,7 +533,10 @@ impl Renderer {
 
         // Rebuild the atlas at the new ppem so glyphs re-rasterize (size + ligature
         // changes need fresh coverage), then re-point the glyph bind group at it.
-        if let Some(atlas) = Atlas::new(&self.device, self.font.clone(), 0, self.ppem) {
+        // Rebuilding shares the same mapped bytes (D7/R3.2): a live ppem change
+        // must not re-read (or re-copy) the 55 MB fallback face on every tick of
+        // the config watcher.
+        if let Some(atlas) = Atlas::new(&self.device, &self.fonts, self.ppem) {
             self.atlas = atlas;
             self.glyph_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("glyph-bg"),
@@ -636,6 +640,11 @@ impl Renderer {
     /// Draw one frame to an arbitrary target view (surface or offscreen). Split
     /// out so the [`DrawLayer`] seam is headless-testable without a surface.
     pub fn draw_to(&mut self, view: &wgpu::TextureView, snapshot: &GridSnapshot) {
+        // D17/R3.4: the atlas generation this frame starts from. Anything that packs
+        // a glyph — the grid shaping below, or a `DrawLayer` further down — can
+        // overflow the atlas and evict, which invalidates every UV already handed
+        // out. Compared again once the layers have recorded.
+        let generation_at_entry = self.atlas.generation();
         // Idle-CPU cache (D5/D6): re-shape the grid only when the snapshot changed.
         // On a hit the resident `bg_vbuf`/`glyph_vbuf` (built for the cached
         // snapshot) are re-presented as-is — no instance building, no allocation.
@@ -648,7 +657,7 @@ impl Renderer {
             let glyphs = build_glyph_instances(
                 &mut self.atlas,
                 &self.queue,
-                &self.font,
+                &self.fonts,
                 self.ligatures,
                 self.cell_size,
                 self.ppem,
@@ -737,6 +746,28 @@ impl Renderer {
         }
         self.layers = layers;
 
+        // D17/R3.4: a layer (tab bar / overlay / preedit) packing new glyphs may
+        // have evicted the atlas. The grid's resident `glyph_vbuf` then holds UVs
+        // into a texture that has been repacked, and because the snapshot did not
+        // change the cache hit above would re-present those stale UVs *forever* —
+        // permanent on-screen corruption, not a transient glitch. Dropping the
+        // cached snapshot forces the next frame to re-shape against the new
+        // generation. (Reachable by construction: while an IME composes, keystrokes
+        // are suppressed, so the grid snapshot is static while the preedit layer
+        // rasterizes a brand-new syllable per keystroke.)
+        //
+        // DEPENDENCY: this only reaches the screen because the app's
+        // `RedrawRequested` arm (`app/src/terminal_app.rs`, search
+        // `request_redraw` in that arm) drives a *continuous* redraw (paused
+        // while occluded) — the renderer never
+        // requests a frame itself. If that ever reverts to on-demand redraws, this
+        // corruption path silently reopens and this invalidation must be paired with
+        // an explicit redraw request. The current frame still draws the stale UVs;
+        // intra-frame invalidation is an accepted Known Gap.
+        if self.atlas.generation() != generation_at_entry {
+            self.last_snapshot = None;
+        }
+
         self.queue.submit(std::iter::once(encoder.finish()));
     }
 }
@@ -817,21 +848,137 @@ fn glyph_color(cell: &Cell) -> [f32; 3] {
     c
 }
 
+/// A maximal span of consecutive characters that resolved to the *same* face — the
+/// unit of shaping (D16/R4.1).
+///
+/// Bounds index the row's **continuation-skipped char sequence** (the order
+/// [`row_chars`] produces), never raw column numbers: a wide char occupies two
+/// columns but one char, so column-based bounds would desync every run boundary
+/// after the first wide char (R4.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Run {
+    /// The face every char in the run resolved to. `None` = no face covers them,
+    /// so the run draws nothing at all (D5/R4.2).
+    face: Option<usize>,
+    start_char: usize,
+    /// Exclusive.
+    end_char: usize,
+}
+
+/// Group a row's per-char face resolutions into maximal same-face runs (D16/R4.1).
+///
+/// The Confirmed Goal's "pick a font per cluster" is circular — a cluster is an
+/// *output* of shaping, so the shaping font cannot be chosen from it. The real
+/// order is: resolve each **char** to a face, group consecutive equal faces, then
+/// shape each group with that face's `FontRef`. Pure, so the grouping rule is
+/// table-testable with no GPU, font, or snapshot.
+fn split_runs(faces: &[Option<usize>]) -> Vec<Run> {
+    let mut runs: Vec<Run> = Vec::new();
+    for (i, &face) in faces.iter().enumerate() {
+        match runs.last_mut() {
+            Some(run) if run.face == face => run.end_char = i + 1,
+            _ => runs.push(Run {
+                face,
+                start_char: i,
+                end_char: i + 1,
+            }),
+        }
+    }
+    runs
+}
+
+/// One row flattened for shaping (D16/R4.3).
+struct RowChars {
+    /// The row's characters in column order, with the trailing spacer of every
+    /// double-width char dropped: its leader's glyph already spans both cells.
+    chars: Vec<char>,
+    /// `char_col[i]` is the absolute column of `chars[i]` — the anchor its cluster
+    /// is placed at (R4.5). Wide chars leave a gap: `한a` → `[0, 2]`.
+    char_col: Vec<u16>,
+}
+
+/// Whether `(col, row)` holds the trailing spacer of a double-width char.
+///
+/// The single predicate both the row walk (R4.3) and the span measurement (D6)
+/// read, so the two can never disagree about what a wide cell is.
+fn is_continuation(snapshot: &GridSnapshot, col: u16, row: u16) -> bool {
+    snapshot
+        .cell(col, row)
+        .map(Cell::is_continuation)
+        .unwrap_or(false)
+}
+
+/// Walk a row into its shaping input: chars with spacers skipped, plus the
+/// absolute column of each (D16/R4.3). Split out of [`build_glyph_instances`] so
+/// the indexing basis — the thing wide chars desync — is testable on its own.
+fn row_chars(snapshot: &GridSnapshot, row: u16) -> RowChars {
+    let mut chars = Vec::new();
+    let mut char_col = Vec::new();
+    for col in 0..snapshot.cols {
+        if is_continuation(snapshot, col, row) {
+            continue;
+        }
+        chars.push(snapshot.cell(col, row).map(|c| c.ch).unwrap_or(' '));
+        char_col.push(col);
+    }
+    RowChars { chars, char_col }
+}
+
+/// Cell span of the char led by `col`: 2 when the next column holds its
+/// continuation spacer, else 1 (D6).
+fn cell_span(snapshot: &GridSnapshot, col: u16, row: u16) -> u16 {
+    if is_continuation(snapshot, col.saturating_add(1), row) {
+        2
+    } else {
+        1
+    }
+}
+
+/// Horizontal offset that centers a cluster inside the cell span it occupies (D6).
+///
+/// Fallback faces are proportional: a Hangul glyph is roughly `1.0 × ppem` where a
+/// two-cell span is `1.2 × ppem`, so anchoring it flush left leaves a visible
+/// right-hand gutter. `adv` must be the cluster's **total** advance, not its first
+/// glyph's — the placement loop resets `pen` per cluster and then advances by
+/// `g.advance` per glyph, so a first-glyph measure mis-centers multi-glyph
+/// clusters.
+///
+/// Two rules are load-bearing:
+///
+/// * face 0 is always `0.0` (R4.8). The primary's placement arithmetic is left
+///   exactly as it was, which is what makes ASCII-only output byte-identical to
+///   before the chain existed (R0.3, a hard constraint). Latin placement is not
+///   "improved" here.
+/// * `max(0.0)` (R4.7): a glyph wider than its span overflows to the **right**
+///   only and never bleeds back into the previous cell.
+fn center_offset(face: usize, span: u16, cw: f32, adv: f32) -> f32 {
+    if face == 0 {
+        return 0.0;
+    }
+    ((span as f32 * cw - adv) * 0.5).max(0.0)
+}
+
 /// Shape each row (ligature-aware per `ligatures`) and emit one textured quad per
 /// glyph, anchored to its lead cell, placed by baseline + bearings (D2/D5/D6).
+///
+/// A row is not shaped as one string: it is split into per-face runs (D16) and
+/// each run is shaped with its own face's `FontRef`, so Hangul reaches the shaper
+/// through the fallback face instead of collapsing to `.notdef` (R0.2/R4.4).
+/// Ligature features apply within a run only — a ligature spanning a
+/// primary↔fallback boundary is not a thing, so breaking there is correct.
+///
+/// Takes the whole [`FontSet`] (D16): the set is owned by [`Renderer`] and the
+/// atlas holds cloned `FontData` handles to the same mapped bytes, so shaping and
+/// rasterization share bytes with a single owner.
 fn build_glyph_instances(
     atlas: &mut Atlas,
     queue: &wgpu::Queue,
-    font_data: &Arc<Vec<u8>>,
+    fonts: &FontSet,
     ligatures: bool,
     cell: (f32, f32),
     ppem: f32,
     snapshot: &GridSnapshot,
 ) -> Vec<GlyphInstance> {
-    let font = match FontRef::from_index(font_data, 0) {
-        Some(f) => f,
-        None => return Vec::new(),
-    };
     let (cw, ch) = cell;
     let ascent = ch * 0.8; // baseline approximation (units-per-em query is a later refinement)
     let liga: u16 = if ligatures { 1 } else { 0 };
@@ -840,66 +987,93 @@ fn build_glyph_instances(
     let mut out = Vec::new();
     let mut shape_ctx = ShapeContext::new();
     for row in 0..snapshot.rows {
-        // Build the row string + a byte→col map so a cluster resolves to its lead cell.
-        // Skip the trailing spacer of a double-width char: its leader's glyph already
-        // spans both cells, so the next real glyph lands 2 columns over (positioning
-        // is by column, so wide chars are 2 cells apart with no overlap).
-        let mut line = String::new();
-        let mut byte_col: Vec<u16> = Vec::new();
-        for col in 0..snapshot.cols {
-            let cell = snapshot.cell(col, row);
-            if cell.map(Cell::is_continuation).unwrap_or(false) {
-                continue;
-            }
-            let ch_at = cell.map(|c| c.ch).unwrap_or(' ');
-            let before = line.len();
-            line.push(ch_at);
-            for _ in before..line.len() {
-                byte_col.push(col);
-            }
-        }
-        let row_y = row as f32 * ch;
-        let baseline = row_y + ascent;
+        let RowChars { chars, char_col } = row_chars(snapshot, row);
+        // Resolve every char to a face first (D2/D16): `resolve` borrows the atlas
+        // immutably while the shaping closure below borrows it mutably, and the
+        // face is an *input* to shaping, so it has to be decided up front.
+        let faces: Vec<Option<usize>> = chars
+            .iter()
+            .map(|&c| atlas.resolve(c).map(|key| key.face as usize))
+            .collect();
+        let baseline = row as f32 * ch + ascent;
 
-        let mut shaper = shape_ctx
-            .builder(font)
-            .size(ppem)
-            .features(features.iter().copied())
-            .build();
-        shaper.add_str(&line);
-        shaper.shape_with(|cluster| {
-            let src = cluster.source.start as usize;
-            let col = byte_col.get(src).copied().unwrap_or(0);
-            // Style comes from the cluster's lead cell (D11): color (reverse/dim)
-            // and the bold/italic that select a synthesized, separately-cached glyph.
-            let (color, bold, italic) = match snapshot.cell(col, row) {
-                Some(c) => (
-                    glyph_color(c),
-                    c.attrs.contains(CellAttrs::BOLD),
-                    c.attrs.contains(CellAttrs::ITALIC),
-                ),
-                None => ([1.0; 3], false, false),
+        for run in split_runs(&faces) {
+            // D5/R4.2: no face covers these chars — emit nothing rather than a wall
+            // of tofu. (In degraded mode `resolve` answers face 0 instead, so the
+            // primary's `.notdef` still draws and the missing font stays visible.)
+            let Some(face_index) = run.face else {
+                continue;
             };
-            let mut pen = col as f32 * cw;
-            for g in cluster.glyphs {
-                let key = GlyphKey {
-                    id: g.id,
-                    bold,
-                    italic,
-                };
-                if let Some(entry) = atlas.get_or_insert_styled(queue, key) {
-                    out.push(GlyphInstance {
-                        pos: [pen + g.x + entry.left, baseline - entry.top],
-                        size: [entry.px_w, entry.px_h],
-                        uv0: entry.uv0,
-                        uv1: entry.uv1,
-                        color,
-                        _pad: 0.0,
-                    });
+            let Some(font) = fonts
+                .faces()
+                .get(face_index)
+                .and_then(|face| FontRef::from_index(&face.data, face.index))
+            else {
+                continue;
+            };
+
+            // The run's string + a **run-relative** byte→column map (R4.5).
+            // `cluster.source.start` is an offset into the string handed to *this*
+            // shaper, so a row-wide map would read the wrong column for every run
+            // after the first. Absolute columns come from `char_col`.
+            let mut text = String::new();
+            let mut byte_col: Vec<u16> = Vec::new();
+            for i in run.start_char..run.end_char {
+                let before = text.len();
+                text.push(chars[i]);
+                for _ in before..text.len() {
+                    byte_col.push(char_col[i]);
                 }
-                pen += g.advance;
             }
-        });
+
+            let mut shaper = shape_ctx
+                .builder(font)
+                .size(ppem)
+                .features(features.iter().copied())
+                .build();
+            shaper.add_str(&text);
+            shaper.shape_with(|cluster| {
+                let src = cluster.source.start as usize;
+                let col = byte_col.get(src).copied().unwrap_or(0);
+                // Style comes from the cluster's lead cell (D11): color (reverse/dim)
+                // and the bold/italic that select a synthesized, separately-cached glyph.
+                let (color, bold, italic) = match snapshot.cell(col, row) {
+                    Some(c) => (
+                        glyph_color(c),
+                        c.attrs.contains(CellAttrs::BOLD),
+                        c.attrs.contains(CellAttrs::ITALIC),
+                    ),
+                    None => ([1.0; 3], false, false),
+                };
+                // D6: a fallback cluster is centered in the span its lead cell
+                // covers; face 0 keeps `pen == col * cw` exactly as before (R4.8).
+                let adv: f32 = cluster.glyphs.iter().map(|g| g.advance).sum();
+                let offset = center_offset(face_index, cell_span(snapshot, col, row), cw, adv);
+                let mut pen = col as f32 * cw + offset;
+                for g in cluster.glyphs {
+                    // The face is the run's, not a guess: glyph ids are per-font
+                    // namespaces, so a key without it would draw the primary's
+                    // gid N for the fallback's gid N (D7/R3.1).
+                    let key = GlyphKey {
+                        face: face_index as u16,
+                        id: g.id,
+                        bold,
+                        italic,
+                    };
+                    if let Some(entry) = atlas.get_or_insert_styled(queue, key) {
+                        out.push(GlyphInstance {
+                            pos: [pen + g.x + entry.left, baseline - entry.top],
+                            size: [entry.px_w, entry.px_h],
+                            uv0: entry.uv0,
+                            uv1: entry.uv1,
+                            color,
+                            _pad: 0.0,
+                        });
+                    }
+                    pen += g.advance;
+                }
+            });
+        }
     }
 
     // Underline pass (R5.3): a solid rule below the baseline of each UNDERLINE
@@ -998,15 +1172,6 @@ fn build_pipeline(
     })
 }
 
-fn load_font() -> Result<Arc<Vec<u8>>> {
-    for path in FONT_CANDIDATES {
-        if let Ok(bytes) = std::fs::read(path) {
-            return Ok(Arc::new(bytes));
-        }
-    }
-    Err(RendererError::NoFont(FONT_CANDIDATES.join(", ")))
-}
-
 fn cell_size_px(cfg: &Config, scale_factor: f64) -> (f32, f32) {
     let px = cfg.font.size_pt * scale_factor as f32;
     ((px * 0.6).round().max(1.0), (px * 1.2).round().max(1.0))
@@ -1058,8 +1223,16 @@ mod tests {
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
     }
 
-    fn font() -> Option<Arc<Vec<u8>>> {
-        super::load_font().ok()
+    /// The primary face of the loaded chain (T2). `None` when no system font is
+    /// available, which the GPU-dependent tests below treat as "skip".
+    fn primary_face() -> Option<FontFace> {
+        FontSet::load().ok()?.faces().first().cloned()
+    }
+
+    /// The loaded fallback chain (T2/T3) — what `Atlas::new` now takes. `None`
+    /// when no system font is available, which the tests below treat as "skip".
+    fn fonts() -> Option<FontSet> {
+        FontSet::load().ok()
     }
 
     #[test]
@@ -1172,11 +1345,11 @@ mod tests {
 
     #[test]
     fn atlas_inserts_caches_and_notdef() {
-        let (Some((device, queue)), Some(font)) = (headless(), font()) else {
+        let (Some((device, queue)), Some(fonts)) = (headless(), fonts()) else {
             eprintln!("skipping: no GPU/font");
             return;
         };
-        let mut atlas = Atlas::new(&device, font, 0, 32.0).expect("atlas");
+        let mut atlas = Atlas::new(&device, &fonts, 32.0).expect("atlas");
         let a = atlas.glyph_id('A');
         let e1 = atlas.get_or_insert(&queue, a);
         assert!(e1.is_some(), "'A' should rasterize into the atlas");
@@ -1187,22 +1360,110 @@ mod tests {
         // A space glyph has no outline → None (nothing to draw), no panic.
         let space = atlas.glyph_id(' ');
         assert!(atlas.get_or_insert(&queue, space).is_none());
-        // .notdef (glyph 0) rasterizes to a visible tofu box — the R6 placeholder.
+        // R2.6: with a fallback face loaded, .notdef is refused outright — those
+        // tofu boxes are exactly the defect this feature removes.
+        if !atlas.is_degraded() {
+            let cached = atlas.cached_len();
+            assert!(
+                atlas.get_or_insert(&queue, 0).is_none(),
+                ".notdef must not be packed while a fallback face exists (R2.6)"
+            );
+            assert_eq!(
+                atlas.cached_len(),
+                cached,
+                "a refused .notdef must not even occupy a cache slot"
+            );
+        }
+        // R2.5: degraded (no fallback face) keeps the guard off, so .notdef still
+        // draws — a missing font must stay *visible*, not silently invisible (D5).
+        atlas.degrade_for_test();
+        assert!(atlas.is_degraded());
         assert!(
             atlas.get_or_insert(&queue, 0).is_some(),
-            ".notdef should be a visible box (R6)"
+            ".notdef should stay a visible box in degraded mode (R2.5)"
         );
     }
 
     #[test]
+    fn atlas_resolve_prefers_the_primary_face() {
+        // R2.1/R2.2: Latin resolves to face 0 (so its render is untouched — R0.3);
+        // Hangul falls through to a later face with a real glyph, not .notdef.
+        let (Some((device, _queue)), Some(fonts)) = (headless(), fonts()) else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let atlas = Atlas::new(&device, &fonts, 32.0).expect("atlas");
+        let latin = atlas.resolve('A').expect("the primary covers 'A'");
+        assert_eq!(latin.face, 0, "Latin must keep using the primary face");
+        assert_ne!(latin.id, 0);
+        if atlas.is_degraded() {
+            eprintln!("skipping the fallback half: no Hangul face on this machine");
+            return;
+        }
+        let hangul = atlas.resolve('한').expect("some face covers U+D55C");
+        assert_ne!(hangul.face, 0, "Hangul must come from a fallback face");
+        assert_ne!(hangul.id, 0, "and from a real glyph, not .notdef (R0.2)");
+    }
+
+    #[test]
+    fn atlas_resolve_reports_uncovered_by_mode() {
+        // R2.4 vs R2.5: normal mode declines to draw what no face covers; degraded
+        // mode answers with the primary's .notdef so the breakage stays visible.
+        let (Some((device, _queue)), Some(fonts)) = (headless(), fonts()) else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let mut atlas = Atlas::new(&device, &fonts, 32.0).expect("atlas");
+        // A private-use codepoint no system font maps.
+        let uncovered = '\u{F8FF0}';
+        if !atlas.is_degraded() {
+            assert_eq!(atlas.resolve(uncovered), None, "R2.4: nothing to draw");
+        }
+        atlas.degrade_for_test();
+        assert_eq!(
+            atlas.resolve(uncovered),
+            Some(GlyphKey::plain(0)),
+            "R2.5: degraded mode keeps the primary .notdef"
+        );
+    }
+
+    #[test]
+    fn atlas_caches_the_same_glyph_id_per_face() {
+        // R3.1: glyph ids are per-font namespaces — face 0's gid N and face 1's
+        // gid N are different glyphs and must not share a cache slot.
+        let (Some((device, queue)), Some(fonts)) = (headless(), fonts()) else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let mut atlas = Atlas::new(&device, &fonts, 32.0).expect("atlas");
+        if atlas.is_degraded() {
+            eprintln!("skipping: no fallback face on this machine");
+            return;
+        }
+        let primary = atlas.resolve('A').expect("the primary covers 'A'");
+        let same_id_elsewhere = GlyphKey { face: 1, ..primary };
+        let before = atlas.cached_len();
+        let a = atlas.get_or_insert_styled(&queue, primary);
+        let b = atlas.get_or_insert_styled(&queue, same_id_elsewhere);
+        assert_eq!(
+            atlas.cached_len(),
+            before + 2,
+            "one cache entry per (face, id)"
+        );
+        if let (Some(a), Some(b)) = (a, b) {
+            assert_ne!(a.uv0, b.uv0, "each face's glyph packs to its own UV rect");
+        }
+    }
+
+    #[test]
     fn shaping_ligature_combines_glyphs() {
-        let Some(font) = font() else {
+        let Some(face) = primary_face() else {
             eprintln!("skipping: no font");
             return;
         };
         let count = |ligatures: bool| {
             let mut ctx = ShapeContext::new();
-            let f = FontRef::from_index(&font, 0).unwrap();
+            let f = FontRef::from_index(&face.data, face.index).unwrap();
             let liga: u16 = if ligatures { 1 } else { 0 };
             let mut sh = ctx
                 .builder(f)
@@ -1221,19 +1482,330 @@ mod tests {
 
     #[test]
     fn glyph_instances_place_by_baseline() {
-        let (Some((device, queue)), Some(font)) = (headless(), font()) else {
+        let (Some((device, queue)), Some(fonts)) = (headless(), fonts()) else {
             eprintln!("skipping: no GPU/font");
             return;
         };
-        let mut atlas = Atlas::new(&device, font.clone(), 0, 32.0).expect("atlas");
+        let mut atlas = Atlas::new(&device, &fonts, 32.0).expect("atlas");
         let mut t = term_core::Terminal::new(4, 1, term_core::Color(0xFFFFFF), term_core::Color(0));
         t.advance(b"Ag");
         let snap = t.snapshot();
         let inst =
-            build_glyph_instances(&mut atlas, &queue, &font, true, (20.0, 40.0), 32.0, &snap);
+            build_glyph_instances(&mut atlas, &queue, &fonts, true, (20.0, 40.0), 32.0, &snap);
         assert!(inst.len() >= 2, "A and g should each emit a glyph quad");
         // 'g' has a descender: its quad top is below the baseline-top of 'A'.
         assert!(inst.iter().all(|g| g.size[0] > 0.0 && g.size[1] > 0.0));
+    }
+
+    #[test]
+    fn split_runs_groups_consecutive_same_face() {
+        // R4.1: maximal runs — the same face returning later starts a NEW run, it
+        // does not rejoin the earlier one (shaping is per contiguous span).
+        let faces = [Some(0), Some(0), Some(1), Some(1), Some(0)];
+        assert_eq!(
+            split_runs(&faces),
+            vec![
+                Run {
+                    face: Some(0),
+                    start_char: 0,
+                    end_char: 2
+                },
+                Run {
+                    face: Some(1),
+                    start_char: 2,
+                    end_char: 4
+                },
+                Run {
+                    face: Some(0),
+                    start_char: 4,
+                    end_char: 5
+                },
+            ]
+        );
+        // The R0.3 shape: an all-primary row is ONE run over the whole row, so it
+        // is shaped exactly as the single-font path shaped it.
+        assert_eq!(
+            split_runs(&[Some(0); 5]),
+            vec![Run {
+                face: Some(0),
+                start_char: 0,
+                end_char: 5
+            }]
+        );
+        assert!(split_runs(&[]).is_empty());
+    }
+
+    #[test]
+    fn split_runs_isolates_uncovered_chars() {
+        // R4.2: `None` (no face covers it) is a face value like any other — such
+        // chars group together and the caller emits nothing for them (D5).
+        let runs = split_runs(&[Some(0), None, None, Some(1)]);
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[1].face, None);
+        assert_eq!((runs[1].start_char, runs[1].end_char), (1, 3));
+        // Two different covered faces never merge just because neither is `None`.
+        assert_eq!(split_runs(&[Some(1), Some(2)]).len(), 2);
+    }
+
+    #[test]
+    fn row_chars_skips_wide_char_spacers() {
+        // R4.3: the indexing basis is the continuation-skipped char sequence, NOT
+        // raw columns. `한a` is cols 0(한)/1(spacer)/2(a) → 2 chars at cols [0, 2].
+        // Getting this wrong desyncs every run boundary after the first wide char.
+        let mut t = term_core::Terminal::new(4, 1, term_core::Color(0xFFFFFF), term_core::Color(0));
+        t.advance("한a".as_bytes());
+        let snap = t.snapshot();
+        let row = row_chars(&snap, 0);
+        assert_eq!(row.chars.len(), 2 + 1, "한, a, and the trailing blank col");
+        assert_eq!(&row.chars[..2], &['한', 'a']);
+        assert_eq!(&row.char_col[..2], &[0, 2]);
+        assert_eq!(row.chars.len(), row.char_col.len());
+        // The span predicate agrees with the walk: the lead cell covers 2 columns.
+        assert_eq!(cell_span(&snap, 0, 0), 2, "한 spans its spacer");
+        assert_eq!(cell_span(&snap, 2, 0), 1, "a is single-width");
+    }
+
+    #[test]
+    fn fallback_cluster_is_centered_in_its_span() {
+        // R4.6: col 4, cw 10, 2-cell span, total advance 16 → offset 2, pen 42.
+        let cw = 10.0;
+        let offset = center_offset(1, 2, cw, 16.0);
+        assert_eq!(offset, 2.0);
+        assert_eq!(4.0 * cw + offset, 42.0);
+        // R4.7: an oversized glyph overflows right only — never into col 3.
+        assert_eq!(center_offset(1, 2, cw, 24.0), 0.0);
+        assert_eq!(
+            center_offset(1, 2, cw, 20.0),
+            0.0,
+            "exact fit is flush left"
+        );
+        // A single-cell fallback char centers in one cell.
+        assert_eq!(center_offset(1, 1, cw, 6.0), 2.0);
+    }
+
+    #[test]
+    fn primary_face_placement_is_untouched() {
+        // R4.8/R0.3, a hard constraint: face 0 offsets to exactly 0.0 whatever its
+        // advance is, so Latin placement is byte-identical to the pre-chain path.
+        // Menlo's advance does not equal `cw` exactly, so "improving" this would
+        // silently move every ASCII glyph.
+        for adv in [0.0, 6.0, 11.7, 40.0] {
+            for span in [1, 2] {
+                assert_eq!(center_offset(0, span, 10.0, adv), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn ascii_placement_matches_single_font_shaping() {
+        // R0.3: an ASCII-only snapshot resolves entirely to face 0, so run
+        // splitting yields one whole-row run and every offset is 0 — the emitted
+        // instances must match the pre-fallback path (one `FontRef`, one row-wide
+        // byte→col map) field for field, not merely "look right".
+        let (Some((device, queue)), Some(fonts)) = (headless(), fonts()) else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let face = fonts.faces().first().cloned().expect("a primary face");
+        let mut atlas = Atlas::new(&device, &fonts, 32.0).expect("atlas");
+        let mut t =
+            term_core::Terminal::new(12, 2, term_core::Color(0xFFFFFF), term_core::Color(0));
+        t.advance(b"hi != ok\r\nzsh %");
+        let snap = t.snapshot();
+        let (cw, ch) = (20.0f32, 40.0f32);
+        let got = build_glyph_instances(&mut atlas, &queue, &fonts, true, (cw, ch), 32.0, &snap);
+        assert!(!got.is_empty(), "an ASCII row must emit glyphs");
+
+        // The pre-change path, reproduced verbatim.
+        let font = FontRef::from_index(&face.data, face.index).expect("a valid primary face");
+        let mut want: Vec<GlyphInstance> = Vec::new();
+        let mut shape_ctx = ShapeContext::new();
+        for row in 0..snap.rows {
+            let mut line = String::new();
+            let mut byte_col: Vec<u16> = Vec::new();
+            for col in 0..snap.cols {
+                let cell = snap.cell(col, row);
+                if cell.map(Cell::is_continuation).unwrap_or(false) {
+                    continue;
+                }
+                let before = line.len();
+                line.push(cell.map(|c| c.ch).unwrap_or(' '));
+                for _ in before..line.len() {
+                    byte_col.push(col);
+                }
+            }
+            let baseline = row as f32 * ch + ch * 0.8;
+            let mut shaper = shape_ctx
+                .builder(font)
+                .size(32.0)
+                .features([("liga", 1u16), ("calt", 1u16)].iter().copied())
+                .build();
+            shaper.add_str(&line);
+            shaper.shape_with(|cluster| {
+                let col = byte_col
+                    .get(cluster.source.start as usize)
+                    .copied()
+                    .unwrap_or(0);
+                let (color, bold, italic) = match snap.cell(col, row) {
+                    Some(c) => (
+                        glyph_color(c),
+                        c.attrs.contains(CellAttrs::BOLD),
+                        c.attrs.contains(CellAttrs::ITALIC),
+                    ),
+                    None => ([1.0; 3], false, false),
+                };
+                let mut pen = col as f32 * cw;
+                for g in cluster.glyphs {
+                    let key = GlyphKey {
+                        face: 0,
+                        id: g.id,
+                        bold,
+                        italic,
+                    };
+                    if let Some(entry) = atlas.get_or_insert_styled(&queue, key) {
+                        want.push(GlyphInstance {
+                            pos: [pen + g.x + entry.left, baseline - entry.top],
+                            size: [entry.px_w, entry.px_h],
+                            uv0: entry.uv0,
+                            uv1: entry.uv1,
+                            color,
+                            _pad: 0.0,
+                        });
+                    }
+                    pen += g.advance;
+                }
+            });
+        }
+
+        assert_eq!(got.len(), want.len(), "same number of glyph quads");
+        for (a, b) in got.iter().zip(&want) {
+            assert_eq!(a.pos, b.pos, "ASCII glyph positions must not move (R0.3)");
+            assert_eq!(a.size, b.size);
+            assert_eq!((a.uv0, a.uv1), (b.uv0, b.uv1));
+            assert_eq!(a.color, b.color);
+        }
+    }
+
+    #[test]
+    fn hangul_shapes_through_the_fallback_run() {
+        // R0.2/R4.4/R4.5: the Hangul run is shaped with the fallback face's own
+        // `FontRef`, so it emits a real glyph instead of the `.notdef` the atlas
+        // now refuses — and it anchors to its own lead column, not the run's start.
+        let (Some((device, queue)), Some(fonts)) = (headless(), fonts()) else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let mut atlas = Atlas::new(&device, &fonts, 32.0).expect("atlas");
+        if atlas.is_degraded() {
+            eprintln!("skipping: no fallback face on this machine");
+            return;
+        }
+        let mut t = term_core::Terminal::new(6, 1, term_core::Color(0xFFFFFF), term_core::Color(0));
+        t.advance("A한".as_bytes()); // cols: 0 = 'A', 1 = '한', 2 = its spacer
+        let snap = t.snapshot();
+        let cw = 20.0f32;
+        let inst = build_glyph_instances(&mut atlas, &queue, &fonts, true, (cw, 40.0), 32.0, &snap);
+        assert_eq!(inst.len(), 2, "'A' from face 0 and '한' from the fallback");
+        assert!(inst[0].pos[0] < cw, "'A' stays anchored at column 0");
+        let hangul_x = inst[1].pos[0];
+        assert!(
+            (cw..3.0 * cw).contains(&hangul_x),
+            "'한' anchors to column 1 and stays inside its 2-cell span, got {hangul_x}"
+        );
+    }
+
+    #[test]
+    fn layer_eviction_forces_a_reshape() {
+        // D17/R3.4: a DrawLayer that fills the atlas evicts it, invalidating the
+        // UVs baked into the grid's resident `glyph_vbuf`. Since the snapshot is
+        // unchanged, without this the stale UVs would be re-presented forever.
+        let cfg = Config::default();
+        let Ok(mut r) = Renderer::new_headless(256, 128, 4.0, &cfg) else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        let target = r.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen"),
+            size: wgpu::Extent3d {
+                width: 256,
+                height: 128,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: r.surface_format(),
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut t = term_core::Terminal::new(8, 2, term_core::Color(0xFFFFFF), term_core::Color(0));
+        t.advance(b"hello");
+        let snap = t.snapshot();
+
+        r.draw_to(&view, &snap);
+        let settled = r.reshape_count();
+        r.draw_to(&view, &snap);
+        assert_eq!(
+            r.reshape_count(),
+            settled,
+            "baseline: unchanged → cache hit"
+        );
+
+        /// Packs distinct glyphs until the atlas evicts — the tab-bar/overlay/
+        /// preedit behavior that D17 exists for, reduced to its essential effect.
+        struct Evictor(std::rc::Rc<std::cell::Cell<bool>>);
+        impl DrawLayer for Evictor {
+            fn z_order(&self) -> i32 {
+                50
+            }
+            fn record(&mut self, ctx: &mut FrameCtx<'_>) {
+                if self.0.get() {
+                    return; // evict once; later frames must settle
+                }
+                let start = ctx.atlas.generation();
+                for gid in 1u16..900 {
+                    for (bold, italic) in
+                        [(false, false), (true, false), (false, true), (true, true)]
+                    {
+                        let _ = ctx.atlas.get_or_insert_styled(
+                            ctx.queue,
+                            GlyphKey {
+                                face: 0,
+                                id: gid,
+                                bold,
+                                italic,
+                            },
+                        );
+                    }
+                    if ctx.atlas.generation() != start {
+                        self.0.set(true);
+                        return;
+                    }
+                }
+            }
+        }
+
+        let evicted = std::rc::Rc::new(std::cell::Cell::new(false));
+        r.add_layer(Box::new(Evictor(evicted.clone())));
+        r.draw_to(&view, &snap); // the layer evicts during this frame
+        if !evicted.get() {
+            eprintln!("skipping: this font could not fill the atlas");
+            return;
+        }
+        let after = r.reshape_count();
+        r.draw_to(&view, &snap); // same snapshot — must re-shape anyway
+        assert_eq!(
+            r.reshape_count(),
+            after + 1,
+            "an eviction must force the next frame to re-shape (R3.4)"
+        );
+        r.draw_to(&view, &snap); // and then settle back to cache hits
+        assert_eq!(
+            r.reshape_count(),
+            after + 1,
+            "the forced re-shape must settle, not loop every frame"
+        );
     }
 
     #[test]
@@ -1249,11 +1821,11 @@ mod tests {
     fn registered_layer_record_is_invoked() {
         // R4.2: a registered layer's `record` fires when the frame's layer loop
         // runs — drives the real FrameCtx + loop headlessly, without a surface.
-        let (Some((device, queue)), Some(font)) = (headless(), font()) else {
+        let (Some((device, queue)), Some(fonts)) = (headless(), fonts()) else {
             eprintln!("skipping: no GPU/font");
             return;
         };
-        let mut atlas = Atlas::new(&device, font, 0, 24.0).expect("atlas");
+        let mut atlas = Atlas::new(&device, &fonts, 24.0).expect("atlas");
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen"),
             size: wgpu::Extent3d {
@@ -1306,18 +1878,99 @@ mod tests {
         assert!(fired.get(), "registered layer's record must be invoked");
     }
 
+    /// R5.1/R5.4/D10: the layer text path — the single `tab_bar::layout_line`
+    /// chokepoint that the tab bar, the ai-monitor overlay AND the preedit layer all
+    /// funnel through — resolves Hangul through the *fallback* chain and emits real
+    /// glyph quads, advancing two columns per syllable.
+    ///
+    /// The sibling tests assert this by inspecting shared code; this one observes the
+    /// emitted instances, so the "all layer paths get fallback" property is
+    /// regression-proof rather than inferred.
+    #[test]
+    fn layer_text_path_resolves_hangul_through_the_fallback() {
+        let (Some((device, queue)), Some(fonts)) = (headless(), fonts()) else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        if fonts.is_degraded() {
+            eprintln!("skipping: no Hangul fallback face on this machine");
+            return;
+        }
+        let mut atlas = Atlas::new(&device, &fonts, 24.0).expect("atlas");
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen"),
+            size: wgpu::Extent3d {
+                width: 64,
+                height: 64,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let t = term_core::Terminal::new(2, 1, term_core::Color(0xFFFFFF), term_core::Color(0));
+        let snap = t.snapshot();
+
+        // The face a Hangul syllable resolves to must not be the primary — that is
+        // the whole point of the fallback chain (a tab title like `~/문서/프로젝트`
+        // used to render as `.notdef` boxes).
+        let key = atlas.resolve('한').expect("한 resolves to some face");
+        assert_ne!(key.face, 0, "Hangul must come from a fallback face");
+        assert_ne!(key.id, 0, "and must not be .notdef");
+
+        let cw = 12.0;
+        let mut ctx = FrameCtx {
+            device: &device,
+            queue: &queue,
+            encoder: &mut encoder,
+            view: &view,
+            viewport: [64.0, 64.0],
+            cell: [cw, 24.0],
+            top_inset: 0.0,
+            left_inset: 0.0,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            snapshot: &snap,
+            atlas: &mut atlas,
+        };
+        let mut pens = Vec::new();
+        crate::tab_bar::layout_line(&mut ctx, "한a", 0.0, cw, |pen, _entry| pens.push(pen));
+
+        // Both chars emit a quad, and the Latin one starts two columns over — the
+        // width-aware advance (R5.2) observed through the real layer path.
+        assert_eq!(pens.len(), 2, "both glyphs emitted");
+        assert_eq!(pens[0], 0.0);
+        assert_eq!(pens[1], 2.0 * cw, "한 advances 2 columns, not 1");
+    }
+
     #[test]
     fn atlas_eviction_is_bounded() {
         // R1.3: overflowing the atlas evicts (clear + repack) instead of growing
         // unboundedly or panicking; the generation bumps.
-        let (Some((device, queue)), Some(font)) = (headless(), font()) else {
+        let (Some((device, queue)), Some(fonts)) = (headless(), fonts()) else {
             eprintln!("skipping: no GPU/font");
             return;
         };
-        let mut atlas = Atlas::new(&device, font, 0, 64.0).expect("atlas");
-        // Many distinct glyph ids at a large size force a shelf overflow.
+        let mut atlas = Atlas::new(&device, &fonts, 64.0).expect("atlas");
+        // Many distinct glyphs at a large size force a shelf overflow. D13 took the
+        // atlas 1024²→2048², i.e. 4× the area, so this needs 4× the glyph area the
+        // 1024² version did: the same glyph-id range, now in all four synthesized
+        // styles — each a distinct `GlyphKey`, hence its own packed bitmap.
         for gid in 1u16..900 {
-            let _ = atlas.get_or_insert(&queue, gid); // must never panic
+            for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+                let key = GlyphKey {
+                    face: 0,
+                    id: gid,
+                    bold,
+                    italic,
+                };
+                let _ = atlas.get_or_insert_styled(&queue, key); // must never panic
+            }
         }
         assert!(
             atlas.generation() >= 1,

@@ -16,13 +16,20 @@
 //! Data flows one way (D6/SD2): the app writes a [`TabBarModel`] into a shared
 //! handle each frame; this layer only *reads* it. The renderer never reaches into
 //! `crates/app`.
+//!
+//! Text layout for *every* non-grid layer lives here (D10/R5.4): [`char_cols`],
+//! [`advance_px`], [`pen_layout`], [`truncate_cols`] and [`layout_line`] are
+//! `pub(crate)` and [`crate::overlay_layer`] consumes them, so the fallback +
+//! width rules cannot drift into two copies.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use bytemuck::{Pod, Zeroable};
+use unicode_width::UnicodeWidthChar;
 use wgpu::util::DeviceExt;
 
+use crate::atlas::GlyphEntry;
 use crate::{DrawLayer, FrameCtx};
 
 /// The app-owned tab-bar state the layer renders (D6). Plain data — no GPU, no
@@ -375,9 +382,13 @@ impl TabBar {
     }
 
     /// Lay out each tab's title as textured glyph quads — stacked top→bottom, one
-    /// title per slot, drawn left-to-right (monospace advance) indented by
-    /// [`PAD_X`], vertically centered within its slot, and truncated to the
-    /// sidebar width `w`.
+    /// title per slot, drawn left-to-right indented by [`PAD_X`], vertically
+    /// centered within its slot, and truncated to the sidebar width `w`.
+    ///
+    /// Layout is **column-based**, not char-based (D10/R5.2-R5.3): a Hangul cwd
+    /// basename is 2 columns per char, so a fixed per-char advance overlapped the
+    /// glyphs and a char-counting truncate overflowed the 14-column sidebar. Both
+    /// go through the shared [`truncate_cols`]/[`layout_line`] helpers (R5.4).
     fn text(
         &self,
         ctx: &mut FrameCtx<'_>,
@@ -389,7 +400,10 @@ impl TabBar {
         if cw <= 0.0 || model.titles.is_empty() {
             return Vec::new();
         }
-        let max_chars = (((w - 2.0 * PAD_X) / cw).floor() as i32).max(0) as usize;
+        // A **column** budget (R5.3): how many cell-widths of title fit between
+        // the two PAD_X gutters. Formerly named `max_chars`, which only meant the
+        // same thing while every char was assumed 1 column wide.
+        let max_cols = (((w - 2.0 * PAD_X) / cw).floor() as i32).max(0) as usize;
         let ascent = ch * 0.8;
 
         let mut out = Vec::new();
@@ -403,19 +417,15 @@ impl TabBar {
             // Vertically center the title within its own slot (not the whole strip).
             let text_top = slot_y(i, tab_h) + ((tab_h - ch) * 0.5).max(0.0);
             let baseline = text_top + ascent;
-            let mut pen = PAD_X;
-            for c in truncate(title, max_chars).chars() {
-                let gid = ctx.atlas.glyph_id(c);
-                if let Some(e) = ctx.atlas.get_or_insert(ctx.queue, gid) {
-                    out.push(TextInstance {
-                        rect: [pen + e.left, baseline - e.top, e.px_w, e.px_h],
-                        uv0: e.uv0,
-                        uv1: e.uv1,
-                        color,
-                    });
-                }
-                pen += cw;
-            }
+            let fitted = truncate_cols(title, max_cols);
+            layout_line(ctx, &fitted, PAD_X, cw, |pen, e| {
+                out.push(TextInstance {
+                    rect: [pen + e.left, baseline - e.top, e.px_w, e.px_h],
+                    uv0: e.uv0,
+                    uv1: e.uv1,
+                    color,
+                });
+            });
         }
         out
     }
@@ -580,9 +590,86 @@ fn linear(packed: u32, a: f32) -> [f32; 4] {
     [r, g, b, a]
 }
 
-/// First `max` chars of `s` (char-aware, never splits a codepoint).
-fn truncate(s: &str, max: usize) -> String {
-    s.chars().take(max).collect()
+// ---------------------------------------------------------------------------
+// Shared layer-text layout (D10/R5) — used by this layer AND `overlay_layer`.
+//
+// Every non-grid text path routes through these four functions so the fallback
+// rule and the width rule exist exactly once (R5.4). Duplicating them per layer
+// is what let "Hangul tab title draws `.notdef`" survive as its own bug.
+// ---------------------------------------------------------------------------
+
+/// Display width of `c` in terminal **columns** (R5.2).
+///
+/// `unicode-width` (same crate + version `term-core` uses, so the engine and the
+/// renderer can never disagree) reports 2 for Hangul/CJK. `None` means a control
+/// char, which we lay out as one column rather than collapsing it.
+pub(crate) fn char_cols(c: char) -> usize {
+    c.width().unwrap_or(1)
+}
+
+/// Pen advance in px for `c` at cell width `cell_w` (R5.2) — the replacement for
+/// the old fixed `pen += cell_w`, which overlapped every wide glyph.
+pub(crate) fn advance_px(c: char, cell_w: f32) -> f32 {
+    char_cols(c) as f32 * cell_w
+}
+
+/// `(char, pen_x)` for each char of `s`, starting at `start_x` and advancing by
+/// [`advance_px`] (R5.2). Pure and allocation-free so the advance rule is unit
+/// testable without a GPU.
+pub(crate) fn pen_layout(
+    s: &str,
+    start_x: f32,
+    cell_w: f32,
+) -> impl Iterator<Item = (char, f32)> + '_ {
+    let mut pen = start_x;
+    s.chars().map(move |c| {
+        let at = pen;
+        pen += advance_px(c, cell_w);
+        (c, at)
+    })
+}
+
+/// The prefix of `s` that fits in a **column** budget of `max_cols` (R5.3).
+///
+/// Counts display width, not chars: `truncate_cols("한글abc", 5) == "한글a"`
+/// (2+2+1). A char is taken only when it fits whole, so a wide char is never
+/// half-drawn past the budget and a codepoint is never split.
+pub(crate) fn truncate_cols(s: &str, max_cols: usize) -> String {
+    let mut used = 0usize;
+    let mut out = String::new();
+    for c in s.chars() {
+        let w = char_cols(c);
+        if used + w > max_cols {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out
+}
+
+/// Lay `s` out left-to-right from `start_x`, calling `emit(pen_x, entry)` once
+/// per drawable char (R5.1/R5.4).
+///
+/// Glyph lookup goes through [`Atlas::resolve`](crate::atlas::Atlas::resolve) +
+/// `get_or_insert_styled`, so layers pick up the font-fallback chain (Hangul
+/// resolves to the fallback face instead of the primary's `.notdef`). A char no
+/// face covers emits nothing **but still advances the pen**, keeping the rest of
+/// the line in its columns.
+pub(crate) fn layout_line(
+    ctx: &mut FrameCtx<'_>,
+    s: &str,
+    start_x: f32,
+    cell_w: f32,
+    mut emit: impl FnMut(f32, GlyphEntry),
+) {
+    for (c, pen) in pen_layout(s, start_x, cell_w) {
+        if let Some(key) = ctx.atlas.resolve(c) {
+            if let Some(e) = ctx.atlas.get_or_insert_styled(ctx.queue, key) {
+                emit(pen, e);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -639,12 +726,13 @@ mod tests {
         assert!(tab_height_px(20.0) >= 1.0);
         // height_px is retained and equals tab_height_px (legacy delegate).
         assert_eq!(height_px(20.0), tab_height_px(20.0));
-        // The sidebar leaves room for >= 8 chars after PAD_X for a typical cell (R3.1).
+        // The sidebar leaves room for >= 8 columns after PAD_X for a typical cell
+        // (R3.1). Columns, not chars — a Hangul title spends 2 per char (R5.2).
         let cw = 8.0;
-        let max_chars = ((width_px(cw) - 2.0 * PAD_X) / cw).floor() as i32;
+        let max_cols = ((width_px(cw) - 2.0 * PAD_X) / cw).floor() as i32;
         assert!(
-            max_chars >= 8,
-            "sidebar must fit >= 8 chars, got {max_chars}"
+            max_cols >= 8,
+            "sidebar must fit >= 8 columns, got {max_cols}"
         );
     }
 
@@ -675,9 +763,45 @@ mod tests {
     }
 
     #[test]
-    fn truncate_is_char_safe() {
-        assert_eq!(truncate("hello", 3), "hel");
-        assert_eq!(truncate("hi", 9), "hi");
-        assert_eq!(truncate("café", 4), "café");
+    fn truncate_cols_spends_a_column_budget_not_a_char_count() {
+        // R5.3: the spec's exact case — 2 + 2 + 1 = 5 columns.
+        assert_eq!(truncate_cols("한글abc", 5), "한글a");
+        // ASCII: one column each, so it still behaves like the old char count.
+        assert_eq!(truncate_cols("hello", 3), "hel");
+        assert_eq!(truncate_cols("hi", 9), "hi");
+        // Never splits a codepoint (multi-byte but 1 column).
+        assert_eq!(truncate_cols("café", 4), "café");
+        // A budget that would split a wide char drops it whole rather than
+        // letting it bleed one column past the sidebar.
+        assert_eq!(truncate_cols("한글", 3), "한");
+        assert_eq!(truncate_cols("한", 1), "");
+        // Edges: empty input, zero budget.
+        assert_eq!(truncate_cols("", 5), "");
+        assert_eq!(truncate_cols("한글abc", 0), "");
+    }
+
+    #[test]
+    fn pen_advances_by_display_width() {
+        // R5.2: `프` is 2 columns, `a` is 1 — the pen positions are 0 then 2*cw,
+        // not the old fixed 1*cw stride that overlapped the two glyphs.
+        let cw = 8.0;
+        let xs: Vec<f32> = pen_layout("프a", 0.0, cw).map(|(_, x)| x).collect();
+        assert_eq!(xs, vec![0.0, 2.0 * cw]);
+        // The advance past the whole string is 3 columns.
+        let end = pen_layout("프a", 0.0, cw)
+            .map(|(c, _)| advance_px(c, cw))
+            .sum::<f32>();
+        assert_eq!(end, 3.0 * cw);
+        // A start offset (PAD_X in the draw path) shifts every pen.
+        let xs: Vec<f32> = pen_layout("프a", PAD_X, cw).map(|(_, x)| x).collect();
+        assert_eq!(xs, vec![PAD_X, PAD_X + 2.0 * cw]);
+    }
+
+    #[test]
+    fn char_cols_matches_the_grid_width_rule() {
+        assert_eq!(char_cols('a'), 1);
+        assert_eq!(char_cols('프'), 2);
+        // Control chars have no width; lay them out as one column, not zero.
+        assert_eq!(char_cols('\u{7}'), 1);
     }
 }

@@ -2146,12 +2146,14 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "common",
+ "memmap2",
  "pollster",
  "raw-window-handle",
  "swash",
  "term-core",
  "thiserror 2.0.18",
  "tracing",
+ "unicode-width",
  "wgpu",
 ]
 
