@@ -538,8 +538,11 @@ impl Running {
         if let Some(action) = tab_action(&input.key, &input.mods) {
             return self.do_tab_action(action);
         }
-        // 4) Default: encode to the active shell only (R3.1).
-        if let Some(bytes) = encode_key(&input.key, input.text.as_deref()) {
+        // 4) Default: encode to the active shell only (R3.1). DECCKM is
+        // per-session (D7), so read the active tab's mode *before* taking the
+        // mutable borrow for the write.
+        let app_cursor = self.tabs.active().terminal.app_cursor_keys();
+        if let Some(bytes) = encode_key(&input.key, input.text.as_deref(), input.mods, app_cursor) {
             if let Err(e) = self.tabs.active_mut().write(&bytes) {
                 tracing::warn!("pty write failed: {e}");
             }
