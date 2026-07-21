@@ -88,12 +88,15 @@ pub trait InputHandler {
     fn on_key(&mut self, input: &KeyInput, ctx: &mut AppCtx) -> Handled;
 }
 
-/// A visible overlay that both consumes input (when visible) and contributes a
-/// renderer [`DrawLayer`] (SD3). Used by ai-monitor/settings later.
+/// An overlay that both consumes input and contributes a renderer [`DrawLayer`]
+/// (SD3). Used by ai-monitor/settings later.
 pub trait Overlay {
     /// Higher priority sees keys first.
     fn priority(&self) -> i32;
-    /// Only visible overlays receive keys.
+    /// Whether the overlay is currently showing. Reported state — NOT an input
+    /// gate: dispatch offers keys to hidden overlays too, so an overlay can
+    /// consume the chord that opens it (a hidden overlay consumes only its own
+    /// hotkey; everything else it passes through).
     fn visible(&self) -> bool;
     fn on_key(&mut self, input: &KeyInput, ctx: &mut AppCtx) -> Handled;
     /// The overlay's draw layer, registered with the renderer.
@@ -135,7 +138,9 @@ impl InputRouter {
 }
 
 /// Registry of overlays (highest priority first), consulted before the router and
-/// default input (R4). Overlays that are not visible are skipped.
+/// default input (R4). Every overlay receives keys (priority order) whether shown
+/// or hidden; a hidden overlay consumes only its own hotkey (e.g. the chord that
+/// opens it) and passes everything else through.
 #[derive(Default)]
 pub struct OverlayHost {
     overlays: Vec<Box<dyn Overlay>>,
@@ -149,11 +154,14 @@ impl OverlayHost {
             .sort_by_key(|o| std::cmp::Reverse(o.priority()));
     }
 
-    /// Offer the key to each visible overlay (priority order); first `Consumed`
-    /// wins (R4.1). All-passthrough → default input proceeds (R4.2).
+    /// Offer the key to every overlay (priority order), visible or not; first
+    /// `Consumed` wins (R4.1). All-passthrough → default input proceeds (R4.2).
+    /// A hidden overlay is no longer skipped, so it can consume the chord that
+    /// opens it (e.g. ai-monitor's Cmd+Shift+M); it passes non-hotkey keys
+    /// through, so hidden overlays don't swallow shell input.
     pub fn dispatch(&mut self, input: &KeyInput, ctx: &mut AppCtx) -> Handled {
         for o in &mut self.overlays {
-            if o.visible() && o.on_key(input, ctx) == Handled::Consumed {
+            if o.on_key(input, ctx) == Handled::Consumed {
                 return Handled::Consumed;
             }
         }
@@ -272,13 +280,18 @@ mod tests {
     }
 
     #[test]
-    fn hidden_or_passthrough_overlay_falls_through() {
+    fn all_overlays_passthrough_falls_through() {
+        // R4.2: when no overlay claims the key — a hidden overlay passes through
+        // its non-hotkey keys, a visible one declines — default input runs. Under
+        // the new contract a hidden overlay IS dispatched to, so "falls through"
+        // now rests on the overlays declining, not on the host skipping a hidden
+        // one.
         let mut buf: Vec<u8> = Vec::new();
         let mut host = OverlayHost::default();
         host.register(Box::new(Ov {
             prio: 10,
-            vis: false, // hidden → skipped
-            verdict: Handled::Consumed,
+            vis: false, // hidden — receives the key but passes it through
+            verdict: Handled::Passthrough,
         }));
         host.register(Box::new(Ov {
             prio: 5,
@@ -289,7 +302,29 @@ mod tests {
         assert_eq!(
             host.dispatch(&key("j"), &mut ctx),
             Handled::Passthrough,
-            "R4.2: passthrough overlay lets default input run"
+            "R4.2: all overlays passthrough → default input runs"
+        );
+    }
+
+    #[test]
+    fn hidden_overlay_receives_its_own_toggle() {
+        // Regression for the ai-monitor toggle bug: the overlay opens on its own
+        // hotkey (Cmd+Shift+M) but starts hidden. Under the old `o.visible() &&`
+        // guard a hidden overlay was skipped, so its opening chord never reached
+        // `on_key` — it could never open (chicken-and-egg). Now a hidden overlay's
+        // `on_key` runs and its `Consumed` verdict is honored.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut host = OverlayHost::default();
+        host.register(Box::new(Ov {
+            prio: 10,
+            vis: false,                 // hidden, like a fresh ai-monitor overlay
+            verdict: Handled::Consumed, // consumes its opening chord
+        }));
+        let mut ctx = AppCtx::new(&mut buf, 1, 0, None);
+        assert_eq!(
+            host.dispatch(&key("m"), &mut ctx),
+            Handled::Consumed,
+            "a hidden overlay now receives (and can consume) the chord that opens it"
         );
     }
 
