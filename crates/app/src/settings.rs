@@ -1,42 +1,50 @@
-//! Live settings application (settings feature, D3/R3).
+//! Live settings application (settings feature, D3/R3) + the shared grid-refit helper.
 //!
-//! The [`common::watch::ConfigWatcher`] (spawned by the app loop) delivers a
-//! fresh [`Config`] on change; this module applies it to the running renderer and
-//! tabs without a restart:
-//! - `renderer.apply_config` re-derives cell metrics, theme clear color, ligature
-//!   state, and rebuilds the glyph atlas (R0.1/R3.2),
-//! - the grid re-fits to the new [`Renderer::grid_size`] and every tab's PTY is
-//!   resized (R3.1),
-//! - each tab's default cell colors are re-themed (R3.3),
-//! - the inline IME preedit layer is re-themed (hangul-ime R7.5): its colors ride
-//!   on the shared handle rather than `FrameCtx`, so nothing else would update them.
+//! The [`common::watch::ConfigWatcher`] (spawned by the app loop) delivers a fresh
+//! [`Config`] on change; [`apply`] applies it to the running renderer, tabs and preedit
+//! layer without a restart:
+//! - `renderer.apply_config` re-derives cell metrics, theme clear color, ligature state,
+//!   rebuilds the glyph atlas, and re-fits the sidebar inset via `sync_left_inset`
+//!   (sidebar-row-redesign D4 — so this module no longer touches `set_left_inset`),
+//! - [`refit`] re-fits the grid to the new [`Renderer::grid_size`] and resizes every tab,
+//! - each tab's default cell colors are re-themed,
+//! - the inline IME preedit layer is re-themed (hangul-ime R7.5): its colors ride on the
+//!   shared handle rather than `FrameCtx`, so nothing else would update them.
 //!
-//! Registered through the app owner's config-reload wake (the SD4 seam covers key
-//! events; a background file-change is delivered as `UserEvent::ConfigReloaded`).
+//! [`refit`] is the ONE place the grid is re-fitted (D6): every path that can change the
+//! reserved inset or the window size — startup, config reload, sidebar collapse/expand,
+//! and `Resized` — calls it, so the "change the inset first, then read `grid_size`"
+//! ordering has a single enforcement point instead of five conventions.
 
 use common::config::Config;
 use renderer::preedit_layer::PreeditHandle;
-use renderer::tab_bar;
 use renderer::Renderer;
 use term_core::Color;
 
 use crate::tabs::Tabs;
 
-/// Apply a reloaded config to the live renderer + tabs + preedit layer.
-pub fn apply(cfg: &Config, renderer: &mut Renderer, tabs: &mut Tabs, preedit: &PreeditHandle) {
-    renderer.apply_config(cfg);
-    // Font size may have changed the cell width → keep the left tab sidebar in
-    // step before reading grid_size (so the reserved band matches the new metrics
-    // and the drawn sidebar width). Reserves the LEFT inset, never a top band.
-    renderer.set_left_inset(tab_bar::width_px(renderer.cell_size().0));
-    // Cell metrics may have changed (font size) → re-fit every tab (R3.1).
+/// Re-fit the grid to the renderer's current geometry and resize **every** tab (D6).
+/// Reads [`Renderer::grid_size`] itself — after any inset change is already applied — so
+/// it can never be handed a stale column count; resizes background tabs too, since a tab
+/// left at the old width renders wrapped garbage the moment it is switched to. Returns the
+/// new `(cols, rows)`.
+pub fn refit(renderer: &Renderer, tabs: &mut Tabs) -> (u16, u16) {
     let (cols, rows) = renderer.grid_size();
     tabs.resize_all(cols, rows);
-    // Re-theme default cell colors so new output uses the new theme (R3.3).
+    (cols, rows)
+}
+
+/// Apply a reloaded config to the live renderer + tabs + preedit layer.
+pub fn apply(cfg: &Config, renderer: &mut Renderer, tabs: &mut Tabs, preedit: &PreeditHandle) {
+    // `apply_config` re-derives cell metrics + atlas AND re-fits the sidebar inset
+    // (`sync_left_inset`, D4), so the old `set_left_inset(width_px(..))` call — a no-op
+    // computing a stale `cell_w × 14` under D4 — is deleted (R7.1).
+    renderer.apply_config(cfg);
+    refit(renderer, tabs);
     tabs.set_default_colors_all(Color(cfg.theme.foreground), Color(cfg.theme.background));
-    // Re-theme the inline IME composition (hangul-ime R7.5/D14). The preedit paints
-    // an opaque theme-background fill under its glyphs; leaving it on the old theme
-    // would stamp a stale-colored block over the newly themed grid.
+    // Re-theme the inline IME composition (hangul-ime R7.5/D14). The preedit paints an
+    // opaque theme-background fill under its glyphs; leaving it on the old theme would
+    // stamp a stale-colored block over the newly themed grid.
     let (bg, fg) = preedit_theme(cfg);
     preedit.set_theme(bg, fg);
 }

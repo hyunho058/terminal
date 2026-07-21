@@ -23,18 +23,22 @@
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
-use common::config::Config;
+use common::config::{Config, SidebarConfig};
 use common::watch::ConfigWatcher;
 use objc2_app_kit::NSView;
 use renderer::cursor_layer::CursorLayer;
 use renderer::preedit_layer::{PreeditHandle, PreeditLayer};
-use renderer::tab_bar::{self, TabBar, TabBarModel, TabModelHandle};
+use renderer::sidebar_header::{SidebarChromeHandle, SidebarChromeLayer};
+use renderer::sidebar_layout::{self, SidebarLayoutInput};
+use renderer::sidebar_row::{self, SidebarGeom};
+use renderer::sidebar_theme::SidebarMetrics;
+use renderer::tab_bar::{TabBar, TabBarModel, TabModelHandle};
 use renderer::Renderer;
 use term_core::Color;
 use term_core::GridSnapshot;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, Ime, MouseButton, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 // winit 0.30 re-exports raw-window-handle 0.6 (`rwh_06`, a default feature), so
@@ -42,7 +46,10 @@ use winit::keyboard::ModifiersState;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
-use crate::input::{encode_key, suppress_key, tab_action, tab_target, TabAction};
+use crate::input::{
+    encode_key, sidebar_hover, sidebar_press, suppress_key, tab_action, wheel_scroll,
+    SidebarAction, TabAction, WheelDelta,
+};
 use crate::seam::{AppCtx, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayHost};
 use crate::session::{Session, TabId};
 use crate::tabs::Tabs;
@@ -106,11 +113,23 @@ struct Running {
     renderer: Renderer,
     tabs: Tabs,
     tab_model: TabModelHandle,
+    /// The chrome layer's handle (D10/D11): the raw cursor is pushed here each move; the
+    /// header/restore layer resolves its own hover from it.
+    chrome_handle: SidebarChromeHandle,
+    /// Sidebar config mirror, refreshed by `settings::apply` — read for one field,
+    /// `show_git_branch`, when building the layout (D5). `collapsed` is NOT read from here
+    /// (the renderer's override is the single source of truth).
+    sidebar_cfg: SidebarConfig,
+    /// The sidebar list scroll offset in physical px, app-owned (D10). Published to the
+    /// row layer via `set_list_scroll`, clamped whenever `max_scroll` shrinks.
+    scroll: f32,
+    /// Last resolved card-hover index — the region debounce for `set_hovered` (D8).
+    last_hit: Option<usize>,
     router: InputRouter,
     overlays: OverlayHost,
     mods: ModifiersState,
     /// Latest cursor position in physical px (raw winit `f64`), updated on
-    /// `CursorMoved` and read on a left-button press to hit-test the tab sidebar.
+    /// `CursorMoved` and read on a press to hit-test the sidebar and re-resolve hover.
     last_cursor: (f64, f64),
     /// Fresh configs delivered by the background watcher (settings feature).
     config_rx: Receiver<Config>,
@@ -175,12 +194,14 @@ impl App {
         let mut renderer = Renderer::new(window.clone(), size.width, size.height, scale, &self.cfg)
             .map_err(err)?;
 
-        // Reserve the vertical tab-sidebar band on the left, then register the
-        // layer (SD3/R2). The grid narrows by this width (top inset stays 0).
-        let bar_w = tab_bar::width_px(renderer.cell_size().0);
-        renderer.set_left_inset(bar_w);
+        // The renderer already reserved the sidebar band in `assemble` from the config
+        // width (row-redesign D4) — no `set_left_inset` here (it is now a no-op). Register
+        // the card layer, then the chrome layer (header + collapsed restore button) whose
+        // first drawn frame is this one (chrome-collapse D14).
         let (bar, tab_model) = TabBar::new();
         renderer.add_layer(Box::new(bar));
+        let (chrome, chrome_handle) = SidebarChromeLayer::new();
+        renderer.add_layer(Box::new(chrome));
         // Blinking block cursor, above the glyphs (a DrawLayer so it blinks off the
         // continuous-redraw loop, unaffected by the idle-CPU snapshot cache).
         renderer.add_layer(Box::new(CursorLayer::new()));
@@ -238,6 +259,10 @@ impl App {
             renderer,
             tabs,
             tab_model,
+            chrome_handle,
+            sidebar_cfg: self.cfg.sidebar.clone(),
+            scroll: 0.0,
+            last_hit: None,
             router,
             overlays,
             mods: ModifiersState::empty(),
@@ -466,12 +491,99 @@ impl Running {
         }
     }
 
-    /// Push the current tab titles + active index into the tab-bar layer (D6).
+    /// Push the current tab rows + active index into the sidebar layer. `Tabs::titles()`
+    /// also pushes the metadata roster to the worker (tab-metadata seam).
     fn sync_tab_model(&mut self) {
         self.tab_model.set(TabBarModel {
             titles: self.tabs.titles(),
             active: self.tabs.active_index(),
         });
+    }
+
+    /// Build the sidebar layout input from live accessors + the siblings' own functions —
+    /// no app-side geometry (SD2/D3). `sidebar_w` is read **live** so a post-toggle build
+    /// sees the new width; `row_h` comes from `sidebar_row::layout`, never a local formula.
+    fn sidebar_input(&self) -> SidebarLayoutInput {
+        let sidebar_w = self.renderer.left_inset();
+        let size = self.window.inner_size();
+        let viewport = [size.width as f32, size.height as f32];
+        let scale = self.renderer.scale_factor();
+        let cell = self.renderer.cell_size();
+        let count = self.tab_model.with(|m| m.rows.len());
+        let geom = SidebarGeom {
+            sidebar_w,
+            viewport_h: viewport[1],
+            cell: [cell.0, cell.1],
+            scale,
+            show_branch: self.sidebar_cfg.show_git_branch,
+            list_top: sidebar_layout::header_h(scale),
+            scroll_px: self.scroll,
+        };
+        let row_h = sidebar_row::layout(&geom, count).card_h;
+        SidebarLayoutInput {
+            sidebar_w,
+            viewport,
+            scale,
+            row_h,
+            row_count: count,
+            metrics: SidebarMetrics::DEFAULT.scaled(scale),
+        }
+    }
+
+    /// Whether the sidebar is collapsed — the renderer's inset is the single source of
+    /// truth (D5), so the app stores no boolean.
+    fn collapsed(&self) -> bool {
+        self.renderer.left_inset() <= 0.0
+    }
+
+    /// Publish the scroll offset (and the header height) to the row layer so the drawn
+    /// cards and the hit-test move together (D10). `list_top` is byte-identical to what
+    /// the chrome layer writes, so the two writers cannot clobber each other.
+    fn publish_scroll(&self) {
+        let scale = self.renderer.scale_factor();
+        self.tab_model
+            .set_list_scroll(sidebar_layout::header_h(scale), self.scroll);
+    }
+
+    /// Collapse or restore the sidebar (D6). The order is load-bearing: set the override
+    /// (which re-fits the inset) FIRST, then read `grid_size` inside `refit`, then rebuild
+    /// the layout from the now-live width, re-clamp the scroll, re-resolve hover under the
+    /// stationary pointer, and redraw (the grid geometry changed).
+    fn toggle_sidebar(&mut self, collapsed: bool) {
+        self.renderer.set_sidebar_collapsed(collapsed);
+        crate::settings::refit(&self.renderer, &mut self.tabs);
+        let inp = self.sidebar_input();
+        self.scroll = sidebar_layout::clamp_scroll(self.scroll, &inp);
+        self.publish_scroll();
+        self.refresh_hover();
+        self.redraw();
+    }
+
+    /// Re-resolve hover at `last_cursor` after the layout moved under a stationary pointer
+    /// (D8): push the raw cursor to the chrome layer (undebounced — it must be exact for a
+    /// button edge) and the resolved card index to the row layer (region-debounced).
+    fn refresh_hover(&mut self) {
+        let inp = self.sidebar_input();
+        let collapsed = self.collapsed();
+        self.chrome_handle
+            .set_cursor(Some([self.last_cursor.0 as f32, self.last_cursor.1 as f32]));
+        let hit = sidebar_hover(self.last_cursor, &inp, self.scroll, collapsed);
+        if hit != self.last_hit {
+            self.last_hit = hit;
+            self.tab_model.set_hovered(hit);
+        }
+        self.window.request_redraw();
+    }
+
+    /// Clear all hover state — the pointer left the window or focus was lost with it still
+    /// inside (Cmd-Tab fires no `CursorLeft`), else the highlight stays lit (D8).
+    fn clear_hover(&mut self) {
+        self.chrome_handle.set_cursor(None);
+        if self.last_hit.is_some() {
+            self.last_hit = None;
+            self.tab_model.set_hovered(None);
+        }
+        self.window.request_redraw();
     }
 
     /// Handle a tab chord (R3.2). Returns false if the app should exit (last tab
@@ -498,6 +610,12 @@ impl Running {
             TabAction::Jump(i) => self.tabs.jump(i),
         }
         self.sync_tab_model();
+        // Reveal the (possibly newly-appended or below-the-fold) active tab and re-clamp
+        // the offset — a tab close shrinks the content (D6/D10). Then re-resolve hover.
+        let inp = self.sidebar_input();
+        self.scroll = sidebar_layout::scroll_to_reveal(self.tabs.active_index(), self.scroll, &inp);
+        self.publish_scroll();
+        self.refresh_hover();
         // Re-point cwd-derived overlays (ai-monitor) at the new active tab (R3.1).
         let cwd = self.tabs.active_cwd();
         self.overlays.notify_active_changed(cwd);
@@ -591,6 +709,14 @@ impl ApplicationHandler<UserEvent> for App {
                         &mut inner.tabs,
                         &inner.preedit_handle,
                     );
+                    // A reload can change show_git_branch (card height) or width_px (inset),
+                    // both of which move max_scroll; refresh the cached section, re-clamp,
+                    // and re-resolve hover under the stationary pointer (D10/D8).
+                    inner.sidebar_cfg = cfg.sidebar.clone();
+                    let inp = inner.sidebar_input();
+                    inner.scroll = sidebar_layout::clamp_scroll(inner.scroll, &inp);
+                    inner.publish_scroll();
+                    inner.refresh_hover();
                     inner.redraw();
                 }
             }
@@ -615,34 +741,67 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                // Track the raw physical cursor; the f64→f32 cast happens in
-                // `tab_target` at press time (R2.1).
                 inner.last_cursor = (position.x, position.y);
+                inner.refresh_hover(); // one hit_test feeds both hover fields (D8)
             }
+
+            WindowEvent::CursorLeft { .. } => inner.clear_hover(),
 
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
             } => {
-                // A left-click inside the left sidebar switches to that tab (R2).
-                // The hit-test geometry lives in tab_bar (SD2); a press outside the
-                // sidebar (or below the last tab) returns None → no-op. On a hit,
-                // reuse the exact chord-switch path via `do_tab_action(Jump)`.
-                if let Some(i) = tab_target(
-                    inner.last_cursor,
-                    inner.renderer.cell_size(),
-                    inner.renderer.left_inset(),
-                    inner.tabs.len(),
-                ) {
-                    inner.do_tab_action(TabAction::Jump(i));
+                // Resolve the press through the sibling's ONE ordered hit_test (D1) — the
+                // app performs no geometry (SD2). Cards + new-tab route through the same
+                // path as chords (D2); hide/restore toggle; inert regions are swallowed.
+                let inp = inner.sidebar_input();
+                let collapsed = inner.collapsed();
+                if let Some(action) =
+                    sidebar_press(inner.last_cursor, &inp, inner.scroll, collapsed)
+                {
+                    match action {
+                        SidebarAction::Switch(i) => {
+                            if !inner.do_tab_action(TabAction::Jump(i)) {
+                                event_loop.exit();
+                            }
+                        }
+                        SidebarAction::NewTab => {
+                            if !inner.do_tab_action(TabAction::New) {
+                                event_loop.exit();
+                            }
+                        }
+                        SidebarAction::Collapse => inner.toggle_sidebar(true),
+                        SidebarAction::Expand => inner.toggle_sidebar(false),
+                        SidebarAction::Inert => {}
+                    }
+                }
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                let wd = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => WheelDelta::Lines(y),
+                    MouseScrollDelta::PixelDelta(p) => WheelDelta::Pixels(p.y as f32),
+                };
+                let inp = inner.sidebar_input();
+                let collapsed = inner.collapsed();
+                let new_scroll = wheel_scroll(wd, inner.last_cursor, inner.scroll, &inp, collapsed);
+                if new_scroll != inner.scroll {
+                    inner.scroll = new_scroll;
+                    inner.publish_scroll();
+                    inner.refresh_hover(); // the list moved under the pointer (D8)
+                    inner.window.request_redraw(); // sidebar-only change (D7)
                 }
             }
 
             WindowEvent::Resized(size) => {
                 inner.renderer.resize(size.width, size.height);
-                let (cols, rows) = inner.renderer.grid_size();
-                inner.tabs.resize_all(cols, rows); // background tabs too (R5.1)
+                crate::settings::refit(&inner.renderer, &mut inner.tabs); // shared refit (D6)
+                                                                          // A smaller window shrinks list_viewport.h → max_scroll; re-clamp (D10).
+                let inp = inner.sidebar_input();
+                inner.scroll = sidebar_layout::clamp_scroll(inner.scroll, &inp);
+                inner.publish_scroll();
+                inner.refresh_hover();
                 inner.redraw();
             }
 
@@ -661,6 +820,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // preedit is drawn by *our* layer, so leaving it on screen would
                 // show text the shell never received.
                 inner.cancel_composition();
+                // …and clears the sidebar hover, since a Cmd-Tab away fires no
+                // `CursorLeft` while the pointer is still inside (D8).
+                inner.clear_hover();
             }
 
             WindowEvent::KeyboardInput {

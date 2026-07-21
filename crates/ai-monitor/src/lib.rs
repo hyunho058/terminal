@@ -12,6 +12,10 @@ use std::sync::mpsc::{self, Receiver};
 use notify::{RecursiveMode, Watcher};
 use serde_json::Value;
 
+/// Bounded tail read of a session log — the activity signal consumed by the sidebar's
+/// `tab-metadata` worker (D7). Purely additive; uses only `std` + `serde_json`.
+pub mod activity;
+
 /// One parsed log event: who spoke and a one-line summary (D1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AiEvent {

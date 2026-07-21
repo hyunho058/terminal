@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use renderer::sidebar_row::SidebarRow;
 use term_core::Color;
 use winit::event_loop::EventLoopProxy;
 
@@ -130,22 +131,44 @@ impl Tabs {
         }
     }
 
-    /// Titles for the tab bar model (D6/D7) — the session title, or `Tab N`
-    /// fallback. (cwd-basename titles need a `term_core::Pty::child_pid()`
-    /// accessor, which is outside `tabs`' declared surface — a documented
-    /// follow-up; the model already carries owned strings so the source swaps in
-    /// without touching the renderer.)
-    pub fn titles(&self) -> Vec<String> {
+    /// Rows for the sidebar model (D2) — each carries the tab's stable `TabId` (as a
+    /// plain `u64`, so async metadata joins by id, D10) plus its title: the live cwd
+    /// basename, or a `Tab N` fallback. Called on tab actions, not per frame, so its
+    /// per-tab `proc_pidinfo` is not on the render path (SD4). The field/method keep the
+    /// name `titles` although they now carry rows — a documented cost of the frozen
+    /// `terminal_app` struct literal (D2).
+    pub fn titles(&self) -> Vec<SidebarRow> {
+        // Push the live roster + active tab to the metadata worker (the tab-metadata
+        // seam's natural site — called on tab actions, not per frame), so it derives each
+        // tab's git branch + agent state off the UI thread. Idempotent; a no-op when the
+        // worker failed to spawn.
+        if let Some(handle) = crate::tabmeta::global() {
+            let roster: Vec<crate::tabmeta::TabPid> = self
+                .sessions
+                .iter()
+                .filter_map(|s| {
+                    s.pty
+                        .child_pid()
+                        .map(|pid| crate::tabmeta::TabPid { id: s.id, pid })
+                })
+                .collect();
+            handle.set_roster(&roster);
+            handle.set_active(self.sessions.get(self.active).map(|s| s.id));
+        }
         self.sessions
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                // Prefer the live cwd basename (R6.1); fall back to `Tab N`.
-                s.cwd()
+                let title = s
+                    .cwd()
                     .as_deref()
                     .and_then(|p| p.file_name())
                     .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| format!("Tab {}", i + 1))
+                    .unwrap_or_else(|| format!("Tab {}", i + 1));
+                SidebarRow {
+                    tab_id: s.id.0,
+                    title,
+                }
             })
             .collect()
     }

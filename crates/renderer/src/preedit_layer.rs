@@ -795,6 +795,7 @@ mod tests {
         let (mut layer, handle) = PreeditLayer::new();
         handle.set_theme(0x101010, 0xE6E1CF);
         handle.set_text("한글".into());
+        let sidebar_cfg = common::config::SidebarConfig::default();
         let mut ctx = FrameCtx {
             device: &device,
             queue: &queue,
@@ -805,6 +806,8 @@ mod tests {
             top_inset: 0.0,
             left_inset: 0.0,
             format: wgpu::TextureFormat::Rgba8Unorm,
+            sidebar: &sidebar_cfg,
+            scale_factor: 1.0,
             snapshot: &snap,
             atlas: &mut atlas,
         };

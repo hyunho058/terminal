@@ -21,3 +21,19 @@ foreground = 0xE6E1CF
 # Initial grid hint. The actual grid is fit to the window on launch/resize.
 columns = 100
 rows = 30
+
+[sidebar]
+# Left tab-sidebar appearance. Defaults below are the design mock's values.
+# Width in logical px (scaled by the display's backing factor at render time, like
+# font.size_pt). Out-of-range values are clamped to [260, 440] and warned — never
+# rejected — so a typo can't stop the terminal starting.
+width_px = 340.0
+# Show each tab's git branch on the card's second line.
+show_git_branch = true
+# Show each tab's AI-agent status marker.
+show_agent_status = true
+# Start with the sidebar hidden. Persists the collapsed state across restarts.
+collapsed = false
+# Accent colour, packed 0xRRGGBB. RESERVED: no sidebar element reads it yet, so
+# setting it currently changes nothing on screen.
+accent = 0x86B0A1

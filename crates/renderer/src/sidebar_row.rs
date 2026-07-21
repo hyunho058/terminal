@@ -1,0 +1,1237 @@
+//! The redesigned left sidebar: rounded two-line cards (line 1 mark + title, line 2
+//! branch icon + branch), an active highlight, per-agent skins — drawn on the
+//! hand-rolled wgpu renderer (SD1). This module holds the real implementation;
+//! [`crate::tab_bar`] is a thin source-compatibility façade over it (D1).
+//!
+//! **The model bus (D3).** Four parties must see one model but only one is handed a
+//! handle, so the model is a per-UI-thread `thread_local!` singleton reached by
+//! [`TabModelHandle::shared`]. The app single-window/single-UI-thread invariant makes
+//! this sound (the layer is `!Send`, exactly like the old `Rc<RefCell<_>>`). Borrow
+//! discipline is structural: [`TabModelHandle::with`] / [`TabModelHandle::with_mut`]
+//! are the only borrow entry points and each releases its borrow inside the call, so
+//! no caller can hold one across another — the `RefCell` double-borrow that would
+//! panic at ~60 fps is unrepresentable.
+//!
+//! **T1 scope.** This lands the model, the plain-data row/meta types, the singleton,
+//! the [`MetaSource`] pull trait (D10), and the `TabBar` layer as a **stub** whose
+//! `record` returns immediately — the drawing (pure layout T2, text T3, chrome T4)
+//! lands next. The façade's legacy hit-test formulas ship here now (D7) so
+//! `input.rs`'s out-of-surface test stays green before any layout is published.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use bytemuck::{Pod, Zeroable};
+use common::config::SidebarConfig;
+use wgpu::util::DeviceExt;
+
+use crate::sidebar_icons::{push_icon, Icon};
+use crate::sidebar_shapes::{Fill, SidebarShape, SidebarShapePipeline};
+use crate::sidebar_theme::{linear, AgentSkin, SidebarMetrics, SidebarTheme};
+use crate::{DrawLayer, FrameCtx};
+
+/// The z-order of the sidebar layer (above the terminal glyph pass = 0, below overlays).
+pub const TAB_BAR_Z: i32 = 10;
+
+// ---------------------------------------------------------------------------
+// Plain-data row + metadata types (SD3 — the renderer never names app types)
+// ---------------------------------------------------------------------------
+
+/// One tab as the app hands it over (D2): a stable id so asynchronous metadata can be
+/// joined to it by id (never by index, D10), plus its title. Deliberately carries only
+/// what `Tabs` owns; branch / mark / skin live in [`RowMeta`], pulled separately.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidebarRow {
+    /// The app's `session::TabId` as a plain `u64` — the renderer must not know app types.
+    pub tab_id: u64,
+    pub title: String,
+}
+
+/// The leading mark on a card's first line (D11/D12), drawn as a foundations icon —
+/// never a font glyph, so it cannot become tofu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RowMark {
+    /// No agent — line 1 starts at the padding edge with no mark column.
+    #[default]
+    None,
+    /// An agent is working (the `✳` asterisk).
+    Agent,
+    /// An agent is idle / ready (the `◇` diamond).
+    Ready,
+}
+
+/// Per-tab metadata pulled from the app each frame (D10). Owned strings + `Copy` marks;
+/// `default()` is a plain card (no branch, no mark, [`AgentSkin::Generic`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowMeta {
+    pub branch: Option<String>,
+    pub mark: RowMark,
+    pub skin: AgentSkin,
+}
+
+impl Default for RowMeta {
+    fn default() -> Self {
+        RowMeta {
+            branch: None,
+            mark: RowMark::None,
+            skin: AgentSkin::Generic,
+        }
+    }
+}
+
+/// The renderer-side pull contract (D10): the layer refreshes its `Vec<RowMeta>` only
+/// when [`generation`](MetaSource::generation) moves, joining by `tab_id`. Implemented
+/// in the app crate (`sidebar_model.rs`), the single place naming `tab-metadata`.
+pub trait MetaSource {
+    /// Cheap, allocation-free change token.
+    fn generation(&self) -> u64;
+    /// Clear and refill `out` with one [`RowMeta`] per row, joined by `tab_id`.
+    fn fill(&self, rows: &[SidebarRow], out: &mut Vec<RowMeta>);
+}
+
+/// The app-owned tab state the layer renders (D2). Same shape as before; the element
+/// type of `titles` changed `String` → [`SidebarRow`], which `Tabs::titles()` matches,
+/// so `terminal_app`'s struct literal compiles byte-unchanged.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TabBarModel {
+    /// One row per tab, left to right. (Named `titles` for the frozen call site; it now
+    /// carries rows, not titles — a documented cost of not editing `terminal_app.rs`.)
+    pub titles: Vec<SidebarRow>,
+    /// Index of the active (highlighted) tab.
+    pub active: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Geometry (T2 fills the pure layout; T1 declares the types the model + shims need)
+// ---------------------------------------------------------------------------
+
+/// Every input to the pure card layout, all in physical px (D7). `list_top`/`scroll_px`
+/// are 0.0 here; `sidebar-chrome-collapse` supplies them through the model (D13).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SidebarGeom {
+    pub sidebar_w: f32,
+    pub viewport_h: f32,
+    pub cell: [f32; 2],
+    pub scale: f64,
+    pub show_branch: bool,
+    pub list_top: f32,
+    pub scroll_px: f32,
+}
+
+/// The computed layout the layer draws into and publishes (D7); the hit-test then reads
+/// these exact values, not merely the same formula, so draw and hit-test cannot drift.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SidebarLayout {
+    pub geom: SidebarGeom,
+    pub count: usize,
+    /// Per-card vertical stride (card height + both vertical margins).
+    pub stride: f32,
+    /// The drawn card height (excludes the vertical margins).
+    pub card_h: f32,
+    /// Horizontal margin between the sidebar edge and the card box.
+    pub margin_x: f32,
+    /// Vertical margin between the stride band edge and the card box.
+    pub margin_y: f32,
+}
+
+/// The pure card layout (D6/D7). One card height per frame — the branch line is reserved
+/// by `show_branch`, never by per-tab branch presence, so no card jitters when a branch
+/// appears or vanishes (D6). Scales the metrics once; `record` shares that same result
+/// via [`layout_with`] so a frame converts exactly once (R8.6).
+pub fn layout(geom: &SidebarGeom, count: usize) -> SidebarLayout {
+    layout_with(geom, count, &SidebarMetrics::DEFAULT.scaled(geom.scale))
+}
+
+/// The pure layout given **already-scaled** metrics — the single `scaled()` result a
+/// frame produces (D6/R8.6), shared between the card geometry here and `record`'s chrome
+/// so nothing converts logical→physical px twice.
+fn layout_with(geom: &SidebarGeom, count: usize, m: &SidebarMetrics) -> SidebarLayout {
+    let meta_ratio = if m.title_px > 0.0 {
+        m.meta_px / m.title_px
+    } else {
+        1.0
+    };
+    let line1_h = geom.cell[1];
+    let line2_h = geom.cell[1] * meta_ratio;
+    let card_h = 2.0 * (m.border_w + m.card_pad_y)
+        + line1_h
+        + if geom.show_branch {
+            m.card_gap + line2_h
+        } else {
+            0.0
+        };
+    let stride = card_h + 2.0 * m.card_margin_y;
+    SidebarLayout {
+        geom: geom.clone(),
+        count,
+        stride,
+        card_h,
+        margin_x: m.card_margin_x,
+        margin_y: m.card_margin_y,
+    }
+}
+
+impl SidebarLayout {
+    /// The screen-space top of card `i`'s stride band (list origin + stride, scrolled).
+    fn band_top(&self, i: usize) -> f32 {
+        self.geom.list_top + i as f32 * self.stride - self.geom.scroll_px
+    }
+
+    /// Forward: card `i`'s drawn rect `[x, y, w, h]` in physical px, or `None` past the
+    /// last card. The box sits inside its stride band by `margin_y` and spans the sidebar
+    /// width less `margin_x` on each side.
+    pub fn card_rect(&self, i: usize) -> Option<[f32; 4]> {
+        if i >= self.count {
+            return None;
+        }
+        let x = self.margin_x;
+        let y = self.band_top(i) + self.margin_y;
+        let w = (self.geom.sidebar_w - 2.0 * self.margin_x).max(0.0);
+        Some([x, y, w, self.card_h])
+    }
+
+    /// Exact inverse: the card whose **stride band** contains `(x, y)` (D7 — the 3px
+    /// margins are visual, so a click in a margin still selects its card). Horizontally
+    /// the whole `[0, sidebar_w)` band is live. Returns `None` outside the visible range
+    /// (D13), so a click below the last visible card is a no-op, not a phantom hit.
+    pub fn card_at(&self, x: f32, y: f32) -> Option<usize> {
+        if self.stride <= 0.0 || x < 0.0 || x >= self.geom.sidebar_w {
+            return None;
+        }
+        let rel = y - self.geom.list_top + self.geom.scroll_px;
+        if rel < 0.0 {
+            return None;
+        }
+        let i = (rel / self.stride).floor() as usize;
+        (i < self.count && self.visible_range().contains(&i)).then_some(i)
+    }
+
+    /// The index range whose stride bands intersect the visible list region
+    /// `[list_top, viewport_h)` (D13) — so a hundred tabs cost a handful of instances,
+    /// not a hundred cards drawn off-screen.
+    pub fn visible_range(&self) -> std::ops::Range<usize> {
+        if self.stride <= 0.0 || self.count == 0 {
+            return 0..0;
+        }
+        let g = &self.geom;
+        let start = (g.scroll_px / self.stride).floor().max(0.0) as usize;
+        let start = start.min(self.count);
+        let end_f = ((g.viewport_h - g.list_top + g.scroll_px) / self.stride).ceil();
+        let end = (end_f.max(0.0) as usize).min(self.count).max(start);
+        start..end
+    }
+}
+
+/// Truncate `s` to at most `max_w` physical px at a fixed `advance` per char, appending
+/// `ellipsis` when anything was cut (D8). Never wider than `max_w`; iterates `chars()`
+/// so it cannot split a codepoint; `max_w <= 0` or `advance <= 0` yields `""`.
+pub fn truncate_to_width(s: &str, advance: f32, max_w: f32, ellipsis: char) -> String {
+    if max_w <= 0.0 || advance <= 0.0 {
+        return String::new();
+    }
+    let max_chars = (max_w / advance).floor() as usize;
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    if max_chars == 0 {
+        return String::new(); // not even one char (plus its ellipsis) fits
+    }
+    // Keep one fewer than fits and append the ellipsis, so width == max_chars*advance ≤ max_w.
+    let mut out: String = s.chars().take(max_chars - 1).collect();
+    out.push(ellipsis);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// The shared model + its handle (D3)
+// ---------------------------------------------------------------------------
+
+/// The one model every party shares (D3). Reached only through [`TabModelHandle`].
+#[derive(Default)]
+pub struct SidebarModel {
+    /// Written by `terminal_app` via [`TabModelHandle::set`] (D2).
+    pub rows: Vec<SidebarRow>,
+    pub active: usize,
+    /// Bumped by `set`; D10's second (row-change) pull gate.
+    pub rows_rev: u64,
+    /// Written by `sidebar-interaction`; `None` here (D12).
+    pub hovered: Option<usize>,
+    /// Written by `sidebar-chrome-collapse`; `0.0` here (D13).
+    pub list_top: f32,
+    pub scroll_px: f32,
+    /// Published by the layer after drawing (D7).
+    pub layout: Option<SidebarLayout>,
+    /// Installed once from `main.rs` (D10). Private: only this module's layer reads it.
+    meta_source: Option<Rc<dyn MetaSource>>,
+}
+
+thread_local! {
+    /// The per-UI-thread singleton (D3). Every party clones this same `Rc`.
+    static SHARED: Rc<RefCell<SidebarModel>> = Rc::new(RefCell::new(SidebarModel::default()));
+}
+
+/// A handle onto the shared [`SidebarModel`] (D3). `Clone`/`Default`/[`TabBar::new`] all
+/// yield clones of the one per-thread `Rc`, so `terminal_app`'s wiring is unchanged and
+/// every other party reaches the same model through [`shared`](TabModelHandle::shared).
+#[derive(Clone)]
+pub struct TabModelHandle(Rc<RefCell<SidebarModel>>);
+
+impl Default for TabModelHandle {
+    fn default() -> Self {
+        TabModelHandle::shared()
+    }
+}
+
+impl TabModelHandle {
+    /// The shared per-thread handle — the public reach for the parties not handed one.
+    pub fn shared() -> TabModelHandle {
+        SHARED.with(|s| TabModelHandle(s.clone()))
+    }
+
+    /// Replace the rows + active index, bumping `rows_rev` so the layer's pull gate fires
+    /// (D10). The frozen `set(TabBarModel)` signature (D2).
+    pub fn set(&self, model: TabBarModel) {
+        let mut m = self.0.borrow_mut();
+        m.rows = model.titles;
+        m.active = model.active;
+        m.rows_rev = m.rows_rev.wrapping_add(1);
+    }
+
+    /// Install the metadata pull source once (D10), from `main.rs`.
+    pub fn set_meta_source(&self, source: Rc<dyn MetaSource>) {
+        self.0.borrow_mut().meta_source = Some(source);
+    }
+
+    /// Publish the hovered card index (D12). Written by `sidebar-interaction`.
+    pub fn set_hovered(&self, hovered: Option<usize>) {
+        self.0.borrow_mut().hovered = hovered;
+    }
+
+    /// Publish the list top offset + scroll (D13). Written by `sidebar-chrome-collapse`.
+    pub fn set_list_scroll(&self, list_top: f32, scroll_px: f32) {
+        let mut m = self.0.borrow_mut();
+        m.list_top = list_top;
+        m.scroll_px = scroll_px;
+    }
+
+    /// The last layout the layer published (D7), owned. `None` before the first frame.
+    pub fn layout(&self) -> Option<SidebarLayout> {
+        self.0.borrow().layout.clone()
+    }
+
+    /// Read the model under a short borrow — the only immutable borrow entry point (D3).
+    pub fn with<R>(&self, f: impl FnOnce(&SidebarModel) -> R) -> R {
+        f(&self.0.borrow())
+    }
+
+    /// Mutate the model under a short borrow — the only mutable borrow entry point (D3).
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut SidebarModel) -> R) -> R {
+        f(&mut self.0.borrow_mut())
+    }
+}
+
+/// Reset the singleton between tests (D3): the `thread_local` leaks a published `layout`
+/// or an installed `MetaSource` across serially-run tests, so every test that touches it
+/// calls this first.
+#[cfg(test)]
+pub(crate) fn reset_shared_model() {
+    SHARED.with(|s| *s.borrow_mut() = SidebarModel::default());
+}
+
+// ---------------------------------------------------------------------------
+// Façade formulas (D7) — the frozen free functions `input.rs` / `settings.rs` call
+// ---------------------------------------------------------------------------
+
+/// Suggested sidebar width for a cell width. Retained for the frozen `set_left_inset`
+/// call sites; its value is now advisory — the renderer owns the real width (D4).
+pub fn width_px(cell_w: f32) -> f32 {
+    (cell_w * 14.0).round().max(1.0)
+}
+
+/// The sidebar's **physical**-px width for a config + backing scale (D4): the logical
+/// `width_px` scaled, `0.0` when collapsed. Defensive (R5.8) — the last guard before a
+/// negative/`NaN` width reaches `grid_dims`: a non-finite width falls back to the mock
+/// default (340) and the result is floored at `0.0`.
+pub fn sidebar_width_px(cfg: &SidebarConfig, scale: f64) -> f32 {
+    if cfg.collapsed {
+        return 0.0;
+    }
+    let logical = if cfg.width_px.is_finite() {
+        cfg.width_px
+    } else {
+        340.0
+    };
+    (logical * scale as f32).max(0.0)
+}
+
+/// The per-card vertical stride. Returns the published layout's stride when one exists,
+/// else today's legacy formula (D7) so pre-first-frame hit-testing matches the old code.
+pub fn tab_height_px(cell_h: f32) -> f32 {
+    TabModelHandle::shared()
+        .layout()
+        .map(|l| l.stride)
+        .unwrap_or_else(|| (cell_h * 1.5).round().max(1.0))
+}
+
+/// Hit-test: the tab index at physical `(x, y)`. When a layout is published it delegates
+/// to [`SidebarLayout::card_at`] (bounding `x` by `sidebar_w`, capping at `count`,
+/// ignoring `tab_h` whose value the caller can no longer compute); otherwise it falls
+/// back to today's `floor(y / tab_h)` with today's bounds (D7). The signature is frozen
+/// (D1) — it is called from the out-of-surface `input.rs`.
+pub fn tab_at(x: f32, y: f32, sidebar_w: f32, tab_h: f32, count: usize) -> Option<usize> {
+    match TabModelHandle::shared().layout() {
+        Some(layout) => {
+            if x < 0.0 || x >= sidebar_w {
+                return None;
+            }
+            layout.card_at(x, y).filter(|&i| i < count)
+        }
+        None => {
+            if x < 0.0 || x >= sidebar_w || y < 0.0 || tab_h <= 0.0 {
+                return None;
+            }
+            let i = (y / tab_h).floor() as usize;
+            (i < count).then_some(i)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Card visual state resolution (D12)
+// ---------------------------------------------------------------------------
+
+/// A card's combined visual state (D12). Selection outranks hover.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CardState {
+    Idle,
+    Hovered,
+    Selected,
+}
+
+/// Resolve a card's `(background fill, border colour)` from its skin + state (D12's
+/// table). A `Generic` idle card returns `None` fill — **no instance is emitted at all**,
+/// keeping the panel continuous and the instance count low.
+fn resolve_card(
+    skin: AgentSkin,
+    state: CardState,
+    theme: &SidebarTheme,
+) -> (Option<Fill>, Option<[f32; 4]>) {
+    match skin {
+        AgentSkin::Generic => match state {
+            CardState::Idle => (None, None),
+            CardState::Hovered => (Some(Fill::solid(linear(theme.card_bg_hover, 1.0))), None),
+            CardState::Selected => (
+                Some(Fill::solid(linear(theme.card_bg_active, 1.0))),
+                Some(linear(theme.card_border_active, 1.0)),
+            ),
+        },
+        AgentSkin::Claude | AgentSkin::Antigravity => {
+            let s = skin.states();
+            let (fill, border) = match state {
+                CardState::Idle => (s.bg, s.dim),
+                CardState::Hovered => (s.hi, s.dim),
+                CardState::Selected => (s.hi, s.border),
+            };
+            (
+                Some(Fill::gradient(fill.stops, fill.mid, fill.dir)),
+                Some(border),
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The text pipeline (D9) — a resident-buffer glyph pass over the shared atlas
+// ---------------------------------------------------------------------------
+
+/// A textured glyph quad in physical px sampling the atlas coverage.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TextInstance {
+    rect: [f32; 4],
+    uv0: [f32; 2],
+    uv1: [f32; 2],
+    color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TextUniforms {
+    viewport: [f32; 2],
+    _pad: [f32; 2],
+}
+
+/// Premultiplied-alpha blending — glyph coverage is emitted premultiplied by the shader.
+const TEXT_PREMULTIPLIED: wgpu::BlendState = wgpu::BlendState {
+    color: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+        operation: wgpu::BlendOperation::Add,
+    },
+    alpha: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+        operation: wgpu::BlendOperation::Add,
+    },
+};
+
+/// A `VERTEX_FRAGMENT` uniform entry — `crate::uniform_entry` is `VERTEX`-only, but the
+/// text bind group's layout is shared with the fragment-stage texture/sampler (D9).
+fn text_uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+const TEXT_WGSL: &str = r#"
+struct U { viewport: vec2<f32>, _pad: vec2<f32> };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var atlas_tex: texture_2d<f32>;
+@group(0) @binding(2) var atlas_samp: sampler;
+struct VsIn {
+    @location(0) corner: vec2<f32>,
+    @location(1) rect: vec4<f32>,
+    @location(2) uv0: vec2<f32>,
+    @location(3) uv1: vec2<f32>,
+    @location(4) color: vec4<f32>,
+};
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+    let px = in.rect.xy + in.corner * in.rect.zw;
+    let clip = vec2<f32>(px.x / u.viewport.x * 2.0 - 1.0, 1.0 - px.y / u.viewport.y * 2.0);
+    var o: VsOut;
+    o.pos = vec4<f32>(clip, 0.0, 1.0);
+    o.uv = mix(in.uv0, in.uv1, in.corner);
+    o.color = in.color;
+    return o;
+}
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let a = textureSample(atlas_tex, atlas_samp, in.uv).r;
+    return vec4<f32>(in.color.rgb * a, a); // premultiplied
+}
+"#;
+
+/// The glyph pass. Mirrors foundations' shape-pipeline API; instances ride a resident
+/// buffer (`upload_resident`, never `create_buffer_init` per frame — G1). The bind group
+/// is rebuilt on a **composite** key `(format, atlas.generation(), cell)` so a live
+/// `apply_config` atlas swap cannot leave it sampling a dead texture (D8's R8.4 fix).
+struct SidebarTextPipeline {
+    format: wgpu::TextureFormat,
+    pipeline: wgpu::RenderPipeline,
+    bgl: wgpu::BindGroupLayout,
+    quad: wgpu::Buffer,
+    uniform: wgpu::Buffer,
+    bind: Option<wgpu::BindGroup>,
+    bind_key: Option<(wgpu::TextureFormat, u64, [u32; 2])>,
+    instances: Option<wgpu::Buffer>,
+}
+
+impl SidebarTextPipeline {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> SidebarTextPipeline {
+        let quad = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("sidebar-text-quad"),
+            contents: bytemuck::cast_slice(&crate::QUAD),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sidebar-text-uniform"),
+            size: std::mem::size_of::<TextUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sidebar-text-bgl"),
+            entries: &[
+                text_uniform_entry(0),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sidebar-text"),
+            source: wgpu::ShaderSource::Wgsl(TEXT_WGSL.into()),
+        });
+        let pipeline = crate::build_pipeline(
+            device,
+            &shader,
+            &bgl,
+            format,
+            std::mem::size_of::<TextInstance>() as u64,
+            &wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x2, 3 => Float32x2, 4 => Float32x4],
+            TEXT_PREMULTIPLIED,
+        );
+        SidebarTextPipeline {
+            format,
+            pipeline,
+            bgl,
+            quad,
+            uniform,
+            bind: None,
+            bind_key: None,
+            instances: None,
+        }
+    }
+
+    fn ensure<'a>(
+        slot: &'a mut Option<SidebarTextPipeline>,
+        ctx: &FrameCtx<'_>,
+    ) -> &'a mut SidebarTextPipeline {
+        let stale = slot
+            .as_ref()
+            .map(|p| p.format != ctx.format)
+            .unwrap_or(true);
+        if stale {
+            *slot = Some(SidebarTextPipeline::new(ctx.device, ctx.format));
+        }
+        slot.as_mut().expect("just built")
+    }
+
+    fn draw(&mut self, ctx: &mut FrameCtx<'_>, text: &[TextInstance]) {
+        if text.is_empty() {
+            return;
+        }
+        // Composite bind key (D8/R8.4): rebuild if the atlas texture may have been
+        // swapped (generation) or replaced by a config-driven cell change.
+        let key = (
+            ctx.format,
+            ctx.atlas.generation(),
+            [ctx.cell[0].to_bits(), ctx.cell[1].to_bits()],
+        );
+        if self.bind_key != Some(key) {
+            self.bind = Some(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("sidebar-text-bg"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(ctx.atlas.view()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(ctx.atlas.sampler()),
+                    },
+                ],
+            }));
+            self.bind_key = Some(key);
+        }
+        ctx.queue.write_buffer(
+            &self.uniform,
+            0,
+            bytemuck::bytes_of(&TextUniforms {
+                viewport: ctx.viewport,
+                _pad: [0.0, 0.0],
+            }),
+        );
+        let count = crate::upload_resident(
+            ctx.device,
+            ctx.queue,
+            &mut self.instances,
+            text,
+            "sidebar-text",
+        );
+        if count == 0 {
+            return;
+        }
+        let instances = self.instances.as_ref().expect("resident buffer present");
+        let bind = self.bind.as_ref().expect("bind group present");
+        let mut pass = ctx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("sidebar-text"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: ctx.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, bind, &[]);
+        pass.set_vertex_buffer(0, self.quad.slice(..));
+        pass.set_vertex_buffer(1, instances.slice(..));
+        pass.draw(0..6, 0..count);
+    }
+}
+
+/// Lay out `text` as glyph instances from `x` at `top` (physical px), scaled by `scale`
+/// (1.0 title, `meta_ratio` sub-line, D5). Truncated to `max_w` with `ellipsis` (D8). The
+/// title uses the atlas's synthesized bold; the sub-line the plain glyph.
+#[allow(clippy::too_many_arguments)]
+fn push_glyphs(
+    out: &mut Vec<TextInstance>,
+    ctx: &mut FrameCtx<'_>,
+    text: &str,
+    x: f32,
+    top: f32,
+    cell: [f32; 2],
+    scale: f32,
+    bold: bool,
+    color: [f32; 4],
+    max_w: f32,
+    ellipsis: char,
+) {
+    let advance = cell[0] * scale;
+    let line_h = cell[1] * scale;
+    let ascent = line_h * 0.8; // preserve tab_bar.rs's baseline constant
+    let baseline = top + ascent;
+    let clipped = truncate_to_width(text, advance, max_w, ellipsis);
+    let mut pen = x;
+    for c in clipped.chars() {
+        // Resolve through the fallback chain (#6) so a Hangul/CJK basename renders on the
+        // fallback face instead of tofu, then carry the title's bold synthesis on the
+        // resolved key. `resolve` returns an owned key, so the immutable borrow is released
+        // before `get_or_insert_styled` takes the mutable one.
+        let entry = ctx.atlas.resolve(c).and_then(|mut key| {
+            key.bold = bold;
+            ctx.atlas.get_or_insert_styled(ctx.queue, key)
+        });
+        if let Some(e) = entry {
+            out.push(TextInstance {
+                rect: [
+                    pen + e.left * scale,
+                    baseline - e.top * scale,
+                    e.px_w * scale,
+                    e.px_h * scale,
+                ],
+                uv0: e.uv0,
+                uv1: e.uv1,
+                color,
+            });
+        }
+        pen += advance;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The layer (T3 text + T4 chrome)
+// ---------------------------------------------------------------------------
+
+/// The sidebar draw layer (D9). Owns two pipelines — foundations' shape pipeline for the
+/// panel/cards/marks/icons and the local text pipeline for titles/branches — plus reused
+/// instance + metadata buffers so a steady frame allocates nothing (SD4/D10).
+pub struct TabBar {
+    model: TabModelHandle,
+    shape_pipe: Option<SidebarShapePipeline>,
+    text_pipe: Option<SidebarTextPipeline>,
+    shape_buf: Vec<SidebarShape>,
+    text_buf: Vec<TextInstance>,
+    /// Pulled from the app via `MetaSource`, refreshed only on a generation change (D10).
+    meta: Vec<RowMeta>,
+    meta_gen: u64,
+    rows_rev_seen: u64,
+}
+
+impl TabBar {
+    /// Create the layer and a write handle for the app (frozen tuple, D1). Both share the
+    /// one per-thread model (D3).
+    pub fn new() -> (TabBar, TabModelHandle) {
+        let model = TabModelHandle::shared();
+        (
+            TabBar {
+                model: model.clone(),
+                shape_pipe: None,
+                text_pipe: None,
+                shape_buf: Vec::new(),
+                text_buf: Vec::new(),
+                meta: Vec::new(),
+                meta_gen: 0,
+                rows_rev_seen: u64::MAX,
+            },
+            model,
+        )
+    }
+
+    /// Refresh `self.meta` from the pulled source, gated on the source generation and the
+    /// row revision (D10). The source is called AFTER the model borrow is released (D3's
+    /// reentrancy rule), so a `MetaSource` reaching `shared()` cannot double-borrow.
+    fn refresh_meta(
+        &mut self,
+        rows: &[SidebarRow],
+        rows_rev: u64,
+        source: &Option<Rc<dyn MetaSource>>,
+    ) {
+        match source {
+            Some(src) => {
+                let gen = src.generation();
+                if gen != self.meta_gen || rows_rev != self.rows_rev_seen {
+                    src.fill(rows, &mut self.meta);
+                    self.meta_gen = gen;
+                    self.rows_rev_seen = rows_rev;
+                }
+            }
+            None => {
+                // No source (renderer tests, pre-install window): plain default cards.
+                if rows_rev != self.rows_rev_seen || self.meta.len() != rows.len() {
+                    self.meta.clear();
+                    self.meta.resize(rows.len(), RowMeta::default());
+                    self.rows_rev_seen = rows_rev;
+                }
+            }
+        }
+    }
+}
+
+impl DrawLayer for TabBar {
+    fn z_order(&self) -> i32 {
+        TAB_BAR_Z
+    }
+
+    fn record(&mut self, ctx: &mut FrameCtx<'_>) {
+        // D14/R5.9: nothing to draw for a collapsed band (inset ≤ 0) or a zero viewport.
+        let sidebar_w = ctx.left_inset; // D4 — the band width is the inset, not ctx.sidebar
+        if sidebar_w <= 0.0 || ctx.viewport[1] <= 0.0 {
+            return;
+        }
+
+        // Copy everything out of the model under ONE borrow, then release it (D3) before
+        // touching the (possibly reentrant) metadata source.
+        let (rows, active, hovered, rows_rev, list_top, scroll_px, source) = self.model.with(|m| {
+            (
+                m.rows.clone(),
+                m.active,
+                m.hovered,
+                m.rows_rev,
+                m.list_top,
+                m.scroll_px,
+                m.meta_source.clone(),
+            )
+        });
+        self.refresh_meta(&rows, rows_rev, &source);
+
+        let show_branch = ctx.sidebar.show_git_branch;
+        let show_agent = ctx.sidebar.show_agent_status;
+        let cell = ctx.cell;
+        let theme = SidebarTheme::from_config(ctx.sidebar);
+        let m = SidebarMetrics::DEFAULT.scaled(ctx.scale_factor);
+        let meta_ratio = if m.title_px > 0.0 {
+            m.meta_px / m.title_px
+        } else {
+            1.0
+        };
+        let ellipsis = if ctx.atlas.glyph_id('…') != 0 {
+            '…'
+        } else {
+            '.'
+        };
+
+        let geom = SidebarGeom {
+            sidebar_w,
+            viewport_h: ctx.viewport[1],
+            cell,
+            scale: ctx.scale_factor,
+            show_branch,
+            list_top,
+            scroll_px,
+        };
+        // Reuse the single `scaled()` result `m` (R8.6) — do not convert a second time.
+        let lay = layout_with(&geom, rows.len(), &m);
+        let vis = lay.visible_range();
+
+        let mut shapes = std::mem::take(&mut self.shape_buf);
+        let mut text = std::mem::take(&mut self.text_buf);
+        shapes.clear();
+        text.clear();
+
+        // Panel background + right border (the whole band).
+        if let Some(bg) = SidebarShape::rounded_box(
+            [0.0, 0.0, sidebar_w, ctx.viewport[1]],
+            0.0,
+            0.0,
+            Fill::solid(linear(theme.panel_bg, 1.0)),
+            [0.0; 4],
+        ) {
+            shapes.push(bg);
+        }
+        if let Some(border) = SidebarShape::rounded_box(
+            [sidebar_w - m.border_w, 0.0, m.border_w, ctx.viewport[1]],
+            0.0,
+            0.0,
+            Fill::solid(linear(theme.panel_border, 1.0)),
+            [0.0; 4],
+        ) {
+            shapes.push(border);
+        }
+
+        let default_meta = RowMeta::default();
+        let icon_gap = m.card_gap;
+        for i in vis {
+            let rect = match lay.card_rect(i) {
+                Some(r) => r,
+                None => continue,
+            };
+            let meta = self.meta.get(i).unwrap_or(&default_meta);
+            let state = if i == active {
+                CardState::Selected
+            } else if hovered == Some(i) {
+                CardState::Hovered
+            } else {
+                CardState::Idle
+            };
+            let (fill, border) = resolve_card(meta.skin, state, &theme);
+            if let Some(fill) = fill {
+                let bw = if border.is_some() { m.border_w } else { 0.0 };
+                if let Some(card) = SidebarShape::rounded_box(
+                    rect,
+                    m.card_radius,
+                    bw,
+                    fill,
+                    border.unwrap_or([0.0; 4]),
+                ) {
+                    shapes.push(card);
+                }
+            }
+
+            let inner_x = rect[0] + m.border_w + m.card_pad_x;
+            let inner_top = rect[1] + m.border_w + m.card_pad_y;
+            let right_edge = rect[0] + rect[2] - m.border_w - m.card_pad_x;
+
+            // Line 1: optional mark, then the bold title.
+            let mut title_x = inner_x;
+            if show_agent {
+                let mark = match meta.mark {
+                    RowMark::Agent => Some((Icon::Asterisk, theme.mark_agent_fg)),
+                    RowMark::Ready => Some((Icon::Diamond, theme.mark_ready_fg)),
+                    RowMark::None => None,
+                };
+                if let Some((icon, color)) = mark {
+                    let my = inner_top + (cell[1] - m.mark_px) * 0.5;
+                    push_icon(
+                        &mut shapes,
+                        icon,
+                        inner_x,
+                        my.max(inner_top),
+                        m.mark_px,
+                        color,
+                    );
+                    title_x = inner_x + m.mark_px + icon_gap;
+                }
+            }
+            push_glyphs(
+                &mut text,
+                ctx,
+                &rows[i].title,
+                title_x,
+                inner_top,
+                cell,
+                1.0,
+                true,
+                linear(theme.title_fg, 1.0),
+                (right_edge - title_x).max(0.0),
+                ellipsis,
+            );
+
+            // Line 2: the branch, only when the tab actually has one (D6).
+            if show_branch {
+                if let Some(branch) = self.meta.get(i).and_then(|mt| mt.branch.as_deref()) {
+                    let line2_top = inner_top + cell[1] + m.card_gap;
+                    let iy = line2_top + (cell[1] * meta_ratio - m.meta_px) * 0.5;
+                    push_icon(
+                        &mut shapes,
+                        Icon::GitBranch,
+                        inner_x,
+                        iy.max(line2_top),
+                        m.meta_px,
+                        theme.icon_fg,
+                    );
+                    let branch_x = inner_x + m.meta_px + icon_gap;
+                    push_glyphs(
+                        &mut text,
+                        ctx,
+                        branch,
+                        branch_x,
+                        line2_top,
+                        cell,
+                        meta_ratio,
+                        false,
+                        linear(theme.meta_fg, 1.0),
+                        (right_edge - branch_x).max(0.0),
+                        ellipsis,
+                    );
+                }
+            }
+        }
+
+        {
+            let sp = SidebarShapePipeline::ensure(&mut self.shape_pipe, ctx);
+            sp.draw(ctx, &shapes);
+        }
+        {
+            let tp = SidebarTextPipeline::ensure(&mut self.text_pipe, ctx);
+            tp.draw(ctx, &text);
+        }
+
+        // Publish the exact layout we drew, so the hit-test reads these values (D7).
+        self.model.with_mut(|mm| mm.layout = Some(lay));
+
+        self.shape_buf = shapes;
+        self.text_buf = text;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tab_at_fallback_matches_legacy_formula() {
+        // R4.6/R4.7 — before any layout is published, tab_at reproduces the old
+        // floor(y/tab_h) behaviour, including input.rs's frozen assertion.
+        reset_shared_model();
+        assert_eq!(tab_at(40.0, 65.0, 160.0, 30.0, 3), Some(2));
+        // Out of the x band, below the last tab, and negative y all reject.
+        assert_eq!(tab_at(200.0, 65.0, 160.0, 30.0, 3), None);
+        assert_eq!(tab_at(40.0, 500.0, 160.0, 30.0, 3), None);
+        assert_eq!(tab_at(40.0, -1.0, 160.0, 30.0, 3), None);
+    }
+
+    #[test]
+    fn tab_height_px_fallback_is_legacy_stride() {
+        // R4.7 — with no layout, the stride is today's (cell_h*1.5).round().
+        reset_shared_model();
+        assert_eq!(tab_height_px(20.0), 30.0);
+    }
+
+    #[test]
+    fn set_replaces_rows_and_bumps_rev() {
+        // R6.2 — set() writes rows/active and bumps the row-change gate.
+        reset_shared_model();
+        let h = TabModelHandle::shared();
+        h.set(TabBarModel {
+            titles: vec![SidebarRow {
+                tab_id: 7,
+                title: "proj".into(),
+            }],
+            active: 0,
+        });
+        h.with(|m| {
+            assert_eq!(m.rows.len(), 1);
+            assert_eq!(m.rows[0].tab_id, 7);
+            assert_eq!(m.active, 0);
+            assert_eq!(m.rows_rev, 1);
+        });
+        h.set(TabBarModel {
+            titles: Vec::new(),
+            active: 0,
+        });
+        h.with(|m| assert_eq!(m.rows_rev, 2, "each set bumps rows_rev"));
+    }
+
+    #[test]
+    fn shared_handles_see_one_model() {
+        // R6.3 — every party reaches the same singleton.
+        reset_shared_model();
+        let a = TabModelHandle::shared();
+        let b = TabModelHandle::shared();
+        a.set(TabBarModel {
+            titles: vec![SidebarRow {
+                tab_id: 1,
+                title: "x".into(),
+            }],
+            active: 0,
+        });
+        b.with(|m| assert_eq!(m.rows.len(), 1, "b sees a's write"));
+    }
+
+    struct ReentrantSource;
+    impl MetaSource for ReentrantSource {
+        fn generation(&self) -> u64 {
+            // Re-enters shared() — legal because the caller must not hold a borrow across
+            // this call (D3). Proves the reentrancy discipline is satisfiable.
+            TabModelHandle::shared().layout().map_or(0, |_| 1)
+        }
+        fn fill(&self, rows: &[SidebarRow], out: &mut Vec<RowMeta>) {
+            out.clear();
+            out.extend(rows.iter().map(|_| RowMeta::default()));
+        }
+    }
+
+    #[test]
+    fn meta_source_can_reenter_shared_after_borrow_released() {
+        // R6.5 (discipline) — the layer copies out under `with`, drops the borrow, then
+        // calls the source (which itself reaches shared()). No double-borrow panic.
+        reset_shared_model();
+        let h = TabModelHandle::shared();
+        h.set_meta_source(Rc::new(ReentrantSource));
+        h.set(TabBarModel {
+            titles: vec![SidebarRow {
+                tab_id: 3,
+                title: "a".into(),
+            }],
+            active: 0,
+        });
+        // Copy rows + the source Rc out under one borrow (the record() pattern)…
+        let (rows, source) = h.with(|m| (m.rows.clone(), m.meta_source.clone()));
+        // …then call the source AFTER the borrow is released.
+        let mut meta = Vec::new();
+        if let Some(src) = source {
+            let _ = src.generation();
+            src.fill(&rows, &mut meta);
+        }
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0], RowMeta::default());
+    }
+
+    // ---- T2: pure layout, hit-test, truncation ----
+
+    fn geom(sidebar_w: f32, viewport_h: f32, show_branch: bool) -> SidebarGeom {
+        SidebarGeom {
+            sidebar_w,
+            viewport_h,
+            cell: [8.0, 16.0],
+            scale: 1.0,
+            show_branch,
+            list_top: 0.0,
+            scroll_px: 0.0,
+        }
+    }
+
+    #[test]
+    fn card_height_reserves_the_branch_line_by_config() {
+        // R3 / D6 — the second line is reserved by show_branch, for every card, so a
+        // per-tab branch appearing never changes the stride.
+        let two = layout(&geom(340.0, 2000.0, true), 5);
+        let one = layout(&geom(340.0, 2000.0, false), 5);
+        assert!(
+            two.card_h > one.card_h,
+            "a branch-line card is taller than a one-line card"
+        );
+        assert_eq!(two.stride, two.card_h + 6.0, "stride adds both 3px margins");
+        // Height is independent of count — one card height per frame.
+        let two_many = layout(&geom(340.0, 2000.0, true), 40);
+        assert_eq!(two.card_h, two_many.card_h);
+        assert_eq!(two.stride, two_many.stride);
+    }
+
+    #[test]
+    fn card_rect_and_card_at_are_exact_inverses() {
+        // R4.1 — the redesign's replacement for slot_y/tab_at exact-inverse (SD2). Over
+        // the whole stride band (margins included), card_at recovers the drawn index.
+        let l = layout(&geom(340.0, 4000.0, true), 6);
+        for i in 0..l.count {
+            let rect = l.card_rect(i).expect("card in range");
+            let cx = rect[0] + rect[2] / 2.0;
+            let cy = rect[1] + rect[3] / 2.0;
+            assert_eq!(l.card_at(cx, cy), Some(i), "card center round-trips");
+            // Anywhere in the stride band selects the same card, margins included.
+            let band_top = i as f32 * l.stride;
+            assert_eq!(l.card_at(170.0, band_top), Some(i), "band top");
+            assert_eq!(
+                l.card_at(170.0, band_top + l.stride - 0.01),
+                Some(i),
+                "band bottom"
+            );
+        }
+        // Outside the x band and below the last card → None.
+        assert_eq!(l.card_at(-1.0, 10.0), None);
+        assert_eq!(l.card_at(340.0, 10.0), None);
+        assert_eq!(l.card_at(170.0, l.count as f32 * l.stride + 1.0), None);
+    }
+
+    #[test]
+    fn visible_range_culls_offscreen_cards() {
+        // R4.2/R4.3 / D13 — only the bands intersecting the viewport are visible, and
+        // card_at returns None for a culled index even though it is < count.
+        let l = layout(&geom(340.0, 200.0, true), 20);
+        let vis = l.visible_range();
+        assert_eq!(vis.start, 0);
+        // 200px viewport / ~67px stride ⇒ 3 cards visible.
+        assert!(vis.end >= 3 && vis.end <= 4, "got {vis:?}");
+        assert!(vis.end < l.count, "most cards are culled");
+        // A click deep past the viewport bottom is a no-op (D13).
+        assert_eq!(l.card_at(170.0, 190.0 + 5.0 * l.stride), None);
+    }
+
+    #[test]
+    fn published_layout_makes_shims_delegate() {
+        // R4.5 — once a layout is published, tab_at delegates to card_at and
+        // tab_height_px returns the published stride.
+        reset_shared_model();
+        let l = layout(&geom(340.0, 4000.0, true), 4);
+        let stride = l.stride;
+        TabModelHandle::shared().with_mut(|m| m.layout = Some(l));
+        assert_eq!(
+            tab_height_px(999.0),
+            stride,
+            "delegates to published stride"
+        );
+        // tab_at delegates: a point in band 2 → Some(2) (tab_h arg ignored).
+        assert_eq!(tab_at(170.0, 2.5 * stride, 340.0, 0.0, 4), Some(2));
+        reset_shared_model();
+    }
+
+    #[test]
+    fn d12_card_state_table() {
+        // R1.x / D12 — the six combinations resolve as the table says; a Generic idle
+        // card emits no instance (None fill).
+        let t = SidebarTheme::DEFAULT;
+        assert!(resolve_card(AgentSkin::Generic, CardState::Idle, &t)
+            .0
+            .is_none());
+        let (f, b) = resolve_card(AgentSkin::Generic, CardState::Hovered, &t);
+        assert!(f.is_some() && b.is_none(), "generic hover: bg, no border");
+        let (f, b) = resolve_card(AgentSkin::Generic, CardState::Selected, &t);
+        assert!(f.is_some() && b.is_some(), "generic selected: bg + border");
+        // Agent cards always carry a skin fill + border, idle border is the dim tint.
+        for skin in [AgentSkin::Claude, AgentSkin::Antigravity] {
+            for state in [CardState::Idle, CardState::Hovered, CardState::Selected] {
+                let (f, b) = resolve_card(skin, state, &t);
+                assert!(
+                    f.is_some() && b.is_some(),
+                    "{skin:?} {state:?} draws a card"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_to_width_fits_and_elides() {
+        // D8 — px-based, per line, ellipsis on cut, never wider than max_w, char-safe.
+        assert_eq!(truncate_to_width("hello", 10.0, 100.0, '…'), "hello");
+        // 11 chars at advance 10 into 50px ⇒ 5 fit ⇒ keep 4 + ellipsis.
+        let cut = truncate_to_width("hello world", 10.0, 50.0, '…');
+        assert_eq!(cut, "hell…");
+        assert!(cut.chars().count() as f32 * 10.0 <= 50.0);
+        // Degenerate inputs.
+        assert_eq!(truncate_to_width("x", 10.0, 0.0, '…'), "");
+        assert_eq!(truncate_to_width("x", 0.0, 10.0, '…'), "");
+        // Char-safe on multibyte, no panic, respects boundaries.
+        let jp = truncate_to_width("日本語テスト", 10.0, 35.0, '…');
+        assert_eq!(jp, "日本…");
+    }
+}
