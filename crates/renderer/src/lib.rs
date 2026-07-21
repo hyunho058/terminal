@@ -17,11 +17,17 @@ pub mod glyph;
 pub mod image_layer;
 pub mod overlay_layer;
 pub mod preedit_layer;
+pub mod sidebar_header;
+pub mod sidebar_icons;
+pub mod sidebar_layout;
+pub mod sidebar_row;
+pub mod sidebar_shapes;
+pub mod sidebar_theme;
 pub mod tab_bar;
 
 use atlas::{Atlas, GlyphKey};
 use bytemuck::{Pod, Zeroable};
-use common::config::Config;
+use common::config::{Config, SidebarConfig};
 use font_set::FONT_CANDIDATES;
 use swash::shape::ShapeContext;
 use swash::FontRef;
@@ -122,6 +128,13 @@ pub struct FrameCtx<'a> {
     pub left_inset: f32,
     /// Render-target format — a layer needs it to build its own pipelines.
     pub format: wgpu::TextureFormat,
+    /// The live sidebar config (D10). A sidebar layer reads its toggles and width
+    /// from here; it is the pre-override config, so `left_inset` (not
+    /// `sidebar.width_px`) is the authoritative drawn band width.
+    pub sidebar: &'a SidebarConfig,
+    /// Window backing scale factor — multiply logical-px sidebar metrics by this to
+    /// get physical px (D1/D10, `SidebarMetrics::scaled`).
+    pub scale_factor: f64,
     pub snapshot: &'a GridSnapshot,
     pub atlas: &'a mut Atlas,
 }
@@ -138,6 +151,16 @@ pub trait DrawLayer {
 }
 
 /// GPU state for drawing the cell grid.
+/// Runtime sidebar overrides that outrank the config for the rest of the session (D4):
+/// a hide/restore button or a drag-resize writes here, and `apply_config` leaves it
+/// untouched — so saving `config.toml` for an unrelated reason cannot undo a click the
+/// user just made. `None` fields defer to the config.
+#[derive(Default)]
+struct SidebarOverride {
+    collapsed: Option<bool>,
+    width_px: Option<f32>,
+}
+
 pub struct Renderer {
     /// `None` for a headless renderer (benchmarks/tests draw to an offscreen view).
     surface: Option<wgpu::Surface<'static>>,
@@ -160,14 +183,21 @@ pub struct Renderer {
     fonts: FontSet,
     /// Needed to re-derive cell size / ppem when the config changes live.
     scale_factor: f64,
+    /// Live sidebar config (D10). Refreshed by `apply_config`; handed to each layer
+    /// via `FrameCtx.sidebar`. Foundations stores it but registers no layer.
+    sidebar: SidebarConfig,
     cell_size: (f32, f32),
     /// Physical px reserved above the grid (e.g. a tab bar). Grid + glyphs are
     /// shifted down by this, and `grid_size` reports the rows that fit below it.
     top_inset: f32,
     /// Physical px reserved left of the grid (e.g. a vertical tab sidebar). The
     /// grid and glyphs are shifted right by this, and `grid_size` reports the
-    /// columns that fit beside it. Orthogonal to `top_inset` (rows vs cols).
+    /// columns that fit beside it. Orthogonal to `top_inset` (rows vs cols). The
+    /// renderer owns this now (D4): it is derived from the sidebar config + override by
+    /// `sync_left_inset`, and `set_left_inset`'s argument is ignored.
     left_inset: f32,
+    /// Runtime sidebar overrides (D4), consulted before the config by `effective_sidebar`.
+    sidebar_override: SidebarOverride,
     ppem: f32,
     ligatures: bool,
     bg_default: u32,
@@ -416,7 +446,7 @@ impl Renderer {
             glyph_blend,
         );
 
-        Ok(Renderer {
+        let mut renderer = Renderer {
             surface,
             device,
             queue,
@@ -432,9 +462,11 @@ impl Renderer {
             atlas,
             fonts,
             scale_factor,
+            sidebar: cfg.sidebar.clone(),
             cell_size,
             top_inset: 0.0,
             left_inset: 0.0,
+            sidebar_override: SidebarOverride::default(),
             ppem,
             ligatures: cfg.font.ligatures,
             bg_default: cfg.theme.background,
@@ -446,7 +478,10 @@ impl Renderer {
             bg_count: 0,
             glyph_count: 0,
             reshape_count: 0,
-        })
+        };
+        // The startup inset must be right before the first frame (D4).
+        renderer.sync_left_inset();
+        Ok(renderer)
     }
 
     /// Register an extra draw layer (SD3/D4). Ordered by `z_order` at draw time —
@@ -506,14 +541,64 @@ impl Renderer {
     ///
     /// [`grid_size`]: Renderer::grid_size
     /// [`set_top_inset`]: Renderer::set_top_inset
-    pub fn set_left_inset(&mut self, px: f32) {
-        self.left_inset = px.max(0.0);
+    pub fn set_left_inset(&mut self, _requested_px: f32) {
+        // D4: the sidebar owns its width now — the argument is ignored, retained only so
+        // the two out-of-surface call sites (`terminal_app.rs`, `settings.rs`) keep
+        // compiling. `set_sidebar_width` / `set_sidebar_collapsed` are the real setters.
+        self.sync_left_inset();
+    }
+
+    /// The sidebar config with the runtime override's `Some` fields applied (D4). The
+    /// override outranks the file for the session, so a click survives a `config.toml`
+    /// save.
+    fn effective_sidebar(&self) -> SidebarConfig {
+        let mut s = self.sidebar.clone();
+        if let Some(c) = self.sidebar_override.collapsed {
+            s.collapsed = c;
+        }
+        if let Some(w) = self.sidebar_override.width_px {
+            s.width_px = w;
+        }
+        s
+    }
+
+    /// Re-derive `left_inset` from the effective sidebar (config + override) and push the
+    /// uniforms (D4). The single site that writes the inset; called from `assemble`,
+    /// `apply_config`, and the three runtime setters.
+    fn sync_left_inset(&mut self) {
+        self.left_inset =
+            sidebar_row::sidebar_width_px(&self.effective_sidebar(), self.scale_factor);
         self.write_uniforms();
+    }
+
+    /// Collapse or restore the sidebar at runtime (D4). Returns the reclaimed width to
+    /// the grid; a subsequent `apply_config` will not undo it.
+    pub fn set_sidebar_collapsed(&mut self, collapsed: bool) {
+        self.sidebar_override.collapsed = Some(collapsed);
+        self.sync_left_inset();
+    }
+
+    /// Set the sidebar's logical width at runtime (D4), clamped to foundations' 260–440
+    /// band (R5.7) — the public backing for a drag-resize, which does not go through
+    /// `Config::load_from`'s clamp.
+    pub fn set_sidebar_width(&mut self, logical_px: f32) {
+        self.sidebar_override.width_px = Some(logical_px.clamp(
+            common::config::SIDEBAR_WIDTH_MIN,
+            common::config::SIDEBAR_WIDTH_MAX,
+        ));
+        self.sync_left_inset();
     }
 
     /// Current left inset in physical px.
     pub fn left_inset(&self) -> f32 {
         self.left_inset
+    }
+
+    /// The window backing scale factor. A sidebar `DrawLayer` multiplies logical-px
+    /// [`SidebarConfig::width_px`] / `SidebarMetrics` by this to get physical px
+    /// (D1/D10); `FrameCtx.scale_factor` carries the same value to layers.
+    pub fn scale_factor(&self) -> f64 {
+        self.scale_factor
     }
 
     /// Apply a new [`Config`] live (settings feature, D4): re-derive cell metrics,
@@ -530,6 +615,8 @@ impl Renderer {
         self.ligatures = cfg.font.ligatures;
         self.bg_default = cfg.theme.background;
         self.clear = to_wgpu_color(cfg.theme.background);
+        // Sidebar toggles/width/accent reach layers via `FrameCtx.sidebar` (D10).
+        self.sidebar = cfg.sidebar.clone();
 
         // Rebuild the atlas at the new ppem so glyphs re-rasterize (size + ligature
         // changes need fresh coverage), then re-point the glyph bind group at it.
@@ -560,7 +647,10 @@ impl Renderer {
         // Theme/font/atlas/cell-metrics changed → force the next frame to re-shape,
         // else a content-equal snapshot would re-present stale-theme buffers (R1.4).
         self.last_snapshot = None;
-        self.write_uniforms();
+        // Re-fit the grid to the (possibly changed) sidebar width, WITHOUT clearing the
+        // runtime override — a saved config must not undo a runtime collapse (D4). This
+        // also calls write_uniforms.
+        self.sync_left_inset();
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -737,6 +827,8 @@ impl Renderer {
                 top_inset: self.top_inset,
                 left_inset: self.left_inset,
                 format: self.config.format,
+                sidebar: &self.sidebar,
+                scale_factor: self.scale_factor,
                 snapshot,
                 atlas: &mut self.atlas,
             };
@@ -1207,6 +1299,23 @@ fn to_wgpu_color(packed: u32) -> wgpu::Color {
     }
 }
 
+/// A guarded headless `(Device, Queue)` for GPU-touching tests, or `None` when no
+/// adapter is available (adapterless CI → the test skips). Hoisted to the crate root
+/// (D10) so sibling modules' tests — e.g. `sidebar_shapes::tests` — can reach it;
+/// a private item inside `mod tests` is invisible to sibling modules. `#[cfg(test)]`,
+/// so it costs the shipped binary nothing.
+#[cfg(test)]
+pub(crate) fn headless() -> Option<(wgpu::Device, wgpu::Queue)> {
+    let instance = wgpu::Instance::default();
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        ..Default::default()
+    }))
+    .ok()?;
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1293,9 +1402,9 @@ mod tests {
     }
 
     #[test]
-    fn set_left_inset_clamps_and_narrows_grid() {
-        // R2.1: set_left_inset clamps negatives to 0; a positive inset shrinks
-        // the reported column count (rows unchanged). Needs a GPU (new_headless).
+    fn sidebar_owns_width_and_set_left_inset_is_a_no_op() {
+        // D4: the renderer owns the sidebar width — the config drives it at startup, a
+        // stale set_left_inset cannot move it, and the runtime setters do. Needs a GPU.
         if headless().is_none() {
             eprintln!("skipping: no GPU");
             return;
@@ -1305,24 +1414,35 @@ mod tests {
             eprintln!("skipping: headless renderer unavailable");
             return;
         };
-        let (cols0, rows0) = r.grid_size();
-        assert_eq!(r.left_inset(), 0.0, "default left inset is 0");
-
-        // A negative inset clamps to 0 → geometry unchanged (R2.1 clamp).
-        r.set_left_inset(-5.0);
-        assert_eq!(r.left_inset(), 0.0, "negative inset clamps to 0.0");
+        // The config's 340px logical width (× 1.0 scale) reserves the band at startup —
+        // NOT 0 as before D4.
         assert_eq!(
-            r.grid_size(),
-            (cols0, rows0),
-            "clamped-to-0 inset changes nothing"
+            r.left_inset(),
+            340.0,
+            "startup inset comes from the config width"
         );
+        let (cols_open, rows_open) = r.grid_size();
 
-        // A one-cell-wide inset drops exactly one column, rows unchanged.
-        let cw = r.cell_size().0;
-        r.set_left_inset(cw);
-        let (cols1, rows1) = r.grid_size();
-        assert_eq!(cols1, cols0 - 1, "a one-cell left inset drops one column");
-        assert_eq!(rows1, rows0, "left inset never changes rows");
+        // A stale set_left_inset argument is ignored — the band does not move (D4).
+        r.set_left_inset(0.0);
+        assert_eq!(r.left_inset(), 340.0, "set_left_inset(0) is a no-op");
+        r.set_left_inset(99_999.0);
+        assert_eq!(r.left_inset(), 340.0, "set_left_inset(huge) is a no-op");
+        assert_eq!(r.grid_size(), (cols_open, rows_open), "grid unchanged");
+
+        // Collapsing returns the reclaimed width to the grid; restoring brings it back.
+        r.set_sidebar_collapsed(true);
+        assert_eq!(r.left_inset(), 0.0, "collapsed → no band");
+        assert!(r.grid_size().0 > cols_open, "collapse gives columns back");
+        r.set_sidebar_collapsed(false);
+        assert_eq!(r.left_inset(), 340.0, "restored to the config width");
+
+        // A runtime width applies and is clamped to foundations' 260–440 band (R5.7).
+        r.set_sidebar_width(260.0);
+        assert_eq!(r.left_inset(), 260.0, "runtime width applied");
+        r.set_sidebar_width(100_000.0);
+        assert_eq!(r.left_inset(), 440.0, "clamped to SIDEBAR_WIDTH_MAX");
+        assert_eq!(r.grid_size().1, rows_open, "left inset never changes rows");
     }
 
     #[test]
@@ -1869,6 +1989,8 @@ mod tests {
             top_inset: 0.0,
             left_inset: 0.0,
             format: wgpu::TextureFormat::Rgba8Unorm,
+            sidebar: &SidebarConfig::default(),
+            scale_factor: 1.0,
             snapshot: &snap,
             atlas: &mut atlas,
         };
@@ -1925,6 +2047,7 @@ mod tests {
         assert_ne!(key.id, 0, "and must not be .notdef");
 
         let cw = 12.0;
+        let sidebar_cfg = SidebarConfig::default();
         let mut ctx = FrameCtx {
             device: &device,
             queue: &queue,
@@ -1935,6 +2058,8 @@ mod tests {
             top_inset: 0.0,
             left_inset: 0.0,
             format: wgpu::TextureFormat::Rgba8Unorm,
+            sidebar: &sidebar_cfg,
+            scale_factor: 1.0,
             snapshot: &snap,
             atlas: &mut atlas,
         };

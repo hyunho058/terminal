@@ -3,7 +3,7 @@
 //! Both are pure functions over winit's logical `Key` + `ModifiersState`, so the
 //! chord table is unit-tested without a window.
 
-use renderer::tab_bar;
+use renderer::sidebar_layout::{self, ChromeRegion, SidebarLayoutInput, SidebarRegion};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 /// A tab-management action triggered by a Cmd chord (D5). Intercepted before
@@ -41,22 +41,82 @@ pub fn tab_action(key: &Key, mods: &ModifiersState) -> Option<TabAction> {
     }
 }
 
-/// Translate a left-mouse press into the tab it targets in the left sidebar, or
-/// `None` if the press is outside the sidebar / below the last tab. This is the
-/// pointer analogue of [`tab_action`] (raw device input → a tab intent): it casts
-/// winit's `f64` physical cursor to `f32`, derives the per-tab slot height from
-/// the cell metrics, and delegates the floor/bounds *geometry* to
-/// [`tab_bar::tab_at`] — so the hit-test math lives in exactly one place (SD2),
-/// the same functions the sidebar draws with. `sidebar_w` is the renderer's live
-/// `left_inset`; `count` is the number of open tabs.
-pub fn tab_target(
+/// What the app does about a pointer press (D1). Distinct from the renderer's *region*
+/// enum: several regions map to one action, and two map to "consumed" (`Inert`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SidebarAction {
+    Switch(usize),
+    NewTab,
+    Collapse,
+    Expand,
+    Inert,
+}
+
+/// A wheel delta in one of winit 0.30's two unit systems (D10) — a small app-side enum so
+/// the translation is testable without constructing a winit event.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum WheelDelta {
+    /// `MouseScrollDelta::LineDelta` — abstract lines; one line is one card (D10).
+    Lines(f32),
+    /// `MouseScrollDelta::PixelDelta` — already physical px (trackpad).
+    Pixels(f32),
+}
+
+/// Resolve a left-button press to an app action through the sibling's ONE ordered
+/// `hit_test` (D1) — the app performs no geometry (SD2). `Panel` (sidebar dead space) and
+/// the inert filter are swallowed as `Inert`; `None` (over the grid) stays `None`.
+pub fn sidebar_press(
     cursor: (f64, f64),
-    cell: (f32, f32),
-    sidebar_w: f32,
-    count: usize,
+    inp: &SidebarLayoutInput,
+    scroll: f32,
+    collapsed: bool,
+) -> Option<SidebarAction> {
+    let p = [cursor.0 as f32, cursor.1 as f32];
+    sidebar_layout::hit_test(p, scroll, inp, collapsed).map(|region| match region {
+        SidebarRegion::Card(i) => SidebarAction::Switch(i),
+        SidebarRegion::Chrome(ChromeRegion::NewTab) => SidebarAction::NewTab,
+        SidebarRegion::Chrome(ChromeRegion::HideSidebar) => SidebarAction::Collapse,
+        SidebarRegion::Chrome(ChromeRegion::Restore) => SidebarAction::Expand,
+        SidebarRegion::Panel => SidebarAction::Inert,
+    })
+}
+
+/// Resolve the card index under the cursor for the row layer's `hovered` highlight (D8).
+/// Chrome hover is driven separately by the chrome layer's own raw-cursor handle
+/// (chrome-collapse D10 as shipped), so this returns only the card index.
+pub fn sidebar_hover(
+    cursor: (f64, f64),
+    inp: &SidebarLayoutInput,
+    scroll: f32,
+    collapsed: bool,
 ) -> Option<usize> {
-    let tab_h = tab_bar::tab_height_px(cell.1);
-    tab_bar::tab_at(cursor.0 as f32, cursor.1 as f32, sidebar_w, tab_h, count)
+    let p = [cursor.0 as f32, cursor.1 as f32];
+    match sidebar_layout::hit_test(p, scroll, inp, collapsed) {
+        Some(SidebarRegion::Card(i)) => Some(i),
+        _ => None,
+    }
+}
+
+/// The new scroll offset after a wheel event (D10). Gated by `hit_test` (not `x <
+/// sidebar_w`, D1): a wheel over the terminal leaves the list unmoved. A line delta
+/// advances one card (`row_stride`); the sign follows winit (positive y = content down =
+/// scroll increases). Clamping is the sibling's (NaN-safe).
+pub fn wheel_scroll(
+    delta: WheelDelta,
+    cursor: (f64, f64),
+    scroll: f32,
+    inp: &SidebarLayoutInput,
+    collapsed: bool,
+) -> f32 {
+    let p = [cursor.0 as f32, cursor.1 as f32];
+    if sidebar_layout::hit_test(p, scroll, inp, collapsed).is_none() {
+        return scroll; // over the grid — do not move an invisible/other list
+    }
+    let delta_px = match delta {
+        WheelDelta::Pixels(y) => y,
+        WheelDelta::Lines(y) => y * sidebar_layout::row_stride(inp),
+    };
+    sidebar_layout::clamp_scroll(scroll - delta_px, inp)
 }
 
 /// Which escape-sequence family a cursor/navigation/function key belongs to
@@ -591,20 +651,81 @@ mod tests {
         assert!(!suppress_key(false, &Key::Named(NamedKey::Enter)));
     }
 
+    fn layout_input(sidebar_w: f32, count: usize) -> SidebarLayoutInput {
+        SidebarLayoutInput {
+            sidebar_w,
+            viewport: [sidebar_w.max(200.0), 900.0],
+            scale: 1.0,
+            row_h: 60.0,
+            row_count: count,
+            metrics: renderer::sidebar_theme::SidebarMetrics::DEFAULT.scaled(1.0),
+        }
+    }
+
     #[test]
-    fn tab_target_maps_click_to_tab_and_delegates_geometry() {
-        // cell (8, 20) → tab_h = tab_height_px(20) = 30; sidebar 160px, 3 tabs.
-        // A click at y=65 (slot 2), x=40 (inside the band) hits tab 2.
-        assert_eq!(tab_target((40.0, 65.0), (8.0, 20.0), 160.0, 3), Some(2));
-        // A click past the sidebar width is not a tab click.
-        assert_eq!(tab_target((200.0, 65.0), (8.0, 20.0), 160.0, 3), None);
-        // With no tabs there is never a target.
-        assert_eq!(tab_target((40.0, 10.0), (8.0, 20.0), 160.0, 0), None);
-        // The result is exactly the tab_bar geometry (SD2 — one source of truth):
-        // tab_target casts the f64 cursor and derives tab_h, then delegates.
+    fn sidebar_press_maps_regions_and_matches_hit_test() {
+        // SD2 / D1 — the app performs no geometry: every press equals what hit_test says.
+        let inp = layout_input(340.0, 5);
+        // A point well into the list (below the 54px header) is a card switch.
+        let card_y = sidebar_layout::header_h(1.0) + 100.0;
+        let press = sidebar_press((170.0, card_y as f64), &inp, 0.0, false);
+        let region = sidebar_layout::hit_test([170.0, card_y], 0.0, &inp, false);
+        assert!(
+            matches!(press, Some(SidebarAction::Switch(_))),
+            "list press → Switch"
+        );
+        assert!(
+            matches!(region, Some(SidebarRegion::Card(_))),
+            "and hit_test agrees"
+        );
+        // The hide button (top-right) collapses.
+        let hide = sidebar_layout::button_rect(ChromeRegion::HideSidebar, &inp);
+        let c = (
+            (hide.x + hide.w / 2.0) as f64,
+            (hide.y + hide.h / 2.0) as f64,
+        );
         assert_eq!(
-            tab_target((40.0, 65.0), (8.0, 20.0), 160.0, 3),
-            tab_bar::tab_at(40.0, 65.0, 160.0, tab_bar::tab_height_px(20.0), 3),
+            sidebar_press(c, &inp, 0.0, false),
+            Some(SidebarAction::Collapse)
+        );
+        // A point over the grid is not the sidebar's business.
+        assert_eq!(sidebar_press((400.0, 100.0), &inp, 0.0, false), None);
+        // Collapsed: the restore button expands; elsewhere None.
+        let r = sidebar_layout::restore_button_rect(1.0);
+        let rc = ((r.x + r.w / 2.0) as f64, (r.y + r.h / 2.0) as f64);
+        assert_eq!(
+            sidebar_press(rc, &inp, 0.0, true),
+            Some(SidebarAction::Expand)
+        );
+        assert_eq!(sidebar_press((400.0, 400.0), &inp, 0.0, true), None);
+    }
+
+    #[test]
+    fn sidebar_hover_returns_only_card_index() {
+        let inp = layout_input(340.0, 5);
+        let card_y = sidebar_layout::header_h(1.0) + 100.0;
+        assert!(sidebar_hover((170.0, card_y as f64), &inp, 0.0, false).is_some());
+        // A header point is not a card hover.
+        assert_eq!(sidebar_hover((170.0, 10.0), &inp, 0.0, false), None);
+    }
+
+    #[test]
+    fn wheel_scroll_gates_units_and_sign() {
+        let inp = layout_input(340.0, 40); // overflows → scrollable
+        let over_list = (170.0, (sidebar_layout::header_h(1.0) + 50.0) as f64);
+        // Positive line delta scrolls down by one card stride.
+        let stride = sidebar_layout::row_stride(&inp);
+        assert_eq!(
+            wheel_scroll(WheelDelta::Lines(1.0), over_list, 0.0, &inp, false),
+            sidebar_layout::clamp_scroll(-stride, &inp),
+        );
+        // Pixel delta is used directly (sign: new = scroll - delta).
+        let after = wheel_scroll(WheelDelta::Pixels(30.0), over_list, 100.0, &inp, false);
+        assert_eq!(after, sidebar_layout::clamp_scroll(70.0, &inp));
+        // A wheel over the grid leaves the offset unchanged (gated by hit_test).
+        assert_eq!(
+            wheel_scroll(WheelDelta::Pixels(30.0), (400.0, 400.0), 100.0, &inp, false),
+            100.0,
         );
     }
 }
