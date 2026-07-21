@@ -85,6 +85,8 @@ pub enum SidebarAction {
     Collapse,
     Expand,
     Inert,
+    /// A press on the resize grab-band — begin a live sidebar resize (sidebar-resize D6).
+    BeginResize,
 }
 
 /// A wheel delta in one of winit 0.30's two unit systems (D10) — a small app-side enum so
@@ -113,6 +115,7 @@ pub fn sidebar_press(
         SidebarRegion::Chrome(ChromeRegion::HideSidebar) => SidebarAction::Collapse,
         SidebarRegion::Chrome(ChromeRegion::Restore) => SidebarAction::Expand,
         SidebarRegion::Panel => SidebarAction::Inert,
+        SidebarRegion::ResizeHandle => SidebarAction::BeginResize,
     })
 }
 

@@ -21,6 +21,7 @@ pub mod selection_layer;
 pub mod sidebar_header;
 pub mod sidebar_icons;
 pub mod sidebar_layout;
+pub mod sidebar_resize;
 pub mod sidebar_row;
 pub mod sidebar_shapes;
 pub mod sidebar_theme;

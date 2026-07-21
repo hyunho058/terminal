@@ -14,6 +14,7 @@ mod seam;
 mod session;
 mod settings;
 mod sidebar_model;
+mod sidebar_resize;
 mod tabmeta;
 mod tabs;
 mod terminal_app;

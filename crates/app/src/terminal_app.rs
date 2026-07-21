@@ -31,6 +31,7 @@ use renderer::preedit_layer::{PreeditHandle, PreeditLayer};
 use renderer::selection_layer::{SelectionHandle, SelectionLayer};
 use renderer::sidebar_header::{SidebarChromeHandle, SidebarChromeLayer};
 use renderer::sidebar_layout::{self, SidebarLayoutInput};
+use renderer::sidebar_resize::{SidebarResizeHandle, SidebarResizeLayer};
 use renderer::sidebar_row::{self, SidebarGeom};
 use renderer::sidebar_theme::SidebarMetrics;
 use renderer::tab_bar::{TabBar, TabBarModel, TabModelHandle};
@@ -188,6 +189,12 @@ struct Running {
     /// rectangle to the highlight layer each time the drag moves. Like
     /// `preedit_handle`, it never touches `term-core` (selection is display-only UI).
     selection_handle: SelectionHandle,
+    /// True while a sidebar resize drag is in flight — a press on the right-edge grab-band
+    /// started it and `CursorMoved` sets the width until release (sidebar-resize D6).
+    resizing: bool,
+    /// Write end of the [`SidebarResizeLayer`]'s shared state — set active while dragging
+    /// so the edge rule brightens.
+    resize_handle: SidebarResizeHandle,
 }
 
 impl App {
@@ -224,6 +231,10 @@ impl App {
         // drag off the continuous-redraw loop like the cursor.
         let (selection_layer, selection_handle) = SelectionLayer::new();
         renderer.add_layer(Box::new(selection_layer));
+        // Sidebar resize-handle rule at the right edge (z=3), drawn from the same
+        // geometry the hit-test uses; brightens while dragging via its handle.
+        let (resize_layer, resize_handle) = SidebarResizeLayer::new();
+        renderer.add_layer(Box::new(resize_layer));
         // Blinking block cursor, above the glyphs (a DrawLayer so it blinks off the
         // continuous-redraw loop, unaffected by the idle-CPU snapshot cache).
         renderer.add_layer(Box::new(CursorLayer::new()));
@@ -302,6 +313,8 @@ impl App {
             selecting: false,
             sel_anchor: None,
             selection_handle,
+            resizing: false,
+            resize_handle,
         };
         running.sync_tab_model();
         running.redraw();
@@ -727,6 +740,39 @@ impl Running {
         }
     }
 
+    /// Begin a sidebar resize drag (press on the right-edge grab-band). Marks the rule
+    /// active and snaps the edge to the cursor immediately (sidebar-resize D6). Clears any
+    /// live text selection first: `apply_resize` reflows the grid (`refit`), which
+    /// invalidates viewport-relative selection coords — the same guard `Resized` applies.
+    fn begin_resize(&mut self) {
+        self.clear_selection();
+        self.resizing = true;
+        self.resize_handle.set_active(true);
+        self.apply_resize();
+    }
+
+    /// Set the sidebar width from the current cursor x and re-fit the tabs. Routes through
+    /// `set_sidebar_width`, which clamps to the Warp-style `[MIN, MAX]` band (D7/SD4).
+    fn apply_resize(&mut self) {
+        let w = crate::sidebar_resize::resize_width_logical(
+            self.last_cursor.0,
+            self.renderer.scale_factor(),
+        );
+        self.renderer.set_sidebar_width(w);
+        // The inset changed → re-fit the active and background tabs' grids (R4).
+        crate::settings::refit(&self.renderer, &mut self.tabs);
+        self.redraw();
+    }
+
+    /// End the resize drag on mouse release (no-op if not resizing).
+    fn end_resize(&mut self) {
+        if self.resizing {
+            self.resizing = false;
+            self.resize_handle.set_active(false);
+            self.window.request_redraw();
+        }
+    }
+
     /// Dispatch a key through the seam, then default input (R3.3/R4). Returns
     /// false if the app should exit.
     fn on_key(&mut self, input: KeyInput) -> bool {
@@ -860,7 +906,9 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 inner.last_cursor = (position.x, position.y);
                 inner.refresh_hover(); // one hit_test feeds both hover fields (D8)
-                if inner.selecting {
+                if inner.resizing {
+                    inner.apply_resize(); // drag → set sidebar width live (R2.2)
+                } else if inner.selecting {
                     inner.extend_selection(); // drag → grow the selection + highlight
                 }
             }
@@ -893,6 +941,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         SidebarAction::Collapse => inner.toggle_sidebar(true),
                         SidebarAction::Expand => inner.toggle_sidebar(false),
+                        SidebarAction::BeginResize => inner.begin_resize(),
                         SidebarAction::Inert => {}
                     }
                 } else if over_grid(inner.last_cursor.0, inner.renderer.left_inset()) {
@@ -906,8 +955,9 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                // Finish the drag (a plain click left no selection).
+                // Finish whichever drag was in flight (both are no-ops if inactive).
                 inner.end_selection();
+                inner.end_resize();
             }
 
             WindowEvent::MouseWheel { delta, .. } => {

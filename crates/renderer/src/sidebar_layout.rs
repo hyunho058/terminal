@@ -77,6 +77,8 @@ pub enum SidebarRegion {
     Chrome(ChromeRegion),
     Card(usize),
     Panel,
+    /// The resize grab-band on the grid side of the right edge (sidebar-resize D5).
+    ResizeHandle,
 }
 
 /// Everything the layout needs, all physical px except `scale` and `row_count` (D7).
@@ -311,8 +313,30 @@ pub fn chrome_hit(p: [f32; 2], inp: &SidebarLayoutInput, collapsed: bool) -> Opt
     None
 }
 
-/// The ordered full hit-test (D9): collapsed → outside → header (never falling through to
-/// a card) → list. `collapsed` is an argument, never a gate on whether to call this (D3).
+/// Grab-band width for the sidebar resize handle, logical px (× `scale` at use). Kept
+/// thin so it intrudes only a few px into the terminal's left margin and the
+/// absolute-cursor "jump" on press stays ≤ this (sidebar-resize D5/D7).
+pub const RESIZE_GRAB_PX: f32 = 6.0;
+
+/// The resize grab-band on the GRID side of the sidebar's right edge:
+/// `x ∈ [sidebar_w, sidebar_w + grab]`, full viewport height. `None` when collapsed
+/// (`sidebar_w <= 0`) so the draw layer AND the hit-test both derive "no handle" from
+/// this ONE function (sidebar-resize SD3/D5/D10).
+pub fn resize_handle_rect(inp: &SidebarLayoutInput) -> Option<Rect> {
+    if inp.sidebar_w <= 0.0 {
+        return None;
+    }
+    Some(Rect {
+        x: inp.sidebar_w,
+        y: 0.0,
+        w: RESIZE_GRAB_PX * inp.scale as f32,
+        h: inp.viewport[1],
+    })
+}
+
+/// The ordered full hit-test (D9): collapsed → resize-handle → outside → header (never
+/// falling through to a card) → list. `collapsed` is an argument, never a gate on whether
+/// to call this (D3).
 pub fn hit_test(
     p: [f32; 2],
     s: f32,
@@ -325,18 +349,28 @@ pub fn hit_test(
             .contains(p)
             .then_some(SidebarRegion::Chrome(ChromeRegion::Restore));
     }
-    // 2. Outside the sidebar band.
+    // 2. The resize grab-band, grid-side of the right edge (sidebar-resize D5) — checked
+    //    BEFORE the outside-band `None` so a press just right of the edge starts a resize,
+    //    not a grid action. `resize_handle_rect` is `None` when collapsed, so this is
+    //    reached only for an expanded sidebar; being at `x >= sidebar_w` it never overlaps
+    //    the header/card checks below (which run only for `x < sidebar_w`).
+    if let Some(handle) = resize_handle_rect(inp) {
+        if handle.contains(p) {
+            return Some(SidebarRegion::ResizeHandle);
+        }
+    }
+    // 3. Outside the sidebar band.
     if p[0] < 0.0 || p[0] >= inp.sidebar_w || p[1] < 0.0 || p[1] >= inp.viewport[1] {
         return None;
     }
-    // 3. Inside the header: a button, else Panel — never a card (D9's whole point).
+    // 4. Inside the header: a button, else Panel — never a card (D9's whole point).
     if header_rect(inp).contains(p) {
         return Some(match chrome_hit(p, inp, false) {
             Some(r) => SidebarRegion::Chrome(r),
             None => SidebarRegion::Panel,
         });
     }
-    // 4. The list: a card, else Panel (dead space is swallowed, not leaked).
+    // 5. The list: a card, else Panel (dead space is swallowed, not leaked).
     Some(match row_at(p[1], s, inp) {
         Some(i) => SidebarRegion::Card(i),
         None => SidebarRegion::Panel,
@@ -363,6 +397,50 @@ mod tests {
         // R1.1
         assert_eq!(header_h(1.0), 54.0);
         assert_eq!(header_h(2.0), 108.0);
+    }
+
+    #[test]
+    fn resize_handle_is_grid_side_band_or_none_collapsed() {
+        // sidebar-resize R1.1 / R6.1
+        let inp = input(300.0, 900.0, 1.0, 5);
+        let h = resize_handle_rect(&inp).expect("expanded → a band");
+        assert_eq!(h.x, 300.0, "band starts at the right edge (grid side)");
+        assert_eq!(h.w, RESIZE_GRAB_PX, "grab width at scale 1.0");
+        assert_eq!(h.y, 0.0);
+        assert_eq!(h.h, 900.0, "full viewport height");
+        // Scale widens the band.
+        let inp2 = input(600.0, 900.0, 2.0, 5);
+        assert_eq!(resize_handle_rect(&inp2).unwrap().w, RESIZE_GRAB_PX * 2.0);
+        // Collapsed (sidebar_w == 0) → no handle — ONE source for draw + hit-test (D10).
+        assert_eq!(resize_handle_rect(&input(0.0, 900.0, 1.0, 5)), None);
+    }
+
+    #[test]
+    fn hit_test_resize_handle_before_grid_and_not_over_body() {
+        // sidebar-resize R1.1 / R1.2
+        let inp = input(300.0, 900.0, 1.0, 5);
+        // Just right of the edge, within the grab band → ResizeHandle…
+        assert_eq!(
+            hit_test([301.0, 400.0], 0.0, &inp, false),
+            Some(SidebarRegion::ResizeHandle)
+        );
+        // …the left edge x == sidebar_w is included (half-open, grid-side)…
+        assert_eq!(
+            hit_test([300.0, 10.0], 0.0, &inp, false),
+            Some(SidebarRegion::ResizeHandle)
+        );
+        // …a point in the sidebar body (x < sidebar_w) is NOT the resize handle…
+        assert_ne!(
+            hit_test([150.0, 400.0], 0.0, &inp, false),
+            Some(SidebarRegion::ResizeHandle)
+        );
+        // …past the band (x > sidebar_w + grab) is the grid → None…
+        assert_eq!(hit_test([320.0, 400.0], 0.0, &inp, false), None);
+        // …and collapsed never yields a resize handle.
+        assert_ne!(
+            hit_test([2.0, 2.0], 0.0, &input(0.0, 900.0, 1.0, 5), true),
+            Some(SidebarRegion::ResizeHandle)
+        );
     }
 
     #[test]
@@ -498,7 +576,10 @@ mod tests {
     fn outside_and_dead_space() {
         // R6.5 / R6.6
         let inp = input(340.0, 900.0, 1.0, 2);
-        assert_eq!(hit_test([341.0, 100.0], 0.0, &inp, false), None);
+        // Past the resize grab-band (sidebar_w=340 + grab=6 → ≥346) is the grid → None.
+        // (The first ~6px right of the edge is now the resize handle — see
+        // `hit_test_resize_handle_before_grid_and_not_over_body`.)
+        assert_eq!(hit_test([347.0, 100.0], 0.0, &inp, false), None);
         assert_eq!(hit_test([170.0, -1.0], 0.0, &inp, false), None);
         // Header dead space and below-last-row both Panel, not None.
         let hdr_dead = [inp.metrics.header_pad_x + 1.0, 20.0];
