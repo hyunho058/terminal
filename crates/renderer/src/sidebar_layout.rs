@@ -9,37 +9,23 @@
 //!   when collapsed reserves no width (pass `collapsed = true`, R7.2).
 //! - [`SidebarRegion::Panel`] means "inside the sidebar, on no target" — swallow it;
 //!   `None` means "over the grid" (R6.6).
-//! - Push the raw cursor to this layer's handle and let it resolve hover via
-//!   [`chrome_hit`] (R7.4) — the same function you call on a press, so highlight and
-//!   click never disagree.
 //! - The header height reaches the cards via the shared model's `list_top` (R7.5), the
 //!   scroll offset via `scroll_px` (R7.6, you own it, D6). On a tab switch call
 //!   [`scroll_to_reveal`] so the active row is visible (R7.7).
 //!
 //! **Traps this module deliberately avoids:** it derives no card height (that is
-//! `sidebar-row-redesign`'s — `row_h` is an *input*, R4.8); it scales metrics nowhere —
-//! `inp.metrics` arrives already scaled (R6.9); and [`restore_button_rect`] takes a scale
-//! alone, so the collapsed affordance is reachable with no published card layout (D7).
+//! `sidebar-row-redesign`'s — `row_h` is an *input*, R4.8); and it scales metrics nowhere
+//! — `inp.metrics` arrives already scaled (R6.9). (The collapsed restore affordance is
+//! gone: that control now lives in the title bar, titlebar-tab-controls R5.)
 
 use crate::sidebar_theme::SidebarMetrics;
 
 /// Tokens the mock defines for surfaces only this feature draws (D15). Logical px,
-/// multiplied by `scale` at the single point of use. **Destination note:** the two
-/// colours belong in `SidebarTheme` and `ICON_PX` in `SidebarMetrics`; they live here
-/// only because `sidebar_theme.rs` is another feature's declared surface.
+/// multiplied by `scale` at the single point of use. **Destination note:** `ICON_PX`
+/// belongs in `SidebarMetrics`; it lives here only because `sidebar_theme.rs` is another
+/// feature's declared surface. (The restore-button tokens were retired with the button —
+/// the title bar's toggle now serves restore, titlebar-tab-controls R5.)
 pub mod tokens {
-    /// Restore button fill (`#2c2822`).
-    pub const RESTORE_BG: u32 = 0x002C_2822;
-    /// Restore button border (`#3b362e`).
-    pub const RESTORE_BORDER: u32 = 0x003B_362E;
-    /// Restore button top offset from the window top-left, logical px.
-    pub const RESTORE_TOP: f32 = 12.0;
-    /// Restore button left offset, logical px.
-    pub const RESTORE_LEFT: f32 = 14.0;
-    /// Padding around the restore icon inside its button, logical px.
-    pub const RESTORE_PAD: f32 = 8.0;
-    /// Restore button corner radius, logical px.
-    pub const RESTORE_RADIUS: f32 = 9.0;
     /// Header-button icon render size, logical px. A judgement, not a transcription —
     /// the mock's 24-unit viewBox was not captured in foundations' research (Known Gap).
     pub const ICON_PX: f32 = 16.0;
@@ -62,19 +48,13 @@ impl Rect {
     }
 }
 
-/// A live chrome target (D2 — no `Filter`: the filter is drawn but has no hit region).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChromeRegion {
-    NewTab,
-    HideSidebar,
-    Restore,
-}
-
 /// The result of a full sidebar hit-test (D9). `Panel` = "inside the sidebar, on no
 /// target" (swallow); the absence of a hit (over the grid) is `None`, never `Panel`.
+/// The new-tab / collapse / restore controls now live in the title bar
+/// (titlebar-tab-controls R5), so the sidebar exposes no chrome target — the header is
+/// inert (`Panel`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidebarRegion {
-    Chrome(ChromeRegion),
     Card(usize),
     Panel,
     /// The resize grab-band on the grid side of the right edge (sidebar-resize D5).
@@ -97,6 +77,11 @@ pub struct SidebarLayoutInput {
     pub row_count: usize,
     /// **Already scaled**: `SidebarMetrics::scaled(scale)`, never `SidebarMetrics::DEFAULT`.
     pub metrics: SidebarMetrics,
+    /// Physical px reserved by the top title bar (titlebar-tab-controls D6). Every
+    /// top-relative sidebar y is shifted down by this from THIS single value, so the
+    /// sidebar begins below the title bar and drawn rows stay aligned with hit-test rows.
+    /// `0.0` when there is no title bar.
+    pub top_inset: f32,
 }
 
 impl SidebarLayoutInput {
@@ -114,6 +99,7 @@ impl SidebarLayoutInput {
             row_h,
             row_count,
             metrics: SidebarMetrics::DEFAULT.scaled(ctx.scale_factor),
+            top_inset: ctx.top_inset,
         }
     }
 }
@@ -133,41 +119,27 @@ fn button_side(inp: &SidebarLayoutInput) -> f32 {
     (header_h(inp.scale) - inp.metrics.header_pad_top - inp.metrics.header_pad_bottom).max(0.0)
 }
 
-/// The opaque header band.
+/// The opaque header band. Its top begins at `top_inset` so it sits below the title bar
+/// (titlebar-tab-controls D6).
 pub fn header_rect(inp: &SidebarLayoutInput) -> Rect {
     Rect {
         x: 0.0,
-        y: 0.0,
+        y: inp.top_inset,
         w: inp.sidebar_w,
         h: header_h(inp.scale),
     }
 }
 
-/// A live header button's box. `NewTab`/`HideSidebar` are right-aligned at the trailing
-/// edge (hide at the corner); `Restore` is the collapsed affordance (D1/D7).
-pub fn button_rect(region: ChromeRegion, inp: &SidebarLayoutInput) -> Rect {
-    let bw = button_side(inp);
-    let gap = inp.metrics.header_gap;
-    let right = inp.sidebar_w - inp.metrics.header_pad_x;
-    let y = inp.metrics.header_pad_top;
-    let x = match region {
-        ChromeRegion::HideSidebar => right - bw,
-        ChromeRegion::NewTab => right - 2.0 * bw - gap,
-        ChromeRegion::Restore => return restore_button_rect(inp.scale),
-    };
-    Rect { x, y, w: bw, h: bw }
-}
-
-/// The inert filter icon's box — one `header_gap` left of `NewTab` (D2). Published so the
-/// other icons' positions and the deferred search field can depend on it; it has no hit
-/// region.
+/// The inert filter icon's box — the trailing icon in the header (D2). Its `y` includes
+/// `top_inset` so it sits inside the header band below the title bar (D6). Published so
+/// the deferred search field can depend on it; it has no hit region.
 pub fn filter_icon_rect(inp: &SidebarLayoutInput) -> Rect {
     let bw = button_side(inp);
     let gap = inp.metrics.header_gap;
     let right = inp.sidebar_w - inp.metrics.header_pad_x;
     Rect {
         x: right - 3.0 * bw - 2.0 * gap,
-        y: inp.metrics.header_pad_top,
+        y: inp.top_inset + inp.metrics.header_pad_top,
         w: bw,
         h: bw,
     }
@@ -180,15 +152,17 @@ pub fn search_slot_rect(inp: &SidebarLayoutInput) -> Rect {
     let x = inp.metrics.header_pad_x;
     Rect {
         x,
-        y: inp.metrics.header_pad_top,
+        y: inp.top_inset + inp.metrics.header_pad_top,
         w: (filter.x - inp.metrics.header_gap - x).max(0.0),
         h: button_side(inp),
     }
 }
 
-/// The band the cards live in — below the pinned header, to the framebuffer bottom.
+/// The band the cards live in — below the title bar + pinned header, to the framebuffer
+/// bottom. The `top_inset` shift flows to every card via `row_rect`/`row_at`, so drawn
+/// rows and hit-test rows move together (titlebar-tab-controls D6).
 pub fn list_viewport(inp: &SidebarLayoutInput) -> Rect {
-    let top = header_h(inp.scale);
+    let top = inp.top_inset + header_h(inp.scale);
     Rect {
         x: 0.0,
         y: top,
@@ -283,36 +257,6 @@ pub fn visible_rows(s: f32, inp: &SidebarLayoutInput) -> std::ops::Range<usize> 
     start..end
 }
 
-/// The collapsed restore affordance's box — layout-free, so it is reachable when no card
-/// layout has ever been published (D7). Uses only [`tokens`], no `SidebarMetrics`.
-pub fn restore_button_rect(scale: f64) -> Rect {
-    let s = scale as f32;
-    let box_sz = (tokens::ICON_PX + 2.0 * tokens::RESTORE_PAD) * s;
-    Rect {
-        x: tokens::RESTORE_LEFT * s,
-        y: tokens::RESTORE_TOP * s,
-        w: box_sz,
-        h: box_sz,
-    }
-}
-
-/// Chrome-only, scroll-free hit-test — what the layer calls to resolve hover, and what
-/// `sidebar-interaction` calls on a press (D10). The filter has no region (D2).
-pub fn chrome_hit(p: [f32; 2], inp: &SidebarLayoutInput, collapsed: bool) -> Option<ChromeRegion> {
-    if collapsed {
-        return restore_button_rect(inp.scale)
-            .contains(p)
-            .then_some(ChromeRegion::Restore);
-    }
-    if button_rect(ChromeRegion::NewTab, inp).contains(p) {
-        return Some(ChromeRegion::NewTab);
-    }
-    if button_rect(ChromeRegion::HideSidebar, inp).contains(p) {
-        return Some(ChromeRegion::HideSidebar);
-    }
-    None
-}
-
 /// Grab-band width for the sidebar resize handle, logical px (× `scale` at use). Kept
 /// thin so it intrudes only a few px into the terminal's left margin and the
 /// absolute-cursor "jump" on press stays ≤ this (sidebar-resize D5/D7).
@@ -326,11 +270,13 @@ pub fn resize_handle_rect(inp: &SidebarLayoutInput) -> Option<Rect> {
     if inp.sidebar_w <= 0.0 {
         return None;
     }
+    // Starts at `top_inset` so the band (and its drawn rule) sit below the title bar,
+    // not up through it (titlebar-tab-controls D6).
     Some(Rect {
         x: inp.sidebar_w,
-        y: 0.0,
+        y: inp.top_inset,
         w: RESIZE_GRAB_PX * inp.scale as f32,
-        h: inp.viewport[1],
+        h: (inp.viewport[1] - inp.top_inset).max(0.0),
     })
 }
 
@@ -343,11 +289,10 @@ pub fn hit_test(
     inp: &SidebarLayoutInput,
     collapsed: bool,
 ) -> Option<SidebarRegion> {
-    // 1. Collapsed: only the restore button is live; every other point is the terminal.
+    // 1. Collapsed: the sidebar exposes no target — restore now lives in the title bar
+    //    (titlebar-tab-controls R5), so every point is the terminal.
     if collapsed {
-        return restore_button_rect(inp.scale)
-            .contains(p)
-            .then_some(SidebarRegion::Chrome(ChromeRegion::Restore));
+        return None;
     }
     // 2. The resize grab-band, grid-side of the right edge (sidebar-resize D5) — checked
     //    BEFORE the outside-band `None` so a press just right of the edge starts a resize,
@@ -363,12 +308,11 @@ pub fn hit_test(
     if p[0] < 0.0 || p[0] >= inp.sidebar_w || p[1] < 0.0 || p[1] >= inp.viewport[1] {
         return None;
     }
-    // 4. Inside the header: a button, else Panel — never a card (D9's whole point).
+    // 4. Inside the header: always Panel — the header hosts no live target now (its
+    //    controls moved to the title bar, R5), and it must never fall through to a card
+    //    (D9's whole point).
     if header_rect(inp).contains(p) {
-        return Some(match chrome_hit(p, inp, false) {
-            Some(r) => SidebarRegion::Chrome(r),
-            None => SidebarRegion::Panel,
-        });
+        return Some(SidebarRegion::Panel);
     }
     // 5. The list: a card, else Panel (dead space is swallowed, not leaked).
     Some(match row_at(p[1], s, inp) {
@@ -389,6 +333,7 @@ mod tests {
             row_h: 60.0 * scale as f32,
             row_count,
             metrics: SidebarMetrics::DEFAULT.scaled(scale),
+            top_inset: 0.0,
         }
     }
 
@@ -397,6 +342,31 @@ mod tests {
         // R1.1
         assert_eq!(header_h(1.0), 54.0);
         assert_eq!(header_h(2.0), 108.0);
+    }
+
+    #[test]
+    fn top_inset_shifts_rows_and_resize_band_together() {
+        // titlebar-tab-controls D6: a title bar of height k shifts every top-relative y
+        // by k, from the ONE `top_inset` value — drawn rows AND hit-test rows AND the
+        // header/resize band — so nothing desyncs.
+        let mut inp = input(300.0, 900.0, 1.0, 5);
+        inp.top_inset = 40.0;
+        // The list viewport (hence every row) starts at top_inset + header_h.
+        assert_eq!(list_viewport(&inp).y, 40.0 + header_h(1.0));
+        // A drawn card's rect and the hit-test of its centre agree under the shift.
+        let r = row_rect(1, 0.0, &inp);
+        let hit = row_at(r.y + r.h / 2.0, 0.0, &inp);
+        assert_eq!(
+            hit,
+            Some(1),
+            "drawn row 1 centre hit-tests to row 1 (no desync)"
+        );
+        // The header band and the resize band both start at top_inset.
+        assert_eq!(header_rect(&inp).y, 40.0);
+        assert_eq!(resize_handle_rect(&inp).unwrap().y, 40.0);
+        // The inert filter icon (the header's only remaining glyph, R5) shifts with the
+        // band: top_inset + pad_top, not a bare pad_top.
+        assert_eq!(filter_icon_rect(&inp).y, 40.0 + inp.metrics.header_pad_top);
     }
 
     #[test]
@@ -444,28 +414,18 @@ mod tests {
     }
 
     #[test]
-    fn icons_right_aligned_in_order() {
-        // R1.2 — hide at the corner, new-tab one gap left, filter one gap left of that.
+    fn filter_icon_geometry() {
+        // R1.2 (residual) — the inert filter icon keeps its slot after the +/hide
+        // controls moved to the title bar (R5): a 28px square at pad_top, inside the band.
         let inp = input(340.0, 900.0, 1.0, 5);
-        let hide = button_rect(ChromeRegion::HideSidebar, &inp);
-        let newtab = button_rect(ChromeRegion::NewTab, &inp);
         let filter = filter_icon_rect(&inp);
-        assert_eq!(
-            hide.x + hide.w,
-            340.0 - 12.0,
-            "hide right edge at sidebar_w - pad_x"
-        );
-        assert_eq!(hide.w, 28.0);
-        assert_eq!(hide.h, 28.0);
-        assert_eq!(newtab.x, hide.x - 8.0 - 28.0, "new-tab one header_gap left");
-        assert_eq!(
-            filter.x,
-            newtab.x - 8.0 - 28.0,
-            "filter one gap left of new-tab"
-        );
-        assert_eq!(hide.y, 14.0);
-        assert_eq!(newtab.y, 14.0);
+        assert_eq!(filter.w, 28.0);
+        assert_eq!(filter.h, 28.0);
         assert_eq!(filter.y, 14.0);
+        assert!(
+            filter.x + filter.w <= 340.0 - 12.0 + 0.01,
+            "filter stays inside sidebar_w - pad_x"
+        );
     }
 
     #[test]
@@ -481,16 +441,11 @@ mod tests {
                     "slot {} at logical w={logical_w}, scale={scale}",
                     slot.w
                 );
-                for icon in [
-                    button_rect(ChromeRegion::HideSidebar, &inp),
-                    button_rect(ChromeRegion::NewTab, &inp),
-                    filter_icon_rect(&inp),
-                ] {
-                    assert!(
-                        slot.x + slot.w <= icon.x + 0.01,
-                        "search slot must not reach the icons"
-                    );
-                }
+                let icon = filter_icon_rect(&inp);
+                assert!(
+                    slot.x + slot.w <= icon.x + 0.01,
+                    "search slot must not reach the filter icon"
+                );
             }
         }
     }
@@ -504,29 +459,13 @@ mod tests {
     }
 
     #[test]
-    fn chrome_regions_round_trip() {
-        // R6.1 — the centre of each live region resolves to that region.
-        for scale in [1.0_f64, 2.0] {
-            let inp = input(340.0, 900.0, scale, 5);
-            for region in [ChromeRegion::NewTab, ChromeRegion::HideSidebar] {
-                let r = button_rect(region, &inp);
-                let c = [r.x + r.w / 2.0, r.y + r.h / 2.0];
-                assert_eq!(chrome_hit(c, &inp, false), Some(region));
-            }
-            // Collapsed: the restore button.
-            let r = restore_button_rect(scale);
-            let c = [r.x + r.w / 2.0, r.y + r.h / 2.0];
-            assert_eq!(chrome_hit(c, &inp, true), Some(ChromeRegion::Restore));
-        }
-    }
-
-    #[test]
-    fn filter_is_never_a_hover_target() {
-        // R2.4 — the filter icon's centre resolves to nothing (no hit region, D2).
+    fn filter_is_inert_panel() {
+        // R2.4 / R5 — the filter icon has no hit region (D2); a press on it lands in the
+        // header and is swallowed as Panel, never a chrome target (those are retired).
         let inp = input(340.0, 900.0, 1.0, 5);
         let f = filter_icon_rect(&inp);
         let c = [f.x + f.w / 2.0, f.y + f.h / 2.0];
-        assert_eq!(chrome_hit(c, &inp, false), None);
+        assert_eq!(hit_test(c, 0.0, &inp, false), Some(SidebarRegion::Panel));
     }
 
     #[test]
@@ -595,15 +534,11 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_only_restore_is_live() {
-        // R3.1-ish / R3.5 — collapsed, only the restore button hits; all else is None.
+    fn collapsed_sidebar_is_all_none() {
+        // R5 — collapsed, the sidebar exposes no target (restore moved to the title bar):
+        // every point is the terminal (None), including where the old restore box sat.
         let inp = input(0.0, 900.0, 1.0, 5);
-        let r = restore_button_rect(inp.scale);
-        let c = [r.x + r.w / 2.0, r.y + r.h / 2.0];
-        assert_eq!(
-            hit_test(c, 0.0, &inp, true),
-            Some(SidebarRegion::Chrome(ChromeRegion::Restore))
-        );
+        assert_eq!(hit_test([20.0, 20.0], 0.0, &inp, true), None);
         assert_eq!(hit_test([400.0, 400.0], 0.0, &inp, true), None);
     }
 

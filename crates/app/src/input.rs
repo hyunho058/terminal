@@ -3,7 +3,7 @@
 //! Both are pure functions over winit's logical `Key` + `ModifiersState`, so the
 //! chord table is unit-tested without a window.
 
-use renderer::sidebar_layout::{self, ChromeRegion, SidebarLayoutInput, SidebarRegion};
+use renderer::sidebar_layout::{self, SidebarLayoutInput, SidebarRegion};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey};
 
 /// A tab-management action triggered by a Cmd chord (D5). Intercepted before
@@ -77,13 +77,12 @@ fn logical_tab_action(c: char) -> Option<TabAction> {
 }
 
 /// What the app does about a pointer press (D1). Distinct from the renderer's *region*
-/// enum: several regions map to one action, and two map to "consumed" (`Inert`).
+/// enum. The new-tab / collapse / restore controls moved to the title bar
+/// (titlebar-tab-controls R5), so the sidebar itself now only switches tabs, swallows
+/// dead space (`Inert`), or starts a resize.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SidebarAction {
     Switch(usize),
-    NewTab,
-    Collapse,
-    Expand,
     Inert,
     /// A press on the resize grab-band — begin a live sidebar resize (sidebar-resize D6).
     BeginResize,
@@ -111,9 +110,6 @@ pub fn sidebar_press(
     let p = [cursor.0 as f32, cursor.1 as f32];
     sidebar_layout::hit_test(p, scroll, inp, collapsed).map(|region| match region {
         SidebarRegion::Card(i) => SidebarAction::Switch(i),
-        SidebarRegion::Chrome(ChromeRegion::NewTab) => SidebarAction::NewTab,
-        SidebarRegion::Chrome(ChromeRegion::HideSidebar) => SidebarAction::Collapse,
-        SidebarRegion::Chrome(ChromeRegion::Restore) => SidebarAction::Expand,
         SidebarRegion::Panel => SidebarAction::Inert,
         SidebarRegion::ResizeHandle => SidebarAction::BeginResize,
     })
@@ -795,6 +791,7 @@ mod tests {
             row_h: 60.0,
             row_count: count,
             metrics: renderer::sidebar_theme::SidebarMetrics::DEFAULT.scaled(1.0),
+            top_inset: 0.0,
         }
     }
 
@@ -814,25 +811,20 @@ mod tests {
             matches!(region, Some(SidebarRegion::Card(_))),
             "and hit_test agrees"
         );
-        // The hide button (top-right) collapses.
-        let hide = sidebar_layout::button_rect(ChromeRegion::HideSidebar, &inp);
-        let c = (
-            (hide.x + hide.w / 2.0) as f64,
-            (hide.y + hide.h / 2.0) as f64,
+        // The header is now inert (its +/hide controls moved to the title bar, R5): a
+        // press in the header band is swallowed, not a collapse.
+        let hdr = (
+            (inp.metrics.header_pad_x + 1.0) as f64,
+            (sidebar_layout::header_h(1.0) / 2.0) as f64,
         );
         assert_eq!(
-            sidebar_press(c, &inp, 0.0, false),
-            Some(SidebarAction::Collapse)
+            sidebar_press(hdr, &inp, 0.0, false),
+            Some(SidebarAction::Inert)
         );
         // A point over the grid is not the sidebar's business.
         assert_eq!(sidebar_press((400.0, 100.0), &inp, 0.0, false), None);
-        // Collapsed: the restore button expands; elsewhere None.
-        let r = sidebar_layout::restore_button_rect(1.0);
-        let rc = ((r.x + r.w / 2.0) as f64, (r.y + r.h / 2.0) as f64);
-        assert_eq!(
-            sidebar_press(rc, &inp, 0.0, true),
-            Some(SidebarAction::Expand)
-        );
+        // Collapsed: the sidebar exposes no target at all (restore is a title-bar control).
+        assert_eq!(sidebar_press((20.0, 20.0), &inp, 0.0, true), None);
         assert_eq!(sidebar_press((400.0, 400.0), &inp, 0.0, true), None);
     }
 

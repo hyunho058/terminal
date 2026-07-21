@@ -1,29 +1,26 @@
-//! The pinned sidebar header + collapsed restore button, as a [`crate::DrawLayer`] that
-//! **nobody registers** (D14 — `sidebar-interaction` calls `add_layer` from
-//! `terminal_app.rs`). It draws no text (D12): the opaque `panel_bg` band (D5), the three
-//! header icons via [`push_icon`], the hover highlight resolved from a raw cursor through
-//! [`chrome_hit`], and — while collapsed — the floating restore button (D3/D4).
+//! The pinned sidebar header band, as a [`crate::DrawLayer`] that **nobody registers**
+//! (D14 — `sidebar-interaction` calls `add_layer` from `terminal_app.rs`). It draws no
+//! text (D12): the opaque `panel_bg` band (D5) and the inert filter icon via [`push_icon`].
+//!
+//! The new-tab (`+`), hide, and collapsed-restore controls it used to host all moved to
+//! the top title bar (`titlebar-tab-controls` R5), so this layer no longer hit-tests a
+//! hover cursor — it has no live target left. The band's top and the filter icon are
+//! shifted down by `top_inset` so they sit below the title bar (D6).
 //!
 //! Shape building is a device-free free function ([`build_shapes`]) so every R2/R3
 //! assertion runs without a GPU; `record` is a thin wrapper that assembles the input,
 //! calls it, draws, and publishes `list_top` to the shared model (D13).
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use crate::sidebar_icons::{push_icon, Icon};
-use crate::sidebar_layout::{
-    button_rect, chrome_hit, filter_icon_rect, header_h, restore_button_rect, tokens, ChromeRegion,
-    SidebarLayoutInput,
-};
+use crate::sidebar_layout::{filter_icon_rect, header_h, tokens, SidebarLayoutInput};
 use crate::sidebar_row::TabModelHandle;
 use crate::sidebar_shapes::{Fill, SidebarShape, SidebarShapePipeline};
 use crate::sidebar_theme::{linear, SidebarTheme};
 use crate::{DrawLayer, FrameCtx};
 
 /// z-order: above the cards (`TAB_BAR_Z = 10`, so the opaque band clips scrolled cards)
-/// and inline images (`IMAGE_Z = 20`, so the restore button is never buried), below the
-/// ai-monitor overlay (`OVERLAY_Z = 100`) (D4).
+/// and inline images (`IMAGE_Z = 20`), below the ai-monitor overlay (`OVERLAY_Z = 100`)
+/// (D4).
 pub const SIDEBAR_CHROME_Z: i32 = 30;
 
 // R3.7 / D4 — a compile-time invariant, not a comment: the chrome must sit above the
@@ -33,106 +30,56 @@ const _: () = assert!(SIDEBAR_CHROME_Z > crate::sidebar_row::TAB_BAR_Z);
 const _: () = assert!(SIDEBAR_CHROME_Z > crate::image_layer::IMAGE_Z);
 const _: () = assert!(SIDEBAR_CHROME_Z < crate::overlay_layer::OVERLAY_Z);
 
-/// The one field the app writes (D10/D11): the raw cursor in physical px, `None` when the
-/// pointer leaves the window. Resolved to a hover region by the layer, never the app.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct SidebarChromeModel {
-    pub cursor: Option<[f32; 2]>,
-}
-
-/// The third instance of the established handle idiom (D11) — `Rc<RefCell<_>>`, single
-/// UI thread, never `Send`.
-#[derive(Clone, Default)]
-pub struct SidebarChromeHandle(Rc<RefCell<SidebarChromeModel>>);
-
-impl SidebarChromeHandle {
-    /// Replace the model (the app pushes the cursor each pointer move).
-    pub fn set(&self, model: SidebarChromeModel) {
-        *self.0.borrow_mut() = model;
-    }
-
-    /// Convenience: push just the raw cursor.
-    pub fn set_cursor(&self, cursor: Option<[f32; 2]>) {
-        self.0.borrow_mut().cursor = cursor;
-    }
-
-    fn cursor(&self) -> Option<[f32; 2]> {
-        self.0.borrow().cursor
-    }
-}
-
-/// The header/restore draw layer (D14). Reuses one `Vec<SidebarShape>` so a steady frame
+/// The header draw layer (D14). Reuses one `Vec<SidebarShape>` so a steady frame
 /// allocates nothing (D12/SD4).
 pub struct SidebarChromeLayer {
-    handle: SidebarChromeHandle,
     pipe: Option<SidebarShapePipeline>,
     shapes: Vec<SidebarShape>,
 }
 
 impl SidebarChromeLayer {
-    /// Create the layer and its handle (D14 — the app cannot write a cursor into a handle
-    /// it was never given). Matches `TabBar::new()`'s tuple shape.
-    pub fn new() -> (SidebarChromeLayer, SidebarChromeHandle) {
-        let handle = SidebarChromeHandle::default();
-        (
-            SidebarChromeLayer {
-                handle: handle.clone(),
-                pipe: None,
-                shapes: Vec::new(),
-            },
-            handle,
-        )
+    /// Create the layer. No handle: the header has no interactive target since its
+    /// controls moved to the title bar (R5), so there is no hover cursor to feed it.
+    pub fn new() -> SidebarChromeLayer {
+        SidebarChromeLayer {
+            pipe: None,
+            shapes: Vec::new(),
+        }
+    }
+}
+
+impl Default for SidebarChromeLayer {
+    fn default() -> Self {
+        SidebarChromeLayer::new()
     }
 }
 
 /// Emit the chrome shapes for `inp` — device-free (D12), so R2/R3 test it directly. When
-/// `collapsed`, only the restore button; otherwise the opaque band + three icons, the two
-/// live ones brightened with a hover background when `hover` names them (D10). The band's
-/// alpha is 1.0 by contract, not taste — it is the clip mechanism (D5).
-pub fn build_shapes(
-    inp: &SidebarLayoutInput,
-    collapsed: bool,
-    hover: Option<ChromeRegion>,
-    out: &mut Vec<SidebarShape>,
-) {
+/// `collapsed`, nothing (the header reserves no width, and restore now lives in the title
+/// bar, R5); otherwise the opaque band + the inert filter icon, both shifted down by
+/// `top_inset` (D6). The band's alpha is 1.0 by contract, not taste — it is the clip
+/// mechanism (D5).
+pub fn build_shapes(inp: &SidebarLayoutInput, collapsed: bool, out: &mut Vec<SidebarShape>) {
     if inp.viewport[1] <= 0.0 || !inp.viewport[1].is_finite() || !inp.scale.is_finite() {
         return; // R8.2 / R8.4 — degenerate viewport or scale emits nothing
     }
-    let theme = SidebarTheme::DEFAULT;
-    let scale = inp.scale as f32;
-    let icon_sz = tokens::ICON_PX * scale;
-    let border_w = inp.metrics.border_w;
-
-    // Collapsed: only the floating restore button, over the terminal (D3/D4).
+    // Collapsed reserves no header band; the restore control is retired (R5). Draw nothing.
     if collapsed {
-        let r = restore_button_rect(inp.scale);
-        if let Some(s) = SidebarShape::rounded_box(
-            [r.x, r.y, r.w, r.h],
-            tokens::RESTORE_RADIUS * scale,
-            border_w,
-            Fill::solid(linear(tokens::RESTORE_BG, 1.0)),
-            linear(tokens::RESTORE_BORDER, 1.0),
-        ) {
-            out.push(s);
-        }
-        push_icon(
-            out,
-            Icon::Panel,
-            r.x + (r.w - icon_sz) * 0.5,
-            r.y + (r.h - icon_sz) * 0.5,
-            icon_sz,
-            theme.icon_fg,
-        );
         return;
     }
-
     if inp.sidebar_w <= 0.0 || !inp.sidebar_w.is_finite() {
         return; // R8.4 — expanded but no band
     }
 
+    let theme = SidebarTheme::DEFAULT;
+    let scale = inp.scale as f32;
+    let icon_sz = tokens::ICON_PX * scale;
+
     // The opaque header band — OPAQUE by contract, it is what clips a scrolled card (D5).
+    // Its top begins at `top_inset` so it sits below the title bar (D6), matching
+    // `header_rect` in the layout module (draw == hit-test, SD3).
     if let Some(band) = SidebarShape::rounded_box(
-        [0.0, 0.0, inp.sidebar_w, header_h(inp.scale)],
+        [0.0, inp.top_inset, inp.sidebar_w, header_h(inp.scale)],
         0.0,
         0.0,
         Fill::solid(linear(theme.panel_bg, 1.0)),
@@ -141,7 +88,8 @@ pub fn build_shapes(
         out.push(band);
     }
 
-    // The inert filter icon — no hover, no region (D2).
+    // The inert filter icon — no hover, no region (D2). Its rect already carries the
+    // `top_inset` shift (see `filter_icon_rect`), so it lands inside the band.
     let f = filter_icon_rect(inp);
     push_icon(
         out,
@@ -151,36 +99,6 @@ pub fn build_shapes(
         icon_sz,
         theme.icon_fg,
     );
-
-    // The two live buttons — new-tab (plus) and hide (panel), hover-aware (D10).
-    for (region, icon) in [
-        (ChromeRegion::NewTab, Icon::Plus),
-        (ChromeRegion::HideSidebar, Icon::Panel),
-    ] {
-        let b = button_rect(region, inp);
-        let color = if hover == Some(region) {
-            if let Some(bg) = SidebarShape::rounded_box(
-                [b.x, b.y, b.w, b.h],
-                inp.metrics.button_radius,
-                0.0,
-                Fill::solid(linear(theme.icon_bg_hover, 1.0)),
-                [0.0; 4],
-            ) {
-                out.push(bg);
-            }
-            theme.icon_fg_hover
-        } else {
-            theme.icon_fg
-        };
-        push_icon(
-            out,
-            icon,
-            b.x + (b.w - icon_sz) * 0.5,
-            b.y + (b.h - icon_sz) * 0.5,
-            icon_sz,
-            color,
-        );
-    }
 }
 
 impl DrawLayer for SidebarChromeLayer {
@@ -196,8 +114,8 @@ impl DrawLayer for SidebarChromeLayer {
         // the OPPOSITE guard to the row layer, which stops drawing here as this one starts.
         let collapsed = ctx.left_inset <= 0.0;
 
-        // Row count feeds the input; the header/restore geometry does not use row_h, so a
-        // missing published card layout (collapsed session) is harmless.
+        // Row count feeds the input; the header geometry does not use row_h, so a missing
+        // published card layout (collapsed session) is harmless.
         let (row_h, row_count) = TabModelHandle::shared().with(|m| {
             (
                 m.layout.as_ref().map(|l| l.card_h).unwrap_or(0.0),
@@ -205,14 +123,10 @@ impl DrawLayer for SidebarChromeLayer {
             )
         });
         let inp = SidebarLayoutInput::from_frame(ctx, row_h, row_count);
-        let hover = self
-            .handle
-            .cursor()
-            .and_then(|p| chrome_hit(p, &inp, collapsed));
 
         let mut shapes = std::mem::take(&mut self.shapes);
         shapes.clear();
-        build_shapes(&inp, collapsed, hover, &mut shapes);
+        build_shapes(&inp, collapsed, &mut shapes);
         {
             let pipe = SidebarShapePipeline::ensure(&mut self.pipe, ctx);
             pipe.draw(ctx, &shapes);
@@ -243,6 +157,7 @@ mod tests {
             row_h: 60.0 * scale as f32,
             row_count: 5,
             metrics: SidebarMetrics::DEFAULT.scaled(scale),
+            top_inset: 0.0,
         }
     }
 
@@ -253,7 +168,7 @@ mod tests {
     fn band_is_opaque_panel_bg() {
         // R2.1 — the first shape is the full-width band, fully opaque, in panel_bg.
         let mut out = Vec::new();
-        build_shapes(&input(340.0, 1.0), false, None, &mut out);
+        build_shapes(&input(340.0, 1.0), false, &mut out);
         assert!(!out.is_empty());
         let band = out[0];
         assert_eq!(band.bbox, [0.0, 0.0, 340.0, header_h(1.0)]);
@@ -262,69 +177,54 @@ mod tests {
     }
 
     #[test]
-    fn expanded_emits_band_and_icons_no_restore() {
-        // R2.2 / R3.2 — expanded draws the band + icon strokes and no restore button.
+    fn band_and_filter_shift_with_top_inset() {
+        // D6 / R5 — with a title bar reserved, the band's top and the filter icon both
+        // move down by top_inset (nothing is drawn up in the title-bar strip).
+        let mut inp = input(340.0, 1.0);
+        inp.top_inset = 40.0;
         let mut out = Vec::new();
-        build_shapes(&input(340.0, 1.0), false, None, &mut out);
-        // The band plus multiple icon-stroke capsules for the three icons.
-        assert!(out.len() > 3, "band + three icons' strokes");
-        // No shape sits at the collapsed restore button's origin.
-        let r = restore_button_rect(1.0);
+        build_shapes(&inp, false, &mut out);
+        // The band starts at top_inset.
+        assert_eq!(out[0].bbox[1], 40.0, "band top at top_inset");
+        // Every drawn shape sits at or below top_inset (nothing above the band).
         assert!(
-            !out.iter()
-                .any(|s| s.bbox[0] == r.x && s.bbox[1] == r.y && s.kind == 0),
-            "no restore box while expanded"
+            out.iter().all(|s| s.bbox[1] >= 40.0 - 0.01),
+            "no shape drawn above the title bar"
         );
     }
 
     #[test]
-    fn hover_adds_a_button_background() {
-        // R2.3 — hovering a live button emits one extra shape (its hover bg).
-        let inp = input(340.0, 1.0);
-        let mut plain = Vec::new();
-        build_shapes(&inp, false, None, &mut plain);
-        let mut hovered = Vec::new();
-        build_shapes(&inp, false, Some(ChromeRegion::NewTab), &mut hovered);
-        assert_eq!(
-            hovered.len(),
-            plain.len() + 1,
-            "hover adds exactly the button background"
+    fn expanded_emits_band_and_filter_no_restore() {
+        // R2.2 / R5 — expanded draws the band + the inert filter, and no floating restore
+        // button (there is no restore affordance any more).
+        let mut out = Vec::new();
+        build_shapes(&input(340.0, 1.0), false, &mut out);
+        assert!(out.len() >= 2, "band + at least the filter icon's strokes");
+        // The old restore button lived up at (14,12) logical; nothing draws there now.
+        assert!(
+            !out.iter().any(|s| s.bbox[0] == 14.0 && s.bbox[1] == 12.0),
+            "no restore box"
         );
     }
 
     #[test]
-    fn collapsed_emits_only_the_restore_button() {
-        // R3.1 — collapsed draws the restore box + its icon, and no full-width band.
+    fn collapsed_emits_nothing() {
+        // R5 — collapsed, the sidebar draws no chrome at all (restore moved to the bar).
         let mut out = Vec::new();
-        build_shapes(&input(0.0, 1.0), true, None, &mut out);
-        assert!(!out.is_empty());
-        let r = restore_button_rect(1.0);
-        assert_eq!(out[0].bbox, [r.x, r.y, r.w, r.h], "the restore box");
-        // No opaque full-width band (its bbox would start at 0,0 with a large width).
-        assert!(
-            !out.iter().any(|s| s.bbox == [0.0, 0.0, 0.0, header_h(1.0)]),
-            "no header band while collapsed"
-        );
+        build_shapes(&input(0.0, 1.0), true, &mut out);
+        assert!(out.is_empty(), "collapsed draws nothing");
     }
 
     #[test]
     fn degenerate_inputs_emit_nothing() {
         // R8.2 / R8.4
         let mut out = Vec::new();
-        build_shapes(&input(340.0, f64::NAN), false, None, &mut out);
+        build_shapes(&input(340.0, f64::NAN), false, &mut out);
         assert!(out.is_empty(), "non-finite scale emits nothing");
         let mut zero = input(340.0, 1.0);
         zero.viewport[1] = 0.0;
         let mut out2 = Vec::new();
-        build_shapes(&zero, false, None, &mut out2);
+        build_shapes(&zero, false, &mut out2);
         assert!(out2.is_empty(), "zero viewport emits nothing");
-    }
-
-    #[test]
-    fn handle_is_reachable_at_construction() {
-        // R7.8 — new() returns the handle; a cursor pushed to it is visible.
-        let (_layer, handle) = SidebarChromeLayer::new();
-        handle.set_cursor(Some([10.0, 20.0]));
-        assert_eq!(handle.cursor(), Some([10.0, 20.0]));
     }
 }

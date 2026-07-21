@@ -29,12 +29,15 @@ use objc2_app_kit::NSView;
 use renderer::cursor_layer::CursorLayer;
 use renderer::preedit_layer::{PreeditHandle, PreeditLayer};
 use renderer::selection_layer::{SelectionHandle, SelectionLayer};
-use renderer::sidebar_header::{SidebarChromeHandle, SidebarChromeLayer};
+use renderer::sidebar_header::SidebarChromeLayer;
 use renderer::sidebar_layout::{self, SidebarLayoutInput};
 use renderer::sidebar_resize::{SidebarResizeHandle, SidebarResizeLayer};
 use renderer::sidebar_row::{self, SidebarGeom};
 use renderer::sidebar_theme::SidebarMetrics;
 use renderer::tab_bar::{TabBar, TabBarModel, TabModelHandle};
+use renderer::titlebar::{
+    titlebar_height, titlebar_hit, TitlebarButton, TitlebarHandle, TitlebarLayer,
+};
 use renderer::Renderer;
 use term_core::Color;
 use term_core::GridSnapshot;
@@ -116,9 +119,6 @@ struct Running {
     renderer: Renderer,
     tabs: Tabs,
     tab_model: TabModelHandle,
-    /// The chrome layer's handle (D10/D11): the raw cursor is pushed here each move; the
-    /// header/restore layer resolves its own hover from it.
-    chrome_handle: SidebarChromeHandle,
     /// Sidebar config mirror, refreshed by `settings::apply` — read for one field,
     /// `show_git_branch`, when building the layout (D5). `collapsed` is NOT read from here
     /// (the renderer's override is the single source of truth).
@@ -195,6 +195,9 @@ struct Running {
     /// Write end of the [`SidebarResizeLayer`]'s shared state — set active while dragging
     /// so the edge rule brightens.
     resize_handle: SidebarResizeHandle,
+    /// Write end of the [`TitlebarLayer`]'s shared state — set to the current collapsed
+    /// state so the toggle glyph reflects it (titlebar-tab-controls D14).
+    titlebar_handle: TitlebarHandle,
 }
 
 impl App {
@@ -218,13 +221,18 @@ impl App {
         let mut renderer = Renderer::new(window.clone(), size.width, size.height, scale, &self.cfg)
             .map_err(err)?;
 
+        // Reserve the top title-bar band BEFORE grid_size is read below (it feeds the first
+        // tab's cols/rows). The grid + shaders honor top_inset automatically (titlebar D5).
+        renderer.set_top_inset(titlebar_height(scale));
+
         // The renderer already reserved the sidebar band in `assemble` from the config
         // width (row-redesign D4) — no `set_left_inset` here (it is now a no-op). Register
-        // the card layer, then the chrome layer (header + collapsed restore button) whose
-        // first drawn frame is this one (chrome-collapse D14).
+        // the card layer, then the chrome layer (the opaque header band + filter icon; its
+        // +/hide/restore controls moved to the title bar, R5) whose first drawn frame is
+        // this one.
         let (bar, tab_model) = TabBar::new();
         renderer.add_layer(Box::new(bar));
-        let (chrome, chrome_handle) = SidebarChromeLayer::new();
+        let chrome = SidebarChromeLayer::new();
         renderer.add_layer(Box::new(chrome));
         // Drag-to-select highlight, above the glyphs but below the cursor block
         // (z=4 < CURSOR_Z=5). A DrawLayer fed by a shared handle, so it follows the
@@ -235,6 +243,11 @@ impl App {
         // geometry the hit-test uses; brightens while dragging via its handle.
         let (resize_layer, resize_handle) = SidebarResizeLayer::new();
         renderer.add_layer(Box::new(resize_layer));
+        // Top title bar (z=40, pinned topmost among content) hosting new-tab / close /
+        // collapse-toggle. Seed the toggle glyph with the current collapsed state (D14).
+        let (titlebar_layer, titlebar_handle) = TitlebarLayer::new();
+        titlebar_handle.set_collapsed(renderer.left_inset() <= 0.0);
+        renderer.add_layer(Box::new(titlebar_layer));
         // Blinking block cursor, above the glyphs (a DrawLayer so it blinks off the
         // continuous-redraw loop, unaffected by the idle-CPU snapshot cache).
         renderer.add_layer(Box::new(CursorLayer::new()));
@@ -292,7 +305,6 @@ impl App {
             renderer,
             tabs,
             tab_model,
-            chrome_handle,
             sidebar_cfg: self.cfg.sidebar.clone(),
             scroll: 0.0,
             last_hit: None,
@@ -315,6 +327,7 @@ impl App {
             selection_handle,
             resizing: false,
             resize_handle,
+            titlebar_handle,
         };
         running.sync_tab_model();
         running.redraw();
@@ -544,6 +557,7 @@ impl Running {
     /// sees the new width; `row_h` comes from `sidebar_row::layout`, never a local formula.
     fn sidebar_input(&self) -> SidebarLayoutInput {
         let sidebar_w = self.renderer.left_inset();
+        let top_inset = self.renderer.top_inset();
         let size = self.window.inner_size();
         let viewport = [size.width as f32, size.height as f32];
         let scale = self.renderer.scale_factor();
@@ -555,7 +569,8 @@ impl Running {
             cell: [cell.0, cell.1],
             scale,
             show_branch: self.sidebar_cfg.show_git_branch,
-            list_top: sidebar_layout::header_h(scale),
+            // The list starts below the title bar + header (titlebar-tab-controls D6).
+            list_top: top_inset + sidebar_layout::header_h(scale),
             scroll_px: self.scroll,
         };
         let row_h = sidebar_row::layout(&geom, count).card_h;
@@ -566,6 +581,7 @@ impl Running {
             row_h,
             row_count: count,
             metrics: SidebarMetrics::DEFAULT.scaled(scale),
+            top_inset,
         }
     }
 
@@ -577,11 +593,13 @@ impl Running {
 
     /// Publish the scroll offset (and the header height) to the row layer so the drawn
     /// cards and the hit-test move together (D10). `list_top` is byte-identical to what
-    /// the chrome layer writes, so the two writers cannot clobber each other.
+    /// the chrome layer writes, so the two writers cannot clobber each other — both include
+    /// `top_inset` so drawn rows shift down with the title bar (titlebar-tab-controls D6).
     fn publish_scroll(&self) {
         let scale = self.renderer.scale_factor();
+        let top_inset = self.renderer.top_inset();
         self.tab_model
-            .set_list_scroll(sidebar_layout::header_h(scale), self.scroll);
+            .set_list_scroll(top_inset + sidebar_layout::header_h(scale), self.scroll);
     }
 
     /// Collapse or restore the sidebar (D6). The order is load-bearing: set the override
@@ -590,6 +608,8 @@ impl Running {
     /// stationary pointer, and redraw (the grid geometry changed).
     fn toggle_sidebar(&mut self, collapsed: bool) {
         self.renderer.set_sidebar_collapsed(collapsed);
+        // Keep the title-bar toggle glyph in sync with the new state (D14).
+        self.titlebar_handle.set_collapsed(collapsed);
         crate::settings::refit(&self.renderer, &mut self.tabs);
         let inp = self.sidebar_input();
         self.scroll = sidebar_layout::clamp_scroll(self.scroll, &inp);
@@ -599,13 +619,11 @@ impl Running {
     }
 
     /// Re-resolve hover at `last_cursor` after the layout moved under a stationary pointer
-    /// (D8): push the raw cursor to the chrome layer (undebounced — it must be exact for a
-    /// button edge) and the resolved card index to the row layer (region-debounced).
+    /// (D8): push the resolved card index to the row layer (region-debounced). The header
+    /// has no hover target since its controls moved to the title bar (R5).
     fn refresh_hover(&mut self) {
         let inp = self.sidebar_input();
         let collapsed = self.collapsed();
-        self.chrome_handle
-            .set_cursor(Some([self.last_cursor.0 as f32, self.last_cursor.1 as f32]));
         let hit = sidebar_hover(self.last_cursor, &inp, self.scroll, collapsed);
         if hit != self.last_hit {
             self.last_hit = hit;
@@ -617,7 +635,6 @@ impl Running {
     /// Clear all hover state — the pointer left the window or focus was lost with it still
     /// inside (Cmd-Tab fires no `CursorLeft`), else the highlight stays lit (D8).
     fn clear_hover(&mut self) {
-        self.chrome_handle.set_cursor(None);
         if self.last_hit.is_some() {
             self.last_hit = None;
             self.tab_model.set_hovered(None);
@@ -920,9 +937,36 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
+                // Title bar owns the top band (titlebar D13): consume EVERY press with
+                // y < top_inset before the sidebar hit-test, resize handle, or selection.
+                let top_inset = inner.renderer.top_inset();
+                if (inner.last_cursor.1 as f32) < top_inset {
+                    let size = inner.window.inner_size();
+                    let vp = [size.width as f32, size.height as f32];
+                    let scale = inner.renderer.scale_factor();
+                    let p = [inner.last_cursor.0 as f32, inner.last_cursor.1 as f32];
+                    // Map the two tab buttons to a tab action; the toggle is handled inline.
+                    let tab_action = match titlebar_hit(p, vp, top_inset, scale) {
+                        Some(TitlebarButton::NewTab) => Some(TabAction::New),
+                        Some(TitlebarButton::CloseTab) => Some(TabAction::CloseActive),
+                        Some(TitlebarButton::ToggleSidebar) => {
+                            let collapsed = inner.collapsed();
+                            inner.toggle_sidebar(!collapsed);
+                            None
+                        }
+                        None => None, // empty band → consumed (no-op)
+                    };
+                    // Run it; a false return (last tab closed) exits, mirroring Cmd+W.
+                    if tab_action.is_some_and(|a| !inner.do_tab_action(a)) {
+                        event_loop.exit();
+                    }
+                    return; // the band press is fully consumed
+                }
                 // Resolve the press through the sibling's ONE ordered hit_test (D1) — the
-                // app performs no geometry (SD2). Cards + new-tab route through the same
-                // path as chords (D2); hide/restore toggle; inert regions are swallowed.
+                // app performs no geometry (SD2). A card switches tabs (same path as the
+                // chords, D2); the resize band starts a drag; inert regions (header + dead
+                // space) are swallowed. New-tab / collapse / restore are title-bar controls
+                // now (R5), handled by the `cursor.y < top_inset` band above.
                 let inp = inner.sidebar_input();
                 let collapsed = inner.collapsed();
                 if let Some(action) =
@@ -934,13 +978,6 @@ impl ApplicationHandler<UserEvent> for App {
                                 event_loop.exit();
                             }
                         }
-                        SidebarAction::NewTab => {
-                            if !inner.do_tab_action(TabAction::New) {
-                                event_loop.exit();
-                            }
-                        }
-                        SidebarAction::Collapse => inner.toggle_sidebar(true),
-                        SidebarAction::Expand => inner.toggle_sidebar(false),
                         SidebarAction::BeginResize => inner.begin_resize(),
                         SidebarAction::Inert => {}
                     }

@@ -26,6 +26,7 @@ pub mod sidebar_row;
 pub mod sidebar_shapes;
 pub mod sidebar_theme;
 pub mod tab_bar;
+pub mod titlebar;
 
 use atlas::{Atlas, GlyphKey};
 use bytemuck::{Pod, Zeroable};

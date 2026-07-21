@@ -295,6 +295,7 @@ mod tests {
             row_h: 60.0,
             row_count: 3,
             metrics: SidebarMetrics::DEFAULT.scaled(scale),
+            top_inset: 0.0,
         }
     }
 
