@@ -770,7 +770,7 @@ impl Running {
             }
         }
         // 3) Tab chords, intercepted before the shell (D5/R3.2).
-        if let Some(action) = tab_action(&input.key, &input.mods) {
+        if let Some(action) = tab_action(&input.key, input.physical, &input.mods) {
             return self.do_tab_action(action);
         }
         // 4) Default: encode to the active shell only (R3.1). DECCKM is

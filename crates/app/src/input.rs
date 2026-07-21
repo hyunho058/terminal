@@ -4,7 +4,7 @@
 //! chord table is unit-tested without a window.
 
 use renderer::sidebar_layout::{self, ChromeRegion, SidebarLayoutInput, SidebarRegion};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey};
 
 /// A tab-management action triggered by a Cmd chord (D5). Intercepted before
 /// `encode_key`, so these keys never reach the shell (R3.2).
@@ -21,24 +21,59 @@ pub enum TabAction {
 /// Map a keypress to a tab action, or `None` if it isn't a tab chord. macOS
 /// chords use Cmd (the `super` modifier): Cmd+T/W, Cmd+Shift+[ / ], Cmd+1..9.
 ///
-/// Bracket vs. brace is accepted either way (`[`/`{`, `]`/`}`) so the chord works
-/// whether or not Shift alters the produced character across layouts.
-pub fn tab_action(key: &Key, mods: &ModifiersState) -> Option<TabAction> {
+/// Matched by **physical** key position first (`KeyCode`), so the chords fire under
+/// a non-Latin IME — the Korean 2-beolsik layout maps T→`ㅅ`, W→`ㅈ`, etc., so the
+/// logical char is not `t`/`w`. Falls back to the logical char when the platform
+/// reports the physical key unidentified; bracket vs. brace is still accepted either
+/// way there (`[`/`{`, `]`/`}`).
+pub fn tab_action(
+    key: &Key,
+    physical: Option<KeyCode>,
+    mods: &ModifiersState,
+) -> Option<TabAction> {
     if !mods.super_key() {
         return None;
+    }
+    if let Some(action) = physical.and_then(physical_tab_action) {
+        return Some(action);
     }
     let Key::Character(s) = key else {
         return None;
     };
-    let c = s.chars().next()?;
-    match c {
-        't' | 'T' => Some(TabAction::New),
-        'w' | 'W' => Some(TabAction::CloseActive),
-        '[' | '{' => Some(TabAction::Prev),
-        ']' | '}' => Some(TabAction::Next),
-        '1'..='9' => Some(TabAction::Jump(c as usize - '1' as usize)),
-        _ => None,
-    }
+    logical_tab_action(s.chars().next()?)
+}
+
+/// The tab chord for a physical key position (layout-independent), or `None`.
+fn physical_tab_action(code: KeyCode) -> Option<TabAction> {
+    Some(match code {
+        KeyCode::KeyT => TabAction::New,
+        KeyCode::KeyW => TabAction::CloseActive,
+        KeyCode::BracketLeft => TabAction::Prev,
+        KeyCode::BracketRight => TabAction::Next,
+        KeyCode::Digit1 => TabAction::Jump(0),
+        KeyCode::Digit2 => TabAction::Jump(1),
+        KeyCode::Digit3 => TabAction::Jump(2),
+        KeyCode::Digit4 => TabAction::Jump(3),
+        KeyCode::Digit5 => TabAction::Jump(4),
+        KeyCode::Digit6 => TabAction::Jump(5),
+        KeyCode::Digit7 => TabAction::Jump(6),
+        KeyCode::Digit8 => TabAction::Jump(7),
+        KeyCode::Digit9 => TabAction::Jump(8),
+        _ => return None,
+    })
+}
+
+/// The tab chord for a logical character (the fallback when the physical key is
+/// unidentified — e.g. a US layout where the char already equals the key).
+fn logical_tab_action(c: char) -> Option<TabAction> {
+    Some(match c {
+        't' | 'T' => TabAction::New,
+        'w' | 'W' => TabAction::CloseActive,
+        '[' | '{' => TabAction::Prev,
+        ']' | '}' => TabAction::Next,
+        '1'..='9' => TabAction::Jump(c as usize - '1' as usize),
+        _ => return None,
+    })
 }
 
 /// What the app does about a pointer press (D1). Distinct from the renderer's *region*
@@ -333,27 +368,61 @@ mod tests {
 
     #[test]
     fn cmd_chords_map_to_actions() {
+        // Logical fallback (physical unidentified) — the US-layout path.
         let cmd = ModifiersState::SUPER;
-        assert_eq!(tab_action(&ch("t"), &cmd), Some(TabAction::New));
-        assert_eq!(tab_action(&ch("w"), &cmd), Some(TabAction::CloseActive));
-        assert_eq!(tab_action(&ch("]"), &cmd), Some(TabAction::Next));
-        assert_eq!(tab_action(&ch("["), &cmd), Some(TabAction::Prev));
-        assert_eq!(tab_action(&ch("}"), &cmd), Some(TabAction::Next));
-        assert_eq!(tab_action(&ch("{"), &cmd), Some(TabAction::Prev));
-        assert_eq!(tab_action(&ch("1"), &cmd), Some(TabAction::Jump(0)));
-        assert_eq!(tab_action(&ch("9"), &cmd), Some(TabAction::Jump(8)));
+        let la = |c: &str| tab_action(&ch(c), None, &cmd);
+        assert_eq!(la("t"), Some(TabAction::New));
+        assert_eq!(la("w"), Some(TabAction::CloseActive));
+        assert_eq!(la("]"), Some(TabAction::Next));
+        assert_eq!(la("["), Some(TabAction::Prev));
+        assert_eq!(la("}"), Some(TabAction::Next));
+        assert_eq!(la("{"), Some(TabAction::Prev));
+        assert_eq!(la("1"), Some(TabAction::Jump(0)));
+        assert_eq!(la("9"), Some(TabAction::Jump(8)));
+    }
+
+    #[test]
+    fn cmd_chords_map_by_physical_key_under_non_latin_ime() {
+        // Korean 2-beolsik: Cmd+T yields the logical char `ㅅ`, Cmd+W → `ㅈ`, etc.
+        // The physical key still resolves the chord (the regression this guards).
+        let cmd = ModifiersState::SUPER;
+        assert_eq!(
+            tab_action(&ch("ㅅ"), Some(KeyCode::KeyT), &cmd),
+            Some(TabAction::New),
+            "Cmd+T must open a tab even when the IME maps T→ㅅ"
+        );
+        assert_eq!(
+            tab_action(&ch("ㅈ"), Some(KeyCode::KeyW), &cmd),
+            Some(TabAction::CloseActive)
+        );
+        assert_eq!(
+            tab_action(&ch("`"), Some(KeyCode::BracketRight), &cmd),
+            Some(TabAction::Next)
+        );
+        assert_eq!(
+            tab_action(&ch("1"), Some(KeyCode::Digit1), &cmd),
+            Some(TabAction::Jump(0))
+        );
+        // The physical key wins even if the logical char would map elsewhere.
+        assert_eq!(
+            tab_action(&ch("t"), Some(KeyCode::KeyW), &cmd),
+            Some(TabAction::CloseActive)
+        );
     }
 
     #[test]
     fn no_super_means_no_chord() {
         let none = ModifiersState::empty();
         assert_eq!(
-            tab_action(&ch("t"), &none),
+            tab_action(&ch("t"), Some(KeyCode::KeyT), &none),
             None,
             "plain 't' types into shell"
         );
-        // A non-chord char with Cmd held is also not a tab action.
-        assert_eq!(tab_action(&ch("z"), &ModifiersState::SUPER), None);
+        // A non-chord key with Cmd held is also not a tab action.
+        assert_eq!(
+            tab_action(&ch("z"), Some(KeyCode::KeyZ), &ModifiersState::SUPER),
+            None
+        );
     }
 
     /// Every cursor/nav test below goes through this: no modifiers, DECCKM off.
