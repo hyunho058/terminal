@@ -4,7 +4,8 @@
 //! `ClipboardHandler` registers a Cmd+V `InputHandler` through the SD4 seam: if
 //! the pasteboard holds an image, it writes a uniquely-named PNG under the cache
 //! dir and types that path into the active shell (so external AI CLIs get a real
-//! file path, D4); text pastes fall through to the default handler (R3.2).
+//! file path, D4); otherwise it pastes the pasteboard's **text** straight into the
+//! active shell (R3.2), consuming the key so the literal `v` isn't also typed.
 //!
 //! `ImagePresenter` is a passthrough overlay whose draw layer is the renderer's
 //! `image_layer` — it registers the inline-image `DrawLayer` (D3) through the same
@@ -16,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSPasteboard, NSPasteboardTypePNG,
-    NSPasteboardTypeTIFF,
+    NSPasteboardTypeString, NSPasteboardTypeTIFF,
 };
 use objc2_foundation::NSDictionary;
 use renderer::image_layer::ImageLayer;
@@ -43,7 +44,31 @@ impl InputHandler for ClipboardHandler {
         if !is_paste(input) {
             return Handled::Passthrough;
         }
-        // No image on the pasteboard → let the default text paste proceed (R3.2).
+        // An image on the pasteboard is written to a file and its path typed
+        // (image-paste D4). No image → fall through to a plain text paste.
+        if self.paste_image(ctx) == Handled::Consumed {
+            return Handled::Consumed;
+        }
+        // Text on the pasteboard → write it straight into the active shell. This
+        // is the ordinary "paste copied text into the input line" case (R3.2):
+        // consume the key so the literal `v` is never also typed.
+        if let Some(text) = read_clipboard_text() {
+            if !text.is_empty() {
+                let _ = ctx.writer.write_all(&normalize_paste(&text));
+                return Handled::Consumed;
+            }
+        }
+        // Nothing usable on the pasteboard → let default input run.
+        Handled::Passthrough
+    }
+}
+
+impl ClipboardHandler {
+    /// Write a clipboard image (if any) to a unique file and type its path + a
+    /// space into the shell (R3.1/R3.3/D4). Returns `Consumed` when an image was
+    /// written; `Passthrough` when there is no image (or the write fails) so the
+    /// caller can try a text paste instead.
+    fn paste_image(&self, ctx: &mut AppCtx) -> Handled {
         let Some(png) = read_clipboard_image_png() else {
             return Handled::Passthrough;
         };
@@ -108,6 +133,26 @@ fn read_clipboard_image_png() -> Option<Vec<u8>> {
     }
 }
 
+/// Read a plain-text string from the general pasteboard. `None` when the
+/// pasteboard holds no text. Runs on the UI thread.
+fn read_clipboard_text() -> Option<String> {
+    unsafe {
+        let pb = NSPasteboard::generalPasteboard();
+        let s = pb.stringForType(NSPasteboardTypeString)?;
+        Some(s.to_string())
+    }
+}
+
+/// Turn clipboard text into the bytes written to the shell on paste. Newlines are
+/// normalised to CR — what the shell's line editor treats as Enter — so a CRLF or
+/// a lone LF collapses to a single CR and a pasted line never double-accepts (a
+/// bare CR then an LF would accept the line and then an empty one). No
+/// bracketed-paste wrapping: this terminal doesn't track DEC private mode `?2004`
+/// yet, so wrapping would leak literal `ESC[200~` into programs that don't expect it.
+fn normalize_paste(text: &str) -> Vec<u8> {
+    text.replace("\r\n", "\n").replace('\n', "\r").into_bytes()
+}
+
 /// A passthrough overlay that registers the inline-image `DrawLayer` (D3) through
 /// the SD4 overlay seam. Always "visible" (images draw whenever present) and never
 /// consumes input.
@@ -140,6 +185,30 @@ mod tests {
         let b = unique_name(1000, 1);
         assert_ne!(a, b, "same second, different seq → distinct (R3.3)");
         assert!(a.ends_with(".png"));
+    }
+
+    #[test]
+    fn paste_of_plain_text_is_unchanged() {
+        // The common case — pasting a command/URL with no newline goes through
+        // verbatim so it lands in the input line as typed.
+        assert_eq!(normalize_paste("echo hello"), b"echo hello");
+        assert_eq!(normalize_paste(""), b"");
+    }
+
+    #[test]
+    fn paste_normalizes_newlines_to_cr() {
+        // Lone LF and CRLF both become a single CR (Enter for the line editor)…
+        assert_eq!(normalize_paste("a\nb"), b"a\rb");
+        assert_eq!(normalize_paste("a\r\nb"), b"a\rb");
+        // …and a bare CR is preserved (no doubling).
+        assert_eq!(normalize_paste("a\rb"), b"a\rb");
+    }
+
+    #[test]
+    fn paste_crlf_never_double_accepts() {
+        // Two CRLF-separated lines → exactly two CRs, not CR-LF-CR-LF (which would
+        // insert blank accepts between the lines).
+        assert_eq!(normalize_paste("a\r\n\r\nb"), b"a\r\rb");
     }
 
     #[test]
