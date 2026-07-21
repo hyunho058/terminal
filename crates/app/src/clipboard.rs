@@ -19,10 +19,10 @@ use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSPasteboard, NSPasteboardTypePNG,
     NSPasteboardTypeString, NSPasteboardTypeTIFF,
 };
-use objc2_foundation::NSDictionary;
+use objc2_foundation::{NSDictionary, NSString};
 use renderer::image_layer::ImageLayer;
 use renderer::DrawLayer;
-use winit::keyboard::Key;
+use winit::keyboard::{Key, KeyCode};
 
 use crate::seam::{AppCtx, Handled, InputHandler, KeyInput, Overlay};
 
@@ -50,16 +50,17 @@ impl InputHandler for ClipboardHandler {
             return Handled::Consumed;
         }
         // Text on the pasteboard → write it straight into the active shell. This
-        // is the ordinary "paste copied text into the input line" case (R3.2):
-        // consume the key so the literal `v` is never also typed.
+        // is the ordinary "paste copied text into the input line" case (R3.2).
         if let Some(text) = read_clipboard_text() {
             if !text.is_empty() {
                 let _ = ctx.writer.write_all(&normalize_paste(&text));
                 return Handled::Consumed;
             }
         }
-        // Nothing usable on the pasteboard → let default input run.
-        Handled::Passthrough
+        // Nothing usable on the pasteboard, but this WAS Cmd+V — swallow it anyway so
+        // the shortcut never types a stray character (the shell's `Key::Character`
+        // fallback would otherwise send `v` / the IME-mapped `ㅍ`).
+        Handled::Consumed
     }
 }
 
@@ -93,9 +94,15 @@ impl ClipboardHandler {
     }
 }
 
-/// Is this Cmd+V?
+/// Is this Cmd+V? Detected by the **physical** V key so paste works under a
+/// non-Latin IME (Korean maps V→`ㅍ`, so the logical char is not `v`), with a
+/// logical-`v` fallback for platforms that report the physical key unidentified.
 fn is_paste(input: &KeyInput) -> bool {
-    input.mods.super_key() && matches!(&input.key, Key::Character(s) if s.eq_ignore_ascii_case("v"))
+    if !input.mods.super_key() {
+        return false;
+    }
+    input.physical == Some(KeyCode::KeyV)
+        || matches!(&input.key, Key::Character(s) if s.eq_ignore_ascii_case("v"))
 }
 
 /// `~/.cache/mac-terminal/pasted`, created if missing (C4). `None` if `$HOME`
@@ -130,6 +137,21 @@ fn read_clipboard_image_png() -> Option<Vec<u8>> {
         let empty = NSDictionary::new();
         let png = rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &empty)?;
         Some(png.to_vec())
+    }
+}
+
+/// Write `text` to the general pasteboard as a plain string (Cmd+C copy). Clears
+/// the pasteboard first, per the standard AppKit `clearContents` + `setString`
+/// sequence. Runs on the UI thread. No-op for empty text.
+pub fn write_clipboard_text(text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    unsafe {
+        let pb = NSPasteboard::generalPasteboard();
+        pb.clearContents();
+        let s = NSString::from_str(text);
+        pb.setString_forType(&s, NSPasteboardTypeString);
     }
 }
 
@@ -185,6 +207,44 @@ mod tests {
         let b = unique_name(1000, 1);
         assert_ne!(a, b, "same second, different seq → distinct (R3.3)");
         assert!(a.ends_with(".png"));
+    }
+
+    #[test]
+    fn is_paste_matches_physical_v_under_non_latin_ime() {
+        use winit::keyboard::ModifiersState;
+
+        let ki = |logical: &str, mods, physical| KeyInput {
+            key: Key::Character(logical.into()),
+            text: Some(logical.into()),
+            mods,
+            physical,
+        };
+        // Korean 2-beolsik: Cmd+V yields the logical char `ㅍ`, but the physical key
+        // is V — the regression this guards. Must still be a paste.
+        assert!(
+            is_paste(&ki("ㅍ", ModifiersState::SUPER, Some(KeyCode::KeyV))),
+            "Cmd+V must paste even when the IME maps V→ㅍ"
+        );
+        // US layout: logical `v`, physical V — matches too.
+        assert!(is_paste(&ki(
+            "v",
+            ModifiersState::SUPER,
+            Some(KeyCode::KeyV)
+        )));
+        // Logical-`v` fallback (physical unidentified) still works.
+        assert!(is_paste(&ki("v", ModifiersState::SUPER, None)));
+        // Without Cmd, plain `ㅍ`/`v` types normally — not a paste.
+        assert!(!is_paste(&ki(
+            "ㅍ",
+            ModifiersState::empty(),
+            Some(KeyCode::KeyV)
+        )));
+        // Cmd + a different physical key (B→ㅠ) is not a paste.
+        assert!(!is_paste(&ki(
+            "ㅠ",
+            ModifiersState::SUPER,
+            Some(KeyCode::KeyB)
+        )));
     }
 
     #[test]

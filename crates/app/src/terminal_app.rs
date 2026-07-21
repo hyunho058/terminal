@@ -28,6 +28,7 @@ use common::watch::ConfigWatcher;
 use objc2_app_kit::NSView;
 use renderer::cursor_layer::CursorLayer;
 use renderer::preedit_layer::{PreeditHandle, PreeditLayer};
+use renderer::selection_layer::{SelectionHandle, SelectionLayer};
 use renderer::sidebar_header::{SidebarChromeHandle, SidebarChromeLayer};
 use renderer::sidebar_layout::{self, SidebarLayoutInput};
 use renderer::sidebar_row::{self, SidebarGeom};
@@ -36,6 +37,7 @@ use renderer::tab_bar::{TabBar, TabBarModel, TabModelHandle};
 use renderer::Renderer;
 use term_core::Color;
 use term_core::GridSnapshot;
+use term_core::Selection;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -47,8 +49,8 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
 use crate::input::{
-    encode_key, sidebar_hover, sidebar_press, suppress_key, tab_action, wheel_scroll,
-    SidebarAction, TabAction, WheelDelta,
+    cell_at, encode_key, over_grid, sidebar_hover, sidebar_press, suppress_key, tab_action,
+    wheel_scroll, SidebarAction, TabAction, WheelDelta,
 };
 use crate::seam::{AppCtx, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayHost};
 use crate::session::{Session, TabId};
@@ -171,6 +173,21 @@ struct Running {
     /// the shell never received. The handle also carries the theme colors, since
     /// `FrameCtx` has none (D14/R7.5).
     preedit_handle: PreeditHandle,
+    /// The current text selection over the visible viewport (drag-to-select), or
+    /// `None` when nothing is selected. Cell coords are viewport-relative; the copy
+    /// path reads them against the live snapshot. Kept in `app` (mouse-driven UI),
+    /// not `term-core`.
+    selection: Option<Selection>,
+    /// True between a left-press on the grid and its release — the drag is live and
+    /// `CursorMoved` extends the selection.
+    selecting: bool,
+    /// Where the in-flight drag started (col, row). The selection's `head` tracks
+    /// the cursor; the `anchor` stays here until release.
+    sel_anchor: Option<(u16, u16)>,
+    /// Write end of the [`SelectionLayer`]'s shared model — pushes the selection
+    /// rectangle to the highlight layer each time the drag moves. Like
+    /// `preedit_handle`, it never touches `term-core` (selection is display-only UI).
+    selection_handle: SelectionHandle,
 }
 
 impl App {
@@ -202,6 +219,11 @@ impl App {
         renderer.add_layer(Box::new(bar));
         let (chrome, chrome_handle) = SidebarChromeLayer::new();
         renderer.add_layer(Box::new(chrome));
+        // Drag-to-select highlight, above the glyphs but below the cursor block
+        // (z=4 < CURSOR_Z=5). A DrawLayer fed by a shared handle, so it follows the
+        // drag off the continuous-redraw loop like the cursor.
+        let (selection_layer, selection_handle) = SelectionLayer::new();
+        renderer.add_layer(Box::new(selection_layer));
         // Blinking block cursor, above the glyphs (a DrawLayer so it blinks off the
         // continuous-redraw loop, unaffected by the idle-CPU snapshot cache).
         renderer.add_layer(Box::new(CursorLayer::new()));
@@ -276,6 +298,10 @@ impl App {
             preedit: String::new(),
             composing_tab: None,
             preedit_handle,
+            selection: None,
+            selecting: false,
+            sel_anchor: None,
+            selection_handle,
         };
         running.sync_tab_model();
         running.redraw();
@@ -593,6 +619,9 @@ impl Running {
         // Named key + modifier, so it sails straight through the composing gate
         // (R6.3) and is reachable by keyboard, not just by a sidebar click.
         self.cancel_composition();
+        // A tab switch drops the selection so no highlight bleeds onto another tab's
+        // content (the highlight layer is shared across tabs).
+        self.clear_selection();
         match action {
             TabAction::New => {
                 let (cols, rows) = self.renderer.grid_size();
@@ -623,9 +652,97 @@ impl Running {
         true
     }
 
+    /// Begin a drag selection anchored at the grid cell under the cursor. A fresh
+    /// press first clears any prior selection; the highlight only appears once the
+    /// drag moves to a different cell (so a plain click deselects and shows nothing).
+    fn begin_selection(&mut self) {
+        let (cols, rows) = self.renderer.grid_size();
+        let anchor = cell_at(
+            self.last_cursor,
+            self.renderer.cell_size(),
+            self.renderer.left_inset(),
+            self.renderer.top_inset(),
+            cols,
+            rows,
+        );
+        self.clear_selection(); // a new press drops the old highlight
+        self.sel_anchor = anchor;
+        self.selecting = anchor.is_some();
+    }
+
+    /// Extend the in-flight selection to the cell under the cursor. While the head
+    /// still equals the anchor the selection stays empty (a click shows no highlight).
+    fn extend_selection(&mut self) {
+        let Some(anchor) = self.sel_anchor else {
+            return;
+        };
+        let (cols, rows) = self.renderer.grid_size();
+        let Some(head) = cell_at(
+            self.last_cursor,
+            self.renderer.cell_size(),
+            self.renderer.left_inset(),
+            self.renderer.top_inset(),
+            cols,
+            rows,
+        ) else {
+            return;
+        };
+        let next = if head == anchor {
+            None // not yet a drag
+        } else {
+            Some(Selection { anchor, head })
+        };
+        if next != self.selection {
+            self.selection = next;
+            self.selection_handle.set(next);
+            self.window.request_redraw(); // selection-only: no grid re-snapshot (D7)
+        }
+    }
+
+    /// Finish the drag on mouse release. A click with no movement left no selection.
+    fn end_selection(&mut self) {
+        self.selecting = false;
+        self.sel_anchor = None;
+    }
+
+    /// Drop any active selection and its highlight (tab switch, resize, fresh press).
+    /// Also abandons any in-flight drag so a selection can't rebuild on a switched-to
+    /// tab if the button were still logically held.
+    fn clear_selection(&mut self) {
+        self.selecting = false;
+        self.sel_anchor = None;
+        if self.selection.take().is_some() {
+            self.selection_handle.set(None);
+            self.window.request_redraw();
+        }
+    }
+
+    /// Copy the current selection to the macOS clipboard (Cmd+C). No-op when nothing
+    /// is selected. Reads the live snapshot so wide-char continuations are skipped
+    /// and trailing spaces trimmed (`GridSnapshot::selection_text`).
+    fn copy_selection(&mut self) {
+        if let Some(sel) = self.selection {
+            let text = self.tabs.active().terminal.snapshot().selection_text(&sel);
+            crate::clipboard::write_clipboard_text(&text);
+        }
+    }
+
     /// Dispatch a key through the seam, then default input (R3.3/R4). Returns
     /// false if the app should exit.
     fn on_key(&mut self, input: KeyInput) -> bool {
+        // Cmd+C copies the current selection (the macOS copy shortcut), before any
+        // shell encoding so no literal `c` reaches the PTY. Ctrl+C (SIGINT) uses the
+        // control modifier, not super, so it is untouched. Match the *physical* C key
+        // so copy works under a non-Latin IME (Korean maps C→ㅊ), with a logical-`c`
+        // fallback if the platform reports the physical key unidentified.
+        if input.mods.super_key() {
+            let is_copy = input.physical == Some(winit::keyboard::KeyCode::KeyC)
+                || matches!(&input.key, winit::keyboard::Key::Character(s) if s.eq_ignore_ascii_case("c"));
+            if is_copy {
+                self.copy_selection();
+                return true;
+            }
+        }
         // 1) Visible overlays first (R4.1/R4.2).
         {
             let active = self.tabs.active_index();
@@ -743,6 +860,9 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 inner.last_cursor = (position.x, position.y);
                 inner.refresh_hover(); // one hit_test feeds both hover fields (D8)
+                if inner.selecting {
+                    inner.extend_selection(); // drag → grow the selection + highlight
+                }
             }
 
             WindowEvent::CursorLeft { .. } => inner.clear_hover(),
@@ -775,7 +895,19 @@ impl ApplicationHandler<UserEvent> for App {
                         SidebarAction::Expand => inner.toggle_sidebar(false),
                         SidebarAction::Inert => {}
                     }
+                } else if over_grid(inner.last_cursor.0, inner.renderer.left_inset()) {
+                    // Not a sidebar hit and inside the grid → start a text selection.
+                    inner.begin_selection();
                 }
+            }
+
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                // Finish the drag (a plain click left no selection).
+                inner.end_selection();
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -795,6 +927,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::Resized(size) => {
+                inner.clear_selection(); // grid reflows → viewport cell coords invalid
                 inner.renderer.resize(size.width, size.height);
                 crate::settings::refit(&inner.renderer, &mut inner.tabs); // shared refit (D6)
                                                                           // A smaller window shrinks list_viewport.h → max_scroll; re-clamp (D10).
@@ -839,6 +972,12 @@ impl ApplicationHandler<UserEvent> for App {
                     key: key_event.logical_key.clone(),
                     text: key_event.text.as_ref().map(|t| t.to_string()),
                     mods: inner.mods,
+                    // Physical key position (layout-independent) so ⌘-shortcuts fire
+                    // even under a non-Latin IME (Korean maps V→ㅍ, C→ㅊ).
+                    physical: match key_event.physical_key {
+                        winit::keyboard::PhysicalKey::Code(c) => Some(c),
+                        _ => None,
+                    },
                 };
                 if !inner.on_key(input) {
                     event_loop.exit();

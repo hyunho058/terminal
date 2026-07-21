@@ -259,12 +259,76 @@ pub fn suppress_key(composing: bool, key: &Key) -> bool {
     composing && matches!(key, Key::Character(_) | Key::Dead(_))
 }
 
+/// Whether a physical-pixel x lands on the terminal grid (right of the sidebar
+/// band) rather than over the left sidebar. The edge itself counts as grid.
+pub fn over_grid(cursor_x: f64, left_inset: f32) -> bool {
+    cursor_x as f32 >= left_inset
+}
+
+/// Map a physical-pixel cursor position to a grid cell `(col, row)`, **clamped**
+/// into `[0, cols) × [0, rows)`. The grid origin is offset by the sidebar
+/// `left_inset` and `top_inset` (matching the renderer's forward `col*cell + inset`
+/// mapping). A cursor left-of / above the grid clamps to column / row 0, and one
+/// past the right / bottom edge clamps to the last cell — so a drag that runs off an
+/// edge still selects to that edge. Returns `None` only for a zero-size grid.
+pub fn cell_at(
+    cursor: (f64, f64),
+    cell: (f32, f32),
+    left_inset: f32,
+    top_inset: f32,
+    cols: u16,
+    rows: u16,
+) -> Option<(u16, u16)> {
+    if cols == 0 || rows == 0 || cell.0 <= 0.0 || cell.1 <= 0.0 {
+        return None;
+    }
+    let x = cursor.0 as f32 - left_inset;
+    let y = cursor.1 as f32 - top_inset;
+    let col = (x / cell.0).floor().clamp(0.0, (cols - 1) as f32) as u16;
+    let row = (y / cell.1).floor().clamp(0.0, (rows - 1) as f32) as u16;
+    Some((col, row))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ch(c: &str) -> Key {
         Key::Character(c.into())
+    }
+
+    #[test]
+    fn cell_at_maps_pixel_to_cell_with_insets() {
+        // cell 10×20, left_inset 40, top_inset 30; cursor (65, 75):
+        // col = floor((65-40)/10) = 2, row = floor((75-30)/20) = 2.
+        assert_eq!(
+            cell_at((65.0, 75.0), (10.0, 20.0), 40.0, 30.0, 80, 24),
+            Some((2, 2))
+        );
+    }
+
+    #[test]
+    fn cell_at_clamps_off_every_edge() {
+        let c = (10.0, 20.0);
+        // Left of the grid → column 0 (row still maps: floor(100/20) = 5).
+        assert_eq!(cell_at((5.0, 100.0), c, 40.0, 0.0, 80, 24), Some((0, 5)));
+        // Far past the right / bottom edge → the last cell.
+        assert_eq!(
+            cell_at((100_000.0, 100_000.0), c, 40.0, 0.0, 80, 24),
+            Some((79, 23))
+        );
+        // A zero-size grid has no cell.
+        assert_eq!(cell_at((10.0, 10.0), c, 0.0, 0.0, 0, 0), None);
+    }
+
+    #[test]
+    fn over_grid_excludes_the_sidebar_band() {
+        assert!(over_grid(200.0, 160.0), "right of the band → grid");
+        assert!(!over_grid(100.0, 160.0), "inside the band → sidebar");
+        assert!(
+            over_grid(160.0, 160.0),
+            "exactly at the edge counts as grid"
+        );
     }
 
     #[test]

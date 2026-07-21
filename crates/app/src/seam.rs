@@ -21,7 +21,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use renderer::DrawLayer;
-use winit::keyboard::{Key, ModifiersState};
+use winit::keyboard::{Key, KeyCode, ModifiersState};
 
 /// Whether a handler/overlay swallowed a key or lets it fall through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +39,11 @@ pub struct KeyInput {
     pub key: Key,
     pub text: Option<String>,
     pub mods: ModifiersState,
+    /// The layout-independent physical key (winit `physical_key`), or `None` if the
+    /// platform reported it unidentified. Used to detect ⌘-shortcuts (⌘C/⌘V, tab
+    /// chords) by key *position*, so they still fire under a non-Latin IME layout —
+    /// e.g. Korean 2-beolsik maps the V key to `ㅍ`, so the logical char is not `v`.
+    pub physical: Option<KeyCode>,
 }
 
 /// What a handler/overlay may do to the app during `on_key`: write to the active
@@ -193,6 +198,7 @@ mod tests {
             key: k,
             text: Some(text.to_string()),
             mods: ModifiersState::empty(),
+            physical: None,
         }
     }
 
