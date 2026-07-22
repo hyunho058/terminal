@@ -27,6 +27,13 @@ pub enum Icon {
     Asterisk,
     /// Ready status mark `◇` (drawn, not a font glyph — D8).
     Diamond,
+    /// Waiting-band signal `⏸` — an agent handed its turn back and is waiting for
+    /// input (two vertical bars). Drawn geometry, not a font glyph (D6/D8).
+    Pause,
+    /// Waiting-band signal `✓` — a long foreground command completed cleanly (D6).
+    Check,
+    /// Waiting-band signal `✕` — a foreground command exited with an error code (D6).
+    Cross,
 }
 
 /// A stroke primitive in the 24×24 unit box.
@@ -88,6 +95,24 @@ const DIAMOND: &[Stroke] = &[
     Stroke::Line(4.0, 12.0, 12.0, 4.0),
 ];
 
+// Two vertical bars — the pause / input-waiting mark (⏸).
+const PAUSE: &[Stroke] = &[
+    Stroke::Line(9.5, 6.0, 9.5, 18.0),
+    Stroke::Line(14.5, 6.0, 14.5, 18.0),
+];
+
+// A checkmark — the clean-completion mark (✓).
+const CHECK: &[Stroke] = &[
+    Stroke::Line(5.0, 12.5, 10.0, 17.5),
+    Stroke::Line(10.0, 17.5, 19.0, 6.5),
+];
+
+// An X — the error mark (✕).
+const CROSS: &[Stroke] = &[
+    Stroke::Line(6.5, 6.5, 17.5, 17.5),
+    Stroke::Line(17.5, 6.5, 6.5, 17.5),
+];
+
 fn strokes(icon: Icon) -> &'static [Stroke] {
     match icon {
         Icon::Filter => FILTER,
@@ -96,6 +121,9 @@ fn strokes(icon: Icon) -> &'static [Stroke] {
         Icon::GitBranch => GIT_BRANCH,
         Icon::Asterisk => ASTERISK,
         Icon::Diamond => DIAMOND,
+        Icon::Pause => PAUSE,
+        Icon::Check => CHECK,
+        Icon::Cross => CROSS,
     }
 }
 
@@ -140,13 +168,16 @@ pub fn push_icon(out: &mut Vec<SidebarShape>, icon: Icon, x: f32, y: f32, size: 
 mod tests {
     use super::*;
 
-    const ALL: [Icon; 6] = [
+    const ALL: [Icon; 9] = [
         Icon::Filter,
         Icon::Plus,
         Icon::Panel,
         Icon::GitBranch,
         Icon::Asterisk,
         Icon::Diamond,
+        Icon::Pause,
+        Icon::Check,
+        Icon::Cross,
     ];
 
     #[test]

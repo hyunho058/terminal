@@ -158,6 +158,27 @@ pub struct Grid {
     app_cursor_keys: bool,
     /// Inline-image placements anchored to cells (image-paste D2, SD5).
     images: ImageLayer,
+    /// Most-recent OSC 133 command-end event parsed from the shell's output
+    /// (shell-integration D10/D21). Transient, one-shot: the app drains it via
+    /// [`take_command_end`](Grid::take_command_end) after each `advance`. Absent
+    /// from `GridSnapshot` — the renderer never reads it, exactly like
+    /// `app_cursor_keys` (spec D21).
+    command_end: Option<CommandEnd>,
+}
+
+/// A parsed OSC 133 command-end event
+/// (`ESC ] 133 ; D ; <exit_code> ; <elapsed_ms> ST`).
+///
+/// Raw shell-reported facts only (spec D21): `term-core` applies **no** policy —
+/// no ≥30s completion threshold, no `{1, 130}` error ignore-list, no session
+/// keying. The `app` owns all of that. Elapsed time is measured shell-side (from
+/// `EPOCHREALTIME`) so it survives laptop sleep without an app-side clock (D19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandEnd {
+    /// Exit status of the just-finished foreground command.
+    pub exit_code: i32,
+    /// Elapsed wall-clock time the shell measured, in milliseconds.
+    pub elapsed_ms: u64,
 }
 
 impl Grid {
@@ -179,6 +200,7 @@ impl Grid {
             alt_screen: false,
             app_cursor_keys: false,
             images: ImageLayer::new(),
+            command_end: None,
         }
     }
 
@@ -398,6 +420,19 @@ impl Grid {
     }
     pub fn app_cursor_keys(&self) -> bool {
         self.app_cursor_keys
+    }
+
+    /// Record the most-recent OSC 133 command-end event (parser → grid). A newer
+    /// event overwrites an unconsumed one — only the latest matters (spec D17:
+    /// one waiting item per session).
+    pub fn record_command_end(&mut self, event: CommandEnd) {
+        self.command_end = Some(event);
+    }
+
+    /// Take the most-recent OSC 133 command-end event, clearing it (one-shot
+    /// drain). Returns `None` if none is pending.
+    pub fn take_command_end(&mut self) -> Option<CommandEnd> {
+        self.command_end.take()
     }
 
     /// Read a retained history row (0 == oldest). Used by snapshot composition.

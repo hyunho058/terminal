@@ -8,7 +8,7 @@
 
 use vte::{Params, Parser, Perform};
 
-use crate::grid::{CellAttrs, Color, Grid};
+use crate::grid::{CellAttrs, Color, CommandEnd, Grid};
 use crate::image::parse_graphics_apc;
 
 /// Where the APC pre-scanner is in the byte stream.
@@ -196,6 +196,18 @@ fn to_u8(v: u16) -> u8 {
     v.min(255) as u8
 }
 
+/// Parse an OSC 133 field as a signed exit code. `None` (not a panic) on
+/// non-UTF-8 or non-numeric bytes, so a garbage field drops the event (D20).
+fn parse_ascii_i32(bytes: &[u8]) -> Option<i32> {
+    std::str::from_utf8(bytes).ok()?.trim().parse().ok()
+}
+
+/// Parse an OSC 133 field as an unsigned elapsed-milliseconds value. Same
+/// silent-failure contract as [`parse_ascii_i32`].
+fn parse_ascii_u64(bytes: &[u8]) -> Option<u64> {
+    std::str::from_utf8(bytes).ok()?.trim().parse().ok()
+}
+
 /// Resolve a `38`/`48` extended-color directive to a [`Color`]. `p` is the param
 /// that carried the `38`/`48`; `rest` is the remaining param iterator (consumed for
 /// the semicolon form). Returns `None` for an unsupported selector or a truncated
@@ -274,6 +286,48 @@ impl Perform for Performer<'_> {
         if intermediates.is_empty() && byte == b'c' {
             self.grid.set_app_cursor_keys(false);
         }
+    }
+
+    /// OSC — Operating System Command. The only sequence we act on is **OSC 133**
+    /// shell-integration command markers, injected by our generated zshrc
+    /// (`pty.rs` / `shell_integration.rs`). vte splits the payload on `;`, so a
+    /// command-end `ESC ] 133 ; D ; <exit> ; <elapsed_ms> ST` arrives as
+    /// `params = [b"133", b"D", b"<exit>", b"<elapsed_ms>"]`.
+    ///
+    /// The wire contract (emitter + parser both live in this task — keep in sync):
+    /// - Command start: `ESC ] 133 ; C ST`  (recognized, no payload consumed yet)
+    /// - Command end:   `ESC ] 133 ; D ; <exit_code> ; <elapsed_ms> ST`
+    ///
+    /// `elapsed_ms` is measured shell-side from `EPOCHREALTIME` (spec D19). Both
+    /// `BEL` and `ESC \` terminators are accepted (vte handles framing).
+    ///
+    /// Robustness (spec D20, project no-unwrap rule): an unknown OSC number, an
+    /// unknown 133 subkind, or a missing/garbage exit/elapsed field is dropped
+    /// silently — no panic, no `unwrap`, grid state unchanged.
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        // Only OSC 133 is ours; everything else (title, cwd, other integrations)
+        // is intentionally ignored — as it was before osc_dispatch existed.
+        if params.first().copied() != Some(b"133".as_slice()) {
+            return;
+        }
+        // `D` = command end — the only subkind carrying the exit + elapsed payload
+        // the waiting feature needs. `C` (command start) and any other subkind are
+        // recognized but carry nothing we consume, so they fall through to a no-op.
+        if params.get(1).copied() != Some(b"D".as_slice()) {
+            return;
+        }
+        // Both fields are required; either missing/garbage → drop the whole event
+        // and leave prior state untouched (partial params are not a valid marker).
+        let (Some(exit_code), Some(elapsed_ms)) = (
+            params.get(2).copied().and_then(parse_ascii_i32),
+            params.get(3).copied().and_then(parse_ascii_u64),
+        ) else {
+            return;
+        };
+        self.grid.record_command_end(CommandEnd {
+            exit_code,
+            elapsed_ms,
+        });
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
@@ -455,6 +509,66 @@ mod tests {
         p.advance(&mut g, a); // APC begins in chunk 1…
         p.advance(&mut g, b); // …completes in chunk 2
         assert_eq!(g.images().placements().len(), 1, "chunk-split APC parses");
+    }
+
+    // --- OSC 133 shell-integration command markers (left-sidebar-waiting-area) ---
+
+    #[test]
+    fn osc133_command_end_records_exit_and_elapsed() {
+        // R4.4: `ESC ] 133 ; D ; 101 ; 40000 BEL` → exit_code 101, elapsed_ms 40000.
+        let mut g = grid();
+        let mut p = Processor::new();
+        p.advance(&mut g, b"\x1b]133;D;101;40000\x07");
+        let ev = g.take_command_end().expect("command-end recorded");
+        assert_eq!(ev.exit_code, 101);
+        assert_eq!(ev.elapsed_ms, 40000);
+        // One-shot drain: a second take yields nothing.
+        assert!(g.take_command_end().is_none(), "take_command_end drains");
+    }
+
+    #[test]
+    fn osc133_accepts_st_terminator_and_negative_exit() {
+        // The `ESC \` (ST) terminator and a signed exit code both parse.
+        let mut g = grid();
+        let mut p = Processor::new();
+        p.advance(&mut g, b"\x1b]133;D;-1;250\x1b\\");
+        let ev = g.take_command_end().expect("ST-terminated marker parsed");
+        assert_eq!(ev.exit_code, -1);
+        assert_eq!(ev.elapsed_ms, 250);
+    }
+
+    #[test]
+    fn osc133_malformed_or_unknown_is_ignored_without_panic() {
+        // R4.5 / D20: garbage or partial params → no event, no panic, state intact.
+        let mut g = grid();
+        let mut p = Processor::new();
+        p.advance(&mut g, b"\x1b]133;D;notanumber;40000\x07"); // bad exit
+        assert!(g.take_command_end().is_none(), "garbage exit → dropped");
+        p.advance(&mut g, b"\x1b]133;D;5\x07"); // missing elapsed
+        assert!(g.take_command_end().is_none(), "missing elapsed → dropped");
+        p.advance(&mut g, b"\x1b]133;C\x07"); // command-start, no payload
+        assert!(g.take_command_end().is_none(), "C carries no command-end");
+        p.advance(&mut g, b"\x1b]999;whatever\x07"); // unknown OSC number
+        assert!(
+            g.take_command_end().is_none(),
+            "unknown OSC number → dropped"
+        );
+        p.advance(&mut g, b"\x1b]\x07"); // empty OSC
+        assert!(g.take_command_end().is_none(), "empty OSC → dropped");
+    }
+
+    #[test]
+    fn osc133_does_not_disturb_surrounding_text() {
+        // The marker must be swallowed cleanly; text before and after still lands.
+        let mut g = grid();
+        let mut p = Processor::new();
+        p.advance(&mut g, b"ok\x1b]133;D;0;12\x07XY");
+        let ev = g.take_command_end().expect("marker parsed mid-stream");
+        assert_eq!((ev.exit_code, ev.elapsed_ms), (0, 12));
+        assert_eq!(g.cell(0, 0).unwrap().ch, 'o');
+        assert_eq!(g.cell(1, 0).unwrap().ch, 'k');
+        assert_eq!(g.cell(2, 0).unwrap().ch, 'X');
+        assert_eq!(g.cell(3, 0).unwrap().ch, 'Y');
     }
 
     #[test]

@@ -118,6 +118,10 @@ impl Pty {
             LocaleAction::Ok => {}
             LocaleAction::NonUtf8 => warn_non_utf8_locale(),
         }
+        // Point zsh at our generated ZDOTDIR so it emits OSC 133 command markers
+        // (shell-integration R4.1-R4.3). Chains the user's rc, add-only; degrades
+        // to a plain shell on failure (spec D13). Preserves TERM/locale set above.
+        crate::shell_integration::inject(&mut cmd);
         let child = pair.slave.spawn_command(cmd).map_err(Error::pty)?;
         // Slave handle is not needed once the child holds it.
         drop(pair.slave);

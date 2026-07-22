@@ -11,17 +11,41 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::SystemTime;
 
+use serde_json::Value;
+
 use crate::parse_line;
 
 /// The most we ever read from a log's tail.
 pub const TAIL_CAP: u64 = 8 * 1024;
 
-/// The role of the last complete line of a log, plus the facts the caller memoises on.
+/// How the LAST *meaningful* message (a line whose `message.role` is `assistant` or
+/// `user`) classifies for the input-waiting rule (D16 of `left-sidebar-waiting-area`).
+/// The app maps `AssistantEndTurn` → `Waiting` and every other variant → `Busy`; a `None`
+/// on [`TailState::last`] (no meaningful line, or the newest record could not be robustly
+/// parsed — truncated by the tail cap / half-written) must NOT be read as Waiting
+/// (conservative bias: a false "waiting" is the worst failure).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LastMessage {
+    /// assistant turn whose `stop_reason == "end_turn"`: control handed back to the human.
+    AssistantEndTurn,
+    /// assistant turn mid-work (`stop_reason == "tool_use"`, or anything not `end_turn`).
+    AssistantBusy,
+    /// user line carrying a top-level `toolUseResult` (a tool result the agent is consuming).
+    UserToolResult,
+    /// user line without `toolUseResult` (a real human prompt the agent will answer next).
+    UserPrompt,
+}
+
+/// The role of the last complete line of a log, plus the facts the caller memoises on and
+/// the D16 input-waiting classification of the last meaningful message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TailState {
     pub role: String,
     pub mtime: SystemTime,
     pub len: u64,
+    /// The last meaningful (assistant/user) message's classification (D16), or `None` when
+    /// there is none or the newest record is not robustly parseable (see [`LastMessage`]).
+    pub last: Option<LastMessage>,
 }
 
 /// The role of the LAST parseable line in `log`, plus the file's `mtime` and `len`.
@@ -47,7 +71,78 @@ pub fn tail_state(log: &Path) -> Option<TailState> {
     // The last parseable line. Scanning from the end skips a half-written final line and
     // the partial first line left by seeking into the middle of a record.
     let role = text.lines().rev().find_map(parse_line)?.role;
-    Some(TailState { role, mtime, len })
+    // The D16 input-waiting signal from the last *meaningful* message (see below).
+    let last = last_meaningful(&text);
+    Some(TailState {
+        role,
+        mtime,
+        len,
+        last,
+    })
+}
+
+/// Classify the LAST *meaningful* line — one whose `message.role` is `assistant` or `user`
+/// (D16). Scanning from the end, a non-empty line that is NOT complete JSON and sits
+/// *after* (i.e. newer than) the meaningful line means the newest record was truncated by
+/// the tail cap or is half-written, so we return `None`; the caller then keeps its existing
+/// (never-Waiting) fallback — a false "waiting" is the worst failure. Non-meaningful
+/// complete lines (summary/system/ai-title/…) are skipped, not fatal.
+fn last_meaningful(text: &str) -> Option<LastMessage> {
+    let mut unreadable_after = false;
+    for line in text.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(v) => match v.pointer("/message/role").and_then(Value::as_str) {
+                Some("assistant") => {
+                    return if unreadable_after {
+                        None
+                    } else {
+                        Some(classify_assistant(&v))
+                    };
+                }
+                Some("user") => {
+                    return if unreadable_after {
+                        None
+                    } else {
+                        Some(classify_user(&v))
+                    };
+                }
+                // A complete but non-meaningful line (its `message.role` is absent/other):
+                // ignore it and keep scanning back for the real signal.
+                _ => {}
+            },
+            // A non-empty line that is not complete JSON: the newest record is unreadable.
+            Err(_) => unreadable_after = true,
+        }
+    }
+    None
+}
+
+/// An assistant message is `AssistantEndTurn` iff its stop reason is `end_turn`
+/// (`.message.stop_reason`, else top-level `.stopReason`); otherwise `AssistantBusy`.
+fn classify_assistant(v: &Value) -> LastMessage {
+    let stop = v
+        .pointer("/message/stop_reason")
+        .and_then(Value::as_str)
+        .or_else(|| v.get("stopReason").and_then(Value::as_str));
+    if stop == Some("end_turn") {
+        LastMessage::AssistantEndTurn
+    } else {
+        LastMessage::AssistantBusy
+    }
+}
+
+/// A user message is `UserToolResult` iff it carries a top-level `toolUseResult` (the agent
+/// is still working); otherwise it is a real human prompt, `UserPrompt`.
+fn classify_user(v: &Value) -> LastMessage {
+    if v.get("toolUseResult").is_some() {
+        LastMessage::UserToolResult
+    } else {
+        LastMessage::UserPrompt
+    }
 }
 
 #[cfg(test)]
@@ -96,5 +191,87 @@ mod tests {
         let log = tmpfile("partial", body);
         let ts = tail_state(&log).expect("tail");
         assert_eq!(ts.role, "assistant");
+    }
+
+    // ---- the D16 last-meaningful-message signal ----
+
+    #[test]
+    fn last_message_end_turn_is_the_waiting_signal() {
+        let body =
+            br#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn"}}"#;
+        let log = tmpfile("endturn", body);
+        assert_eq!(
+            tail_state(&log).expect("tail").last,
+            Some(LastMessage::AssistantEndTurn)
+        );
+    }
+
+    #[test]
+    fn last_message_tool_use_is_busy() {
+        let body =
+            br#"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use"}}"#;
+        let log = tmpfile("tooluse", body);
+        assert_eq!(
+            tail_state(&log).expect("tail").last,
+            Some(LastMessage::AssistantBusy)
+        );
+    }
+
+    #[test]
+    fn last_message_stop_reason_falls_back_to_top_level() {
+        // stop_reason may appear top-level as `stopReason` rather than under `.message`.
+        let body =
+            br#"{"type":"assistant","stopReason":"end_turn","message":{"role":"assistant"}}"#;
+        let log = tmpfile("topstop", body);
+        assert_eq!(
+            tail_state(&log).expect("tail").last,
+            Some(LastMessage::AssistantEndTurn)
+        );
+    }
+
+    #[test]
+    fn last_message_user_tool_result_vs_prompt() {
+        let res = tmpfile(
+            "uresult",
+            br#"{"type":"user","message":{"role":"user"},"toolUseResult":{"stdout":"ok"}}"#,
+        );
+        assert_eq!(
+            tail_state(&res).expect("tail").last,
+            Some(LastMessage::UserToolResult)
+        );
+        let prompt = tmpfile(
+            "uprompt",
+            br#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        );
+        assert_eq!(
+            tail_state(&prompt).expect("tail").last,
+            Some(LastMessage::UserPrompt)
+        );
+    }
+
+    #[test]
+    fn non_meaningful_trailing_lines_are_skipped() {
+        // A summary line written after the assistant turn has no `message.role`; it is
+        // ignored, so the assistant end_turn remains the last meaningful message.
+        let body = b"{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":\"end_turn\"}}\n{\"type\":\"summary\",\"summary\":\"x\"}\n";
+        let log = tmpfile("summary-after", body);
+        assert_eq!(
+            tail_state(&log).expect("tail").last,
+            Some(LastMessage::AssistantEndTurn)
+        );
+    }
+
+    #[test]
+    fn truncated_newest_record_suppresses_the_waiting_signal() {
+        // The last COMPLETE meaningful line is end_turn, but a newer half-written line
+        // follows (as a >TAIL_CAP record cut by the cap would look) — the newest record is
+        // unreadable, so `last` must be None so the caller never infers Waiting.
+        let body = b"{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":\"end_turn\"}}\n{\"type\":\"user\",\"message\":{\"role\":\"user\"";
+        let log = tmpfile("truncated", body);
+        assert_eq!(
+            tail_state(&log).expect("tail").last,
+            None,
+            "newest record unreadable → no Waiting signal"
+        );
     }
 }

@@ -17,6 +17,7 @@ mod sidebar_model;
 mod tabmeta;
 mod tabs;
 mod terminal_app;
+mod waiting;
 
 use winit::event_loop::{ControlFlow, EventLoop};
 

@@ -18,7 +18,8 @@ use crate::atlas::GlyphEntry;
 use crate::FrameCtx;
 
 pub use crate::sidebar_row::{
-    tab_at, tab_height_px, width_px, SidebarRow, TabBar, TabBarModel, TabModelHandle, TAB_BAR_Z,
+    tab_at, tab_height_px, width_px, SidebarRow, TabBar, TabBarModel, TabModelHandle, WaitingRow,
+    WaitingSignal, TAB_BAR_Z,
 };
 
 /// Display width of `c` in terminal **columns** (R5.2).

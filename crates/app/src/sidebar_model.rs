@@ -73,9 +73,14 @@ pub fn skin_for(agent: Option<&Agent>) -> AgentSkin {
 /// Agent state → the leading mark (D11). Working → `Agent` (`✳`); idle/ready → `Ready`
 /// (`◇`); no agent → `None`. `Unknown` maps to the **present** affordance (`✳`), never
 /// `Ready` (R6.6) — the one thing `Unknown` asserts is that an agent is running.
+///
+/// `Waiting` (input-waiting, D4/D16) maps to its own [`RowMark::Waiting`] (the ⏸ pause in
+/// the waiting colour, D6), so a waiting agent's CARD shows the same affordance as its
+/// waiting-band row — a consistent read across the two zones.
 pub fn mark_for(agent: Option<&Agent>) -> RowMark {
     match agent.map(|a| a.state) {
         Some(AgentState::Busy) => RowMark::Agent,
+        Some(AgentState::Waiting) => RowMark::Waiting,
         Some(AgentState::Unknown) => RowMark::Agent,
         Some(AgentState::Idle) => RowMark::Ready,
         None => RowMark::None,
@@ -125,6 +130,11 @@ mod tests {
         assert_eq!(
             mark_for(Some(&agent(AgentKind::Aider, AgentState::Unknown))),
             RowMark::Agent
+        );
+        // Waiting (D16) maps to its own dedicated ⏸ mark (D6/T4).
+        assert_eq!(
+            mark_for(Some(&agent(AgentKind::Claude, AgentState::Waiting))),
+            RowMark::Waiting
         );
         assert_eq!(mark_for(None), RowMark::None);
     }
