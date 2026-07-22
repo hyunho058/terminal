@@ -51,3 +51,13 @@ the human, not pushed through). No STOP-list items (no schema/auth/payment/migra
 The traffic-light vertical alignment and the single-band look are a live-run visual check
 (`/run-term`), not unit-testable; gates cover the pure geometry (gutter clearance), the
 window-attribute wiring, the press routing, build/clippy/tests.
+
+## Lessons
+
+### L1 — transparent titlebar needs alpha_mode = Opaque
+- cause: gate-fail
+- source: human-approved
+- form: gate3-item
+- status: active
+- check: The on-screen surface forces `CompositeAlphaMode::Opaque` (not `Auto`) so the premultiplied glyph output composites correctly once the native titlebar is transparent.
+- note: A transparent titlebar makes the CAMetalLayer non-opaque, so `get_default_config`'s `alpha_mode: Auto` resolves to `PostMultiplied`; the compositor then treats premultiplied glyph output as straight alpha and darkens ALL terminal text to invisible. Forcing `Opaque` fixes it (fix commit 085ac9e).
