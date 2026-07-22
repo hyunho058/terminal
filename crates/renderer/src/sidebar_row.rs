@@ -58,6 +58,35 @@ pub enum RowMark {
     Agent,
     /// An agent is idle / ready (the `◇` diamond).
     Ready,
+    /// An agent handed its turn back and is waiting for input (the `⏸` pause, in the
+    /// waiting colour) — the card-side echo of the waiting band (D6). Mapped from
+    /// `AgentState::Waiting` in `sidebar_model::mark_for`.
+    Waiting,
+}
+
+/// One waiting-band signal's visual kind (D6). Renderer-owned so the renderer never
+/// names the app's `WaitingKind`; the app maps `WaitingKind` → `WaitingSignal` when it
+/// builds the model. Each maps to a leading icon + a theme colour in [`DrawLayer::record`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitingSignal {
+    /// A foreground command exited with an error code (`✕`, error colour).
+    Error,
+    /// The agent finished its turn and is waiting for input (`⏸`, waiting colour).
+    Waiting,
+    /// A long clean foreground command completed (`✓`, completion colour).
+    Completion,
+}
+
+/// One pinned waiting-band row as the app hands it over (D6/D9): the session's stable id
+/// (so a click can switch to it, R2.1), its title, and which signal to draw. The app
+/// builds these already sorted oldest-wait-first and capped-free (the ≤5 + "+N more" cap
+/// is applied at draw time, R1.5/R1.6).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitingRow {
+    /// The app's `session::TabId` as a plain `u64` — the renderer must not know app types.
+    pub tab_id: u64,
+    pub title: String,
+    pub signal: WaitingSignal,
 }
 
 /// Per-tab metadata pulled from the app each frame (D10). Owned strings + `Copy` marks;
@@ -99,6 +128,10 @@ pub struct TabBarModel {
     pub titles: Vec<SidebarRow>,
     /// Index of the active (highlighted) tab.
     pub active: usize,
+    /// The pinned waiting-band rows (D9), oldest wait first, one per attention-needing
+    /// session (already active-tab-excluded by T3). Empty = no band. The app builds these
+    /// by joining T3's waiting items to the session titles.
+    pub waiting: Vec<WaitingRow>,
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +285,9 @@ pub struct SidebarModel {
     /// Written by `terminal_app` via [`TabModelHandle::set`] (D2).
     pub rows: Vec<SidebarRow>,
     pub active: usize,
+    /// The pinned waiting-band rows (D9), written by `terminal_app` via
+    /// [`TabModelHandle::set`] / [`TabModelHandle::set_waiting`]. Empty = no band.
+    pub waiting: Vec<WaitingRow>,
     /// Bumped by `set`; D10's second (row-change) pull gate.
     pub rows_rev: u64,
     /// Written by `sidebar-interaction`; `None` here (D12).
@@ -288,12 +324,23 @@ impl TabModelHandle {
         SHARED.with(|s| TabModelHandle(s.clone()))
     }
 
-    /// Replace the rows + active index, bumping `rows_rev` so the layer's pull gate fires
-    /// (D10). The frozen `set(TabBarModel)` signature (D2).
+    /// Replace the rows + active index + waiting band, bumping `rows_rev` so the layer's
+    /// pull gate fires (D10). The frozen `set(TabBarModel)` signature (D2).
     pub fn set(&self, model: TabBarModel) {
         let mut m = self.0.borrow_mut();
         m.rows = model.titles;
         m.active = model.active;
+        m.waiting = model.waiting;
+        m.rows_rev = m.rows_rev.wrapping_add(1);
+    }
+
+    /// Replace only the waiting-band rows, bumping `rows_rev` so the layer refreshes (D9).
+    /// The incremental path for a waiting-set change that did not open/close a tab (a
+    /// background command completing, an agent handing its turn back), so the app need not
+    /// recompute the tab titles (which re-does per-tab `proc_pidinfo`).
+    pub fn set_waiting(&self, waiting: Vec<WaitingRow>) {
+        let mut m = self.0.borrow_mut();
+        m.waiting = waiting;
         m.rows_rev = m.rows_rev.wrapping_add(1);
     }
 
@@ -821,17 +868,19 @@ impl DrawLayer for TabBar {
 
         // Copy everything out of the model under ONE borrow, then release it (D3) before
         // touching the (possibly reentrant) metadata source.
-        let (rows, active, hovered, rows_rev, list_top, scroll_px, source) = self.model.with(|m| {
-            (
-                m.rows.clone(),
-                m.active,
-                m.hovered,
-                m.rows_rev,
-                m.list_top,
-                m.scroll_px,
-                m.meta_source.clone(),
-            )
-        });
+        let (rows, active, hovered, rows_rev, list_top, scroll_px, waiting, source) =
+            self.model.with(|m| {
+                (
+                    m.rows.clone(),
+                    m.active,
+                    m.hovered,
+                    m.rows_rev,
+                    m.list_top,
+                    m.scroll_px,
+                    m.waiting.clone(),
+                    m.meta_source.clone(),
+                )
+            });
         self.refresh_meta(&rows, rows_rev, &source);
 
         let show_branch = ctx.sidebar.show_git_branch;
@@ -888,6 +937,94 @@ impl DrawLayer for TabBar {
             shapes.push(border);
         }
 
+        // ---- Pinned waiting band (D9/R1): a distinct zone between the header and the
+        // cards. Drawn at a FIXED position (unaffected by `scroll_px`) with the oldest
+        // wait at the top; the card list's `list_top` was already pushed below it (the
+        // chrome layer + `publish_scroll` both add `waiting_band_h`). Each row is a leading
+        // signal icon + the session title only — no timer, no error snippet (R1.3).
+        if !waiting.is_empty() {
+            let scale = ctx.scale_factor;
+            // Below the title bar + header (titlebar-tab-controls D6): the band, its rows,
+            // and the hit-test all add `top_inset` from ctx, matching `waiting_row_rect`.
+            let band_top = ctx.top_inset + crate::sidebar_layout::header_h(scale);
+            let band_h = crate::sidebar_layout::waiting_band_h(waiting.len(), scale);
+            // Inset by the border so the panel's right border stays continuous through the
+            // band (the band fill is drawn AFTER the border).
+            let band_w = (sidebar_w - m.border_w).max(0.0);
+            // Subtle elevated fill so the band reads as its own pinned zone…
+            if let Some(bg) = SidebarShape::rounded_box(
+                [0.0, band_top, band_w, band_h],
+                0.0,
+                0.0,
+                Fill::solid(linear(theme.waiting_band_bg, 1.0)),
+                [0.0; 4],
+            ) {
+                shapes.push(bg);
+            }
+            // …and a 1px separator along its bottom edge, dividing it from the cards.
+            if let Some(sep) = SidebarShape::rounded_box(
+                [0.0, band_top + band_h - m.border_w, band_w, m.border_w],
+                0.0,
+                0.0,
+                Fill::solid(linear(theme.waiting_band_border, 1.0)),
+                [0.0; 4],
+            ) {
+                shapes.push(sep);
+            }
+
+            let shown = waiting.len().min(crate::sidebar_layout::waiting::MAX_ROWS);
+            let left = m.header_pad_x;
+            let right_edge = (sidebar_w - m.header_pad_x).max(left);
+            // Up to 5 session rows (R1.6): icon + colour per signal (R1.4), title only.
+            for (i, wr) in waiting.iter().take(shown).enumerate() {
+                let rect =
+                    crate::sidebar_layout::waiting_row_rect(i, sidebar_w, ctx.top_inset, scale);
+                let (icon, color) = match wr.signal {
+                    WaitingSignal::Error => (Icon::Cross, theme.error_fg),
+                    WaitingSignal::Waiting => (Icon::Pause, theme.waiting_fg),
+                    WaitingSignal::Completion => (Icon::Check, theme.completion_fg),
+                };
+                let iy = rect.y + (rect.h - m.mark_px) * 0.5;
+                push_icon(&mut shapes, icon, left, iy.max(rect.y), m.mark_px, color);
+                let title_x = left + m.mark_px + m.card_gap;
+                let text_top = rect.y + ((rect.h - cell[1]) * 0.5).max(0.0);
+                push_glyphs(
+                    &mut text,
+                    ctx,
+                    &wr.title,
+                    title_x,
+                    text_top,
+                    cell,
+                    1.0,
+                    false,
+                    linear(theme.title_fg, 1.0),
+                    (right_edge - title_x).max(0.0),
+                    ellipsis,
+                );
+            }
+            // "+N more" summary row (R1.6/D11) — non-interactive (its hit resolves to Panel).
+            if waiting.len() > shown {
+                let n = waiting.len() - shown;
+                let rect =
+                    crate::sidebar_layout::waiting_row_rect(shown, sidebar_w, ctx.top_inset, scale);
+                let text_top = rect.y + ((rect.h - cell[1] * meta_ratio) * 0.5).max(0.0);
+                let summary = format!("+{n} more");
+                push_glyphs(
+                    &mut text,
+                    ctx,
+                    &summary,
+                    left,
+                    text_top,
+                    cell,
+                    meta_ratio,
+                    false,
+                    linear(theme.meta_fg, 1.0),
+                    (right_edge - left).max(0.0),
+                    ellipsis,
+                );
+            }
+        }
+
         let default_meta = RowMeta::default();
         let icon_gap = m.card_gap;
         for i in vis {
@@ -927,6 +1064,7 @@ impl DrawLayer for TabBar {
                 let mark = match meta.mark {
                     RowMark::Agent => Some((Icon::Asterisk, theme.mark_agent_fg)),
                     RowMark::Ready => Some((Icon::Diamond, theme.mark_ready_fg)),
+                    RowMark::Waiting => Some((Icon::Pause, theme.waiting_fg)),
                     RowMark::None => None,
                 };
                 if let Some((icon, color)) = mark {
@@ -1038,6 +1176,7 @@ mod tests {
                 title: "proj".into(),
             }],
             active: 0,
+            ..Default::default()
         });
         h.with(|m| {
             assert_eq!(m.rows.len(), 1);
@@ -1048,6 +1187,7 @@ mod tests {
         h.set(TabBarModel {
             titles: Vec::new(),
             active: 0,
+            ..Default::default()
         });
         h.with(|m| assert_eq!(m.rows_rev, 2, "each set bumps rows_rev"));
     }
@@ -1064,6 +1204,7 @@ mod tests {
                 title: "x".into(),
             }],
             active: 0,
+            ..Default::default()
         });
         b.with(|m| assert_eq!(m.rows.len(), 1, "b sees a's write"));
     }
@@ -1094,6 +1235,7 @@ mod tests {
                 title: "a".into(),
             }],
             active: 0,
+            ..Default::default()
         });
         // Copy rows + the source Rc out under one borrow (the record() pattern)…
         let (rows, source) = h.with(|m| (m.rows.clone(), m.meta_source.clone()));

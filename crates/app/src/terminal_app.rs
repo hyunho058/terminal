@@ -22,6 +22,7 @@
 
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
+use std::time::Instant;
 
 use common::config::{Config, SidebarConfig};
 use common::watch::ConfigWatcher;
@@ -34,7 +35,7 @@ use renderer::sidebar_layout::{self, SidebarLayoutInput};
 use renderer::sidebar_resize::{SidebarResizeHandle, SidebarResizeLayer};
 use renderer::sidebar_row::{self, SidebarGeom};
 use renderer::sidebar_theme::SidebarMetrics;
-use renderer::tab_bar::{TabBar, TabBarModel, TabModelHandle};
+use renderer::tab_bar::{TabBar, TabBarModel, TabModelHandle, WaitingRow, WaitingSignal};
 use renderer::titlebar::{
     titlebar_height, titlebar_hit, TitlebarButton, TitlebarHandle, TitlebarLayer,
 };
@@ -59,7 +60,9 @@ use crate::input::{
 };
 use crate::seam::{AppCtx, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayHost};
 use crate::session::{Session, TabId};
+use crate::tabmeta::{AgentState, TabMetaSnapshot};
 use crate::tabs::Tabs;
+use crate::waiting::{WaitingKind, WaitingState};
 
 /// Custom event: something happened off the UI thread that needs a wake.
 #[derive(Debug, Clone, Copy)]
@@ -72,6 +75,16 @@ pub enum UserEvent {
     /// A registered overlay has pending background work (e.g. ai-monitor's log
     /// tail); the loop should `poll` the overlays and redraw.
     OverlayPending,
+}
+
+/// Translate T3's `WaitingKind` to the renderer's `WaitingSignal` (D6). The app owns this
+/// mapping so the renderer never names the app's kind enum (dependency direction).
+fn waiting_signal(kind: WaitingKind) -> WaitingSignal {
+    match kind {
+        WaitingKind::Error => WaitingSignal::Error,
+        WaitingKind::Waiting => WaitingSignal::Waiting,
+        WaitingKind::Completion => WaitingSignal::Completion,
+    }
 }
 
 /// Top-level app. `inner` is populated on `resumed`.
@@ -199,6 +212,16 @@ struct Running {
     /// Write end of the [`TitlebarLayer`]'s shared state — set to the current collapsed
     /// state so the toggle glyph reflects it (titlebar-tab-controls D14).
     titlebar_handle: TitlebarHandle,
+    /// The waiting-band assembly model (T3): consumes per-session command-end
+    /// (OSC 133) + agent-state signals and produces the ordered waiting items T4
+    /// renders. Pure policy — the ≥30s threshold, `{1,130}` ignore-list, per-session
+    /// precedence, active-tab exclusion, and acknowledge-on-activate all live in it.
+    waiting: WaitingState,
+    /// Reused buffer for reading each tab's agent state out of the metadata worker
+    /// (via the process-global [`TabMetaHandle`]) to feed the waiting model's
+    /// rising-edge Waiting detection. Kept across polls so `sync` reuses its
+    /// allocation (mirrors `SidebarMetaSource`'s snapshot).
+    tabmeta_snapshot: TabMetaSnapshot,
 }
 
 impl App {
@@ -338,6 +361,8 @@ impl App {
             resizing: false,
             resize_handle,
             titlebar_handle,
+            waiting: WaitingState::new(),
+            tabmeta_snapshot: TabMetaSnapshot::default(),
         };
         running.sync_tab_model();
         running.redraw();
@@ -556,10 +581,98 @@ impl Running {
     /// Push the current tab rows + active index into the sidebar layer. `Tabs::titles()`
     /// also pushes the metadata roster to the worker (tab-metadata seam).
     fn sync_tab_model(&mut self) {
+        let titles = self.tabs.titles();
+        let waiting = self.build_waiting_rows(&titles);
         self.tab_model.set(TabBarModel {
-            titles: self.tabs.titles(),
+            titles,
             active: self.tabs.active_index(),
+            waiting,
         });
+    }
+
+    /// Join T3's per-session waiting items to session titles, producing the renderer's
+    /// waiting-band rows (D6/D9). Translates each `WaitingKind` → `WaitingSignal` (the
+    /// renderer must not name the app's kind), and drops any item whose session has no
+    /// matching title (a tab closed between assembly and draw). Order is preserved — T3
+    /// already sorted oldest-wait-first (R1.5) — and the ≤5 + "+N more" visual cap is the
+    /// renderer's (R1.6), so the FULL list is handed over. `titles` is passed in (rather
+    /// than recomputed) so the frequent-event refresh path avoids `titles()`'
+    /// per-tab `proc_pidinfo`.
+    fn build_waiting_rows(&self, titles: &[sidebar_row::SidebarRow]) -> Vec<WaitingRow> {
+        self.waiting_items()
+            .into_iter()
+            .filter_map(|item| {
+                let title = titles
+                    .iter()
+                    .find(|r| r.tab_id == item.tab_id.0)
+                    .map(|r| r.title.clone())?;
+                Some(WaitingRow {
+                    tab_id: item.tab_id.0,
+                    title,
+                    signal: waiting_signal(item.kind),
+                })
+            })
+            .collect()
+    }
+
+    /// Rebuild the pinned waiting band from T3's current items + the live tab titles and
+    /// republish it (D9). Used when the waiting SET changed without a tab open/close (a
+    /// background command completing, an agent handing its turn back), so it reuses the
+    /// titles already in the model rather than recomputing them. The band's height shifts
+    /// `list_top`, so it also republishes the scroll offset (re-clamped) and re-resolves
+    /// hover under the stationary pointer.
+    fn refresh_waiting_band(&mut self) {
+        let rows = self.tab_model.with(|m| m.rows.clone());
+        let waiting = self.build_waiting_rows(&rows);
+        self.tab_model.set_waiting(waiting);
+        let inp = self.sidebar_input();
+        self.scroll = sidebar_layout::clamp_scroll(self.scroll, &inp);
+        self.publish_scroll();
+        self.refresh_hover();
+    }
+
+    /// Resolve pinned waiting-band row `band_i` to its tab's list index (D12): the band's
+    /// order (oldest wait first) differs from the tab order, so map through the row's
+    /// `tab_id`. `None` if the row or its tab vanished between draw and click.
+    fn waiting_row_tab_index(&self, band_i: usize) -> Option<usize> {
+        self.tab_model.with(|m| {
+            let tab_id = m.waiting.get(band_i)?.tab_id;
+            m.rows.iter().position(|r| r.tab_id == tab_id)
+        })
+    }
+
+    /// Sync each tab's agent state out of the metadata worker and run the waiting
+    /// model's rising-edge Waiting detection (T3). Returns whether the waiting item
+    /// set changed (so the caller can redraw). No-op returning `false` when the
+    /// metadata worker never spawned — then there are simply no agent signals, and
+    /// command-end/error signals degrade independently (graceful degrade, R7).
+    fn feed_agent_states(&mut self) -> bool {
+        let Some(handle) = crate::tabmeta::global() else {
+            return false;
+        };
+        handle.sync(&mut self.tabmeta_snapshot);
+        let active = self.tabs.active().id;
+        // A tab with no live agent maps to `Unknown` (not `Waiting`), so an agent
+        // that finished (`agent: None`) is seen as leaving Waiting — a falling edge.
+        let states: Vec<(TabId, AgentState)> = self
+            .tabmeta_snapshot
+            .iter()
+            .map(|(id, meta)| {
+                (
+                    id,
+                    meta.agent.map(|a| a.state).unwrap_or(AgentState::Unknown),
+                )
+            })
+            .collect();
+        self.waiting
+            .on_agent_states(&states, active, Instant::now())
+    }
+
+    /// The ordered waiting items for the sidebar band — T4's read point (D2/R1.5).
+    /// Oldest wait first; the full list, with no max-5 / "+N more" cap (that is
+    /// T4's visual concern, R1.6/D11). Consumed by [`build_waiting_rows`](Self::build_waiting_rows).
+    fn waiting_items(&self) -> Vec<crate::waiting::WaitingItem> {
+        self.waiting.items()
     }
 
     /// Build the sidebar layout input from live accessors + the siblings' own functions —
@@ -572,15 +685,20 @@ impl Running {
         let viewport = [size.width as f32, size.height as f32];
         let scale = self.renderer.scale_factor();
         let cell = self.renderer.cell_size();
-        let count = self.tab_model.with(|m| m.rows.len());
+        let (count, waiting_count) = self.tab_model.with(|m| (m.rows.len(), m.waiting.len()));
+        // The list starts below the title bar (top_inset, titlebar D6), the header, AND the
+        // pinned waiting band (D9). An empty band adds 0.0, keeping the title-bar+header top
+        // (R1.2). Byte-identical to what the chrome layer and `publish_scroll` publish.
+        let list_top = top_inset
+            + sidebar_layout::header_h(scale)
+            + sidebar_layout::waiting_band_h(waiting_count, scale);
         let geom = SidebarGeom {
             sidebar_w,
             viewport_h: viewport[1],
             cell: [cell.0, cell.1],
             scale,
             show_branch: self.sidebar_cfg.show_git_branch,
-            // The list starts below the title bar + header (titlebar-tab-controls D6).
-            list_top: top_inset + sidebar_layout::header_h(scale),
+            list_top,
             scroll_px: self.scroll,
         };
         let row_h = sidebar_row::layout(&geom, count).card_h;
@@ -590,6 +708,7 @@ impl Running {
             scale,
             row_h,
             row_count: count,
+            waiting_count,
             metrics: SidebarMetrics::DEFAULT.scaled(scale),
             top_inset,
         }
@@ -607,9 +726,15 @@ impl Running {
     /// `top_inset` so drawn rows shift down with the title bar (titlebar-tab-controls D6).
     fn publish_scroll(&self) {
         let scale = self.renderer.scale_factor();
+        // Byte-identical to what the chrome layer writes each frame and to `sidebar_input`:
+        // top_inset (title bar, D6) + header_h + waiting_band_h(m.waiting.len()) — so the
+        // two every-frame writers cannot clobber each other and rows never desync.
         let top_inset = self.renderer.top_inset();
-        self.tab_model
-            .set_list_scroll(top_inset + sidebar_layout::header_h(scale), self.scroll);
+        let waiting_count = self.tab_model.with(|m| m.waiting.len());
+        let list_top = top_inset
+            + sidebar_layout::header_h(scale)
+            + sidebar_layout::waiting_band_h(waiting_count, scale);
+        self.tab_model.set_list_scroll(list_top, self.scroll);
     }
 
     /// Collapse or restore the sidebar (D6). The order is load-bearing: set the override
@@ -678,6 +803,13 @@ impl Running {
             TabAction::Prev => self.tabs.prev(),
             TabAction::Jump(i) => self.tabs.jump(i),
         }
+        // Becoming the active tab is the "confirmation" that clears its waiting signals
+        // (D12/R2.1). Every path that changes the active tab — click, chord, Cmd+number
+        // jump, or a click on a waiting row — funnels through here. Acknowledge BEFORE
+        // rebuilding the model so the just-activated session's item is already gone from
+        // the band (clicking a waiting row makes it disappear, R2.1). `do_tab_action` ends
+        // in `redraw()`, so the cleared band repaints.
+        self.waiting.acknowledge(self.tabs.active().id);
         self.sync_tab_model();
         // Reveal the (possibly newly-appended or below-the-fold) active tab and re-clamp
         // the offset — a tab close shrinks the content (D6/D10). Then re-resolve hover.
@@ -881,8 +1013,37 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::PtyOutput(id) => {
                 // Advance the originating tab's grid; redraw only if active (R1.2).
                 let is_active = inner.tabs.is_active(id);
-                let advanced = inner.tabs.by_id_mut(id).map(|s| s.drain()).unwrap_or(false);
-                if advanced && is_active {
+                let active_id = inner.tabs.active().id;
+                // Drain, and pull any OSC 133 command-end the shell emitted on this
+                // (possibly background) session's PTY (T1 → T3).
+                let mut command_end = None;
+                let advanced = inner
+                    .tabs
+                    .by_id_mut(id)
+                    .map(|s| {
+                        let got = s.drain();
+                        command_end = s.take_command_end();
+                        got
+                    })
+                    .unwrap_or(false);
+                let needs_redraw = advanced && is_active;
+                // Feed the command-end into the waiting model (T3). A background
+                // tab's completion/error must still repaint the sidebar band even
+                // though its grid output does not (so redraw when the set changed).
+                let mut band_changed = false;
+                if let Some(end) = command_end {
+                    if inner
+                        .waiting
+                        .on_command_end(id, active_id, end, Instant::now())
+                    {
+                        band_changed = true;
+                    }
+                }
+                // Republish the band (rows + shifted list_top) before the redraw (T4).
+                if band_changed {
+                    inner.refresh_waiting_band();
+                }
+                if needs_redraw || band_changed {
                     inner.redraw();
                 }
             }
@@ -912,7 +1073,16 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::OverlayPending => {
                 // An overlay (ai-monitor) tailed new data — fold it in + redraw (R1.3).
-                if inner.overlays.poll_all() {
+                let overlay_changed = inner.overlays.poll_all();
+                // The tab-metadata worker also wakes the loop through this path; sync
+                // the fresh agent states into the waiting model (rising-edge Waiting
+                // detection, T3) and redraw if the waiting band changed.
+                let waiting_changed = inner.feed_agent_states();
+                // Republish the band (rows + shifted list_top) before the redraw (T4).
+                if waiting_changed {
+                    inner.refresh_waiting_band();
+                }
+                if overlay_changed || waiting_changed {
                     inner.redraw();
                 }
             }
@@ -993,6 +1163,16 @@ impl ApplicationHandler<UserEvent> for App {
                         SidebarAction::Switch(i) => {
                             if !inner.do_tab_action(TabAction::Jump(i)) {
                                 event_loop.exit();
+                            }
+                        }
+                        SidebarAction::SwitchWaiting(i) => {
+                            // Resolve the band row to its tab index, then switch — which
+                            // acknowledges + clears the item (D12/R2.1). A stale row (tab
+                            // gone) is a no-op.
+                            if let Some(idx) = inner.waiting_row_tab_index(i) {
+                                if !inner.do_tab_action(TabAction::Jump(idx)) {
+                                    event_loop.exit();
+                                }
                             }
                         }
                         SidebarAction::BeginResize => inner.begin_resize(),

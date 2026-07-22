@@ -20,10 +20,11 @@ pub mod parser;
 pub mod pty;
 pub mod scrollback;
 pub mod selection;
+mod shell_integration;
 pub mod snapshot;
 
 pub use error::{Error, Result};
-pub use grid::{Cell, CellAttrs, Color, Cursor, Grid};
+pub use grid::{Cell, CellAttrs, Color, CommandEnd, Cursor, Grid};
 pub use image::{Decoded, ImageLayer, Placement};
 pub use pty::Pty;
 pub use scrollback::History;
@@ -125,5 +126,44 @@ impl Terminal {
     /// D2); the snapshot is the *renderer* contract.
     pub fn app_cursor_keys(&self) -> bool {
         self.grid.app_cursor_keys()
+    }
+
+    /// Take the most-recent OSC 133 command-end event parsed from the shell's
+    /// output, clearing it (one-shot drain). Poll it right after
+    /// [`advance`](Terminal::advance); `None` if no marker has arrived.
+    ///
+    /// Exposed as an accessor rather than a [`GridSnapshot`] field for the same
+    /// reason as [`app_cursor_keys`](Terminal::app_cursor_keys): the renderer
+    /// never reads it. The event is a raw shell fact ([`CommandEnd`]) — the `app`
+    /// keys it to a session and owns every UI policy (the ≥30s completion
+    /// threshold, the `{1, 130}` error ignore-list). `term-core` stays free of
+    /// UI/wgpu/winit concerns (spec D21).
+    pub fn take_command_end(&mut self) -> Option<CommandEnd> {
+        self.grid.take_command_end()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn take_command_end_exposes_osc133_and_drains() {
+        let mut t = Terminal::new(20, 5, Color(0xE0E0E0), Color(0x101010));
+        t.advance(b"\x1b]133;D;101;40000\x07");
+        let ev = t.take_command_end().expect("accessor returns the event");
+        assert_eq!(ev.exit_code, 101);
+        assert_eq!(ev.elapsed_ms, 40000);
+        assert!(t.take_command_end().is_none(), "one-shot: drains on take");
+    }
+
+    #[test]
+    fn malformed_osc133_yields_no_event() {
+        let mut t = Terminal::new(20, 5, Color(0xE0E0E0), Color(0x101010));
+        t.advance(b"\x1b]133;D;notanumber\x07");
+        assert!(
+            t.take_command_end().is_none(),
+            "garbage → no event, no panic"
+        );
     }
 }

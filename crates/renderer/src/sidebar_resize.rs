@@ -235,9 +235,9 @@ impl DrawLayer for SidebarResizeLayer {
     }
 
     fn record(&mut self, ctx: &mut FrameCtx<'_>) {
-        // `resize_handle_rect` reads only sidebar_w / viewport / scale, so row_h/row_count
-        // are irrelevant here — pass 0.
-        let inp = SidebarLayoutInput::from_frame(ctx, 0.0, 0);
+        // `resize_handle_rect` reads only sidebar_w / viewport / scale / top_inset, so
+        // row_h / row_count / waiting_count are irrelevant here — pass 0.
+        let inp = SidebarLayoutInput::from_frame(ctx, 0.0, 0, 0);
         let Some(inst) = rule_rect(&inp, self.handle.active()) else {
             return; // collapsed — nothing to draw
         };
@@ -294,6 +294,7 @@ mod tests {
             scale,
             row_h: 60.0,
             row_count: 3,
+            waiting_count: 0,
             metrics: SidebarMetrics::DEFAULT.scaled(scale),
             top_inset: 0.0,
         }

@@ -114,15 +114,16 @@ impl DrawLayer for SidebarChromeLayer {
         // the OPPOSITE guard to the row layer, which stops drawing here as this one starts.
         let collapsed = ctx.left_inset <= 0.0;
 
-        // Row count feeds the input; the header geometry does not use row_h, so a missing
-        // published card layout (collapsed session) is harmless.
-        let (row_h, row_count) = TabModelHandle::shared().with(|m| {
+        // Row count + waiting count feed the input; the header geometry does not use row_h,
+        // so a missing published card layout (collapsed session) is harmless.
+        let (row_h, row_count, waiting_count) = TabModelHandle::shared().with(|m| {
             (
                 m.layout.as_ref().map(|l| l.card_h).unwrap_or(0.0),
                 m.rows.len(),
+                m.waiting.len(),
             )
         });
-        let inp = SidebarLayoutInput::from_frame(ctx, row_h, row_count);
+        let inp = SidebarLayoutInput::from_frame(ctx, row_h, row_count, waiting_count);
 
         let mut shapes = std::mem::take(&mut self.shapes);
         shapes.clear();
@@ -133,17 +134,20 @@ impl DrawLayer for SidebarChromeLayer {
         }
         self.shapes = shapes;
 
-        // D13: publish where the card list begins so the row layer offsets its cards
-        // below the header. This MUST include `top_inset` (titlebar-tab-controls D6): the
-        // list starts below BOTH the title bar and the header band, i.e. at
-        // `top_inset + header_h` — the same value the app publishes via `set_list_scroll`
-        // and that `sidebar_layout::list_viewport` uses. Omitting `top_inset` here (this
-        // layer being the every-frame writer) shifted every row up by `top_inset`, hiding
-        // the first row under the opaque header band. Collapsed reserves nothing, so 0.0.
+        // D13/D9 + titlebar D6: publish where the card list begins so the row layer offsets
+        // its cards below the title bar, the header band, AND the pinned waiting band. This
+        // MUST equal what the app publishes via `set_list_scroll` and what
+        // `sidebar_layout::list_viewport` uses — `top_inset + header_h + waiting_band_h` —
+        // so the two every-frame writers can't clobber each other and rows never desync.
+        // (Omitting `top_inset` here once hid the first row under the header band; omitting
+        // `waiting_band_h` would overlap the cards with the waiting band.) Collapsed
+        // reserves nothing, so 0.0.
         let list_top = if collapsed {
             0.0
         } else {
-            ctx.top_inset + header_h(ctx.scale_factor)
+            ctx.top_inset
+                + header_h(ctx.scale_factor)
+                + crate::sidebar_layout::waiting_band_h(waiting_count, ctx.scale_factor)
         };
         TabModelHandle::shared().with_mut(|m| m.list_top = list_top);
     }
@@ -161,6 +165,7 @@ mod tests {
             scale,
             row_h: 60.0 * scale as f32,
             row_count: 5,
+            waiting_count: 0,
             metrics: SidebarMetrics::DEFAULT.scaled(scale),
             top_inset: 0.0,
         }

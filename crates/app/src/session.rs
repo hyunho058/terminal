@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 
-use term_core::{Color, Pty, Terminal};
+use term_core::{Color, CommandEnd, Pty, Terminal};
 use winit::event_loop::EventLoopProxy;
 
 use crate::terminal_app::UserEvent;
@@ -27,6 +27,13 @@ pub struct Session {
     pub writer: Box<dyn Write + Send>,
     pub rx: Receiver<Vec<u8>>,
     title: String,
+    /// Most-recent OSC 133 command-end event observed on this session's PTY,
+    /// keyed implicitly to `id`. Pulled from the terminal in [`drain`] and
+    /// consumed by the waiting model (T3) via [`take_command_end`].
+    ///
+    /// [`drain`]: Session::drain
+    /// [`take_command_end`]: Session::take_command_end
+    command_end: Option<CommandEnd>,
     _reader: JoinHandle<()>,
 }
 
@@ -73,6 +80,7 @@ impl Session {
             writer,
             rx,
             title: String::new(),
+            command_end: None,
             _reader: reader_thread,
         })
     }
@@ -85,7 +93,20 @@ impl Session {
             self.terminal.advance(&bytes);
             got = true;
         }
+        // After advancing, pull any OSC 133 command-end the shell emitted on this
+        // session's PTY. Keeps a still-unconsumed event if none is newer, so a
+        // slow waiting-model poll (T3) can't miss one (spec R4.6).
+        if let Some(ev) = self.terminal.take_command_end() {
+            self.command_end = Some(ev);
+        }
         got
+    }
+
+    /// Take the most-recent OSC 133 command-end event seen on this session's PTY
+    /// since the last poll, clearing it. The app keys it to this session's
+    /// [`TabId`] and feeds the waiting model (T3); `None` if none pending.
+    pub fn take_command_end(&mut self) -> Option<CommandEnd> {
+        self.command_end.take()
     }
 
     /// Write bytes to this session's shell.
