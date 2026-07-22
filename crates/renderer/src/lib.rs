@@ -252,11 +252,23 @@ impl Renderer {
         let info = adapter.get_info();
         tracing::info!(backend = ?info.backend, adapter = %info.name, "gpu adapter selected");
 
-        let config = surface
+        let mut config = surface
             .get_default_config(&adapter, width.max(1), height.max(1))
             .ok_or(RendererError::NoDefaultConfig)?;
+        // Force OPAQUE compositing. The default is `Auto`, which resolves to
+        // `PostMultiplied` once the window's title bar is made transparent (the
+        // native-title-bar merge) — and the compositor then treats our
+        // premultiplied glyph output as straight alpha, darkening all terminal text
+        // to nothing. Our surface fills the whole window with opaque content (an
+        // opaque top band + grid), so `Opaque` is correct: the alpha channel is
+        // ignored and the RGB shows as rendered. Fall back to the default if a
+        // platform ever drops `Opaque` from its supported set.
+        let caps = surface.get_capabilities(&adapter);
+        if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
+        }
         surface.configure(&device, &config);
-        tracing::info!(format = ?config.format, width = config.width, height = config.height, "surface configured");
+        tracing::info!(format = ?config.format, width = config.width, height = config.height, alpha_mode = ?config.alpha_mode, "surface configured");
 
         Self::assemble(
             device,

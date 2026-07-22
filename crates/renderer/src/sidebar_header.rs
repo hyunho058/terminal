@@ -133,12 +133,17 @@ impl DrawLayer for SidebarChromeLayer {
         }
         self.shapes = shapes;
 
-        // D13: publish the header height so the row layer offsets its cards below it. One
-        // write per frame; collapsed reserves no header, so 0.0.
+        // D13: publish where the card list begins so the row layer offsets its cards
+        // below the header. This MUST include `top_inset` (titlebar-tab-controls D6): the
+        // list starts below BOTH the title bar and the header band, i.e. at
+        // `top_inset + header_h` — the same value the app publishes via `set_list_scroll`
+        // and that `sidebar_layout::list_viewport` uses. Omitting `top_inset` here (this
+        // layer being the every-frame writer) shifted every row up by `top_inset`, hiding
+        // the first row under the opaque header band. Collapsed reserves nothing, so 0.0.
         let list_top = if collapsed {
             0.0
         } else {
-            header_h(ctx.scale_factor)
+            ctx.top_inset + header_h(ctx.scale_factor)
         };
         TabModelHandle::shared().with_mut(|m| m.list_top = list_top);
     }
