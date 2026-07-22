@@ -1,8 +1,10 @@
 //! The top title-bar tab controls, as a [`crate::DrawLayer`] that **nobody registers**
 //! here (the `titlebar-tab-controls` feature calls `add_layer` from `terminal_app.rs`).
 //! It draws no text: the opaque `panel_bg` band across the top inset, plus three square
-//! buttons — a sidebar toggle on the left and new-tab / close-tab on the right — built
-//! from the shared [`SidebarShape`] primitive and the existing [`Icon`] set.
+//! buttons — a sidebar toggle just right of the native traffic-light gutter (D15) and
+//! new-tab / close-tab on the right — built from the shared [`SidebarShape`] primitive and
+//! the existing [`Icon`] set. The band merges into the native title bar (D12), so the
+//! traffic lights float over its left end and the gutter keeps our controls clear of them.
 //!
 //! Shape building is a device-free free function ([`build_titlebar_shapes`], mirroring
 //! `sidebar_header::build_shapes`) so every layout/colour assertion runs without a GPU;
@@ -38,6 +40,12 @@ const _: () = assert!(TITLEBAR_Z < crate::overlay_layer::OVERLAY_Z);
 const TITLEBAR_PAD: f32 = 8.0;
 /// Gap between the two right-aligned buttons, logical px (× `scale` at use).
 const TITLEBAR_GAP: f32 = 8.0;
+/// Width reserved at the band's LEFT edge for the native macOS traffic lights
+/// (close/minimise/zoom), logical px (× `scale` at use). The content band now reaches the
+/// true window top (titlebar-tab-controls D12), so the traffic lights float over its left
+/// end; `ToggleSidebar` starts just right of this gutter so no drawn control is occluded
+/// (D15). ~78 covers the three ~14px buttons plus their leading/inter-button spacing.
+const TRAFFIC_LIGHT_GUTTER: f32 = 78.0;
 /// The close-glyph stroke width, logical px — the same 1.7 the icon set draws with.
 const CLOSE_STROKE_W: f32 = 1.7;
 /// Fractional inset of the `×` strokes inside their button rect (~30% each side).
@@ -69,8 +77,9 @@ const BUTTONS: [TitlebarButton; 3] = [
 ];
 
 /// A button's box, physical px (top-left origin). Every button is a square of side
-/// `top_inset - 2·pad`, vertically centred in the band. `ToggleSidebar` is left-aligned at
-/// `pad`; `CloseTab`'s right edge sits at `viewport_x - pad`, with `NewTab` one gap left.
+/// `top_inset - 2·pad`, vertically centred in the band. `ToggleSidebar` is left-aligned
+/// just right of the traffic-light gutter (`gutter + pad`, D15); `CloseTab`'s right edge
+/// sits at `viewport_x - pad`, with `NewTab` one gap left.
 pub fn titlebar_button_rect(
     kind: TitlebarButton,
     viewport: [f32; 2],
@@ -80,10 +89,11 @@ pub fn titlebar_button_rect(
     let s = scale as f32;
     let pad = TITLEBAR_PAD * s;
     let gap = TITLEBAR_GAP * s;
+    let gutter = TRAFFIC_LIGHT_GUTTER * s;
     let side = (top_inset - 2.0 * pad).max(0.0);
     let right = viewport[0] - pad; // the close button's right edge
     let x = match kind {
-        TitlebarButton::ToggleSidebar => pad,
+        TitlebarButton::ToggleSidebar => gutter + pad,
         TitlebarButton::CloseTab => right - side,
         TitlebarButton::NewTab => right - 2.0 * side - gap,
     };
@@ -332,13 +342,53 @@ mod tests {
             "close right edge at vp - pad"
         );
         assert_eq!(newtab.x, close.x - 8.0 - newtab.w, "new-tab one gap left");
-        // Toggle hugs the left edge; all three share the square side and centre line.
-        assert_eq!(toggle.x, 8.0, "toggle at pad");
+        // Toggle sits just right of the traffic-light gutter; all three share the square
+        // side and centre line.
+        assert_eq!(
+            toggle.x,
+            TRAFFIC_LIGHT_GUTTER + 8.0,
+            "toggle at gutter + pad"
+        );
         assert_eq!(toggle.w, top - 2.0 * 8.0, "side = top_inset - 2·pad");
         assert!(
             close.w == newtab.w && newtab.w == toggle.w,
             "all square, equal"
         );
+    }
+
+    #[test]
+    fn toggle_clears_traffic_light_gutter() {
+        // R8.2 / D15 — the toggle never sits under the native traffic lights: its left
+        // edge is at or past the reserved gutter, at every scale.
+        for scale in [1.0_f64, 2.0] {
+            let top = titlebar_height(scale);
+            let toggle = titlebar_button_rect(TitlebarButton::ToggleSidebar, VP, top, scale);
+            let gutter = TRAFFIC_LIGHT_GUTTER * scale as f32;
+            assert!(
+                toggle.x >= gutter,
+                "toggle.x {} must clear gutter {} at scale {scale}",
+                toggle.x,
+                gutter
+            );
+        }
+    }
+
+    #[test]
+    fn no_button_intersects_the_gutter() {
+        // R8.2 — no drawn control overlaps the traffic-light band [0, gutter), at any scale.
+        for scale in [1.0_f64, 2.0] {
+            let top = titlebar_height(scale);
+            let gutter = TRAFFIC_LIGHT_GUTTER * scale as f32;
+            for kind in BUTTONS {
+                let b = titlebar_button_rect(kind, VP, top, scale);
+                assert!(
+                    b.x >= gutter,
+                    "{kind:?} left edge {} must clear gutter {} at scale {scale}",
+                    b.x,
+                    gutter
+                );
+            }
+        }
     }
 
     #[test]

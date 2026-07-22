@@ -47,6 +47,7 @@ use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
+use winit::platform::macos::WindowAttributesExtMacOS;
 // winit 0.30 re-exports raw-window-handle 0.6 (`rwh_06`, a default feature), so
 // reaching the `NSView` needs no new dependency on `app` (D11).
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -207,7 +208,16 @@ impl App {
     ) -> crate::session::anyhow_lite::Result<Running> {
         let attrs = Window::default_attributes()
             .with_title("mac-terminal")
-            .with_inner_size(winit::dpi::LogicalSize::new(900.0, 540.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(900.0, 540.0))
+            // Merge our top band into the native title bar (titlebar-tab-controls D12): a
+            // transparent title bar + full-size content view lets the content view (and
+            // thus the wgpu surface / inner_size / our top_inset band) reach the TRUE
+            // window top, so the +/x/toggle sit in one band with the traffic lights — not
+            // a strip stacked below the OS title bar. Traffic lights are kept (NOT
+            // titlebar_hidden); the OS title text is hidden (we draw our own band).
+            .with_titlebar_transparent(true)
+            .with_fullsize_content_view(true)
+            .with_title_hidden(true);
         let window = Arc::new(event_loop.create_window(attrs)?);
         // Let macOS run the input method (R6.1). Without this winit's `key_down`
         // never calls `interpretKeyEvents` (view.rs:466-468), so a Korean IME never
@@ -954,7 +964,14 @@ impl ApplicationHandler<UserEvent> for App {
                             inner.toggle_sidebar(!collapsed);
                             None
                         }
-                        None => None, // empty band → consumed (no-op)
+                        None => {
+                            // Empty band → start a NATIVE window move (D15/R8.3). The band
+                            // now covers the transparent OS title bar, so without this the
+                            // window could not be dragged by its top. Still consumed — no
+                            // fall-through to selection/resize/grid.
+                            let _ = inner.window.drag_window();
+                            None
+                        }
                     };
                     // Run it; a false return (last tab closed) exits, mirroring Cmd+W.
                     if tab_action.is_some_and(|a| !inner.do_tab_action(a)) {

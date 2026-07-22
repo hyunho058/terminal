@@ -11,7 +11,8 @@
 Move the tab open (new) / close controls AND the sidebar collapse/expand (fold/unfold) toggle to a top title bar (Warp-style), relocated out of the sidebar header.
 
 ## Non-goals
-- Replacing or hiding the native macOS window title bar, or making the new strip a window-drag region (needs objc2 titlebar customization — deferred).
+- Hiding the native macOS traffic lights (close/min/zoom) or re-drawing them ourselves — they are kept, and the band clears them with a left gutter (D12/D15). (The original "in-content strip below the OS title bar" non-goal was reversed in Increment 2: the band now merges into a transparent native title bar, D12.)
+- Repositioning the traffic lights vertically within a taller band (macOS default position is accepted for v1).
 - Per-tab close (×) buttons inside the sidebar tab rows (the title bar hosts a single close-active control).
 - Persisting any title-bar state to config.
 
@@ -75,13 +76,17 @@ A full-width **title bar** occupies the topmost band of the client area (`y ∈ 
 - **Status**: resolved
 - **Rationale**: The sidebar's `ChromeRegion::NewTab` (drawn `Icon::Plus`), `HideSidebar` (collapse), AND the collapsed `Restore` button are all removed from `sidebar_header::build_shapes` / `sidebar_layout` — the title bar now hosts `+`, `×`, and the collapse/expand toggle. Because the title bar is always on screen, one toggle serves BOTH collapse (when expanded) and restore (when collapsed), so the separate `Restore` affordance is retired. Rejected: keeping Hide/Restore in the sidebar (the goal now moves them up, Warp-style); rejected: leaving `Restore` as a floating button (redundant with the always-visible title-bar toggle).
 
-### D12: In-content strip, not a native title bar (v1)
-- **Status**: assumed
-- **Rationale**: The band is an in-content strip below the OS window title bar; the native macOS title bar and its window-drag stay as-is (winit default). A custom/borderless title bar with window-drag needs objc2 work and is deferred (non-goal). Rejected: hiding the native title bar now (larger, platform-fragile change).
+### D12: Merge into the native title bar — content reaches the true window top (Increment 2)
+- **Status**: resolved (superseded the original "in-content strip" assumption at user request, 2026-07-21)
+- **Rationale**: The original v1 drew the band as an in-content strip *below* the native macOS title bar, producing TWO stacked bars — the user rejected this ("완전히 다르다": the open/close buttons must be in the true topmost region, not a strip inside the client area). Resolution: create the window with winit `WindowAttributesExtMacOS` `with_titlebar_transparent(true)` + `with_fullsize_content_view(true)` + `with_title_hidden(true)`, so the content view (and the wgpu surface / winit `inner_size`) spans the full window height and the existing `set_top_inset` band sits at the TRUE window top — one band, Warp-style. The native traffic lights are kept (not `with_titlebar_hidden`). No `objc2` needed: winit's macOS extension + `Window::drag_window()` cover it. Rejected: hiding the traffic lights (would require re-drawing native window controls); rejected: keeping the stacked in-content strip (the rejected v1).
+
+### D15: Traffic-light gutter + native drag on the empty band (Increment 2)
+- **Status**: resolved
+- **Rationale**: With content reaching the true top, the macOS traffic lights (top-left, ~78 logical px) overlap the band. So `titlebar_button_rect` reserves a left `TRAFFIC_LIGHT_GUTTER` and places `ToggleSidebar` just right of it (user-approved layout: toggle left-after-lights, `+`/`×` right-aligned); no button rect intersects `[0, gutter)`, so no control is drawn under the traffic lights. To keep the window draggable now that the band covers the OS titlebar, an empty-band press (D13, no button) calls `Window::drag_window()` — a native move — instead of a dead no-op. This upgrades D13's swallow: still consumed before selection/resize/grid, but now it drags. Rejected: `with_movable_by_window_background` (would drag from the grid too); rejected: leaving the empty band inert (loses window drag).
 
 ### D13: The app consumes EVERY press in the title-bar band
 - **Status**: resolved
-- **Rationale**: On a `MouseInput` Pressed, the app checks `cursor.y < top_inset` FIRST — before the sidebar hit-test, the resize handle, and the `over_grid → begin_selection` path. A band press routes to `titlebar_hit`: a button → its `do_tab_action`; empty band → swallowed (no-op). Either way the press is CONSUMED and never falls through. Without this early-return, an empty-band press over the grid columns (`x ≥ left_inset`) would satisfy `over_grid` and start a text selection, and one over the resize x would start a resize — both wrong. This makes the band's ownership total, not just button-local. Rejected: consuming only button hits (empty-band fall-through starts selection/resize).
+- **Rationale**: On a `MouseInput` Pressed, the app checks `cursor.y < top_inset` FIRST — before the sidebar hit-test, the resize handle, and the `over_grid → begin_selection` path. A band press routes to `titlebar_hit`: a button → its `do_tab_action`; empty band → **native window drag** (D15 upgrades this from the original no-op swallow). Either way the press is CONSUMED and never falls through. Without this early-return, an empty-band press over the grid columns (`x ≥ left_inset`) would satisfy `over_grid` and start a text selection, and one over the resize x would start a resize — both wrong. This makes the band's ownership total, not just button-local. Rejected: consuming only button hits (empty-band fall-through starts selection/resize).
 
 ### D14: The title-bar collapse toggle reflects state and flips it
 - **Status**: resolved
@@ -181,6 +186,20 @@ A full-width **title bar** occupies the topmost band of the client area (`y ∈ 
 - **When**: A card is drawn at row i and the same point is hit-tested
 - **Then**: Both use the `top_inset`-shifted origin (D6), so a click lands on the card under the cursor (no `top_inset` desync)
 
+### R8: The controls live in the TRUE top band (native title bar), clear of the traffic lights
+#### R8.1: Content reaches the true window top
+- **Given**: The app starts
+- **When**: The window is created
+- **Then**: It uses a transparent title bar + full-size content view (native traffic lights kept), so the content view / surface spans the full window height and the `top_inset` band is the topmost strip — there is no separate OS title-bar strip stacked above it
+#### R8.2: No control is drawn under the traffic lights
+- **Given**: The title bar is drawn with the traffic lights at the top-left
+- **When**: `titlebar_button_rect` places the buttons
+- **Then**: A left gutter is reserved; the `ToggleSidebar` button sits to its right and no button rect intersects `[0, gutter)` (the toggle/`+`/`×` are never occluded by the traffic lights)
+#### R8.3: An empty-band press moves the window
+- **Given**: The title bar owns the top band (D13)
+- **When**: The user presses in the band but on no button
+- **Then**: `window.drag_window()` starts a native window move (the press is still consumed — no selection/resize/grid fall-through)
+
 ## Tasks
 
 ### T1: Reserve the title-bar band + shift EVERY top-relative y down [infra]
@@ -202,6 +221,11 @@ A full-width **title bar** occupies the topmost band of the client area (`y ∈ 
 - **Fulfills**: R5
 - **Depends on**: T3
 - `crates/renderer/src/sidebar_layout.rs`: remove `ChromeRegion::NewTab`/`HideSidebar`/`Restore` and their `button_rect`/`restore_button_rect`/`chrome_hit`/`hit_test` handling (the whole `ChromeRegion` enum may retire). `crates/renderer/src/sidebar_header.rs`: remove the `Icon::Plus`/`Icon::Panel` header draws and the collapsed restore button in `build_shapes`. `crates/app/src/input.rs`: drop the `SidebarAction::{Collapse, Expand}` mappings from `sidebar_press`/`sidebar_hover` (now driven by the title bar). Done after T3 so the title bar provides the controls before the sidebar loses them.
+
+### T5: Merge the band into the native title bar [Increment 2]
+- **Fulfills**: R8, D12, D15
+- **Depends on**: T3
+- `crates/app/src/terminal_app.rs`: build the window with `WindowAttributesExtMacOS::with_titlebar_transparent(true)` + `with_fullsize_content_view(true)` + `with_title_hidden(true)` (keep the traffic lights), so content reaches the true top (R8.1). In the `MouseInput` Pressed band-consume arm, an empty-band hit (`titlebar_hit == None`) calls `self.window.drag_window()` instead of a no-op (R8.3). `crates/renderer/src/titlebar.rs`: add a `TRAFFIC_LIGHT_GUTTER` const and shift `ToggleSidebar`'s x to clear it; unit-test the clearance at scale 1.0/2.0 (R8.2). Done after T3 (the controls + routing must exist first).
 
 ## External Dependencies
 ### Pre-work

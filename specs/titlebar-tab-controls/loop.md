@@ -1,13 +1,19 @@
 # loop.md — titlebar-tab-controls
 
 ## Goal
-Implement `specs/titlebar-tab-controls/spec.md` (feature ② of sidebar-titlebar): a
-full-width **top title bar** (reserved via the existing `set_top_inset`) hosting
-**new-tab (+)**, **close (×)**, and the **collapse/expand toggle** — the toggle
-relocated out of the sidebar (D11/D14). Shift EVERY top-relative y-source by
-`top_inset` from ONE value, including the sibling `resize_handle_rect` (D6). Remove
-the relocated controls (NewTab/HideSidebar/Restore) from the sidebar. Consume every
-title-bar-band press before sidebar/resize/selection (D13). Tasks T1→T4.
+Feature ② of sidebar-titlebar. **Increment 2 (native top band):** the tab controls
+(`+` new-tab, `×` close, sidebar collapse toggle) live in the TRUE topmost band of the
+window — the native macOS title bar made transparent with a full-size content view, so
+content reaches the true top — NOT an in-content strip stacked below the OS title bar.
+The macOS traffic lights stay; a left gutter keeps the controls clear of them; an
+empty-band press initiates a native window drag. Overrides the original spec D12
+(in-content strip / native-titlebar non-goal) at explicit user request; spec amended in
+the same change (D12 → resolved, +D15/R8/T5).
+
+Layout (user-approved): toggle just right of the traffic lights; `+`/`×` right-aligned.
+
+> Increment 1 (shipped, commit 406968c): the title bar + its geometry, top_inset shift of
+> every top-relative y, and removal of the relocated controls from the sidebar (T1–T4).
 
 ## Gate 1 — Pass/Fail (binary, 100%)
 - `cargo build` succeeds
@@ -15,31 +21,33 @@ title-bar-band press before sidebar/resize/selection (D13). Tasks T1→T4.
 - `cargo test --workspace` green
 
 ## Gate 2 — Quantitative (numbers vs thresholds)
-- New unit tests ≥ **4**, all passing: `titlebar_hit` for `+` / `×` / toggle / empty
-  band; and the `top_inset` alignment test (with `top_inset = k`, a card's drawn-row y
-  == its hit-test-row y, and `resize_handle_rect` starts at `k`).
-- Files match the declared surface: NEW `crates/renderer/src/titlebar.rs` +
-  `crates/app/src/titlebar.rs`; edits to `sidebar_layout.rs`, `sidebar_header.rs`,
-  `renderer/lib.rs`, `input.rs`, `terminal_app.rs`. **Zero** edits under
-  `crates/term-core/**` (SD2).
+- ≥ **2** new/updated titlebar geometry tests, all passing: the `ToggleSidebar` button's
+  left edge ≥ the reserved traffic-light gutter at scale 1.0 AND 2.0; and no title-bar
+  button rect intersects the gutter band `[0, gutter)`.
+- **Zero** edits under `crates/term-core/**` (SD2).
 
 ## Gate 3 — Qualitative (judged, with grounds + action)
-- **top-inset-single-source** (D6) — every top-relative y shifts by `top_inset` from the
-  single `SidebarLayoutInput.top_inset`: drawn rows (`list_top`/`set_list_scroll`) AND
-  hit-test rows AND `header_rect`/`restore` AND the sibling `resize_handle_rect`. No
-  drawn-vs-hit-test desync; the resize band starts at `top_inset`.
-- **band-ownership** (D13) — every `MouseInput` Pressed with `cursor.y < top_inset` is
-  consumed (button → its action; empty → swallow) BEFORE the sidebar hit-test, the
-  resize handle, and `over_grid → begin_selection`. No fall-through.
-- **toggle-reflects-state** (D14) — the title-bar toggle flips collapse via
-  `toggle_sidebar(!collapsed())` (reusing `set_sidebar_collapsed`, no new collapse
-  logic); its glyph reflects expanded vs collapsed; the separate Restore affordance is
-  retired.
-- **render-fit** (D8/SD1/SD2) — the titlebar `DrawLayer` is pinned topmost (occludes any
-  bleed into the band); `term-core` untouched; no GUI crates; hit-test geometry is a pure
-  `titlebar` module shared by draw + hit-test (SD3).
+- **native-top-band** — the window is created with `with_titlebar_transparent(true)` +
+  `with_fullsize_content_view(true)` + `with_title_hidden(true)` (winit
+  `WindowAttributesExtMacOS`), so the content view (and the wgpu surface / winit
+  inner_size) spans the full window height and `set_top_inset` reserves the band at the
+  TRUE window top — one band, no strip stacked under a visible OS title bar.
+- **traffic-light-clearance** — every title-bar button rect lies clear of the reserved
+  left gutter; the native traffic lights stay visible and clickable and no drawn control
+  is occluded by them.
+- **drag-preserved + band-ownership (D13)** — every `MouseInput` Pressed with
+  `cursor.y < top_inset` is consumed before sidebar/resize/selection: a button → its
+  action; an empty band → `window.drag_window()` (native move), never a fall-through to
+  `begin_selection`/resize/grid.
+- **no-regression / fit (D8/SD1/SD2/SD3)** — top_inset grid shift, the toggle's
+  collapse/glyph behaviour, and the sidebar are unchanged; no GUI crates; `term-core`
+  untouched; title-bar hit geometry stays one pure module shared by draw + hit-test.
 
 ## Autonomy note
-No STOP-list items (no schema/auth/payment/migration). Mouse + GPU can't be
-unit-tested; gates cover the pure geometry (titlebar_hit, top_inset alignment) +
-build/clippy/tests. Final visual/interaction confirmation is a live run (`/run-term`).
+This increment intentionally OVERRIDES spec D12 (an original non-goal) at the user's
+explicit request; the spec is amended in the same change so the contract and spec agree
+(no lingering conflict — the one autonomy-fence "conflicts with spec" item, resolved by
+the human, not pushed through). No STOP-list items (no schema/auth/payment/migration).
+The traffic-light vertical alignment and the single-band look are a live-run visual check
+(`/run-term`), not unit-testable; gates cover the pure geometry (gutter clearance), the
+window-attribute wiring, the press routing, build/clippy/tests.
