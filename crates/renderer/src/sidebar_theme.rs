@@ -46,6 +46,17 @@ pub struct SidebarTheme {
     pub mark_agent_fg: u32,
     /// Ready mark glyph `◇` (`#7796b8`).
     pub mark_ready_fg: u32,
+    /// Waiting-band `⏸` input-waiting signal — amber attention (`#e0a866`, D6).
+    pub waiting_fg: u32,
+    /// Waiting-band `✓` clean-completion signal — green (`#7fb069`, D6).
+    pub completion_fg: u32,
+    /// Waiting-band `✕` error signal — red (`#e0574d`, D6).
+    pub error_fg: u32,
+    /// Waiting-band zone background — a hair lighter than `panel_bg` so the pinned
+    /// band reads as a distinct zone (`#232019`, D9).
+    pub waiting_band_bg: u32,
+    /// Waiting-band bottom separator between the band and the card list (`#3a352d`, D9).
+    pub waiting_band_border: u32,
     /// Accent (config `sidebar.accent`, default `#86b0a1`). Stored so the value has a
     /// home; read by no sidebar element in this feature (D1).
     pub accent: u32,
@@ -66,6 +77,11 @@ impl SidebarTheme {
         icon_bg_hover: 0x002A_2722,
         mark_agent_fg: 0x00E2_D9C8,
         mark_ready_fg: 0x0077_96B8,
+        waiting_fg: 0x00E0_A866,
+        completion_fg: 0x007F_B069,
+        error_fg: 0x00E0_574D,
+        waiting_band_bg: 0x0023_2019,
+        waiting_band_border: 0x003A_352D,
         accent: 0x0086_B0A1,
     };
 

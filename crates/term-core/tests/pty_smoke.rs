@@ -42,3 +42,39 @@ fn zsh_echo_roundtrip() {
         "shell output did not contain marker; got: {seen:?}"
     );
 }
+
+/// End-to-end shell integration: a real zsh started with our ZDOTDIR injection
+/// must emit an OSC 133 command-end marker (`ESC ] 133 ; D ; <exit> ; <ms>`)
+/// after a command runs. This exercises the emit → wire contract against zsh 5.9;
+/// the parse side is covered by the unit tests in `parser.rs`.
+#[test]
+#[ignore = "spawns a real zsh + sources the user's rc; run with --ignored"]
+fn osc133_marker_emitted_by_injected_zsh() {
+    let pty = Pty::spawn(80, 24).expect("spawn zsh");
+    let mut reader = pty.reader().expect("reader");
+    let mut writer = pty.writer().expect("writer");
+
+    // Let the interactive shell finish sourcing rc + print its first prompt.
+    std::thread::sleep(Duration::from_millis(600));
+    writer.write_all(b"true\n").expect("write"); // a command → preexec/precmd fire
+    writer.flush().expect("flush");
+
+    let mut seen: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; 8192];
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(50));
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => seen.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+        // OSC 133 command-end for `true`: exit 0. Match the framed prefix.
+        if seen.windows(8).any(|w| w == b"\x1b]133;D;") {
+            return; // marker observed → contract holds
+        }
+    }
+    panic!(
+        "no OSC 133 command-end marker in {} bytes of shell output",
+        seen.len()
+    );
+}

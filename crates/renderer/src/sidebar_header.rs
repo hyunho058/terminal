@@ -198,13 +198,14 @@ impl DrawLayer for SidebarChromeLayer {
 
         // Row count feeds the input; the header/restore geometry does not use row_h, so a
         // missing published card layout (collapsed session) is harmless.
-        let (row_h, row_count) = TabModelHandle::shared().with(|m| {
+        let (row_h, row_count, waiting_count) = TabModelHandle::shared().with(|m| {
             (
                 m.layout.as_ref().map(|l| l.card_h).unwrap_or(0.0),
                 m.rows.len(),
+                m.waiting.len(),
             )
         });
-        let inp = SidebarLayoutInput::from_frame(ctx, row_h, row_count);
+        let inp = SidebarLayoutInput::from_frame(ctx, row_h, row_count, waiting_count);
         let hover = self
             .handle
             .cursor()
@@ -219,12 +220,16 @@ impl DrawLayer for SidebarChromeLayer {
         }
         self.shapes = shapes;
 
-        // D13: publish the header height so the row layer offsets its cards below it. One
-        // write per frame; collapsed reserves no header, so 0.0.
+        // D13/D9: publish the header height PLUS the pinned waiting band's height so the
+        // row layer offsets its cards below both. One write per frame; collapsed reserves
+        // no header/band, so 0.0. This value is kept byte-identical to what the app writes
+        // via `set_list_scroll` (both add `waiting_band_h(waiting_count)`), so the two
+        // writers cannot clobber each other.
         let list_top = if collapsed {
             0.0
         } else {
             header_h(ctx.scale_factor)
+                + crate::sidebar_layout::waiting_band_h(waiting_count, ctx.scale_factor)
         };
         TabModelHandle::shared().with_mut(|m| m.list_top = list_top);
     }
@@ -242,6 +247,7 @@ mod tests {
             scale,
             row_h: 60.0 * scale as f32,
             row_count: 5,
+            waiting_count: 0,
             metrics: SidebarMetrics::DEFAULT.scaled(scale),
         }
     }

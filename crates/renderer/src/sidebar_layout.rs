@@ -75,8 +75,26 @@ pub enum ChromeRegion {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidebarRegion {
     Chrome(ChromeRegion),
+    /// A pinned waiting-band row (0-based, top = oldest wait). Only the ≤5 real
+    /// session rows are live; the "+N more" summary row is swallowed as `Panel`.
+    WaitingRow(usize),
     Card(usize),
     Panel,
+}
+
+/// Waiting-band layout tokens, logical px (multiplied by `scale` at the point of use,
+/// like [`tokens`]). The band is a pinned zone between the header and the card list
+/// (D9); these are the only metrics it adds over the shared [`SidebarMetrics`].
+pub mod waiting {
+    /// The most session rows the band draws before collapsing the rest into a summary
+    /// row (R1.6/D11).
+    pub const MAX_ROWS: usize = 5;
+    /// One band row's height, logical px (a compact single-line row: icon + title).
+    pub const ROW_H: f32 = 30.0;
+    /// Padding above the first band row, logical px.
+    pub const PAD_TOP: f32 = 6.0;
+    /// Padding below the last band row, logical px.
+    pub const PAD_BOTTOM: f32 = 6.0;
 }
 
 /// Everything the layout needs, all physical px except `scale` and `row_count` (D7).
@@ -93,6 +111,10 @@ pub struct SidebarLayoutInput {
     /// Card height, physical px — from `SidebarLayout.card_h`, **NOT computed here** (D6).
     pub row_h: f32,
     pub row_count: usize,
+    /// Number of pending waiting-band sessions — the count the app pushed as
+    /// `TabBarModel.waiting.len()`. Drives the pinned band's height (which pushes
+    /// `list_top` down) and the band-row hit region; `0` = no band (R1.2/D9).
+    pub waiting_count: usize,
     /// **Already scaled**: `SidebarMetrics::scaled(scale)`, never `SidebarMetrics::DEFAULT`.
     pub metrics: SidebarMetrics,
 }
@@ -104,6 +126,7 @@ impl SidebarLayoutInput {
         ctx: &crate::FrameCtx<'_>,
         row_h: f32,
         row_count: usize,
+        waiting_count: usize,
     ) -> SidebarLayoutInput {
         SidebarLayoutInput {
             sidebar_w: ctx.left_inset,
@@ -111,6 +134,7 @@ impl SidebarLayoutInput {
             scale: ctx.scale_factor,
             row_h,
             row_count,
+            waiting_count,
             metrics: SidebarMetrics::DEFAULT.scaled(ctx.scale_factor),
         }
     }
@@ -123,6 +147,72 @@ pub fn header_h(scale: f64) -> f32 {
     let m = SidebarMetrics::DEFAULT;
     let button_h = tokens::ICON_PX + 2.0 * m.button_pad; // 28 logical
     (m.header_pad_top + button_h + m.header_pad_bottom) * scale as f32
+}
+
+/// The number of band rows actually DRAWN for `items` waiting sessions: up to
+/// [`waiting::MAX_ROWS`] session rows plus one "+N more" summary row when the cap is
+/// exceeded (R1.6/D11). `0` when there is nothing to show.
+pub fn waiting_band_rows(items: usize) -> usize {
+    if items == 0 {
+        0
+    } else {
+        items.min(waiting::MAX_ROWS) + usize::from(items > waiting::MAX_ROWS)
+    }
+}
+
+/// One waiting-band row's height, physical px.
+pub fn waiting_row_h(scale: f64) -> f32 {
+    waiting::ROW_H * scale as f32
+}
+
+/// The pinned waiting band's total height, physical px. `0.0` for an empty set so the
+/// card list keeps its original `list_top` (R1.2); otherwise top+bottom padding plus one
+/// fixed-height row per drawn band row (visible + optional summary, R1.6/D11).
+pub fn waiting_band_h(items: usize, scale: f64) -> f32 {
+    let rows = waiting_band_rows(items);
+    if rows == 0 {
+        0.0
+    } else {
+        (waiting::PAD_TOP + rows as f32 * waiting::ROW_H + waiting::PAD_BOTTOM) * scale as f32
+    }
+}
+
+/// The y of the first band row's top, physical px — below the header and the top pad.
+fn waiting_content_top(scale: f64) -> f32 {
+    header_h(scale) + waiting::PAD_TOP * scale as f32
+}
+
+/// The **drawn** rect of band row `i` (0-based), physical px — a full-width row band
+/// spanning `[0, sidebar_w)`; the caller insets the leading icon and title itself. Both
+/// the band draw (`sidebar_row`) and this module's hit-test derive positions from here,
+/// so they cannot drift (SD2).
+pub fn waiting_row_rect(i: usize, sidebar_w: f32, scale: f64) -> Rect {
+    Rect {
+        x: 0.0,
+        y: waiting_content_top(scale) + i as f32 * waiting_row_h(scale),
+        w: sidebar_w,
+        h: waiting_row_h(scale),
+    }
+}
+
+/// The interactive band row at physical `y` — only the ≤[`waiting::MAX_ROWS`] real
+/// session rows are live; the "+N more" summary row and the band's padding resolve to
+/// `None` (swallowed as `Panel` by [`hit_test`], so a click there is a no-op, D11/R2.1).
+fn waiting_row_at(y: f32, inp: &SidebarLayoutInput) -> Option<usize> {
+    let items = inp.waiting_count;
+    if items == 0 {
+        return None;
+    }
+    let row_h = waiting_row_h(inp.scale);
+    if row_h <= 0.0 {
+        return None;
+    }
+    let rel = y - waiting_content_top(inp.scale);
+    if rel < 0.0 {
+        return None;
+    }
+    let k = (rel / row_h).floor() as usize;
+    (k < items.min(waiting::MAX_ROWS)).then_some(k)
 }
 
 /// The button box side, physical px (square). Derived from `header_h` minus the scaled
@@ -184,9 +274,11 @@ pub fn search_slot_rect(inp: &SidebarLayoutInput) -> Rect {
     }
 }
 
-/// The band the cards live in — below the pinned header, to the framebuffer bottom.
+/// The band the cards live in — below the pinned header AND the pinned waiting band, to
+/// the framebuffer bottom. The waiting band pushes `list_top` down by its height (D9); an
+/// empty band adds `0.0`, so the cards keep their original top (R1.2).
 pub fn list_viewport(inp: &SidebarLayoutInput) -> Rect {
-    let top = header_h(inp.scale);
+    let top = header_h(inp.scale) + waiting_band_h(inp.waiting_count, inp.scale);
     Rect {
         x: 0.0,
         y: top,
@@ -336,6 +428,16 @@ pub fn hit_test(
             None => SidebarRegion::Panel,
         });
     }
+    // 3.5. The pinned waiting band (above the cards, R1.1): a live session row, else
+    // Panel — the "+N more" summary row and the band padding are swallowed, never a
+    // card (the band sits ABOVE the list origin, so it must resolve before step 4).
+    let band_bottom = header_h(inp.scale) + waiting_band_h(inp.waiting_count, inp.scale);
+    if p[1] < band_bottom {
+        return Some(match waiting_row_at(p[1], inp) {
+            Some(i) => SidebarRegion::WaitingRow(i),
+            None => SidebarRegion::Panel,
+        });
+    }
     // 4. The list: a card, else Panel (dead space is swallowed, not leaked).
     Some(match row_at(p[1], s, inp) {
         Some(i) => SidebarRegion::Card(i),
@@ -348,12 +450,23 @@ mod tests {
     use super::*;
 
     fn input(sidebar_w: f32, viewport_h: f32, scale: f64, row_count: usize) -> SidebarLayoutInput {
+        input_w(sidebar_w, viewport_h, scale, row_count, 0)
+    }
+
+    fn input_w(
+        sidebar_w: f32,
+        viewport_h: f32,
+        scale: f64,
+        row_count: usize,
+        waiting_count: usize,
+    ) -> SidebarLayoutInput {
         SidebarLayoutInput {
             sidebar_w,
             viewport: [sidebar_w, viewport_h],
             scale,
             row_h: 60.0 * scale as f32,
             row_count,
+            waiting_count,
             metrics: SidebarMetrics::DEFAULT.scaled(scale),
         }
     }
@@ -578,5 +691,84 @@ mod tests {
         let inp = input(340.0, 900.0, 1.0, 5);
         // A scroll past the content still yields a valid (or None) row, never negative.
         assert!(row_at(100.0, 1e9, &inp).is_none_or(|i| i < inp.row_count));
+    }
+
+    // ---- Waiting band geometry (R1.1, R1.2, R1.6, R2.1 / D9, D11) ----
+
+    #[test]
+    fn waiting_band_rows_caps_and_summarizes() {
+        // R1.6/D11 — 0→0, under the cap → one row each, at the cap → 5, over → 5 + summary.
+        assert_eq!(waiting_band_rows(0), 0);
+        assert_eq!(waiting_band_rows(1), 1);
+        assert_eq!(waiting_band_rows(5), 5);
+        assert_eq!(waiting_band_rows(9), 6, "5 shown + 1 summary row");
+    }
+
+    #[test]
+    fn waiting_band_height_and_list_top_offset() {
+        // R1.1/R1.2/D9 — an empty band adds nothing; a populated band pushes list_top down
+        // by its exact height (PAD_TOP + rows*ROW_H + PAD_BOTTOM, scaled).
+        assert_eq!(waiting_band_h(0, 1.0), 0.0);
+        let empty = input_w(340.0, 900.0, 1.0, 5, 0);
+        assert_eq!(
+            list_viewport(&empty).y,
+            header_h(1.0),
+            "no band → original list_top"
+        );
+        // 1 item: 6 + 30 + 6 = 42 logical.
+        assert_eq!(waiting_band_h(1, 1.0), 42.0);
+        let one = input_w(340.0, 900.0, 1.0, 5, 1);
+        assert_eq!(list_viewport(&one).y, header_h(1.0) + 42.0);
+        // Scale multiplies the band height too.
+        assert_eq!(waiting_band_h(1, 2.0), 84.0);
+        // 9 items: 6 drawn rows (5 + summary) → 6 + 180 + 6 = 192 logical.
+        assert_eq!(waiting_band_h(9, 1.0), 192.0);
+        let nine = input_w(340.0, 900.0, 1.0, 5, 9);
+        assert_eq!(list_viewport(&nine).y, header_h(1.0) + 192.0);
+    }
+
+    #[test]
+    fn hit_test_resolves_band_rows_then_cards() {
+        // R2.1/D9 — a click in band row i → WaitingRow(i); a click below the band → Card,
+        // never mis-numbered by the band offset.
+        let inp = input_w(340.0, 900.0, 1.0, 6, 3);
+        // Band content starts at header_h + PAD_TOP = 60; rows are 30 tall.
+        assert_eq!(
+            hit_test([170.0, 65.0], 0.0, &inp, false),
+            Some(SidebarRegion::WaitingRow(0))
+        );
+        assert_eq!(
+            hit_test([170.0, 95.0], 0.0, &inp, false),
+            Some(SidebarRegion::WaitingRow(1))
+        );
+        assert_eq!(
+            hit_test([170.0, 125.0], 0.0, &inp, false),
+            Some(SidebarRegion::WaitingRow(2))
+        );
+        // The band bottom == the list origin; a point just below is Card(0), not a band row.
+        let band_bottom = header_h(1.0) + waiting_band_h(3, 1.0); // 54 + 102 = 156
+        assert_eq!(list_viewport(&inp).y, band_bottom);
+        assert_eq!(
+            hit_test([170.0, band_bottom + 1.0], 0.0, &inp, false),
+            Some(SidebarRegion::Card(0)),
+            "the card list starts below the band, un-shifted"
+        );
+    }
+
+    #[test]
+    fn hit_test_summary_row_is_inert() {
+        // R1.6/D11 — with 9 items the 6th drawn row is "+N more": inside the band but not
+        // an interactive session row, so it resolves to Panel (a no-op), never WaitingRow(5).
+        let inp = input_w(340.0, 900.0, 1.0, 4, 9);
+        // Row 5 (the summary) spans [60 + 5*30, 60 + 6*30) = [210, 240).
+        assert_eq!(
+            hit_test([170.0, 220.0], 0.0, &inp, false),
+            Some(SidebarRegion::Panel)
+        );
+        // Row 4 (the last real session row) is still live.
+        assert_eq!(
+            hit_test([170.0, 190.0], 0.0, &inp, false),
+            Some(SidebarRegion::WaitingRow(4))
+        );
     }
 }

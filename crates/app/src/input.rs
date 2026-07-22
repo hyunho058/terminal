@@ -45,7 +45,13 @@ pub fn tab_action(key: &Key, mods: &ModifiersState) -> Option<TabAction> {
 /// enum: several regions map to one action, and two map to "consumed" (`Inert`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SidebarAction {
+    /// Switch to the card at this list index.
     Switch(usize),
+    /// Switch to the session behind waiting-band row `i` (D12/R2.1). The renderer's
+    /// hit-test only knows the band-row index; the app resolves it to a `TabId` → tab
+    /// index (the band's order differs from the tab order), then switches — which
+    /// acknowledges and clears the item.
+    SwitchWaiting(usize),
     NewTab,
     Collapse,
     Expand,
@@ -74,6 +80,7 @@ pub fn sidebar_press(
     let p = [cursor.0 as f32, cursor.1 as f32];
     sidebar_layout::hit_test(p, scroll, inp, collapsed).map(|region| match region {
         SidebarRegion::Card(i) => SidebarAction::Switch(i),
+        SidebarRegion::WaitingRow(i) => SidebarAction::SwitchWaiting(i),
         SidebarRegion::Chrome(ChromeRegion::NewTab) => SidebarAction::NewTab,
         SidebarRegion::Chrome(ChromeRegion::HideSidebar) => SidebarAction::Collapse,
         SidebarRegion::Chrome(ChromeRegion::Restore) => SidebarAction::Expand,
@@ -652,12 +659,17 @@ mod tests {
     }
 
     fn layout_input(sidebar_w: f32, count: usize) -> SidebarLayoutInput {
+        layout_input_w(sidebar_w, count, 0)
+    }
+
+    fn layout_input_w(sidebar_w: f32, count: usize, waiting_count: usize) -> SidebarLayoutInput {
         SidebarLayoutInput {
             sidebar_w,
             viewport: [sidebar_w.max(200.0), 900.0],
             scale: 1.0,
             row_h: 60.0,
             row_count: count,
+            waiting_count,
             metrics: renderer::sidebar_theme::SidebarMetrics::DEFAULT.scaled(1.0),
         }
     }
@@ -698,6 +710,29 @@ mod tests {
             Some(SidebarAction::Expand)
         );
         assert_eq!(sidebar_press((400.0, 400.0), &inp, 0.0, true), None);
+    }
+
+    #[test]
+    fn sidebar_press_maps_waiting_band_rows() {
+        // R2.1/D12 — a press in the pinned waiting band resolves to SwitchWaiting(i), not
+        // a card; a press below the band still resolves to a card, un-shifted; the band
+        // padding / summary area is inert.
+        let inp = layout_input_w(340.0, 5, 2); // 2 waiting rows above the cards
+                                               // Band content starts at header_h + PAD_TOP = 60; row 0 = [60,90), row 1 = [90,120).
+        assert_eq!(
+            sidebar_press((170.0, 65.0), &inp, 0.0, false),
+            Some(SidebarAction::SwitchWaiting(0))
+        );
+        assert_eq!(
+            sidebar_press((170.0, 95.0), &inp, 0.0, false),
+            Some(SidebarAction::SwitchWaiting(1))
+        );
+        // A press well below the band is a normal card switch.
+        let band_bottom = sidebar_layout::header_h(1.0) + sidebar_layout::waiting_band_h(2, 1.0);
+        assert!(matches!(
+            sidebar_press((170.0, (band_bottom + 40.0) as f64), &inp, 0.0, false),
+            Some(SidebarAction::Switch(_))
+        ));
     }
 
     #[test]
