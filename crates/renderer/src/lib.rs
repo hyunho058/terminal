@@ -17,6 +17,7 @@ pub mod glyph;
 pub mod image_layer;
 pub mod overlay_layer;
 pub mod preedit_layer;
+pub mod selection_layer;
 pub mod sidebar_header;
 pub mod sidebar_icons;
 pub mod sidebar_layout;
