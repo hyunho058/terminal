@@ -8,6 +8,7 @@
 //! the render happens on the winit thread (C6 — no free-running loop).
 
 mod clipboard;
+mod copy;
 mod input;
 mod overlay;
 mod seam;
@@ -22,6 +23,7 @@ mod waiting;
 use winit::event_loop::{ControlFlow, EventLoop};
 
 use clipboard::{ClipboardHandler, ImagePresenter};
+use copy::{CopyHandler, SelectionPresenter};
 use overlay::AiMonitorOverlay;
 use terminal_app::{App, UserEvent};
 
@@ -50,6 +52,11 @@ fn main() {
     app.register_overlay(Box::new(AiMonitorOverlay::new(proxy.clone())));
     app.register_overlay(Box::new(ImagePresenter));
     app.register_handler(Box::new(ClipboardHandler::new()));
+    // copy-clipboard: Cmd+C copies the grid selection to the pasteboard, and the
+    // selection-highlight DrawLayer is wired in via SelectionPresenter (the same
+    // Overlay seam ImagePresenter uses).
+    app.register_overlay(Box::new(SelectionPresenter));
+    app.register_handler(Box::new(CopyHandler::new()));
 
     // tab-metadata: an off-thread worker derives each tab's git branch + AI-agent
     // status and wakes the loop via OverlayPending; a headless pump turns that wake
