@@ -52,6 +52,14 @@ pub struct AppCtx<'a> {
     pub active: usize,
     /// The active tab's live working directory (ai-monitor log resolution).
     pub active_cwd: Option<PathBuf>,
+    /// Whether the active tab has bracketed-paste mode on (DECSET 2004). Read by
+    /// the text-paste handler to wrap a paste in `ESC[200~`/`ESC[201~`. Populated
+    /// by `terminal_app` from `Terminal::bracketed_paste`; `false` by default.
+    pub bracketed_paste: bool,
+    /// The active grid's current selection text, or `None`. Read by the copy
+    /// handler on Cmd+C. Populated by `terminal_app` (only when a selection exists,
+    /// to avoid a per-keystroke grid clone); `None` by default.
+    pub selection_text: Option<String>,
     redraw: bool,
 }
 
@@ -67,8 +75,23 @@ impl<'a> AppCtx<'a> {
             tab_count,
             active,
             active_cwd,
+            bracketed_paste: false,
+            selection_text: None,
             redraw: false,
         }
+    }
+
+    /// Set the active tab's bracketed-paste mode (builder — keeps `new`'s signature
+    /// and every existing callsite unchanged; only `terminal_app` calls this).
+    pub fn with_bracketed_paste(mut self, on: bool) -> Self {
+        self.bracketed_paste = on;
+        self
+    }
+
+    /// Set the active grid's selection text (builder — see `with_bracketed_paste`).
+    pub fn with_selection_text(mut self, text: Option<String>) -> Self {
+        self.selection_text = text;
+        self
     }
 
     /// Ask the app to redraw after this event.
@@ -202,6 +225,23 @@ mod tests {
             text: Some(text.to_string()),
             mods: ModifiersState::empty(),
         }
+    }
+
+    #[test]
+    fn appctx_defaults_false_none_and_builders_set_them() {
+        // R4.1 — `new` keeps its 4-arg signature; the new fields default to
+        // false/None, and the builders set them.
+        let mut buf: Vec<u8> = Vec::new();
+        let ctx = AppCtx::new(&mut buf, 1, 0, None);
+        assert!(!ctx.bracketed_paste);
+        assert_eq!(ctx.selection_text, None);
+
+        let mut buf2: Vec<u8> = Vec::new();
+        let ctx2 = AppCtx::new(&mut buf2, 1, 0, None)
+            .with_bracketed_paste(true)
+            .with_selection_text(Some("sel".to_string()));
+        assert!(ctx2.bracketed_paste);
+        assert_eq!(ctx2.selection_text.as_deref(), Some("sel"));
     }
 
     struct Fixed(Handled, bool); // (verdict, writes-a-byte)
