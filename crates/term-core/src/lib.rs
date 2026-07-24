@@ -19,6 +19,7 @@ pub mod image;
 pub mod parser;
 pub mod pty;
 pub mod scrollback;
+pub mod selection;
 mod shell_integration;
 pub mod snapshot;
 
@@ -27,6 +28,7 @@ pub use grid::{Cell, CellAttrs, Color, CommandEnd, Cursor, Grid};
 pub use image::{Decoded, ImageLayer, Placement};
 pub use pty::Pty;
 pub use scrollback::History;
+pub use selection::Selection;
 pub use snapshot::GridSnapshot;
 
 use parser::Processor;
@@ -124,6 +126,32 @@ impl Terminal {
     /// D2); the snapshot is the *renderer* contract.
     pub fn app_cursor_keys(&self) -> bool {
         self.grid.app_cursor_keys()
+    }
+
+    /// Whether bracketed-paste mode (DECSET `?2004`) is active. The app reads this
+    /// to wrap a paste in `ESC[200~`/`ESC[201~` (text-paste). Exposed as an accessor
+    /// rather than a [`GridSnapshot`] field for the same reason as
+    /// [`app_cursor_keys`](Terminal::app_cursor_keys): the renderer never reads it.
+    pub fn bracketed_paste(&self) -> bool {
+        self.grid.bracketed_paste()
+    }
+
+    /// Set the live drag selection (the app drives this from the mouse — see the
+    /// `selection-input` feature). Carried to the renderer via
+    /// [`snapshot`](Terminal::snapshot); its text is read via
+    /// [`GridSnapshot::selection_text`](crate::GridSnapshot::selection_text).
+    pub fn set_selection(&mut self, selection: Selection) {
+        self.grid.set_selection(selection);
+    }
+
+    /// Clear any drag selection.
+    pub fn clear_selection(&mut self) {
+        self.grid.clear_selection();
+    }
+
+    /// The current drag selection, if any.
+    pub fn selection(&self) -> Option<Selection> {
+        self.grid.selection()
     }
 
     /// Take the most-recent OSC 133 command-end event parsed from the shell's

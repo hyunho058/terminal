@@ -8,6 +8,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::image::{Decoded, ImageLayer};
 use crate::scrollback::{History, DEFAULT_HISTORY_LIMIT};
+use crate::selection::Selection;
 
 /// A packed `0xRRGGBB` color. UI-agnostic: the renderer converts to whatever the
 /// GPU needs.
@@ -156,6 +157,16 @@ pub struct Grid {
     /// here for the same reason and is deliberately absent from `GridSnapshot`
     /// (the renderer never reads it — D2).
     app_cursor_keys: bool,
+    /// Bracketed-paste mode (DECSET/DECRST `?2004`). A keyboard-input mode like
+    /// `app_cursor_keys`: read by the app via `Terminal::bracketed_paste` to wrap a
+    /// paste in `ESC[200~`/`ESC[201~`, absent from `GridSnapshot` (the renderer
+    /// never reads it), cleared by RIS, and surviving resize/alt-screen.
+    bracketed_paste: bool,
+    /// The live drag selection (anchor/focus viewport cells), or `None`. Carried to
+    /// the renderer on `GridSnapshot.selection` and extracted to text via
+    /// `GridSnapshot::selection_text`. Cleared on `resize` (coords are dimension-
+    /// bound); when to clear it on new output/scroll is the app's policy.
+    selection: Option<Selection>,
     /// Inline-image placements anchored to cells (image-paste D2, SD5).
     images: ImageLayer,
     /// Most-recent OSC 133 command-end event parsed from the shell's output
@@ -199,6 +210,8 @@ impl Grid {
             view_offset: 0,
             alt_screen: false,
             app_cursor_keys: false,
+            bracketed_paste: false,
+            selection: None,
             images: ImageLayer::new(),
             command_end: None,
         }
@@ -422,6 +435,29 @@ impl Grid {
         self.app_cursor_keys
     }
 
+    /// Set/clear bracketed-paste mode (`?2004h`/`?2004l`, cleared by RIS). Survives
+    /// `resize`/alt-screen like `app_cursor_keys` — it is a keyboard-input mode, not
+    /// screen content. Read by the app via `Terminal::bracketed_paste`.
+    pub fn set_bracketed_paste(&mut self, on: bool) {
+        self.bracketed_paste = on;
+    }
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+
+    /// Set the live drag selection (anchor/focus viewport cells).
+    pub fn set_selection(&mut self, selection: Selection) {
+        self.selection = Some(selection);
+    }
+    /// Clear any selection.
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+    /// The current selection, if any.
+    pub fn selection(&self) -> Option<Selection> {
+        self.selection
+    }
+
     /// Record the most-recent OSC 133 command-end event (parser → grid). A newer
     /// event overwrites an unconsumed one — only the latest matters (spec D17:
     /// one waiting item per session).
@@ -509,6 +545,8 @@ impl Grid {
         self.cells = next;
         self.cursor.col = self.cursor.col.min(cols - 1);
         self.cursor.row = self.cursor.row.min(rows - 1);
+        // A selection's coords are dimension-bound; a resize invalidates it (D9).
+        self.selection = None;
     }
 
     /// Iterate cells in row-major order. Used to build a [`crate::GridSnapshot`].
