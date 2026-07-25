@@ -266,9 +266,73 @@ pub fn suppress_key(composing: bool, key: &Key) -> bool {
     composing && matches!(key, Key::Character(_) | Key::Dead(_))
 }
 
+/// Map a physical-px cursor point to a viewport cell `(col, row)`, inverting the
+/// renderer's cursor mapping (`x = left_inset + col*cw`, `y = top_inset + row*ch`).
+///
+/// Returns `None` when the point is left of the grid (over the sidebar band) or
+/// above it (the top inset) — the dead band a grid press must ignore. A point past
+/// the right/bottom edge clamps to the last cell, so a drag off the edge selects the
+/// edge cell rather than going out of bounds. Pure (no winit) → unit-tested.
+pub fn pixel_to_cell(
+    cursor: (f64, f64),
+    cell: (f32, f32),
+    left_inset: f32,
+    top_inset: f32,
+    cols: u16,
+    rows: u16,
+) -> Option<(u16, u16)> {
+    let (px, py) = (cursor.0 as f32, cursor.1 as f32);
+    let (cw, ch) = cell;
+    if px < left_inset || py < top_inset || cw <= 0.0 || ch <= 0.0 || cols == 0 || rows == 0 {
+        return None;
+    }
+    // `px - left_inset >= 0` and `cw > 0` → non-negative quotient; `as u16` floors
+    // (saturating on overflow), and `.min` binds to the last cell.
+    let col = ((px - left_inset) / cw) as u16;
+    let row = ((py - top_inset) / ch) as u16;
+    Some((col.min(cols - 1), row.min(rows - 1)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pixel_to_cell_maps_a_point_inside_the_grid() {
+        // R1.1 — cell (8,16), insets (40,24), cursor (64,40) → (3,1).
+        assert_eq!(
+            pixel_to_cell((64.0, 40.0), (8.0, 16.0), 40.0, 24.0, 100, 40),
+            Some((3, 1))
+        );
+        // Exact top-left corner of the grid (px == insets) → cell (0,0) (strict `<`).
+        assert_eq!(
+            pixel_to_cell((40.0, 24.0), (8.0, 16.0), 40.0, 24.0, 100, 40),
+            Some((0, 0))
+        );
+    }
+
+    #[test]
+    fn pixel_to_cell_rejects_the_sidebar_and_top_band() {
+        // R1.2 — left of left_inset and above top_inset → None.
+        assert_eq!(
+            pixel_to_cell((20.0, 10.0), (8.0, 16.0), 40.0, 24.0, 100, 40),
+            None
+        );
+        // Left band alone (above the grid horizontally) is also None.
+        assert_eq!(
+            pixel_to_cell((10.0, 100.0), (8.0, 16.0), 40.0, 24.0, 100, 40),
+            None
+        );
+    }
+
+    #[test]
+    fn pixel_to_cell_clamps_past_the_far_edge() {
+        // R1.3 — far bottom-right clamps to the last cell (9,4), never out of range.
+        assert_eq!(
+            pixel_to_cell((9_999.0, 9_999.0), (8.0, 16.0), 40.0, 24.0, 10, 5),
+            Some((9, 4))
+        );
+    }
 
     fn ch(c: &str) -> Key {
         Key::Character(c.into())

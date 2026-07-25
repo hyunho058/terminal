@@ -285,6 +285,7 @@ impl Perform for Performer<'_> {
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
         if intermediates.is_empty() && byte == b'c' {
             self.grid.set_app_cursor_keys(false);
+            self.grid.set_bracketed_paste(false);
         }
     }
 
@@ -339,9 +340,12 @@ impl Perform for Performer<'_> {
                 Some(1049) | Some(1047) | Some(47) => self.grid.set_alt_screen(action == 'h'),
                 // DECCKM — application cursor key mode. Only flips the flag the app
                 // reads when encoding arrows (arrow-key-input D3/D10); nothing about
-                // the grid changes. Every other private mode (e.g. `?2004`
-                // bracketed paste, which zsh sends on every prompt) stays ignored.
+                // the grid changes.
                 Some(1) => self.grid.set_app_cursor_keys(action == 'h'),
+                // DECSET/DECRST ?2004 — bracketed paste. Flips the flag the app
+                // reads to wrap a paste in `ESC[200~`/`ESC[201~` (text-paste); the
+                // grid is unchanged and the flag is absent from `GridSnapshot`.
+                Some(2004) => self.grid.set_bracketed_paste(action == 'h'),
                 _ => {}
             }
             return;

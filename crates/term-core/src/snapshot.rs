@@ -6,6 +6,7 @@
 
 use crate::grid::{Cell, Color, Cursor, Grid};
 use crate::image::Placement;
+use crate::selection::Selection;
 
 /// An immutable, cheaply-clonable view of the visible grid at one instant.
 #[derive(Clone, Debug, PartialEq)]
@@ -25,6 +26,11 @@ pub struct GridSnapshot {
     /// Populated only at the live bottom; empty while scrolled into history (a
     /// first cut — images render in the live view).
     pub images: Vec<Placement>,
+    /// The live drag selection (viewport cell range), or `None`. Populated only at
+    /// the live bottom (`view_offset == 0`) — like `images`, a selection is not
+    /// shown while scrolled into history. The renderer reads this to highlight;
+    /// [`selection_text`](GridSnapshot::selection_text) extracts its text.
+    pub selection: Option<Selection>,
 }
 
 impl GridSnapshot {
@@ -60,6 +66,10 @@ impl GridSnapshot {
             Vec::new()
         };
 
+        // A selection is a live-viewport concept: shown only at the live bottom,
+        // absent while scrolled into history (D9 — same policy as images).
+        let selection = if offset == 0 { grid.selection() } else { None };
+
         GridSnapshot {
             cols,
             rows,
@@ -69,6 +79,7 @@ impl GridSnapshot {
             at_top: grid.at_top(),
             cells,
             images,
+            selection,
         }
     }
 
@@ -108,6 +119,66 @@ impl GridSnapshot {
     /// Convenience for callers that only want the default colors of empty cells.
     pub fn is_empty_at(&self, col: u16, row: u16) -> bool {
         self.cell(col, row).map(Cell::is_blank).unwrap_or(true)
+    }
+
+    /// Extract the selected cell range as text (`None` when there is no selection).
+    ///
+    /// Walks the linear span (start row from `start.col`; interior rows full-width;
+    /// end row up to `end.col`), skipping double-width continuation cells and
+    /// `trim_end`-ing each row segment — the same shape as [`to_text`]. Rows are
+    /// joined with `\n`, **except** a soft-wrapped row joins the next with no
+    /// separator: a row is treated as soft-wrapped iff its last column (`cols-1`)
+    /// holds a non-blank, non-continuation cell (the D8 heuristic; its known
+    /// limitations — a full-width hard line, and a CJK margin-wrap that leaves the
+    /// last column blank — are accepted). Never panics on inverted/edge coords.
+    ///
+    /// [`to_text`]: GridSnapshot::to_text
+    pub fn selection_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        if self.cols == 0 || self.rows == 0 {
+            return Some(String::new());
+        }
+        let (start, end) = sel.normalized(); // ((col, row), (col, row))
+        let last_row = self.rows - 1;
+        let last_col = self.cols - 1;
+        let s_row = start.1.min(last_row);
+        let e_row = end.1.min(last_row);
+
+        let mut out = String::new();
+        for row in s_row..=e_row {
+            let first = if row == s_row { start.0 } else { 0 }.min(last_col);
+            let last = if row == e_row { end.0 } else { last_col }.min(last_col);
+            // `first > last` only when out-of-range rows collapse onto one grid row
+            // (column ordering, valid per-row, no longer holds) — `first..=last` is
+            // then an empty range; guard the capacity math against underflow (R3.6).
+            let mut line = String::with_capacity((last.saturating_sub(first) + 1) as usize);
+            for col in first..=last {
+                match self.cell(col, row) {
+                    // The wide leader already carries the glyph — drop its spacer.
+                    Some(c) if c.is_continuation() => {}
+                    Some(c) => line.push(c.ch),
+                    None => line.push(' '),
+                }
+            }
+            out.push_str(line.trim_end());
+            // Join to the next selected row: newline unless this row soft-wraps.
+            if row < e_row && !self.row_soft_wraps(row) {
+                out.push('\n');
+            }
+        }
+        Some(out)
+    }
+
+    /// D8 soft-wrap heuristic: a row is treated as soft-wrapped into the next iff
+    /// its last column holds a non-blank, non-continuation cell.
+    fn row_soft_wraps(&self, row: u16) -> bool {
+        if self.cols == 0 {
+            return false;
+        }
+        match self.cell(self.cols - 1, row) {
+            Some(c) => !c.is_blank() && !c.is_continuation(),
+            None => false,
+        }
     }
 }
 

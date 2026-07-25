@@ -48,14 +48,15 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
 use crate::input::{
-    encode_key, sidebar_hover, sidebar_press, suppress_key, tab_action, wheel_scroll,
-    SidebarAction, TabAction, WheelDelta,
+    encode_key, pixel_to_cell, sidebar_hover, sidebar_press, suppress_key, tab_action,
+    wheel_scroll, SidebarAction, TabAction, WheelDelta,
 };
 use crate::seam::{AppCtx, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayHost};
 use crate::session::{Session, TabId};
 use crate::tabmeta::{AgentState, TabMetaSnapshot};
 use crate::tabs::Tabs;
 use crate::waiting::{WaitingKind, WaitingState};
+use term_core::Selection;
 
 /// Custom event: something happened off the UI thread that needs a wake.
 #[derive(Debug, Clone, Copy)]
@@ -144,6 +145,14 @@ struct Running {
     /// Latest cursor position in physical px (raw winit `f64`), updated on
     /// `CursorMoved` and read on a press to hit-test the sidebar and re-resolve hover.
     last_cursor: (f64, f64),
+    /// Left-drag selection state (selection-input, the sanctioned event-loop
+    /// exception). While `dragging`, `CursorMoved` updates the active grid's
+    /// selection focus. `drag_anchor` is the press cell; `drag_moved` records
+    /// whether the focus ever left the anchor cell — a plain click (never moved)
+    /// clears the selection on release, jitter-safely (cell-granular, not raw px).
+    dragging: bool,
+    drag_anchor: (u16, u16),
+    drag_moved: bool,
     /// Fresh configs delivered by the background watcher (settings feature).
     config_rx: Receiver<Config>,
     /// Kept alive so the watch thread keeps running; dropping it stops watching.
@@ -290,6 +299,9 @@ impl App {
             overlays,
             mods: ModifiersState::empty(),
             last_cursor: (0.0, 0.0),
+            dragging: false,
+            drag_anchor: (0, 0),
+            drag_moved: false,
             config_rx,
             _config_watcher: config_watcher,
             occluded: false,
@@ -752,15 +764,42 @@ impl Running {
         true
     }
 
+    /// Map the latest cursor position to a live-viewport cell, or `None` over the
+    /// sidebar/top band (selection-input). The one geometry the event loop performs,
+    /// via the pure `pixel_to_cell` helper + the renderer's cell/inset accessors.
+    fn cursor_cell(&self) -> Option<(u16, u16)> {
+        let (cols, rows) = self.tabs.active().terminal.dimensions();
+        pixel_to_cell(
+            self.last_cursor,
+            self.renderer.cell_size(),
+            self.renderer.left_inset(),
+            self.renderer.top_inset(),
+            cols,
+            rows,
+        )
+    }
+
     /// Dispatch a key through the seam, then default input (R3.3/R4). Returns
     /// false if the app should exit.
     fn on_key(&mut self, input: KeyInput) -> bool {
+        // Seam data for handlers, read from the active tab BEFORE the mutable
+        // `writer` borrow (D9): bracketed-paste mode (text-paste) + the selection
+        // text (copy-clipboard). The full-grid `snapshot()` clone is paid ONLY when
+        // a selection actually exists, so the common keystroke stays cheap.
+        let bracketed = self.tabs.active().terminal.bracketed_paste();
+        let selection_text = if self.tabs.active().terminal.selection().is_some() {
+            self.tabs.active().terminal.snapshot().selection_text()
+        } else {
+            None
+        };
         // 1) Visible overlays first (R4.1/R4.2).
         {
             let active = self.tabs.active_index();
             let count = self.tabs.len();
             let cwd = self.tabs.active_cwd();
-            let mut ctx = AppCtx::new(&mut self.tabs.active_mut().writer, count, active, cwd);
+            let mut ctx = AppCtx::new(&mut self.tabs.active_mut().writer, count, active, cwd)
+                .with_bracketed_paste(bracketed)
+                .with_selection_text(selection_text.clone());
             if self.overlays.dispatch(&input, &mut ctx) == Handled::Consumed {
                 if ctx.redraw_requested() {
                     self.redraw();
@@ -773,7 +812,9 @@ impl Running {
             let active = self.tabs.active_index();
             let count = self.tabs.len();
             let cwd = self.tabs.active_cwd();
-            let mut ctx = AppCtx::new(&mut self.tabs.active_mut().writer, count, active, cwd);
+            let mut ctx = AppCtx::new(&mut self.tabs.active_mut().writer, count, active, cwd)
+                .with_bracketed_paste(bracketed)
+                .with_selection_text(selection_text);
             if self.router.dispatch(&input, &mut ctx) == Handled::Consumed {
                 if ctx.redraw_requested() {
                     self.redraw();
@@ -910,6 +951,24 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 inner.last_cursor = (position.x, position.y);
                 inner.refresh_hover(); // one hit_test feeds both hover fields (D8)
+                                       // Left-drag selection (selection-input): once the focus leaves the
+                                       // anchor cell, set the active grid's selection live. Keying `moved`
+                                       // on the *cell* (not raw px) makes an ordinary click jitter-safe.
+                if inner.dragging {
+                    if let Some(focus) = inner.cursor_cell() {
+                        if focus != inner.drag_anchor {
+                            inner.drag_moved = true;
+                        }
+                        if inner.drag_moved {
+                            let sel = Selection {
+                                anchor: inner.drag_anchor,
+                                focus,
+                            };
+                            inner.tabs.active_mut().terminal.set_selection(sel);
+                            inner.redraw();
+                        }
+                    }
+                }
             }
 
             WindowEvent::CursorLeft { .. } => inner.clear_hover(),
@@ -952,6 +1011,29 @@ impl ApplicationHandler<UserEvent> for App {
                         SidebarAction::Expand => inner.toggle_sidebar(false),
                         SidebarAction::Inert => {}
                     }
+                } else if let Some(cell) = inner.cursor_cell() {
+                    // Not a sidebar region and over a real grid cell → anchor a
+                    // selection and arm the drag (selection-input). Nothing is shown
+                    // until the focus leaves this cell; a press in the dead band
+                    // (cursor_cell → None) arms nothing.
+                    inner.drag_anchor = cell;
+                    inner.dragging = true;
+                    inner.drag_moved = false;
+                }
+            }
+
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } if inner.dragging => {
+                // End the drag (selection-input). A plain click — the focus never
+                // left the anchor cell — clears any selection; a real drag leaves the
+                // selection standing for Cmd+C.
+                inner.dragging = false;
+                if !inner.drag_moved {
+                    inner.tabs.active_mut().terminal.clear_selection();
+                    inner.redraw();
                 }
             }
 
