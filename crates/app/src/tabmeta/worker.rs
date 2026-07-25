@@ -78,16 +78,33 @@ impl Deriver {
             None
         };
 
-        let agent = if self.enabled_agent {
-            super::agent::agent_of_pid(tp.pid).map(|kind| {
-                let state = self.activity(kind, cwd.as_deref(), tick, now);
-                Agent { kind, state }
-            })
+        let (agent, task) = if self.enabled_agent {
+            match super::agent::agent_of_pid(tp.pid) {
+                Some(kind) => {
+                    let state = self.activity(kind, cwd.as_deref(), tick, now);
+                    // The "current task" label (tab-identity): only Claude has a log source
+                    // (D7), and `self.activity` just warmed the role memo for this cwd, so
+                    // this is a pure memo read — no extra I/O (R4.2). A non-Claude agent or an
+                    // unresolved log yields `None`, so the card falls back to the cwd title.
+                    let task = if kind == AgentKind::Claude {
+                        cwd.as_deref()
+                            .and_then(|c| super::activity::label_of_cwd(&self.act_memo, c))
+                    } else {
+                        None
+                    };
+                    (Some(Agent { kind, state }), task)
+                }
+                None => (None, None),
+            }
         } else {
-            None
+            (None, None)
         };
 
-        TabMeta { branch, agent }
+        TabMeta {
+            branch,
+            agent,
+            task,
+        }
     }
 
     /// The activity state for a detected agent. Only Claude has a log source (D7); every
@@ -270,6 +287,7 @@ mod tests {
             TabMeta {
                 branch: Some("main".into()),
                 agent: None,
+                task: None,
             },
         )];
         publish_if_changed(&s, &mut published, one.clone(), &wake);
@@ -291,6 +309,7 @@ mod tests {
             TabMeta {
                 branch: Some("dev".into()),
                 agent: None,
+                task: None,
             },
         )];
         publish_if_changed(&s, &mut published, two, &wake);
@@ -430,6 +449,7 @@ mod tests {
                 kind: AgentKind::Aider,
                 state: AgentState::Unknown,
             }),
+            task: None,
         };
         d.note_activity_gap(id, &unknown);
         assert_eq!(d.debug_seen.get(&id), Some(&AgentKind::Aider));
@@ -445,6 +465,7 @@ mod tests {
                 kind: AgentKind::Claude,
                 state: AgentState::Busy,
             }),
+            task: None,
         };
         d.note_activity_gap(id, &busy);
         assert!(!d.debug_seen.contains_key(&id));

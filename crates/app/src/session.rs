@@ -27,6 +27,11 @@ pub struct Session {
     pub writer: Box<dyn Write + Send>,
     pub rx: Receiver<Vec<u8>>,
     title: String,
+    /// Set in [`drain`](Session::drain) when an OSC 0/2 title actually changed the manual
+    /// label, cleared by [`take_title_dirty`](Session::take_title_dirty). Lets the event
+    /// loop resync the tab model so a new label shows immediately, not on the next tab
+    /// switch (tab-identity) — even for a background tab.
+    title_dirty: bool,
     /// Most-recent OSC 133 command-end event observed on this session's PTY,
     /// keyed implicitly to `id`. Pulled from the terminal in [`drain`] and
     /// consumed by the waiting model (T3) via [`take_command_end`].
@@ -80,6 +85,7 @@ impl Session {
             writer,
             rx,
             title: String::new(),
+            title_dirty: false,
             command_end: None,
             _reader: reader_thread,
         })
@@ -99,7 +105,22 @@ impl Session {
         if let Some(ev) = self.terminal.take_command_end() {
             self.command_end = Some(ev);
         }
+        // Pull any OSC 0/2 title the shell or user set (tab-identity manual label). The
+        // latest wins; an empty title clears the label back to the auto/cwd label. Flag a
+        // real change so the event loop resyncs the tab model (the label shows at once).
+        if let Some(title) = self.terminal.take_osc_title() {
+            if title != self.title {
+                self.title = title;
+                self.title_dirty = true;
+            }
+        }
         got
+    }
+
+    /// Whether an OSC 0/2 title changed the manual label since the last check, clearing the
+    /// flag (tab-identity). The event loop resyncs the tab model + redraws when this is true.
+    pub fn take_title_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.title_dirty)
     }
 
     /// Take the most-recent OSC 133 command-end event seen on this session's PTY
@@ -130,15 +151,16 @@ impl Session {
         cwd_of_pid(self.pty.child_pid()?)
     }
 
-    /// An explicit tab title override (e.g. a future OSC-2 title). Unused now that
-    /// titles derive from the live cwd; kept as the override hook with `set_title`.
-    #[allow(dead_code)]
+    /// The tab's explicit manual label from an OSC 0/2 title (tab-identity), or `""`
+    /// when none/cleared. `tabs::titles` uses it as the highest-precedence card label
+    /// (manual > auto AI-task > cwd), which is how two sessions in the same folder get
+    /// distinct labels (the D4/R5 same-cwd limitation's user-driven escape hatch).
     pub fn title(&self) -> &str {
         &self.title
     }
 
-    /// Set the tab title (the cwd-title path will call this once a
-    /// `term_core::Pty::child_pid()` accessor exists — see `tabs::titles`).
+    /// Set the tab title explicitly. The OSC-2 drain in [`drain`](Session::drain) is the
+    /// live source; this stays for programmatic overrides/tests.
     #[allow(dead_code)]
     pub fn set_title(&mut self, title: String) {
         self.title = title;

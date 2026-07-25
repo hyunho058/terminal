@@ -865,16 +865,23 @@ impl ApplicationHandler<UserEvent> for App {
                 // Drain, and pull any OSC 133 command-end the shell emitted on this
                 // (possibly background) session's PTY (T1 → T3).
                 let mut command_end = None;
+                let mut title_changed = false;
                 let advanced = inner
                     .tabs
                     .by_id_mut(id)
                     .map(|s| {
                         let got = s.drain();
                         command_end = s.take_command_end();
+                        title_changed = s.take_title_dirty();
                         got
                     })
                     .unwrap_or(false);
-                let needs_redraw = advanced && is_active;
+                // A manual OSC-2 label change refreshes the sidebar rows so the new label
+                // shows immediately — even for a background tab (tab-identity).
+                if title_changed {
+                    inner.sync_tab_model();
+                }
+                let needs_redraw = (advanced && is_active) || title_changed;
                 // Feed the command-end into the waiting model (T3). A background
                 // tab's completion/error must still repaint the sidebar band even
                 // though its grid output does not (so redraw when the set changed).

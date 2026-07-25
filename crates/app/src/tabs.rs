@@ -165,9 +165,16 @@ impl Tabs {
                     .and_then(|p| p.file_name())
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| format!("Tab {}", i + 1));
+                // A non-empty OSC 0/2 title is the user's explicit manual label
+                // (tab-identity): highest precedence on the card's line 1, so two sessions
+                // in one folder can be told apart. Empty → no manual label (auto/cwd wins).
+                let label = Some(s.title())
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string);
                 SidebarRow {
                     tab_id: s.id.0,
                     title,
+                    label,
                 }
             })
             .collect()

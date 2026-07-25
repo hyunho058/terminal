@@ -35,11 +35,17 @@ use crate::session::TabId;
 
 /// A tab's derived metadata. `default()` = a plain zsh tab in a non-repo, which is
 /// also the correct value for a not-yet-polled tab (so there is no third "unpolled"
-/// state). Only `branch` allocates.
+/// state). Only `branch` and `task` allocate.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct TabMeta {
     pub branch: Option<String>,
     pub agent: Option<Agent>,
+    /// The live "current task" label for the tab (tab-identity): the session's latest
+    /// substantive Claude user prompt, one-line normalised. `None` when there is no
+    /// agent, no resolvable log, or no substantive prompt ever seen — the renderer then
+    /// falls back to the cwd title. Derived by the worker (T2), consumed by the sidebar
+    /// card (T3); persisted across ticks so an idle agent keeps its last label (D3/D6).
+    pub task: Option<String>,
 }
 
 /// A running agent: which one, and what it is doing. `Copy` — `Option<Agent>` on
@@ -419,6 +425,7 @@ mod tests {
                     TabMeta {
                         branch: Some("main".into()),
                         agent: None,
+                        task: None,
                     },
                 ),
                 (
@@ -429,6 +436,7 @@ mod tests {
                             kind: AgentKind::Claude,
                             state: AgentState::Busy,
                         }),
+                        task: None,
                     },
                 ),
             ],
@@ -470,7 +478,8 @@ mod tests {
             TabMeta::default(),
             TabMeta {
                 branch: None,
-                agent: None
+                agent: None,
+                task: None
             }
         );
     }

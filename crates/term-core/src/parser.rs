@@ -306,8 +306,21 @@ impl Perform for Performer<'_> {
     /// unknown 133 subkind, or a missing/garbage exit/elapsed field is dropped
     /// silently — no panic, no `unwrap`, grid state unchanged.
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        // Only OSC 133 is ours; everything else (title, cwd, other integrations)
-        // is intentionally ignored — as it was before osc_dispatch existed.
+        // OSC 0 (icon+title) / OSC 2 (window title) → the tab-identity manual label
+        // (set by the shell or the user, e.g. `printf '\e]2;Frontend\a'`). The title is
+        // everything after the number; an empty title clears the label. Invalid UTF-8 is
+        // dropped (lossy would fabricate replacement chars into a user-facing label).
+        let osc_num = params.first().copied();
+        if osc_num == Some(b"0".as_slice()) || osc_num == Some(b"2".as_slice()) {
+            if let Some(title) = params.get(1).copied() {
+                if let Ok(s) = std::str::from_utf8(title) {
+                    self.grid.record_title(s.to_string());
+                }
+            }
+            return;
+        }
+        // Only OSC 133 is ours beyond the title; everything else (cwd, other
+        // integrations) is intentionally ignored — as it was before osc_dispatch existed.
         if params.first().copied() != Some(b"133".as_slice()) {
             return;
         }

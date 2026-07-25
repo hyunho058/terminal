@@ -51,6 +51,7 @@ impl MetaSource for SidebarMetaSource {
                 branch: meta.and_then(|m| m.branch.clone()),
                 mark: mark_for(agent),
                 skin: skin_for(agent),
+                task: meta.and_then(|m| m.task.clone()),
             });
         }
     }
