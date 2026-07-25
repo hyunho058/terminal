@@ -167,6 +167,16 @@ impl Terminal {
     pub fn take_command_end(&mut self) -> Option<CommandEnd> {
         self.grid.take_command_end()
     }
+
+    /// Take the most-recent OSC 0 / OSC 2 window title set since the last take, clearing
+    /// it (one-shot drain). Poll it right after [`advance`](Terminal::advance). `None` if
+    /// no title arrived; `Some("")` when the title was explicitly cleared (the app then
+    /// reverts the tab's manual label to its auto/cwd label). Like
+    /// [`take_command_end`](Terminal::take_command_end), it is an accessor, not a
+    /// [`GridSnapshot`] field — the renderer never reads it; the `app` owns the tab label.
+    pub fn take_osc_title(&mut self) -> Option<String> {
+        self.grid.take_osc_title()
+    }
 }
 
 #[cfg(test)]
@@ -191,5 +201,20 @@ mod tests {
             t.take_command_end().is_none(),
             "garbage → no event, no panic"
         );
+    }
+
+    #[test]
+    fn take_osc_title_exposes_osc2_and_drains() {
+        // tab-identity manual label — OSC 2 (and OSC 0) set the title; one-shot drain.
+        let mut t = Terminal::new(20, 5, Color(0xE0E0E0), Color(0x101010));
+        t.advance(b"\x1b]2;Frontend\x07");
+        assert_eq!(t.take_osc_title().as_deref(), Some("Frontend"));
+        assert!(t.take_osc_title().is_none(), "one-shot: drains on take");
+        // OSC 0 also sets the title.
+        t.advance(b"\x1b]0;Backend\x07");
+        assert_eq!(t.take_osc_title().as_deref(), Some("Backend"));
+        // An empty title is a valid value — it clears the manual label.
+        t.advance(b"\x1b]2;\x07");
+        assert_eq!(t.take_osc_title().as_deref(), Some(""));
     }
 }

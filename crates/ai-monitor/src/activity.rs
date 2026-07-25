@@ -18,6 +18,10 @@ use crate::parse_line;
 /// The most we ever read from a log's tail.
 pub const TAIL_CAP: u64 = 8 * 1024;
 
+/// How many recent human user prompts `recent_prompts` returns — enough for the app to skip
+/// a run of short/continuation prompts (D10) and still find a substantive one.
+const PROMPT_TAIL: usize = 8;
+
 /// How the LAST *meaningful* message (a line whose `message.role` is `assistant` or
 /// `user`) classifies for the input-waiting rule (D16 of `left-sidebar-waiting-area`).
 /// The app maps `AssistantEndTurn` → `Waiting` and every other variant → `Busy`; a `None`
@@ -51,6 +55,11 @@ pub struct TailState {
 /// The role of the LAST parseable line in `log`, plus the file's `mtime` and `len`.
 /// Reads at most the final [`TAIL_CAP`] bytes. `None` if the file is missing, empty, or
 /// has no parseable line in that window. Never panics (D14).
+///
+/// This is the cheap *activity* read (busy/waiting), which only needs the last message.
+/// The tab-identity *label* needs the last human prompt, which can sit far outside this
+/// 8 KiB window (a single assistant turn + tool output easily exceeds it) — that is
+/// [`recent_prompts`], a separate, wider read.
 pub fn tail_state(log: &Path) -> Option<TailState> {
     let mut file = std::fs::File::open(log).ok()?;
     let meta = file.metadata().ok()?;
@@ -79,6 +88,105 @@ pub fn tail_state(log: &Path) -> Option<TailState> {
         len,
         last,
     })
+}
+
+/// The most we scan for the tab-identity label (tab-identity). Wider than [`TAIL_CAP`]
+/// because a human prompt can sit far behind the newest activity — in an active session,
+/// assistant turns + tool output between two human prompts routinely exceed 8 KiB. Still
+/// bounded so a multi-MB log cannot cost an unbounded read; a prompt older than this window
+/// is covered by the caller's carry-forward cache (D6) until the next human prompt lands.
+pub const PROMPT_SCAN_CAP: u64 = 1024 * 1024;
+
+/// The recent *human* user prompts in `log`, newest first, capped to `PROMPT_TAIL` — the
+/// RAW candidates for the tab label (which one wins is the app's D10 policy, not ours).
+/// Reads at most the final [`PROMPT_SCAN_CAP`] bytes. `None`-safe: a missing/empty file
+/// yields an empty vec, never a panic (D14).
+pub fn recent_prompts(log: &Path) -> Vec<String> {
+    let Ok(mut file) = std::fs::File::open(log) else {
+        return Vec::new();
+    };
+    let Ok(meta) = file.metadata() else {
+        return Vec::new();
+    };
+    let len = meta.len();
+    let start = len.saturating_sub(PROMPT_SCAN_CAP);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::new();
+    if file.take(PROMPT_SCAN_CAP).read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    recent_user_prompts(&String::from_utf8_lossy(&buf))
+}
+
+/// The recent *human* user prompts in `text`, newest first, capped to [`PROMPT_TAIL`]. A
+/// candidate is a complete JSON line whose `message.role` is `user`, that carries no
+/// top-level `toolUseResult` (that would be a tool result the agent consumed, not a human
+/// turn — matching [`classify_user`]), and that has non-empty text content. The pick of
+/// which candidate labels the tab (D10) is the app's, not ours.
+fn recent_user_prompts(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+            if let Some(p) = user_prompt_text(&v) {
+                out.push(p);
+                if out.len() >= PROMPT_TAIL {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The one-line text of `v` iff it is a human user prompt (role `user`, no `toolUseResult`)
+/// with non-empty content that is not a Claude Code command-wrapper turn; otherwise `None`.
+fn user_prompt_text(v: &Value) -> Option<String> {
+    if v.pointer("/message/role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    if v.get("toolUseResult").is_some() {
+        return None; // a tool result the agent consumed, not a human turn
+    }
+    let flat = crate::one_line(&message_text(v)?);
+    if flat.is_empty() || is_command_wrapper(&flat) {
+        return None;
+    }
+    Some(flat)
+}
+
+/// Claude Code injects synthetic `role: "user"` turns for its slash-commands and their
+/// output — a tag-wrapped payload (`<command-name>…`, `<command-message>…`, `<command-args>…`,
+/// `<command-contents>…`, `<local-command-stdout>…`, `<local-command-caveat>…`), not something
+/// the person typed. Skip them so a tab label is always a genuine human prompt (tab-identity).
+fn is_command_wrapper(s: &str) -> bool {
+    let t = s.trim_start();
+    t.starts_with("<command-") || t.starts_with("<local-command-")
+}
+
+/// The first non-blank `message.content[].text` (array form), or the `message.content`
+/// string (string form), of `v`. `None` when there is no textual content — e.g. a user
+/// turn whose content is only tool-result / image blocks.
+fn message_text(v: &Value) -> Option<String> {
+    if let Some(items) = v.pointer("/message/content").and_then(Value::as_array) {
+        for it in items {
+            if let Some(t) = it.get("text").and_then(Value::as_str) {
+                if !t.trim().is_empty() {
+                    return Some(t.to_string());
+                }
+            }
+        }
+        return None;
+    }
+    v.pointer("/message/content")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
 }
 
 /// Classify the LAST *meaningful* line — one whose `message.role` is `assistant` or `user`
@@ -259,6 +367,94 @@ mod tests {
             tail_state(&log).expect("tail").last,
             Some(LastMessage::AssistantEndTurn)
         );
+    }
+
+    // ---- recent human prompts (tab-identity, raw candidates) ----
+
+    #[test]
+    fn prompts_are_human_turns_newest_first() {
+        // Only role=user lines without toolUseResult, newest first; tool results and
+        // assistant turns are excluded.
+        let body = concat!(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"first task"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user"},"toolUseResult":{"stdout":"ok"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"second task"}]}}"#,
+            "\n",
+        );
+        let log = tmpfile("prompts", body.as_bytes());
+        assert_eq!(recent_prompts(&log), vec!["second task", "first task"]);
+    }
+
+    #[test]
+    fn prompts_skip_non_text_user_turns() {
+        // A user turn whose content is only a tool_result block (no text) is not a prompt.
+        let body = concat!(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"x"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"real prompt"}]}}"#,
+            "\n",
+        );
+        let log = tmpfile("prompts-notext", body.as_bytes());
+        assert_eq!(recent_prompts(&log), vec!["real prompt"]);
+    }
+
+    #[test]
+    fn prompts_skip_claude_code_command_wrappers() {
+        // Claude Code's slash-command turns arrive as role=user with tag-wrapped text; they
+        // are not human prompts and must not become tab labels (real-data regression).
+        let body = concat!(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"add a retry to the fetch helper"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<command-name>/effort</command-name> <command-args>xhigh</command-args>"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<local-command-stdout>Set effort level to xhigh</local-command-stdout>"}]}}"#,
+            "\n",
+        );
+        let log = tmpfile("prompts-cmdwrap", body.as_bytes());
+        assert_eq!(
+            recent_prompts(&log),
+            vec!["add a retry to the fetch helper"],
+            "command-wrapper turns excluded; only the real prompt remains"
+        );
+    }
+
+    #[test]
+    fn prompts_empty_when_no_human_turn() {
+        let body =
+            br#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn"}}"#;
+        let log = tmpfile("prompts-none", body);
+        assert!(recent_prompts(&log).is_empty());
+    }
+
+    #[test]
+    fn recent_prompts_finds_a_human_prompt_far_beyond_the_activity_tail() {
+        // ROOT-CAUSE regression (tab-identity): the sole human prompt sits at the very start,
+        // then >8 KiB of assistant/tool output pushes it far outside the activity TAIL_CAP.
+        // `tail_state` (8 KiB) cannot see it, but `recent_prompts` (PROMPT_SCAN_CAP) must.
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"실제 사람 프롬프트"}]}}"#.as_bytes(),
+        );
+        body.push(b'\n');
+        // ~40 KiB of assistant/tool filler after it (well past the 8 KiB activity window).
+        let filler =
+            br#"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use"}}"#;
+        while body.len() < 40 * 1024 {
+            body.extend_from_slice(filler);
+            body.push(b'\n');
+        }
+        let log = tmpfile("prompt-far-back", &body);
+        // The activity tail cannot reach the prompt…
+        assert!(
+            body.len() as u64 - TAIL_CAP > 100,
+            "filler pushes the prompt outside TAIL_CAP"
+        );
+        // …but the wider prompt scan finds it.
+        assert_eq!(recent_prompts(&log), vec!["실제 사람 프롬프트"]);
     }
 
     #[test]

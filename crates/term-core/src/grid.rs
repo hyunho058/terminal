@@ -175,6 +175,13 @@ pub struct Grid {
     /// from `GridSnapshot` — the renderer never reads it, exactly like
     /// `app_cursor_keys` (spec D21).
     command_end: Option<CommandEnd>,
+    /// Most-recent OSC 0 / OSC 2 window-title set by the shell or user
+    /// (`ESC ] 2 ; <title> ST`) — the tab-identity manual-label hook. Transient,
+    /// one-shot like `command_end`: the app drains it via
+    /// [`take_osc_title`](Grid::take_osc_title) after each `advance` and stores it on
+    /// the session. An empty title is a valid value (it clears the manual label back to
+    /// the auto/cwd label). Absent from `GridSnapshot` — the renderer never reads it.
+    osc_title: Option<String>,
 }
 
 /// A parsed OSC 133 command-end event
@@ -214,6 +221,7 @@ impl Grid {
             selection: None,
             images: ImageLayer::new(),
             command_end: None,
+            osc_title: None,
         }
     }
 
@@ -469,6 +477,19 @@ impl Grid {
     /// drain). Returns `None` if none is pending.
     pub fn take_command_end(&mut self) -> Option<CommandEnd> {
         self.command_end.take()
+    }
+
+    /// Record the most-recent OSC 0 / OSC 2 window title (parser → grid). A newer
+    /// title overwrites an unconsumed one — only the latest matters (tab-identity).
+    pub fn record_title(&mut self, title: String) {
+        self.osc_title = Some(title);
+    }
+
+    /// Take the most-recent OSC 0 / OSC 2 window title, clearing it (one-shot drain).
+    /// `None` if none arrived since the last take; `Some("")` means the title was
+    /// explicitly cleared (revert the manual label to the auto/cwd label).
+    pub fn take_osc_title(&mut self) -> Option<String> {
+        self.osc_title.take()
     }
 
     /// Read a retained history row (0 == oldest). Used by snapshot composition.

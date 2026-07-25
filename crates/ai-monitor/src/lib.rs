@@ -114,7 +114,7 @@ fn event_summary(v: &Value) -> String {
 }
 
 /// Collapse to a single trimmed line, capped for the overlay.
-fn one_line(s: &str) -> String {
+pub(crate) fn one_line(s: &str) -> String {
     let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() > 200 {
         flat.chars().take(199).collect::<String>() + "…"

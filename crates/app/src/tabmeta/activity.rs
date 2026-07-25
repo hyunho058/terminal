@@ -81,6 +81,12 @@ struct RoleEntry {
     role: String,
     last: Option<LastMessage>,
     last_read_tick: u64,
+    /// The last *substantive* user-prompt label derived for this cwd (tab-identity, D10).
+    /// Persisted across reads: when a newer tail has no substantive prompt (only short /
+    /// continuation turns, or the prompt scrolled past the tail cap) the previous label is
+    /// carried forward, so an idle agent keeps its last label (D3/D6). `None` only until the
+    /// first substantive prompt is seen.
+    label: Option<String>,
 }
 
 impl ActivityMemo {
@@ -168,7 +174,10 @@ fn resolve_path(
 }
 
 /// The tail role + D16 `last` signal for `log`, memoised on `(mtime, len)` (R6.7). A cheap
-/// `stat` revalidates; only a changed log triggers the bounded tail read.
+/// `stat` revalidates; only a changed log triggers the bounded tail read. On a changed log
+/// the tab-identity `label` is re-derived from the fresh prompts (D10) and carried forward
+/// when none is substantive (D6); it lands in the memo so [`label_of_cwd`] can read it with
+/// no further I/O.
 fn tail_role(
     memo: &mut ActivityMemo,
     cwd: &Path,
@@ -182,13 +191,22 @@ fn tail_role(
             return Some((e.last, e.role.clone(), e.mtime)); // unchanged → no read (R6.7)
         }
     }
+    // Carry the previous label forward if the fresh scan has no substantive prompt (D6/D10).
+    let prev_label = memo.role.get(cwd).and_then(|e| e.label.clone());
     let ts = tail_state(log)?;
+    // The label needs the last *human* prompt, which routinely sits far outside the 8 KiB
+    // activity tail (a single assistant turn + tool output exceeds it), so it gets a separate,
+    // wider read (up to PROMPT_SCAN_CAP) — only here, on a changed log (still memoised, R6.7).
+    let label = pick_label(&ai_monitor::activity::recent_prompts(log)).or(prev_label);
     #[cfg(test)]
     {
         super::probe::LOG_READ.bump(1);
-        // Honest wrapper accounting (R6.1): ai-monitor returns no byte count, so we
-        // record what its bounded read is bounded *to* — min(len, TAIL_CAP).
-        super::probe::LOG_READ_BYTES.bump(len.min(ai_monitor::activity::TAIL_CAP));
+        // Honest wrapper accounting (R6.1): the activity tail is bounded to TAIL_CAP; the
+        // label scan adds up to PROMPT_SCAN_CAP more, both only on a changed log.
+        super::probe::LOG_READ_BYTES.bump(
+            len.min(ai_monitor::activity::TAIL_CAP)
+                + len.min(ai_monitor::activity::PROMPT_SCAN_CAP),
+        );
     }
     memo.role.insert(
         cwd.to_path_buf(),
@@ -199,9 +217,63 @@ fn tail_role(
             role: ts.role.clone(),
             last: ts.last,
             last_read_tick: tick,
+            label,
         },
     );
     Some((ts.last, ts.role, ts.mtime))
+}
+
+/// The memoised tab-identity label for `cwd`, if one has been derived (tab-identity, D6).
+/// Pure memo read — no filesystem I/O — so the worker gets the label for free after the
+/// activity pass warmed the role memo this tick. `None` before any substantive prompt was
+/// seen, or when the cwd's log never resolved (→ the card falls back to the cwd title).
+pub(crate) fn label_of_cwd(memo: &ActivityMemo, cwd: &Path) -> Option<String> {
+    memo.role.get(cwd).and_then(|e| e.label.clone())
+}
+
+/// Minimum character count for a prompt to count as substantive (D10). Below this it reads
+/// as a short acknowledgement ("y", "네", "go") rather than a task, so it is skipped.
+const MIN_LABEL_CHARS: usize = 8;
+
+/// The tab label from the recent prompts (newest first): the newest *substantive* one (D10).
+/// Short prompts and known continuation words are skipped so a run of "계속"/"y" does not
+/// collapse every tab to the same label; when none qualifies the caller carries the previous
+/// label forward. App policy — not `ai-monitor`'s — so it lives here beside [`state_from`].
+fn pick_label(prompts: &[String]) -> Option<String> {
+    prompts.iter().find(|p| is_substantive(p)).cloned()
+}
+
+/// A prompt is substantive when it is at least [`MIN_LABEL_CHARS`] long and is not a bare
+/// continuation word (D10).
+fn is_substantive(s: &str) -> bool {
+    let t = s.trim();
+    t.chars().count() >= MIN_LABEL_CHARS && !is_continuation(t)
+}
+
+/// Whether `s` is a bare continuation / acknowledgement, so it should not become a label
+/// (D10). Whole-string, case-insensitive match against a small dictionary; the initial set
+/// is tunable. Length-based skipping already handles the short ones — this catches the
+/// longer continuation words ("continue").
+fn is_continuation(s: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "계속",
+        "continue",
+        "y",
+        "yes",
+        "네",
+        "응",
+        "다시",
+        "go",
+        "ok",
+        "okay",
+        "진행",
+        "sure",
+        "proceed",
+        "next",
+        "continue.",
+    ];
+    let lower = s.trim().to_lowercase();
+    WORDS.contains(&lower.as_str())
 }
 
 /// `stat` the log for `(mtime, len)`, counting the revalidation probe.
@@ -537,5 +609,127 @@ mod tests {
             AgentState::Busy,
             "fresh file → recency fallback Busy"
         );
+    }
+
+    // ---- tab-identity: the label (D10 pick policy, D6 carry-forward) ----
+
+    #[test]
+    fn pick_label_policy() {
+        // D10 — the newest *substantive* prompt wins; short and continuation turns skipped.
+        assert_eq!(
+            pick_label(&["계속".into(), "add pagination to the list".into()]),
+            Some("add pagination to the list".to_string())
+        );
+        assert_eq!(pick_label(&["y".into(), "go".into()]), None, "all skipped");
+        assert_eq!(pick_label(&[]), None);
+        assert!(
+            !is_substantive("continue"),
+            "dictionary catches the 8-char word"
+        );
+        assert!(!is_substantive("네"), "too short");
+        assert!(is_substantive("refactor X"));
+    }
+
+    #[test]
+    fn label_picks_substantive_prompt_end_to_end() {
+        // The newest human prompt becomes the label after one activity pass warms the memo.
+        let _g = super::super::probe::serial();
+        let root = projects_root("label-basic");
+        let cwd = Path::new("/proj/label-basic");
+        write_log(
+            &root,
+            cwd,
+            "s1",
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"refactor the auth module"}]}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn"}}"#,
+                "\n",
+            )
+            .as_bytes(),
+        );
+        let mut memo = ActivityMemo::new();
+        let _ = state_of_cwd(&mut memo, &root, cwd, 0, SystemTime::now());
+        assert_eq!(
+            label_of_cwd(&memo, cwd).as_deref(),
+            Some("refactor the auth module")
+        );
+    }
+
+    #[test]
+    fn label_skips_continuation_for_prior_substantive() {
+        // D10 — newest prompt is "계속"; the label is the earlier substantive prompt.
+        let _g = super::super::probe::serial();
+        let root = projects_root("label-cont");
+        let cwd = Path::new("/proj/label-cont");
+        write_log(
+            &root,
+            cwd,
+            "s1",
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"implement the parser"}]}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn"}}"#,
+                "\n",
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"계속"}]}}"#,
+                "\n",
+            )
+            .as_bytes(),
+        );
+        let mut memo = ActivityMemo::new();
+        let _ = state_of_cwd(&mut memo, &root, cwd, 0, SystemTime::now());
+        assert_eq!(
+            label_of_cwd(&memo, cwd).as_deref(),
+            Some("implement the parser")
+        );
+    }
+
+    #[test]
+    fn label_persists_when_new_tail_has_no_substantive_prompt() {
+        // D6 — once a label is set, a later change adding only a continuation turn keeps the
+        // previous label (carry-forward), so an idle agent keeps its identity.
+        use std::io::Write;
+        let _g = super::super::probe::serial();
+        let root = projects_root("label-persist");
+        let cwd = Path::new("/proj/label-persist");
+        let log = write_log(
+            &root,
+            cwd,
+            "s1",
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"fix the flaky test"}]}}"#,
+                "\n",
+            )
+            .as_bytes(),
+        );
+        let mut memo = ActivityMemo::new();
+        let _ = state_of_cwd(&mut memo, &root, cwd, 0, SystemTime::now());
+        assert_eq!(
+            label_of_cwd(&memo, cwd).as_deref(),
+            Some("fix the flaky test")
+        );
+        // Append a continuation-only turn → len changes → re-read; label carries forward.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .expect("append");
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"text","text":"go"}}]}}}}"#
+        )
+        .expect("write");
+        let _ = state_of_cwd(&mut memo, &root, cwd, 1, SystemTime::now());
+        assert_eq!(
+            label_of_cwd(&memo, cwd).as_deref(),
+            Some("fix the flaky test"),
+            "carry-forward keeps the last substantive label"
+        );
+    }
+
+    #[test]
+    fn label_none_without_resolvable_log() {
+        // No session dir was ever read for this cwd → no label (card falls back to cwd).
+        let memo = ActivityMemo::new();
+        assert_eq!(label_of_cwd(&memo, Path::new("/proj/never")), None);
     }
 }

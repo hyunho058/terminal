@@ -33,6 +33,11 @@ use crate::{DrawLayer, FrameCtx};
 /// The z-order of the sidebar layer (above the terminal glyph pass = 0, below overlays).
 pub const TAB_BAR_Z: i32 = 10;
 
+/// Fraction of line 2's width the repo/folder name may claim before the git branch when a
+/// task label took line 1 (tab-identity, R2.2): the repo is the priority identity on
+/// overflow, so it gets the majority share and the branch takes the remainder.
+const REPO_LINE2_WIDTH_SHARE: f32 = 0.55;
+
 // ---------------------------------------------------------------------------
 // Plain-data row + metadata types (SD3 — the renderer never names app types)
 // ---------------------------------------------------------------------------
@@ -45,6 +50,10 @@ pub struct SidebarRow {
     /// The app's `session::TabId` as a plain `u64` — the renderer must not know app types.
     pub tab_id: u64,
     pub title: String,
+    /// The user's explicit manual label from an OSC 0/2 title (tab-identity), if any. Takes
+    /// precedence over the auto AI-task label on line 1 (manual > task > cwd `title`), so two
+    /// sessions in the same folder can be given distinct labels. `None` = no manual label.
+    pub label: Option<String>,
 }
 
 /// The leading mark on a card's first line (D11/D12), drawn as a foundations icon —
@@ -90,12 +99,17 @@ pub struct WaitingRow {
 }
 
 /// Per-tab metadata pulled from the app each frame (D10). Owned strings + `Copy` marks;
-/// `default()` is a plain card (no branch, no mark, [`AgentSkin::Generic`]).
+/// `default()` is a plain card (no branch, no task, no mark, [`AgentSkin::Generic`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowMeta {
     pub branch: Option<String>,
     pub mark: RowMark,
     pub skin: AgentSkin,
+    /// The tab's live "current task" label (tab-identity). `Some` → line 1 shows this
+    /// instead of the cwd title, and the cwd/repo name moves to line 2 alongside the
+    /// branch; `None` → line 1 is the cwd title (plain shell / no agent). Pulled by
+    /// `tab_id` like `branch`, so it refreshes live off the metadata generation.
+    pub task: Option<String>,
 }
 
 impl Default for RowMeta {
@@ -104,6 +118,7 @@ impl Default for RowMeta {
             branch: None,
             mark: RowMark::None,
             skin: AgentSkin::Generic,
+            task: None,
         }
     }
 }
@@ -273,6 +288,39 @@ pub fn truncate_to_width(s: &str, advance: f32, max_w: f32, ellipsis: char) -> S
     let mut out: String = s.chars().take(max_chars - 1).collect();
     out.push(ellipsis);
     out
+}
+
+/// Line 1 of a card (tab-identity): the label to draw, by precedence **manual > task > cwd**.
+/// `manual` is the user's explicit OSC-2 label (R2.1's escape hatch for two sessions in one
+/// folder); `task` is the live AI-task label (R2.1); `cwd_title` is the fallback (R3.2). An
+/// idle agent keeps its last label because the worker persists `task`, so this same branch
+/// renders the afterglow (R3.1) — the renderer invents nothing; it mirrors the pulled state.
+pub(crate) fn card_line1_text<'a>(
+    manual: Option<&'a str>,
+    task: Option<&'a str>,
+    cwd_title: &'a str,
+) -> &'a str {
+    manual.or(task).unwrap_or(cwd_title)
+}
+
+/// The x-origin (physical px) at which line 2's git-branch icon may start after the repo name,
+/// or `None` when even the icon (`meta_px` wide) would overrun `right_edge` (tab-identity,
+/// R2.2 — the repo has priority, so a branch that can't fit is dropped rather than clipped).
+pub(crate) fn line2_branch_origin(x: f32, meta_px: f32, right_edge: f32) -> Option<f32> {
+    (x + meta_px <= right_edge).then_some(x)
+}
+
+/// The width (physical px) the repo/folder name may claim on line 2 before the git branch
+/// when a task label took line 1 (tab-identity, R2.2): the repo is the priority identity, so
+/// it gets [`REPO_LINE2_WIDTH_SHARE`] of `avail` when a branch follows — never less than one
+/// glyph `advance` so the repo never vanishes entirely — or all of `avail` when there is no
+/// branch. Pure so the repo-first policy is unit-testable without a GPU frame.
+pub(crate) fn repo_line2_budget(avail: f32, advance: f32, has_branch: bool) -> f32 {
+    if has_branch {
+        (avail * REPO_LINE2_WIDTH_SHARE).max(advance)
+    } else {
+        avail.max(0.0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1076,10 +1124,18 @@ impl DrawLayer for TabBar {
                     title_x = inner_x + m.mark_px + icon_gap;
                 }
             }
+            // Line 1 by precedence manual > task > cwd (tab-identity): the user's OSC-2
+            // label wins, else the live AI task, else the cwd title (plain shell / no agent).
+            // An idle agent keeps its last label because the worker persists `task` (D3).
+            let title_text = card_line1_text(
+                rows[i].label.as_deref(),
+                meta.task.as_deref(),
+                rows[i].title.as_str(),
+            );
             push_glyphs(
                 &mut text,
                 ctx,
-                &rows[i].title,
+                title_text,
                 title_x,
                 inner_top,
                 cell,
@@ -1090,20 +1146,52 @@ impl DrawLayer for TabBar {
                 ellipsis,
             );
 
-            // Line 2: the branch, only when the tab actually has one (D6).
+            // Line 2 (D6-reserved). When a task label took line 1, the repo/folder name
+            // (the cwd title) moves here as the secondary identity, ahead of the git branch
+            // and given width priority on overflow (repo-first, R2.2); otherwise line 2 is
+            // the branch alone, exactly as before.
             if show_branch {
-                if let Some(branch) = self.meta.get(i).and_then(|mt| mt.branch.as_deref()) {
-                    let line2_top = inner_top + cell[1] + m.card_gap;
+                let line2_top = inner_top + cell[1] + m.card_gap;
+                let advance = cell[0] * meta_ratio;
+                let branch = meta.branch.as_deref();
+                let mut x = inner_x;
+                // When line 1 is a custom label (manual OSC-2 or the AI task), the cwd/repo
+                // name moves to line 2 as the secondary identity; a plain cwd card keeps the
+                // branch-only line 2 as before.
+                let line1_is_custom = rows[i].label.is_some() || meta.task.is_some();
+                if line1_is_custom {
+                    let repo_budget = repo_line2_budget(right_edge - x, advance, branch.is_some());
+                    let repo = truncate_to_width(&rows[i].title, advance, repo_budget, ellipsis);
+                    push_glyphs(
+                        &mut text,
+                        ctx,
+                        &repo,
+                        x,
+                        line2_top,
+                        cell,
+                        meta_ratio,
+                        false,
+                        linear(theme.meta_fg, 1.0),
+                        repo_budget,
+                        ellipsis,
+                    );
+                    x += repo.chars().count() as f32 * advance + icon_gap;
+                }
+                // Draw the branch (icon + text) only if at least its icon still fits after the
+                // repo name (R2.2 — the repo has priority; a branch that can't fit is dropped).
+                if let (Some(branch), Some(bx)) =
+                    (branch, line2_branch_origin(x, m.meta_px, right_edge))
+                {
                     let iy = line2_top + (cell[1] * meta_ratio - m.meta_px) * 0.5;
                     push_icon(
                         &mut shapes,
                         Icon::GitBranch,
-                        inner_x,
+                        bx,
                         iy.max(line2_top),
                         m.meta_px,
                         theme.icon_fg,
                     );
-                    let branch_x = inner_x + m.meta_px + icon_gap;
+                    let branch_x = bx + m.meta_px + icon_gap;
                     push_glyphs(
                         &mut text,
                         ctx,
@@ -1170,6 +1258,7 @@ mod tests {
             titles: vec![SidebarRow {
                 tab_id: 7,
                 title: "proj".into(),
+                label: None,
             }],
             active: 0,
             ..Default::default()
@@ -1198,6 +1287,7 @@ mod tests {
             titles: vec![SidebarRow {
                 tab_id: 1,
                 title: "x".into(),
+                label: None,
             }],
             active: 0,
             ..Default::default()
@@ -1229,6 +1319,7 @@ mod tests {
             titles: vec![SidebarRow {
                 tab_id: 3,
                 title: "a".into(),
+                label: None,
             }],
             active: 0,
             ..Default::default()
@@ -1371,5 +1462,112 @@ mod tests {
         // Char-safe on multibyte, no panic, respects boundaries.
         let jp = truncate_to_width("日本語テスト", 10.0, 35.0, '…');
         assert_eq!(jp, "日本…");
+    }
+
+    // ---- T3: tab-identity card line-1 / line-2 decisions (renderer/sidebar_row.rs) ----
+
+    #[test]
+    fn card_line1_shows_task_when_present() {
+        // R2.1 — a task label takes line 1 over the cwd title (no manual label).
+        assert_eq!(
+            card_line1_text(None, Some("refactor the auth module"), "terminal"),
+            "refactor the auth module"
+        );
+    }
+
+    #[test]
+    fn card_line1_falls_back_to_cwd_when_no_task() {
+        // R3.2 / R3.1 — no manual label, no task → the cwd title. The same branch renders
+        // the idle afterglow, since the worker keeps `task` Some while idle.
+        assert_eq!(card_line1_text(None, None, "terminal"), "terminal");
+    }
+
+    #[test]
+    fn card_line1_manual_label_wins_over_task_and_cwd() {
+        // tab-identity — the user's manual OSC-2 label has top precedence, so two sessions
+        // in the same folder can be told apart even when both have an AI task.
+        assert_eq!(
+            card_line1_text(
+                Some("Frontend"),
+                Some("refactor the auth module"),
+                "terminal"
+            ),
+            "Frontend"
+        );
+        // Manual label also wins when there is no task at all.
+        assert_eq!(
+            card_line1_text(Some("Backend"), None, "terminal"),
+            "Backend"
+        );
+    }
+
+    #[test]
+    fn repo_budget_prioritizes_repo_when_branch_present() {
+        // R2.2 — with a branch to follow, the repo/folder name gets the majority share.
+        let avail = 100.0;
+        let b = repo_line2_budget(avail, 8.0, true);
+        assert_eq!(b, avail * REPO_LINE2_WIDTH_SHARE);
+        assert!(
+            b > 0.0 && b < avail,
+            "repo takes a majority but leaves room for the branch"
+        );
+    }
+
+    #[test]
+    fn repo_budget_takes_full_width_without_branch() {
+        // R2.2 — no branch → the repo/folder name may use the whole line.
+        assert_eq!(repo_line2_budget(100.0, 8.0, false), 100.0);
+        // Negative avail (degenerate) clamps to 0, never panics.
+        assert_eq!(repo_line2_budget(-5.0, 8.0, false), 0.0);
+    }
+
+    #[test]
+    fn repo_budget_never_below_one_glyph() {
+        // R2.2 robustness — on a very narrow card the repo still keeps at least one glyph
+        // of budget (the advance floor), so it never silently vanishes behind the branch.
+        assert_eq!(repo_line2_budget(4.0, 8.0, true), 8.0);
+    }
+
+    #[test]
+    fn repo_line2_truncates_within_its_budget() {
+        // R1.5 — the repo name on line 2 is elided to fit the budget the policy hands it, so
+        // a long repo name never overruns into the branch segment.
+        let advance = 8.0;
+        let budget = repo_line2_budget(80.0, advance, true); // 44px ⇒ 5 glyphs
+        let drawn = truncate_to_width("very-long-repository-name", advance, budget, '…');
+        assert!(drawn.chars().count() as f32 * advance <= budget);
+        assert!(drawn.ends_with('…'), "a long repo name is elided");
+    }
+
+    #[test]
+    fn line2_branch_fits_when_icon_within_edge() {
+        // R2.2 — the branch icon starts at x when it (meta_px wide) fits before right_edge.
+        assert_eq!(line2_branch_origin(50.0, 10.0, 100.0), Some(50.0));
+        // Exactly flush against the edge still counts as fitting.
+        assert_eq!(line2_branch_origin(90.0, 10.0, 100.0), Some(90.0));
+    }
+
+    #[test]
+    fn line2_branch_dropped_when_icon_overruns_edge() {
+        // R2.2 — once the repo name pushed x past (right_edge - icon), the branch is dropped,
+        // not clipped: repo has priority.
+        assert_eq!(line2_branch_origin(95.0, 10.0, 100.0), None);
+    }
+
+    #[test]
+    fn card_height_is_independent_of_the_task_label() {
+        // R2.3 — the task label is a horizontal, line-1 text swap; card height is governed by
+        // `layout` (show_branch only), which takes no per-tab content, so a labelled card and a
+        // plain card share the exact same stride/height. (Draw uses this same `layout`.)
+        let g = geom(160.0, 600.0, true);
+        let a = layout(&g, 5);
+        let b = layout(&g, 5);
+        assert_eq!(a.card_h, b.card_h);
+        assert_eq!(a.stride, b.stride);
+        // And the reserved height matches the two-line (title + branch) formula, not three.
+        assert!(
+            a.card_h > g.cell[1],
+            "card reserves at least the two card lines"
+        );
     }
 }
