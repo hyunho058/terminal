@@ -126,6 +126,50 @@ pub fn wheel_scroll(
     sidebar_layout::clamp_scroll(scroll - delta_px, inp)
 }
 
+/// Grid lines one mouse-wheel notch scrolls (terminal-scroll D2). Three matches
+/// Terminal.app/iTerm2's default feel. A `const` on purpose (D10): a config key would
+/// have to live in `common::Config`, which is outside this feature's app-only scope.
+pub const LINES_PER_NOTCH: f32 = 3.0;
+
+/// Whole grid lines to scroll for one wheel event over the terminal, carrying the
+/// sub-line remainder in `accum` (terminal-scroll D2/D3/D9).
+///
+/// Positive means **into history** (`scroll_up`), following winit's convention that
+/// positive y moves content down and reveals content above — the same sign
+/// [`wheel_scroll`] follows. macOS applies natural-scrolling upstream, so there is no
+/// preference to read here.
+///
+/// `accum` is why a slow trackpad drag works at all: each event carries a few px, so
+/// truncating them independently would round every one to zero lines and the terminal
+/// would appear not to scroll. Its unit is **lines**, and both `WheelDelta` variants
+/// feed it — a mouse and a trackpad can alternate mid-gesture without a discontinuity.
+/// Direction reversal needs no special case: an unspent `+0.6` cancelled by a later
+/// `-0.6` nets zero, which is the right answer.
+///
+/// A non-finite delta or non-positive `cell_h` (possible before the first layout)
+/// returns 0 and leaves `accum` **untouched** — folding a NaN in would poison it for
+/// the rest of the session, and since `as` saturates NaN to 0 rather than panicking,
+/// scrolling would then die silently.
+pub fn wheel_lines(delta: WheelDelta, cell_h: f32, accum: &mut f32) -> i32 {
+    let lines = match delta {
+        WheelDelta::Lines(y) => y * LINES_PER_NOTCH,
+        WheelDelta::Pixels(y) => {
+            if cell_h <= 0.0 || !cell_h.is_finite() {
+                return 0;
+            }
+            y / cell_h
+        }
+    };
+    if !lines.is_finite() {
+        return 0;
+    }
+    *accum += lines;
+    let whole = accum.trunc();
+    *accum -= whole;
+    // Saturates on overflow; `scroll_up`/`scroll_down` clamp on the other side.
+    whole as i32
+}
+
 /// Which escape-sequence family a cursor/navigation/function key belongs to
 /// (D11/D13). The family decides *both* the unmodified form and where the xterm
 /// modifier parameter goes, so the table below stays a one-liner per key.
@@ -826,5 +870,140 @@ mod tests {
             wheel_scroll(WheelDelta::Pixels(30.0), (400.0, 400.0), 100.0, &inp, false),
             100.0,
         );
+    }
+
+    /// R1.4 — **the discriminator D1 turns on.** In the band above the grid (right of
+    /// the sidebar, `y < top_inset`) `hit_test` says "not mine" while `pixel_to_cell`
+    /// also says "no cell". Routing the wheel on `cursor_cell` would therefore leave
+    /// that visible strip silently inert, so the gate is `hit_test`.
+    ///
+    /// Scope note: this pins the two predicates' disagreement, which is the *reason*
+    /// for the gate. That the `MouseWheel` arm actually routes a `None` to the grid is
+    /// arm-only and needs a live window, so it is not reachable here.
+    #[test]
+    fn the_top_band_routes_to_the_grid_but_has_no_cell() {
+        let inp = layout_input(340.0, 5);
+        let p = (400.0, 10.0); // right of the sidebar, above the first row
+        assert!(
+            sidebar_layout::hit_test([p.0 as f32, p.1 as f32], 0.0, &inp, false).is_none(),
+            "hit_test routes the top band to the grid"
+        );
+        assert_eq!(
+            pixel_to_cell(p, (8.0, 16.0), inp.sidebar_w, 24.0, 100, 40),
+            None,
+            "…but there is no cell there — cursor_cell would make the strip inert"
+        );
+    }
+
+    /// R1.3 — collapsed, everything but the restore button is grid, so the wheel
+    /// scrolls the terminal across the whole window.
+    ///
+    /// Scope note: same as above — this pins what `hit_test` reports, not the arm's
+    /// dispatch on it.
+    #[test]
+    fn collapsed_routes_the_whole_window_to_the_grid() {
+        let inp = layout_input(340.0, 5);
+        let deep_in_the_band = [170.0, 500.0];
+        assert!(
+            sidebar_layout::hit_test(deep_in_the_band, 0.0, &inp, true).is_none(),
+            "collapsed: this point is grid"
+        );
+        assert!(
+            sidebar_layout::hit_test(deep_in_the_band, 0.0, &inp, false).is_some(),
+            "expanded: the very same point belongs to the list"
+        );
+    }
+
+    /// R2.1/R2.2 — a notch is three lines; trackpad px divide by the cell height so
+    /// the text tracks the finger 1:1.
+    #[test]
+    fn wheel_lines_translates_both_unit_systems() {
+        let mut acc = 0.0;
+        assert_eq!(wheel_lines(WheelDelta::Lines(1.0), 16.0, &mut acc), 3);
+        assert_eq!(acc, 0.0, "a whole-line delta leaves no remainder");
+        assert_eq!(wheel_lines(WheelDelta::Pixels(32.0), 16.0, &mut acc), 2);
+        // The cell height is what makes px→lines 1:1; a taller cell means fewer lines.
+        let mut acc = 0.0;
+        assert_eq!(wheel_lines(WheelDelta::Pixels(32.0), 32.0, &mut acc), 1);
+    }
+
+    /// R2.3 — positive is into history, negative is back toward live.
+    #[test]
+    fn wheel_lines_sign_follows_winit() {
+        let mut acc = 0.0;
+        assert_eq!(wheel_lines(WheelDelta::Lines(1.0), 16.0, &mut acc), 3);
+        assert_eq!(wheel_lines(WheelDelta::Lines(-1.0), 16.0, &mut acc), -3);
+        assert_eq!(wheel_lines(WheelDelta::Pixels(-16.0), 16.0, &mut acc), -1);
+    }
+
+    /// R3.1/R3.2 — **the reason the accumulator exists.** Three 6px events on a 16px
+    /// cell are 0.375 lines each; truncating them independently would move nothing at
+    /// all and slow trackpad scrolling would look broken.
+    #[test]
+    fn wheel_lines_accumulates_sub_line_events() {
+        let mut acc = 0.0;
+        assert_eq!(wheel_lines(WheelDelta::Pixels(6.0), 16.0, &mut acc), 0);
+        assert_eq!(wheel_lines(WheelDelta::Pixels(6.0), 16.0, &mut acc), 0);
+        assert_eq!(
+            wheel_lines(WheelDelta::Pixels(6.0), 16.0, &mut acc),
+            1,
+            "three 0.375-line events must total one line, not zero"
+        );
+        // R3.2: the 0.125 remainder survives into the next event (0.125 + 0.875 == 1).
+        assert!((acc - 0.125).abs() < 1e-6, "remainder kept, got {acc}");
+        assert_eq!(wheel_lines(WheelDelta::Pixels(14.0), 16.0, &mut acc), 1);
+        assert!(acc.abs() < 1e-6, "remainder spent, got {acc}");
+    }
+
+    /// R3.3 — a reversal cancels unspent residue instead of needing a reset: the user
+    /// moved back exactly as far as they moved forward, so nothing should scroll.
+    #[test]
+    fn wheel_lines_reversal_is_self_correcting() {
+        let mut acc = 0.0;
+        assert_eq!(wheel_lines(WheelDelta::Pixels(10.0), 16.0, &mut acc), 0);
+        assert_eq!(wheel_lines(WheelDelta::Pixels(-10.0), 16.0, &mut acc), 0);
+        assert!(acc.abs() < 1e-6, "net-zero gesture nets zero, got {acc}");
+    }
+
+    /// R8.1 — **the silent-death guard.** A NaN folded into the accumulator would make
+    /// every later `trunc()` NaN, and `as i32` saturates NaN to 0 rather than panicking,
+    /// so scrolling would stop working for the rest of the session with no error.
+    #[test]
+    fn wheel_lines_rejects_non_finite_deltas_without_poisoning() {
+        let mut acc = 0.5;
+        assert_eq!(wheel_lines(WheelDelta::Pixels(f32::NAN), 16.0, &mut acc), 0);
+        assert_eq!(acc, 0.5, "NaN must not enter the accumulator");
+        assert_eq!(
+            wheel_lines(WheelDelta::Pixels(f32::INFINITY), 16.0, &mut acc),
+            0
+        );
+        assert_eq!(wheel_lines(WheelDelta::Lines(f32::NAN), 16.0, &mut acc), 0);
+        assert_eq!(acc, 0.5);
+        // Still alive afterwards: 0.5 + 0.5 == one line.
+        assert_eq!(wheel_lines(WheelDelta::Pixels(8.0), 16.0, &mut acc), 1);
+    }
+
+    /// R8.2 — `cell_size()` can report zero before the first layout; dividing by it
+    /// would produce an infinity that the finite check would then discard anyway.
+    #[test]
+    fn wheel_lines_rejects_non_positive_cell_height() {
+        let mut acc = 0.25;
+        assert_eq!(wheel_lines(WheelDelta::Pixels(40.0), 0.0, &mut acc), 0);
+        assert_eq!(wheel_lines(WheelDelta::Pixels(40.0), -16.0, &mut acc), 0);
+        assert_eq!(wheel_lines(WheelDelta::Pixels(40.0), f32::NAN, &mut acc), 0);
+        assert_eq!(acc, 0.25, "accumulator untouched by a geometry reject");
+        // Line deltas do not depend on the cell height, so they still work.
+        assert_eq!(wheel_lines(WheelDelta::Lines(1.0), 0.0, &mut acc), 3);
+    }
+
+    /// R8.3 — a huge but finite delta saturates on the cast; the viewport clamp on the
+    /// other side (`Grid::scroll_up`) is what bounds it to the retained history.
+    #[test]
+    fn wheel_lines_saturates_on_a_huge_delta() {
+        let mut acc = 0.0;
+        let n = wheel_lines(WheelDelta::Pixels(1e9), 16.0, &mut acc);
+        assert!(n > 0, "a huge scroll goes up, got {n}");
+        let n = wheel_lines(WheelDelta::Pixels(-1e30), 16.0, &mut acc);
+        assert!(n < 0, "and a huge reverse scroll goes down, got {n}");
     }
 }

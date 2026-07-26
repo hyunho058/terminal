@@ -48,10 +48,12 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
 use crate::input::{
-    encode_key, pixel_to_cell, sidebar_hover, sidebar_press, suppress_key, tab_action,
+    encode_key, pixel_to_cell, sidebar_hover, sidebar_press, suppress_key, tab_action, wheel_lines,
     wheel_scroll, SidebarAction, TabAction, WheelDelta,
 };
-use crate::seam::{AppCtx, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayHost};
+use crate::seam::{
+    AppCtx, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayHost, WriteProbe,
+};
 use crate::session::{Session, TabId};
 use crate::tabmeta::{AgentState, TabMetaSnapshot};
 use crate::tabs::Tabs;
@@ -137,6 +139,16 @@ struct Running {
     /// The sidebar list scroll offset in physical px, app-owned (D10). Published to the
     /// row layer via `set_list_scroll`, clamped whenever `max_scroll` shrinks.
     scroll: f32,
+    /// Unspent sub-line remainder of the in-flight wheel gesture over the *grid*, in
+    /// lines (terminal-scroll D3). Without it a slow trackpad drag — a few px per event
+    /// — would truncate to zero lines every time and the grid would never move.
+    ///
+    /// A tab switch is the **only** thing that resets it. Snaps deliberately do not: a
+    /// snap can be triggered by an invisible tab (output arriving in a background tab,
+    /// or an IME commit routed to the tab it began in), and zeroing it there would let
+    /// an async event in a tab the user is not touching silently eat the gesture they
+    /// are making in the one they are.
+    wheel_accum: f32,
     /// Last resolved card-hover index — the region debounce for `set_hovered` (D8).
     last_hit: Option<usize>,
     router: InputRouter,
@@ -153,6 +165,9 @@ struct Running {
     dragging: bool,
     drag_anchor: (u16, u16),
     drag_moved: bool,
+    /// What the in-flight drag swallowed, replayed on release (terminal-scroll D6).
+    /// Meaningless while `dragging` is false; reset at each press.
+    drag_latch: DragLatch,
     /// Fresh configs delivered by the background watcher (settings feature).
     config_rx: Receiver<Config>,
     /// Kept alive so the watch thread keeps running; dropping it stops watching.
@@ -294,6 +309,7 @@ impl App {
             chrome_handle,
             sidebar_cfg: self.cfg.sidebar.clone(),
             scroll: 0.0,
+            wheel_accum: 0.0,
             last_hit: None,
             router,
             overlays,
@@ -302,6 +318,7 @@ impl App {
             dragging: false,
             drag_anchor: (0, 0),
             drag_moved: false,
+            drag_latch: DragLatch::default(),
             config_rx,
             _config_watcher: config_watcher,
             occluded: false,
@@ -366,22 +383,41 @@ impl Running {
                         commit_target(composing_tab, |id| self.tabs.by_id_mut(id).is_some());
                     match target {
                         // The composing tab is still open — write there (R8.3).
-                        CommitTarget::Tab(id) => match self.tabs.by_id_mut(id) {
-                            Some(session) => {
-                                if let Err(e) = session.write(text.as_bytes()) {
-                                    tracing::warn!("pty write failed: {e}");
+                        CommitTarget::Tab(id) => {
+                            let ok = match self.tabs.by_id_mut(id) {
+                                Some(session) => match session.write(text.as_bytes()) {
+                                    Ok(()) => true,
+                                    Err(e) => {
+                                        tracing::warn!("pty write failed: {e}");
+                                        false
+                                    }
+                                },
+                                // Unreachable: `commit_target` only yields `Tab` when
+                                // the probe said it exists. Never panic on it.
+                                None => {
+                                    tracing::warn!(tab = id.0, "commit target vanished");
+                                    false
                                 }
+                            };
+                            // Snap the tab the bytes went to, not the active one
+                            // (terminal-scroll D4) — a composition that began in a tab
+                            // the user has since left still owns its own viewport.
+                            if ok {
+                                self.snap_after_input(id);
                             }
-                            // Unreachable: `commit_target` only yields `Tab` when
-                            // the probe said it exists. Never panic on it.
-                            None => tracing::warn!(tab = id.0, "commit target vanished"),
-                        },
+                        }
                         // Plain, non-composed text — the active tab, as always.
                         // This branch is what guarantees no character is ever
                         // lost (R8.5).
                         CommitTarget::Active => {
-                            if let Err(e) = self.tabs.active_mut().write(text.as_bytes()) {
-                                tracing::warn!("pty write failed: {e}");
+                            // The path `on_key` never sees: winit's composing gate plus
+                            // `had_ime_input` mean a committed 한글 syllable arrives
+                            // *only* here. Without this snap, typing Korean into a
+                            // scrolled-back view would leave the screen frozen and the
+                            // terminal looking dead (terminal-scroll D4).
+                            match self.tabs.active_mut().write(text.as_bytes()) {
+                                Ok(()) => self.snap_active_after_input(),
+                                Err(e) => tracing::warn!("pty write failed: {e}"),
                             }
                         }
                         // The tab that owned the composition was closed: those
@@ -727,6 +763,11 @@ impl Running {
         // Named key + modifier, so it sails straight through the composing gate
         // (R6.3) and is reachable by keyboard, not just by a sidebar click.
         self.cancel_composition();
+        // A tab switch ends the in-flight wheel gesture, so the unspent sub-line
+        // remainder does not follow the user into the next tab (terminal-scroll D3).
+        // Load-bearing, not hygiene: an unspent +0.9 from here would make the very
+        // first small wheel event over the next grid jump a whole line.
+        self.wheel_accum = 0.0;
         match action {
             TabAction::New => {
                 let (cols, rows) = self.renderer.grid_size();
@@ -779,6 +820,101 @@ impl Running {
         )
     }
 
+    /// Scroll the **active** tab's scrollback viewport for one wheel event over the
+    /// grid (terminal-scroll D2/D3/D7). Display-only — nothing is written to the PTY
+    /// and the shell's cursor never moves (`scrollback` D4).
+    ///
+    /// Apply-then-compare rather than pre-checking the bounds: `scroll_up`/`scroll_down`
+    /// already clamp, so re-reading `view_offset` is the cheapest way to learn whether
+    /// anything actually moved. Wheeling at the oldest retained row or at the live
+    /// bottom is then free — no snapshot re-clone, no frame.
+    ///
+    /// The redraw goes through [`redraw`](Self::redraw), *not* the bare
+    /// `window.request_redraw()` the sidebar path uses: a viewport change is a real
+    /// content change, and without marking `snapshot_dirty` the next frame would
+    /// re-present the cached snapshot and the screen would never move (D7).
+    ///
+    /// Swallowed whole while a drag holds the pointer (D6) — **including** the
+    /// accumulator, which is deliberately not fed: banking a suppressed event would
+    /// make the scroll lurch on the first real one after release.
+    fn wheel_grid(&mut self, delta: WheelDelta) {
+        if self.dragging {
+            return;
+        }
+        let cell_h = self.renderer.cell_size().1;
+        let n = wheel_lines(delta, cell_h, &mut self.wheel_accum);
+        if n == 0 {
+            return; // sub-line residue banked, or a rejected delta (D9)
+        }
+        let term = &mut self.tabs.active_mut().terminal;
+        let before = term.view_offset();
+        if n > 0 {
+            term.scroll_up(n as usize); // positive y = into history (D2)
+        } else {
+            // `unsigned_abs` so `i32::MIN` cannot overflow the negation.
+            term.scroll_down(n.unsigned_abs() as usize);
+        }
+        let moved = term.view_offset() != before;
+        if moved {
+            self.redraw();
+        }
+    }
+
+    /// Return tab `id`'s viewport to the live bottom. The raw move — the drag rules
+    /// live in the two callers below.
+    ///
+    /// Routed **by tab id, not "whoever is active"**: an `Ime::Commit` can land in the
+    /// tab the composition began in after the user switched away, and it is that tab's
+    /// reading position that must follow its own bytes. Only a change to the *visible*
+    /// tab is worth a frame.
+    ///
+    /// Deliberately does **not** touch `wheel_accum` (D3): this can fire for a tab the
+    /// user is not looking at, and clearing the accumulator would eat the sub-line
+    /// residue of a wheel gesture happening in the tab they *are* looking at.
+    fn snap_tab_to_live(&mut self, id: TabId) {
+        let moved = match self.tabs.by_id_mut(id) {
+            Some(s) if !s.terminal.at_bottom() => {
+                s.terminal.scroll_to_bottom();
+                true
+            }
+            _ => false,
+        };
+        if moved && self.tabs.is_active(id) {
+            self.redraw();
+        }
+    }
+
+    /// User input reached tab `id`'s shell — snap it to live (terminal-scroll D4).
+    /// While a drag holds the pointer the move is suppressed (D6) and *latched*, so the
+    /// release can replay it; without the latch, typing mid-drag would leave the view
+    /// frozen with the command already sent.
+    fn snap_after_input(&mut self, id: TabId) {
+        if self.dragging {
+            self.drag_latch.input_while_dragging = Some(id);
+            return;
+        }
+        self.snap_tab_to_live(id);
+    }
+
+    /// [`snap_after_input`](Self::snap_after_input) for the active tab — the common
+    /// case (a typed key, a paste).
+    fn snap_active_after_input(&mut self) {
+        let id = self.tabs.active().id;
+        self.snap_after_input(id);
+    }
+
+    /// Output advanced tab `id`'s grid from within one notch of the bottom — snap it
+    /// (terminal-scroll D12). Suppressed and latched mid-drag, same as D4's snap, since
+    /// `scrollback` D2's auto-increment would otherwise drift the offset past the floor
+    /// and disarm the self-heal for good.
+    fn snap_after_output(&mut self, id: TabId) {
+        if self.dragging {
+            self.drag_latch.advanced_while_dragging = Some(id);
+            return;
+        }
+        self.snap_tab_to_live(id);
+    }
+
     /// Dispatch a key through the seam, then default input (R3.3/R4). Returns
     /// false if the app should exit.
     fn on_key(&mut self, input: KeyInput) -> bool {
@@ -792,16 +928,30 @@ impl Running {
         } else {
             None
         };
+        // The seam's writer is wrapped in a `WriteProbe` at both dispatch points
+        // (terminal-scroll D4): a handler that sends the user's bytes to the shell —
+        // Cmd+V paste is the shipped example — must snap a scrolled-back viewport, and
+        // the probe detects that without `clipboard.rs` (or any future handler) knowing
+        // this feature exists. Classifying which *key* was pressed cannot work here:
+        // paste is consumed two steps before the default path.
+        //
         // 1) Visible overlays first (R4.1/R4.2).
         {
             let active = self.tabs.active_index();
             let count = self.tabs.len();
             let cwd = self.tabs.active_cwd();
-            let mut ctx = AppCtx::new(&mut self.tabs.active_mut().writer, count, active, cwd)
+            let mut probe = WriteProbe::new(&mut self.tabs.active_mut().writer);
+            let mut ctx = AppCtx::new(&mut probe, count, active, cwd)
                 .with_bracketed_paste(bracketed)
                 .with_selection_text(selection_text.clone());
-            if self.overlays.dispatch(&input, &mut ctx) == Handled::Consumed {
-                if ctx.redraw_requested() {
+            let consumed = self.overlays.dispatch(&input, &mut ctx) == Handled::Consumed;
+            let wants_redraw = ctx.redraw_requested();
+            let wrote = probe.wrote();
+            if wrote {
+                self.snap_active_after_input();
+            }
+            if consumed {
+                if wants_redraw {
                     self.redraw();
                 }
                 return true;
@@ -812,11 +962,18 @@ impl Running {
             let active = self.tabs.active_index();
             let count = self.tabs.len();
             let cwd = self.tabs.active_cwd();
-            let mut ctx = AppCtx::new(&mut self.tabs.active_mut().writer, count, active, cwd)
+            let mut probe = WriteProbe::new(&mut self.tabs.active_mut().writer);
+            let mut ctx = AppCtx::new(&mut probe, count, active, cwd)
                 .with_bracketed_paste(bracketed)
                 .with_selection_text(selection_text);
-            if self.router.dispatch(&input, &mut ctx) == Handled::Consumed {
-                if ctx.redraw_requested() {
+            let consumed = self.router.dispatch(&input, &mut ctx) == Handled::Consumed;
+            let wants_redraw = ctx.redraw_requested();
+            let wrote = probe.wrote();
+            if wrote {
+                self.snap_active_after_input();
+            }
+            if consumed {
+                if wants_redraw {
                     self.redraw();
                 }
                 return true;
@@ -831,8 +988,15 @@ impl Running {
         // mutable borrow for the write.
         let app_cursor = self.tabs.active().terminal.app_cursor_keys();
         if let Some(bytes) = encode_key(&input.key, input.text.as_deref(), input.mods, app_cursor) {
-            if let Err(e) = self.tabs.active_mut().write(&bytes) {
-                tracing::warn!("pty write failed: {e}");
+            match self.tabs.active_mut().write(&bytes) {
+                // The user typed something the shell will echo — bring the view back to
+                // where that echo will appear (terminal-scroll D4). Unconditional: this
+                // rule has no `SNAP_FLOOR`, unlike the output snap. Keys that never get
+                // here — Cmd+C, an overlay hotkey, a tab chord, a modifier held alone —
+                // leave a scrolled view standing, since those are things a user does
+                // *while reading history*.
+                Ok(()) => self.snap_active_after_input(),
+                Err(e) => tracing::warn!("pty write failed: {e}"),
             }
         }
         true
@@ -866,16 +1030,34 @@ impl ApplicationHandler<UserEvent> for App {
                 // (possibly background) session's PTY (T1 → T3).
                 let mut command_end = None;
                 let mut title_changed = false;
+                // Sampled INSIDE the closure and BEFORE the drain (terminal-scroll
+                // D12/C8): `scrollback` D2's auto-increment runs in `feed_scroll`, so a
+                // viewport parked at 1 that receives a 10-line burst already reads 11 by
+                // the time `drain` returns. Reading it afterwards would silently disable
+                // the floor for every burst bigger than SNAP_FLOOR — i.e. exactly the
+                // bursts that matter.
+                let mut was_near_bottom = false;
                 let advanced = inner
                     .tabs
                     .by_id_mut(id)
                     .map(|s| {
+                        was_near_bottom = snap_on_output(s.terminal.view_offset());
                         let got = s.drain();
                         command_end = s.take_command_end();
                         title_changed = s.take_title_dirty();
                         got
                     })
                     .unwrap_or(false);
+                // Output that advanced the grid returns a near-bottom viewport to live
+                // (D12). Gated on `advanced` — the flag already in hand — rather than on
+                // the bare wake, which fires for chunks that change nothing. A chunk
+                // carrying only an OSC 133 marker or an OSC 2 title set still counts as
+                // advanced, so this accepts one benign false positive: a viewport within
+                // one notch of the bottom snaps on a title set. That is where the user
+                // almost certainly meant to be anyway.
+                if advanced && was_near_bottom {
+                    inner.snap_after_output(id);
+                }
                 // A manual OSC-2 label change refreshes the sidebar rows so the new label
                 // shows immediately — even for a background tab (tab-identity).
                 if title_changed {
@@ -1026,6 +1208,11 @@ impl ApplicationHandler<UserEvent> for App {
                     inner.drag_anchor = cell;
                     inner.dragging = true;
                     inner.drag_moved = false;
+                    // Start a fresh latch (terminal-scroll D6). The drag freezes the
+                    // viewport while `scrollback` D2's auto-increment keeps drifting it,
+                    // so any snap raised in that window is recorded here and replayed on
+                    // release rather than lost.
+                    inner.drag_latch = DragLatch::default();
                 }
             }
 
@@ -1042,6 +1229,17 @@ impl ApplicationHandler<UserEvent> for App {
                     inner.tabs.active_mut().terminal.clear_selection();
                     inner.redraw();
                 }
+                // Replay whatever the drag swallowed (terminal-scroll D6). Without this
+                // the suppression is permanent: output drifts `view_offset` past
+                // SNAP_FLOOR while the button is down, so D12 could never fire again —
+                // and a command typed mid-drag would sit in a frozen screen.
+                // The snap lands on the tab that earned it, which need not be the
+                // active one (R9.4): output can arrive in a background tab, and an IME
+                // commit routes to the tab its composition began in.
+                let latch = std::mem::take(&mut inner.drag_latch);
+                if let Some(id) = drag_release_snap(latch) {
+                    inner.snap_tab_to_live(id);
+                }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1051,12 +1249,22 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 let inp = inner.sidebar_input();
                 let collapsed = inner.collapsed();
-                let new_scroll = wheel_scroll(wd, inner.last_cursor, inner.scroll, &inp, collapsed);
-                if new_scroll != inner.scroll {
-                    inner.scroll = new_scroll;
-                    inner.publish_scroll();
-                    inner.refresh_hover(); // the list moved under the pointer (D8)
-                    inner.window.request_redraw(); // sidebar-only change (D7)
+                // ONE ordered hit-test owns the routing (terminal-scroll D1). `None` is
+                // the grid — which deliberately includes the band above `top_inset`
+                // (`cursor_cell` would reject it, making a visible strip inert for no
+                // visible reason) and the whole window when the sidebar is collapsed.
+                let p = [inner.last_cursor.0 as f32, inner.last_cursor.1 as f32];
+                if sidebar_layout::hit_test(p, inner.scroll, &inp, collapsed).is_some() {
+                    let new_scroll =
+                        wheel_scroll(wd, inner.last_cursor, inner.scroll, &inp, collapsed);
+                    if new_scroll != inner.scroll {
+                        inner.scroll = new_scroll;
+                        inner.publish_scroll();
+                        inner.refresh_hover(); // the list moved under the pointer (D8)
+                        inner.window.request_redraw(); // sidebar-only change (D7)
+                    }
+                } else {
+                    inner.wheel_grid(wd);
                 }
             }
 
@@ -1155,6 +1363,98 @@ fn err<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
     e: E,
 ) -> Box<dyn std::error::Error + Send + Sync> {
     e.into()
+}
+
+/// How close to the live bottom a viewport must be for new output to snap it back
+/// (terminal-scroll D12). Three lines — one wheel notch, `input::LINES_PER_NOTCH` —
+/// so it means "you didn't mean to be here". Kept a plain `usize` rather than derived
+/// from that `f32` so no const float cast is involved.
+const SNAP_FLOOR: usize = 3;
+
+/// Whether new output should return this viewport to the live bottom, from the offset
+/// **sampled before the drain** (terminal-scroll D12).
+///
+/// A bounded exception to `scrollback` D2's pinning. tmux's pin is tolerable because
+/// copy-mode is modal, marked, and exits with `q`; ours is non-modal with no indicator,
+/// so a stray trackpad brush or a few px of inertial residue parks the view at
+/// `view_offset == 1` — visually identical to live on a 40-row grid — and from there the
+/// terminal is silently frozen: a long build looks hung, and the instinctive "press a
+/// key" recovery injects a stray byte into the command line. Snapping from within one
+/// notch makes exactly that case self-healing while leaving every deliberate scroll of
+/// four lines or more pinned, so the tmux win survives.
+fn snap_on_output(offset_before_drain: usize) -> bool {
+    // `!= 0` is not part of the floor — it says a viewport already at the live bottom
+    // has nothing to snap. It can never *drift* off the bottom either: `feed_scroll`
+    // auto-increments only when `view_offset > 0` (`grid.rs:378-385`).
+    offset_before_drain != 0 && near_bottom(offset_before_drain)
+}
+
+/// Whether `offset` is within one wheel notch of the live bottom — D12's floor proper.
+///
+/// Split out from [`snap_on_output`] so the floor itself stays one named idea, separate
+/// from that rule's additional "and there is something to snap" clause.
+fn near_bottom(offset: usize) -> bool {
+    offset <= SNAP_FLOOR
+}
+
+/// What a left-drag swallowed while it held the pointer (terminal-scroll D6).
+///
+/// A drag freezes the viewport, because `CursorMoved` resolves the drag focus with
+/// `cursor_cell()` (viewport coords) while `Terminal::set_selection` stores live-grid
+/// coords — so *any* offset change mid-drag decouples "the row under my finger" from
+/// "the row I'm selecting". But suppressing without recording is a trap: `scrollback`
+/// D2's auto-increment keeps running in the frozen window, walking `view_offset` past
+/// `SNAP_FLOOR`, so a plain suppress would leave both snaps permanently disarmed. These
+/// two fields are what the release replays them against.
+///
+/// Each records **which tab** deferred a snap, and nothing else. In particular there is
+/// no press-time floor bit: D12's floor is evaluated once, at the source, against the
+/// receiving tab's own pre-drain offset (see the `PtyOutput` arm), so a snap only ever
+/// reaches this latch *having already qualified*. Re-applying the floor here — as the
+/// first two cuts did — could only ever subtract, and subtract on the wrong tab's
+/// position: a background tab whose snap had qualified was discarded whenever the
+/// *dragged* tab happened to sit far from the bottom.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DragLatch {
+    /// The tab whose output snap was swallowed — D12's `advanced` conjunct, which is
+    /// otherwise consumed and discarded per-event inside the window.
+    ///
+    /// Carries the **tab id**, not a bare flag: the deferred snap belongs to the tab
+    /// that received the output, which need not be the active one (R9.4 — "no
+    /// active-tab special case"). Replaying it on the active tab instead would yank a
+    /// tab that needed nothing to live *and* leave the real one drifting past
+    /// `SNAP_FLOOR` — the exact disarm this latch exists to prevent, one tab over.
+    /// Last swallowed wins; two different tabs deferring inside one drag is possible
+    /// but vanishingly rare, and either answer is defensible.
+    advanced_while_dragging: Option<TabId>,
+    /// The tab whose D4 write-boundary snap was swallowed (the user typed, pasted, or
+    /// committed while holding the button). Tab-carrying for the same reason: an
+    /// `Ime::Commit` routes to the tab the composition began in, which the user may
+    /// have already switched away from.
+    input_while_dragging: Option<TabId>,
+}
+
+/// **Which tab** releasing a drag must return to live, or `None` (terminal-scroll D6).
+///
+/// Replays both snap rules against what the drag swallowed, in order. D4 comes first
+/// and **ignores the floor**: its rule is unconditional, so re-applying only D12's
+/// (floor-gated) rule would be strictly narrower and could never stand in for it —
+/// scroll back 100 lines, press-drag, type a command, release, and the view would
+/// otherwise stay at 100 with the command already sent to zsh.
+///
+/// A deferred snap is replayed as-is because it already qualified where it was raised:
+/// `advanced_while_dragging` is set only from the `PtyOutput` arm's `advanced &&
+/// snap_on_output(pre_drain_offset)` gate, so "nothing was latched" is exactly how the
+/// no-trigger cases stay no-ops — a quiet drag at `view_offset == 2` latches nothing and
+/// so cannot jump to live (R6.4), and output during a drag that began 50 lines up fails
+/// the source gate and is never latched (R6.5).
+///
+/// Returns the id rather than a bare `bool` so the deferred snap lands on the tab that
+/// actually earned it (R9.4 — "whichever tab received the output, no active-tab special
+/// case"), which is not necessarily the tab being dragged.
+fn drag_release_snap(latch: DragLatch) -> Option<TabId> {
+    // D4 first: its rule is unconditional, so it can never be stood in for by D12's.
+    latch.input_while_dragging.or(latch.advanced_while_dragging)
 }
 
 /// Where an `Ime::Commit`'s bytes go (R8/D11).
@@ -1372,6 +1672,312 @@ mod tests {
         assert_eq!(
             commit_target(None, |_| unreachable!("no owner: existence is irrelevant")),
             CommitTarget::Active
+        );
+    }
+
+    // --- T5: the engine guarantees the wheel path leans on -----------------------
+    //
+    // These live in the app crate, not `crates/term-core/tests/`, because C1/R11.4
+    // require that crate's diff to stay empty. They read as consumer-contract tests:
+    // each is something `wheel_grid` / the snap paths silently depend on, and a
+    // term-core change that broke one would break scrolling with no app test noticing.
+
+    fn scroll_term(cols: u16, rows: u16) -> term_core::Terminal {
+        term_core::Terminal::new(
+            cols,
+            rows,
+            term_core::Color(0xE0E0E0),
+            term_core::Color(0x101010),
+        )
+    }
+
+    /// Feed `n` numbered lines ("0\r\n1\r\n…").
+    fn feed_lines(t: &mut term_core::Terminal, n: usize) {
+        for i in 0..n {
+            if i > 0 {
+                t.advance(b"\r\n");
+            }
+            t.advance(i.to_string().as_bytes());
+        }
+    }
+
+    fn top_row(t: &term_core::Terminal) -> String {
+        let snap = t.snapshot();
+        (0..snap.cols)
+            .map(|c| snap.cell(c, 0).map(|c| c.ch).unwrap_or(' '))
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// R5.1 — **the concrete win over Warp**, where the wheel under tmux did nothing at
+    /// all. While `?1049h` is active the wheel still reaches the primary-screen history
+    /// captured before the full-screen program took over.
+    ///
+    /// Scrolled a full screen here (`view_offset == rows`), which is the only offset
+    /// that yields an unspliced frame: below it the snapshot stacks frozen history on
+    /// the still-repainting alt screen, the artifact recorded in Known Gaps.
+    #[test]
+    fn the_wheel_reaches_frozen_primary_history_under_alt_screen() {
+        let mut t = scroll_term(4, 3);
+        feed_lines(&mut t, 6); // history: "0","1","2" — live: "3","4","5"
+        assert_eq!(t.history_len(), 3);
+
+        t.advance(b"\x1b[?1049h");
+        assert!(t.alt_screen());
+        feed_lines(&mut t, 10); // vim/tmux churn — retained by nothing
+
+        t.scroll_up(3);
+        assert_eq!(t.view_offset(), 3);
+        assert_eq!(
+            top_row(&t),
+            "0",
+            "the pre-tmux shell output is still reachable"
+        );
+    }
+
+    /// R5.2 — scrolling is display-only (`scrollback` D4). `Terminal` exposes no write
+    /// path from the scroll API at all, so the observable half is that the shell's
+    /// cursor never moves: were it otherwise, the shell and the screen would disagree
+    /// about where the next character lands.
+    #[test]
+    fn scrolling_never_moves_the_shell_cursor() {
+        let mut t = scroll_term(4, 3);
+        feed_lines(&mut t, 6);
+        let before = t.snapshot().cursor;
+        t.scroll_up(2);
+        assert_eq!(t.snapshot().cursor, before);
+        t.scroll_down(1);
+        assert_eq!(t.snapshot().cursor, before);
+        t.scroll_to_bottom();
+        assert_eq!(t.snapshot().cursor, before);
+    }
+
+    /// R10.1 — each tab owns its own `Terminal`, so a reading position is per-tab for
+    /// free. This is what makes the tab-switch accumulator reset (D3) the *only* code
+    /// a tab switch needs.
+    ///
+    /// Scope note: this asserts the *engine* property the per-tab guarantee rests on —
+    /// two `Terminal`s hold independent offsets. Driving a real A→B→A switch needs
+    /// `Tabs`, which spawns a PTY, so it is not reachable from a unit test.
+    #[test]
+    fn terminals_own_their_own_view_offset() {
+        let (mut a, mut b) = (scroll_term(4, 3), scroll_term(4, 3));
+        feed_lines(&mut a, 6);
+        feed_lines(&mut b, 6);
+        a.scroll_up(2);
+        assert_eq!(a.view_offset(), 2);
+        assert_eq!(b.view_offset(), 0, "the other tab stays where it was");
+    }
+
+    /// R10.2 — a resize while scrolled back keeps the position and cannot panic or read
+    /// out of bounds: `Grid::resize` leaves `view_offset` alone and the snapshot reads
+    /// history cells through `.get().unwrap_or(blank)`. History is not *reflowed* to the
+    /// new width — a documented gap owned by `specs/scrollback`, not this feature.
+    #[test]
+    fn resize_while_scrolled_keeps_the_position() {
+        let mut t = scroll_term(8, 4);
+        feed_lines(&mut t, 20);
+        t.scroll_up(5);
+        let before = t.view_offset();
+        assert_eq!(before, 5);
+
+        t.resize(4, 4); // narrower than the history was captured at
+        let snap = t.snapshot();
+        assert_eq!(snap.cols, 4);
+        assert_eq!(t.view_offset(), before, "the reading position survives");
+
+        t.resize(20, 6); // and wider
+        let snap = t.snapshot();
+        assert_eq!(snap.cols, 20);
+        assert_eq!(t.view_offset(), before);
+    }
+
+    /// terminal-scroll R9.1/R9.2/R9.5 — the whole floor rule, as a table.
+    #[test]
+    fn output_snaps_only_from_within_one_notch_of_the_bottom() {
+        // R9.5: already live — nothing to snap.
+        assert!(!snap_on_output(0));
+        // R9.1: the stray-brush band, where the screen looks identical to live.
+        assert!(snap_on_output(1));
+        assert!(snap_on_output(2));
+        assert!(snap_on_output(SNAP_FLOOR));
+        // R9.2: a deliberate scroll stays pinned — `scrollback` D2 keeps the content.
+        assert!(!snap_on_output(SNAP_FLOOR + 1));
+        assert!(!snap_on_output(40));
+        assert!(!snap_on_output(100_000));
+    }
+
+    /// terminal-scroll R11.2 — the release verdict over **every** latch state.
+    ///
+    /// Two distinct ids so the table pins *which* tab comes back, not merely that one
+    /// does (R9.4). There is no floor bit to enumerate: D12's floor is applied once, at
+    /// the source, so a latched `advanced` has already qualified and the "shouldn't
+    /// snap" cases are represented by `None` rather than by a false conjunct — see
+    /// [`the_source_gate_is_what_keeps_unqualified_output_out_of_the_latch`].
+    #[test]
+    fn drag_release_verdict_truth_table() {
+        let (out_tab, in_tab) = (TabId(11), TabId(22));
+        // (output latched, input latched, expected)
+        let cases = [
+            (false, false, None),         // R6.4/R6.5 — nothing was deferred
+            (false, true, Some(in_tab)),  // R6.2 — typed mid-drag, no floor applies
+            (true, false, Some(out_tab)), // R6.3/R6.6 — the deferred output snap's tab
+            (true, true, Some(in_tab)),   // both: D4 is checked first
+        ];
+        for (advanced, input, want) in cases {
+            let latch = DragLatch {
+                advanced_while_dragging: advanced.then_some(out_tab),
+                input_while_dragging: input.then_some(in_tab),
+            };
+            assert_eq!(
+                drag_release_snap(latch),
+                want,
+                "advanced={advanced} input={input}"
+            );
+        }
+    }
+
+    /// **R6.4/R6.5 — where the no-snap cases are actually enforced.** They are not a
+    /// false conjunct at release; they are the source gate refusing to latch at all.
+    /// Pinning it here keeps the truth table above from reading two ways: a `None` row
+    /// means "nothing qualified", never "something qualified and was then discarded".
+    ///
+    /// The mirror image is the bug this replaced: re-testing the floor at release used
+    /// the *dragged* tab's position, so a background tab's already-qualified snap was
+    /// thrown away whenever the dragged tab sat far from the bottom (R6.6).
+    #[test]
+    fn the_source_gate_is_what_keeps_unqualified_output_out_of_the_latch() {
+        // R6.5 — a viewport 50 lines up never qualifies, so nothing is ever latched.
+        assert!(
+            !snap_on_output(50),
+            "far from the bottom: no snap is raised"
+        );
+        // R6.4 — a quiet drag raises nothing at all; the latch stays empty.
+        assert_eq!(drag_release_snap(DragLatch::default()), None);
+        // R6.3/R6.6 — a viewport within one notch qualifies at the source, and whatever
+        // qualifies is replayed on release for *its own* tab.
+        assert!(snap_on_output(1));
+        let background = TabId(7);
+        assert_eq!(
+            drag_release_snap(DragLatch {
+                advanced_while_dragging: Some(background),
+                input_while_dragging: None,
+            }),
+            Some(background),
+            "a qualified snap is replayed regardless of where the dragged tab sits"
+        );
+    }
+
+    /// **R9.4 — the tab-identity regression.** The latch defers a snap; replaying it on
+    /// whoever happens to be *active* was the first cut, and it fails twice over: the
+    /// active tab is yanked to live having earned nothing, while the tab that actually
+    /// received the output stays scrolled and drifts past `SNAP_FLOOR` — the very disarm
+    /// D6 exists to prevent, reproduced one tab over. Reachable by scrolling tab B back,
+    /// switching to A, and drag-selecting in A while B keeps printing.
+    #[test]
+    fn the_release_snaps_the_tab_that_earned_it_not_the_active_one() {
+        let background = TabId(7);
+        let latch = DragLatch {
+            advanced_while_dragging: Some(background), // output landed in a background tab
+            input_while_dragging: None,
+        };
+        assert_eq!(
+            drag_release_snap(latch),
+            Some(background),
+            "the deferred snap belongs to the tab that received the output"
+        );
+
+        // Same for D4: an IME commit routes to the tab its composition began in, which
+        // the user may already have switched away from.
+        let composing_tab = TabId(3);
+        let latch = DragLatch {
+            advanced_while_dragging: None,
+            input_while_dragging: Some(composing_tab),
+        };
+        assert_eq!(drag_release_snap(latch), Some(composing_tab));
+    }
+
+    /// **R6.2 — the one-directional gap that makes replaying D12's rule alone wrong.**
+    ///
+    /// D4's snap has no floor; D12's is gated at `SNAP_FLOOR`. So a release that only
+    /// re-applied the floor-gated rule could never stand in for the unconditional one:
+    /// scroll back 100 lines, press-drag, type a command, release — and the view would
+    /// stay at 100 with the command already sent to zsh, which is exactly the "typed
+    /// into a frozen screen, terminal looks dead" failure D4 exists to prevent.
+    #[test]
+    fn typing_mid_drag_snaps_on_release_even_from_far_up() {
+        let tab = TabId(5);
+        let far_from_bottom = DragLatch {
+            // Pressed at view_offset == 100 — irrelevant to D4, which has no floor.
+            advanced_while_dragging: None,
+            input_while_dragging: Some(tab), // typed a command while holding
+        };
+        assert_eq!(
+            drag_release_snap(far_from_bottom),
+            Some(tab),
+            "D4 is unconditional — the floor must not gate it"
+        );
+    }
+
+    /// **R6.3 — the disarm this latch exists to prevent.** A stray brush parks the view
+    /// at 1 (indistinguishable from live); the user drags to select and nothing
+    /// highlights, because selections don't render off-bottom; output streams and D2's
+    /// auto-increment walks the offset past the floor. Re-testing the floor at release
+    /// would judge the *drifted* value, decline, and leave the terminal silently frozen
+    /// for good — so the release replays the qualified snap instead of re-deciding it.
+    ///
+    /// Scope note: this pins the **verdict function** over a hand-built latch. That the
+    /// floor was applied at the source, pre-drain, is a property of the `PtyOutput` call
+    /// site, which needs a live PTY and is not reachable here.
+    #[test]
+    fn a_snap_deferred_by_a_drag_survives_the_drift() {
+        let tab = TabId(2);
+        let qualified_at_offset_1 = DragLatch {
+            advanced_while_dragging: Some(tab), // qualified at the source, then deferred
+            input_while_dragging: None,
+        };
+        assert_eq!(drag_release_snap(qualified_at_offset_1), Some(tab));
+        // What re-deciding on the drifted offset would have concluded instead.
+        assert!(
+            !snap_on_output(15),
+            "the drifted value fails the floor — which is why it is not re-tested"
+        );
+    }
+
+    /// **R9.3 — the predicate half of the pre-drain rule.** `scrollback` D2 auto-increments
+    /// `view_offset` in `feed_scroll` to pin the content being read, so a viewport parked
+    /// at 2 that receives a 10-line burst reads 12 once the drain returns: the same
+    /// situation yields opposite verdicts depending on which value is fed in.
+    ///
+    /// Scope note: this pins the *predicate*, not the sampling **location**. That the
+    /// call site reads `view_offset()` before `s.drain()` is enforced by the ordering
+    /// inside the `by_id_mut` closure in the `PtyOutput` arm, which needs a live PTY and
+    /// cannot be reached from a unit test — so this test would still pass if that line
+    /// moved. C8 is the standing guard there.
+    #[test]
+    fn snap_on_output_rejects_a_drifted_offset() {
+        let parked = 2;
+        let burst = 10;
+        assert!(
+            snap_on_output(parked),
+            "pre-drain: within the floor, so the view self-heals"
+        );
+        assert!(
+            !snap_on_output(parked + burst),
+            "post-drain: the very same situation now reads as a deliberate scroll"
+        );
+    }
+
+    /// The floor means "one wheel notch" (D12). Nothing enforces that at the type level,
+    /// so retuning `LINES_PER_NOTCH` would silently desynchronise it — this is the check
+    /// that fails loudly instead.
+    #[test]
+    fn the_snap_floor_stays_one_wheel_notch() {
+        assert_eq!(
+            SNAP_FLOOR as f32,
+            crate::input::LINES_PER_NOTCH,
+            "SNAP_FLOOR must track LINES_PER_NOTCH — D12 defines it as one notch"
         );
     }
 }

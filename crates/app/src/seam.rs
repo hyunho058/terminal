@@ -45,6 +45,15 @@ pub struct KeyInput {
 /// shell, read tab state, request a redraw. Deliberately narrow (D4).
 pub struct AppCtx<'a> {
     /// The active tab's PTY writer.
+    ///
+    /// **Invariant: user-originated bytes only** (terminal-scroll D4). Anything written
+    /// here is treated as "the user typed something and expects to see it echoed", and
+    /// snaps a scrolled-back viewport to the live bottom. A handler that needs to write
+    /// for a *non-echo* reason — a shell-integration query, a mode probe, an OSC cwd
+    /// request — must NOT reuse this: it would silently yank the reader out of the
+    /// history they were looking at, with nothing at the call site to hint at it. Add an
+    /// `AppCtx::write_silent()` that bypasses [`WriteProbe`] instead. (Not built yet: it
+    /// would be dead code until the first such handler exists.)
     pub writer: &'a mut dyn Write,
     /// Number of open tabs.
     pub tab_count: usize,
@@ -133,6 +142,51 @@ pub trait Overlay {
     /// The active tab changed; re-point anything cwd-derived (ai-monitor R3.1).
     /// Default: no-op.
     fn on_active_changed(&mut self, _cwd: Option<PathBuf>) {}
+}
+
+/// A `Write` that records whether anything was written through it (terminal-scroll D4).
+///
+/// This is how "user input reached the shell" is detected without classifying
+/// keystrokes. Classifying was tried first and is provably wrong: `Ime::Commit` writes
+/// from a different `WindowEvent` arm that `on_key` never sees (so every CJK keystroke
+/// would type into a frozen screen), and Cmd+V paste writes from a *registered handler*,
+/// two dispatch steps before the default path. Wrapping the writer catches both, and any
+/// future handler, with no change to the handlers themselves.
+///
+/// Its predicate ("bytes reached the PTY") is a proxy for the real one ("the user typed
+/// something"). They come apart for a handler that writes for a non-echo reason — see
+/// the invariant documented on [`AppCtx::writer`], which is what keeps them aligned.
+pub struct WriteProbe<'w> {
+    inner: &'w mut dyn Write,
+    wrote: bool,
+}
+
+impl<'w> WriteProbe<'w> {
+    pub fn new(inner: &'w mut dyn Write) -> Self {
+        WriteProbe {
+            inner,
+            wrote: false,
+        }
+    }
+
+    /// Whether any byte was written through this probe during the dispatch.
+    pub fn wrote(&self) -> bool {
+        self.wrote
+    }
+}
+
+impl Write for WriteProbe<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        // Only a write that actually moved bytes counts — a zero-length write is not
+        // the user typing.
+        self.wrote |= n > 0;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Ordered list of input handlers, consulted before default tab input (R3.3).
@@ -252,6 +306,50 @@ mod tests {
             }
             self.0
         }
+    }
+
+    /// terminal-scroll R4.3/R11.3 — a handler that sends the user's bytes to the shell
+    /// is detected at the **write boundary**, with the handler knowing nothing about
+    /// scrollback. This is what makes Cmd+V paste snap the viewport without editing
+    /// `clipboard.rs`, and what a keystroke-classification rule could never do: paste
+    /// is consumed two dispatch steps before the default path ever runs.
+    #[test]
+    fn write_probe_sees_a_handler_write_without_the_handler_knowing() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut router = InputRouter::default();
+        router.register(Box::new(Fixed(Handled::Consumed, true)));
+        let mut probe = WriteProbe::new(&mut buf);
+        let mut ctx = AppCtx::new(&mut probe, 1, 0, None);
+        assert_eq!(router.dispatch(&key("v"), &mut ctx), Handled::Consumed);
+        assert!(probe.wrote(), "a paste-shaped write must be seen");
+        assert_eq!(buf, b"X", "and must still reach the PTY unchanged");
+    }
+
+    /// The other half: a handler that consumes the key *without* writing — Cmd+C copy,
+    /// an overlay toggle — must not trip the probe. Those are things a user does while
+    /// reading history, and snapping there would fight them.
+    #[test]
+    fn write_probe_ignores_a_consuming_handler_that_writes_nothing() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut router = InputRouter::default();
+        router.register(Box::new(Fixed(Handled::Consumed, false)));
+        let mut probe = WriteProbe::new(&mut buf);
+        let mut ctx = AppCtx::new(&mut probe, 1, 0, None);
+        assert_eq!(router.dispatch(&key("c"), &mut ctx), Handled::Consumed);
+        assert!(
+            !probe.wrote(),
+            "consuming a key is not writing to the shell"
+        );
+        assert!(buf.is_empty());
+    }
+
+    /// A write that moved no bytes is not the user typing.
+    #[test]
+    fn write_probe_ignores_a_zero_byte_write() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut probe = WriteProbe::new(&mut buf);
+        assert_eq!(probe.write(b"").unwrap(), 0);
+        assert!(!probe.wrote());
     }
 
     #[test]
