@@ -24,7 +24,7 @@ mod shell_integration;
 pub mod snapshot;
 
 pub use error::{Error, Result};
-pub use grid::{Cell, CellAttrs, Color, CommandEnd, Cursor, Grid};
+pub use grid::{Cell, CellAttrs, Color, CommandEnd, Cursor, Grid, MouseEncoding, MouseProtocol};
 pub use image::{Decoded, ImageLayer, Placement};
 pub use pty::Pty;
 pub use scrollback::History;
@@ -134,6 +134,39 @@ impl Terminal {
     /// [`app_cursor_keys`](Terminal::app_cursor_keys): the renderer never reads it.
     pub fn bracketed_paste(&self) -> bool {
         self.grid.bracketed_paste()
+    }
+
+    /// Which mouse events the running application asked for (`?9`/`?1000`/`?1002`/
+    /// `?1003`). The app reads this to decide whether a wheel gesture becomes a
+    /// mouse report for the application or a scrollback move for the terminal.
+    pub fn mouse_protocol(&self) -> MouseProtocol {
+        self.grid.mouse_protocol()
+    }
+
+    /// How mouse reports should be encoded (`?1006` → SGR, else X10).
+    pub fn mouse_encoding(&self) -> MouseEncoding {
+        self.grid.mouse_encoding()
+    }
+
+    /// The active DECSTBM scroll region as an inclusive 0-based `(top, bottom)`
+    /// row pair (vt-tui-completeness R1). A full-screen region is `(0, rows - 1)`.
+    pub fn scroll_region(&self) -> (u16, u16) {
+        self.grid.scroll_region()
+    }
+
+    /// Whether DECAWM autowrap (`?7h`) is on.
+    pub fn autowrap(&self) -> bool {
+        self.grid.autowrap()
+    }
+
+    /// Whether the last printed character landed in the final column and left its
+    /// wrap deferred (vt-tui-completeness R7.1).
+    ///
+    /// An accessor rather than a [`GridSnapshot`] field, for the same reason as
+    /// [`app_cursor_keys`](Terminal::app_cursor_keys): the renderer never reads it,
+    /// and the snapshot is the *renderer* contract.
+    pub fn pending_wrap(&self) -> bool {
+        self.grid.pending_wrap()
     }
 
     /// Set the live drag selection (the app drives this from the mouse — see the

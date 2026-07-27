@@ -48,8 +48,8 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
 use crate::input::{
-    encode_key, pixel_to_cell, sidebar_hover, sidebar_press, suppress_key, tab_action, wheel_lines,
-    wheel_scroll, SidebarAction, TabAction, WheelDelta,
+    encode_key, pixel_to_cell, sidebar_hover, sidebar_press, suppress_key, tab_action, wheel_bytes,
+    wheel_lines, wheel_scroll, SidebarAction, TabAction, WheelDelta,
 };
 use crate::seam::{
     AppCtx, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayHost, WriteProbe,
@@ -846,17 +846,44 @@ impl Running {
         if n == 0 {
             return; // sub-line residue banked, or a rejected delta (D9)
         }
-        let term = &mut self.tabs.active_mut().terminal;
-        let before = term.view_offset();
-        if n > 0 {
-            term.scroll_up(n as usize); // positive y = into history (D2)
-        } else {
-            // `unsigned_abs` so `i32::MIN` cannot overflow the negation.
-            term.scroll_down(n.unsigned_abs() as usize);
-        }
-        let moved = term.view_offset() != before;
-        if moved {
-            self.redraw();
+        // ONE exhaustive match, deliberately with no early return: the two
+        // destinations are mutually exclusive, and an `if consumed { return }` shape
+        // made "forget the return" a silent bug that writes to the PTY *and* scrolls
+        // the viewport — a bug no test could catch, since `wheel_grid` needs a real
+        // window. As a match, that state is simply unrepresentable.
+        //
+        // An application that asked for the wheel gets it (alt-screen-scroll): that
+        // is what makes the wheel work inside Claude Code, which enables `?1000`/
+        // `?1002`/`?1003` and scrolls its own transcript from the report. Everyone
+        // else — including an untracked alt-screen app — keeps the scrollback
+        // viewport (`terminal-scroll` R5.1).
+        let term = &self.tabs.active().terminal;
+        let cell = self.cursor_cell().unwrap_or((0, 0));
+        match wheel_bytes(
+            term.mouse_protocol().is_on(),
+            term.mouse_encoding(),
+            n,
+            cell,
+        ) {
+            Some(bytes) => {
+                if let Err(e) = self.tabs.active_mut().write(&bytes) {
+                    tracing::warn!("pty write failed: {e}");
+                }
+            }
+            None => {
+                let term = &mut self.tabs.active_mut().terminal;
+                let before = term.view_offset();
+                if n > 0 {
+                    term.scroll_up(n as usize); // positive y = into history (D2)
+                } else {
+                    // `unsigned_abs` so `i32::MIN` cannot overflow the negation.
+                    term.scroll_down(n.unsigned_abs() as usize);
+                }
+                let moved = term.view_offset() != before;
+                if moved {
+                    self.redraw();
+                }
+            }
         }
     }
 
