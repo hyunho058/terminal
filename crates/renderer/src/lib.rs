@@ -11,6 +11,7 @@
 //! implicit z=0 layer, and registered layers draw after it in `z_order`.
 
 pub mod atlas;
+pub mod box_draw;
 pub mod cursor_layer;
 pub mod font_set;
 pub mod glyph;
@@ -920,6 +921,20 @@ fn build_bg_instances(snapshot: &GridSnapshot, bg_default: u32) -> Vec<BgInstanc
     out
 }
 
+/// The center UV of an atlas entry — the sample point for a solid-fill quad.
+///
+/// Sampling the *center* of the 2×2 block matters: at an edge texel, linear
+/// filtering would blend in a neighbouring glyph's coverage and the fill would come
+/// out patchy along its border. Used by the underline rule and every procedural
+/// box-drawing rect, which are the two paths that draw a flat color rather than a
+/// glyph shape.
+fn center_uv(entry: &atlas::GlyphEntry) -> [f32; 2] {
+    [
+        (entry.uv0[0] + entry.uv1[0]) * 0.5,
+        (entry.uv0[1] + entry.uv1[1]) * 0.5,
+    ]
+}
+
 /// Fraction a DIM cell's foreground is mixed toward its background.
 const DIM_MIX: f32 = 0.45;
 
@@ -1079,15 +1094,33 @@ fn build_glyph_instances(
 
     let mut out = Vec::new();
     let mut shape_ctx = ShapeContext::new();
+    // Box-drawing cells collected during the row walk and drawn after it (D2/D8).
+    // Deferred for the same reason the underline pass is: the shaping closure below
+    // holds a mutable borrow of the atlas, and these need one too.
+    let mut procedural: Vec<(box_draw::Glyph, u16, u16)> = Vec::new();
     for row in 0..snapshot.rows {
         let RowChars { chars, char_col } = row_chars(snapshot, row);
         // Resolve every char to a face first (D2/D16): `resolve` borrows the atlas
         // immutably while the shaping closure below borrows it mutably, and the
         // face is an *input* to shaping, so it has to be decided up front.
-        let faces: Vec<Option<usize>> = chars
+        let mut faces: Vec<Option<usize>> = chars
             .iter()
             .map(|&c| atlas.resolve(c).map(|key| key.face as usize))
             .collect();
+        // D8: take box-drawing characters out of the shaping input by marking their
+        // face `None` — `split_runs` then yields a run the loop below already skips.
+        // Marking rather than *removing* is what keeps `chars`, `char_col` and the
+        // run-relative byte map in sync; deleting an element would desync every
+        // column after it (the hazard documented at the byte_col build below).
+        //
+        // Splitting a face-0 run here moves nothing: `pen` is reset per cluster to
+        // `col * cw + offset`, and `center_offset(0, ..)` is always 0.0.
+        for (i, &c) in chars.iter().enumerate() {
+            if let Some(glyph) = box_draw::classify(c) {
+                faces[i] = None;
+                procedural.push((glyph, char_col[i], row));
+            }
+        }
         let baseline = row as f32 * ch + ascent;
 
         for run in split_runs(&faces) {
@@ -1169,6 +1202,56 @@ fn build_glyph_instances(
         }
     }
 
+    // Procedural box-drawing pass (D2/D4/D7): the cells taken out of shaping above,
+    // drawn as quads snapped to the cell rect. Because every rect comes from
+    // `box_draw`'s `band`/`snap` — pure functions of the cell size — two adjacent
+    // cells compute a shared edge from identical inputs, which is what removes the
+    // seams that per-glyph rasterization leaves.
+    for (glyph, col, row) in procedural {
+        // Style comes from the cell, exactly as it does for a shaped glyph (D11), so
+        // box art honours reverse-video and dim instead of ignoring them.
+        let Some(cell) = snapshot.cell(col, row) else {
+            continue;
+        };
+        let color = glyph_color(cell);
+        let (x, y) = (col as f32 * cw, row as f32 * ch);
+
+        match glyph {
+            // `░▒▓`: one whole-cell quad on a partial-coverage entry. The shader
+            // multiplies that coverage into rgb and alpha alike, so this is a
+            // correct premultiplied 25/50/75% fill — and it composites over an
+            // inline image the way a blend toward the cell background would not.
+            box_draw::Glyph::Shade(level) => {
+                let Some(entry) = atlas.shade_entry(queue, level) else {
+                    continue;
+                };
+                out.push(GlyphInstance {
+                    pos: [x, y],
+                    size: [cw, ch],
+                    uv0: center_uv(&entry),
+                    uv1: center_uv(&entry),
+                    color,
+                    _pad: 0.0,
+                });
+            }
+            _ => {
+                let bold = cell.attrs.contains(CellAttrs::BOLD);
+                let entry = atlas.solid_entry(queue);
+                let uv = center_uv(&entry);
+                for r in box_draw::rects(cell.ch, x, y, cw, ch, bold) {
+                    out.push(GlyphInstance {
+                        pos: [r.x0, r.y0],
+                        size: [r.width(), r.height()],
+                        uv0: uv,
+                        uv1: uv,
+                        color,
+                        _pad: 0.0,
+                    });
+                }
+            }
+        }
+    }
+
     // Underline pass (R5.3): a solid rule below the baseline of each UNDERLINE
     // cell, drawn in the glyph pass via the atlas's opaque solid entry. Kept
     // separate so it doesn't borrow `atlas` inside the shaping closure.
@@ -1183,9 +1266,7 @@ fn build_glyph_instances(
                 continue;
             }
             let e = atlas.solid_entry(queue);
-            // Sample the block center so linear filtering never picks up a
-            // neighboring non-opaque texel — a constant 255 coverage → solid fill.
-            let uv = [(e.uv0[0] + e.uv1[0]) * 0.5, (e.uv0[1] + e.uv1[1]) * 0.5];
+            let uv = center_uv(&e);
             out.push(GlyphInstance {
                 pos: [col as f32 * cw, underline_y],
                 size: [cw, thickness],
@@ -1805,6 +1886,597 @@ mod tests {
             assert_eq!((a.uv0, a.uv1), (b.uv0, b.uv1));
             assert_eq!(a.color, b.color);
         }
+    }
+
+    /// Build the grid's instances for `input` on a `cols`×`rows` snapshot, at the
+    /// 14pt @2x reference cell. `None` when this machine has no GPU or font.
+    fn instances_for(input: &str, cols: u16, rows: u16) -> Option<(Vec<GlyphInstance>, f32, f32)> {
+        let (device, queue) = headless()?;
+        let fonts = fonts()?;
+        let mut atlas = Atlas::new(&device, &fonts, 32.0)?;
+        let mut t =
+            term_core::Terminal::new(cols, rows, term_core::Color(0xFFFFFF), term_core::Color(0));
+        t.advance(input.as_bytes());
+        let snap = t.snapshot();
+        let (cw, ch) = (17.0f32, 34.0f32);
+        Some((
+            build_glyph_instances(&mut atlas, &queue, &fonts, false, (cw, ch), 32.0, &snap),
+            cw,
+            ch,
+        ))
+    }
+
+    #[test]
+    fn adjacent_box_stems_share_an_exact_edge() {
+        // R0.1: the goal, end to end. Three `─` cells must tile with no gap and no
+        // overlap — the seam the font path leaves is exactly what this removes.
+        let Some((got, cw, _)) = instances_for("───", 6, 1) else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let mut spans: Vec<(f32, f32)> = got
+            .iter()
+            .map(|i| (i.pos[0], i.pos[0] + i.size[0]))
+            .collect();
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(
+            spans.len(),
+            3,
+            "one quad per `─` cell — opposing arms merge"
+        );
+        // Coalesce touching spans. Three separate cells collapsing to a single run
+        // is the seamlessness claim: any gap at a cell join leaves two runs here.
+        let merged: Vec<(f32, f32)> = spans.iter().fold(Vec::new(), |mut acc, &(s, e)| {
+            match acc.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => acc.push((s, e)),
+            }
+            acc
+        });
+        assert_eq!(
+            merged,
+            vec![(0.0, 3.0 * cw)],
+            "three `─` cells must merge into one unbroken run"
+        );
+        // Every quad sits on the identical y band.
+        let ys: Vec<(u32, u32)> = got
+            .iter()
+            .map(|i| (i.pos[1].to_bits(), i.size[1].to_bits()))
+            .collect();
+        assert!(ys.windows(2).all(|w| w[0] == w[1]), "one shared band");
+    }
+
+    #[test]
+    fn vertically_adjacent_box_stems_share_an_exact_edge() {
+        // R0.3: the same claim on the other axis — `│` over `│`.
+        let Some((got, _, ch)) = instances_for("│\r\n│", 4, 2) else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        assert_eq!(got.len(), 2, "one quad per stem");
+        let mut spans: Vec<(f32, f32)> = got
+            .iter()
+            .map(|i| (i.pos[1], i.pos[1] + i.size[1]))
+            .collect();
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(spans[0], (0.0, ch));
+        assert_eq!(spans[1], (ch, 2.0 * ch), "abuts exactly, no gap or overlap");
+        assert_eq!(got[0].pos[0], got[1].pos[0], "same x band");
+        assert_eq!(got[0].size[0], got[1].size[0]);
+    }
+
+    #[test]
+    fn a_box_char_is_not_shaped() {
+        // R1.2: the interception actually bypasses swash. A `─` cell emits quads
+        // whose UVs are the solid entry's center point (uv0 == uv1) — a shaped
+        // glyph always spans a real UV rect.
+        let Some((got, _, _)) = instances_for("─", 4, 1) else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        assert!(!got.is_empty());
+        for i in &got {
+            assert_eq!(i.uv0, i.uv1, "a solid fill samples one point, not a rect");
+        }
+
+        // R8.3: and that point must be the entry's CENTER, not just any single
+        // texel — a corner sample would also satisfy `uv0 == uv1` while picking up
+        // a neighbouring glyph's coverage under linear filtering.
+        let (device, queue) = headless().expect("checked above");
+        let fonts = fonts().expect("checked above");
+        let mut atlas = Atlas::new(&device, &fonts, 32.0).expect("atlas");
+        let entry = atlas.solid_entry(&queue);
+        assert_eq!(
+            got[0].uv0,
+            center_uv(&entry),
+            "procedural quads must sample the solid block's center"
+        );
+    }
+
+    #[test]
+    fn sibling_layers_still_shape_box_chars_through_the_font() {
+        // R8.5 / D9: interception is the GRID's behaviour only. A sidebar row or
+        // overlay containing `─` draws it at its own non-cell-snapped position, so
+        // cell-snapped rects would be meaningless there — those layers must keep
+        // resolving the character through the atlas like any other glyph.
+        let Some((device, queue)) = headless() else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        let Some(fonts) = fonts() else {
+            eprintln!("skipping: no font");
+            return;
+        };
+        let mut atlas = Atlas::new(&device, &fonts, 32.0).expect("atlas");
+
+        // The sibling text path resolves box characters to a real rasterized glyph
+        // — a UV *rect*, where a procedural quad collapses to one sampled point.
+        for ch in ['─', '│', '█'] {
+            let key = atlas.resolve(ch).expect("the primary covers the range");
+            let entry = atlas
+                .get_or_insert_styled(&queue, key)
+                .unwrap_or_else(|| panic!("{ch:?} must rasterize for the text layers"));
+            assert_ne!(
+                (entry.uv0[0], entry.uv0[1]),
+                (entry.uv1[0], entry.uv1[1]),
+                "{ch:?} must still rasterize as a shaped glyph for the text layers"
+            );
+        }
+
+        // The above is a property of `Atlas`, not proof that the sibling layers
+        // decline to intercept. THIS is that proof, and it is what actually fails if
+        // one of them starts: interception exists only where `box_draw` is consulted,
+        // and it is consulted from exactly one module. `sidebar_row` calling
+        // `box_draw::classify` would break this immediately.
+        //
+        // (`push_glyphs` in `sidebar_row` is private and needs a live `FrameCtx`, so
+        // driving it directly would cost a GPU harness for a weaker guarantee than
+        // this structural one.)
+        // Derived from the source directory rather than a hardcoded list, so a
+        // module added later is covered automatically instead of escaping silently.
+        let src_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(src_dir).expect("the crate's own src/ dir") {
+            let path = entry.expect("a readable dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            // The grid path and the module itself are the two places allowed to
+            // know about box_draw.
+            if name == "lib.rs" || name == "box_draw.rs" {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("a readable source file");
+            assert!(
+                !src.contains("box_draw"),
+                "{name} references box_draw — interception must stay in the grid \
+                 path (D9); sibling layers draw at their own unsnapped positions \
+                 where cell-snapped rects are meaningless"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 8,
+            "expected to scan the sibling modules, only saw {checked} — the walk \
+             is not finding the source tree"
+        );
+    }
+
+    // R8.6 (cursor/selection compositing over a procedural quad) has **no test of
+    // its own**, deliberately. Its two halves are each already covered elsewhere and
+    // a test here would only restate them:
+    //   * z-order — `selection_layer::SELECTION_Z` / `cursor_layer::CURSOR_Z` are
+    //     compile-time constants, already asserted by
+    //     `selection_layer::tests::z_order_above_glyph_and_below_cursor`.
+    //   * "neither layer re-renders the cell's character" — read from the layers
+    //     themselves (`cursor_layer.rs:3`, `selection_layer.rs:9`): both draw a
+    //     translucent quad over the cell rect and never touch the atlas.
+    // Restating either here would add a passing test and no failure mode. The
+    // residual — that the composite *looks* right on screen — is a visual check,
+    // recorded as post-work in the spec rather than faked as a unit test.
+
+    #[test]
+    fn a_diagonal_still_shapes_through_the_font() {
+        // R1.3: `╱` is the sole fallthrough. It must still come out as a real glyph
+        // — a UV *rect*, not the solid entry's collapsed sample point.
+        let Some((got, _, _)) = instances_for("╱", 4, 1) else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        if got.is_empty() {
+            eprintln!("skipping: the primary face does not cover U+2571");
+            return;
+        }
+        assert!(
+            got.iter().any(|i| i.uv0 != i.uv1),
+            "the diagonal must be a shaped glyph, not a procedural fill"
+        );
+    }
+
+    #[test]
+    fn procedural_quads_honour_reverse_and_dim() {
+        // R8.1/R8.2: box art must respond to the same attributes a glyph does —
+        // reverse-video swaps fg/bg, dim mixes toward the background.
+        let Some((device, queue)) = headless() else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        let Some(fonts) = fonts() else {
+            eprintln!("skipping: no font");
+            return;
+        };
+        let mut atlas = Atlas::new(&device, &fonts, 32.0).expect("atlas");
+        let mut t = term_core::Terminal::new(4, 1, term_core::Color(0xFFFFFF), term_core::Color(0));
+        // SGR 7 = reverse, then a box char.
+        t.advance("\x1b[7m│".as_bytes());
+        let snap = t.snapshot();
+        let got =
+            build_glyph_instances(&mut atlas, &queue, &fonts, false, (17.0, 34.0), 32.0, &snap);
+        assert!(!got.is_empty(), "the stem must draw");
+        let cell = snap.cell(0, 0).expect("a cell");
+        assert!(cell.attrs.contains(CellAttrs::REVERSE), "reverse is set");
+
+        // A plain `│` for comparison — without it, `color == glyph_color(cell)`
+        // would hold even if REVERSE were ignored everywhere, since both sides
+        // would then be the raw foreground.
+        let mut plain =
+            term_core::Terminal::new(4, 1, term_core::Color(0xFFFFFF), term_core::Color(0));
+        plain.advance("│".as_bytes());
+        let plain_snap = plain.snapshot();
+        let plain_cell = plain_snap.cell(0, 0).expect("a cell");
+        for i in &got {
+            assert_eq!(
+                i.color,
+                glyph_color(cell),
+                "the quad uses the cell's resolved color, not a raw fg"
+            );
+            assert_ne!(
+                i.color,
+                glyph_color(plain_cell),
+                "a REVERSE quad must not render in the un-swapped foreground"
+            );
+        }
+
+        // R8.2 — DIM, which the reverse case above does NOT exercise. Mixing toward
+        // the background must reach a procedural quad exactly as it reaches a glyph,
+        // so a dim frame reads as dim rather than full-strength.
+        let mut t = term_core::Terminal::new(4, 1, term_core::Color(0xFFFFFF), term_core::Color(0));
+        t.advance("\x1b[2m│".as_bytes()); // SGR 2 = dim
+        let dim_snap = t.snapshot();
+        let dim_cell = dim_snap.cell(0, 0).expect("a cell");
+        assert!(
+            dim_cell.attrs.contains(CellAttrs::DIM),
+            "the DIM attribute must actually be set, or this proves nothing"
+        );
+        let dim_got = build_glyph_instances(
+            &mut atlas,
+            &queue,
+            &fonts,
+            false,
+            (17.0, 34.0),
+            32.0,
+            &dim_snap,
+        );
+        assert!(!dim_got.is_empty(), "the dim stem must draw");
+
+        let mut plain =
+            term_core::Terminal::new(4, 1, term_core::Color(0xFFFFFF), term_core::Color(0));
+        plain.advance("│".as_bytes());
+        let plain_snap = plain.snapshot();
+        let plain_cell = plain_snap.cell(0, 0).expect("a cell");
+        for i in &dim_got {
+            assert_eq!(i.color, glyph_color(dim_cell), "dim colour must be applied");
+            assert_ne!(
+                i.color,
+                glyph_color(plain_cell),
+                "a DIM quad must not render at full foreground strength"
+            );
+        }
+    }
+
+    #[test]
+    fn shading_blocks_use_a_partial_coverage_entry() {
+        // R6.5 end to end: `▒` must land on a DIFFERENT atlas entry than a solid
+        // block — that difference is the only thing making it 50% rather than opaque.
+        // Both must be drawn into the SAME atlas: two fresh atlases would each pack
+        // their first block at the origin, so the UVs would collide for a reason
+        // that has nothing to do with coverage.
+        let Some((got, cw, ch)) = instances_for("▒█", 4, 1) else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        assert_eq!(got.len(), 2, "one quad each");
+        let shade = got.iter().find(|i| i.pos[0] == 0.0).expect("`▒` at col 0");
+        let solid = got.iter().find(|i| i.pos[0] == cw).expect("`█` at col 1");
+        assert_ne!(
+            (shade.uv0[0].to_bits(), shade.uv0[1].to_bits()),
+            (solid.uv0[0].to_bits(), solid.uv0[1].to_bits()),
+            "`▒` must sample a partial-coverage block, not the opaque one"
+        );
+        // Both still cover the whole cell.
+        assert_eq!(shade.size, [cw, ch]);
+        assert_eq!(solid.size, [cw, ch]);
+    }
+
+    /// Reference implementation of the **pre-interception** placement path.
+    ///
+    /// This resolves *every* character through `atlas.resolve`, exactly as the code
+    /// did before interception existed — so `abc─def` is shaped as ONE unbroken
+    /// face-0 run, not as `abc` / `def`. The box-drawing clusters it produces are
+    /// then dropped **by column**, leaving only the glyphs that must not have moved.
+    ///
+    /// That distinction is the entire point. An earlier version of this helper
+    /// marked box characters `None` here too, which reproduced the *post*-change run
+    /// split — so `want` and `got` came out of identical logic and the comparison
+    /// could not fail for the reason R9.1 states. It only caught column desync.
+    /// Shaping the unsplit run is what actually exercises D8's claim: that splitting
+    /// a face-0 run at a box character moves no surviving glyph, because `pen` is
+    /// reset per cluster to `col * cw + offset` and `center_offset(0, ..) == 0.0`.
+    fn reference_instances(
+        atlas: &mut Atlas,
+        queue: &wgpu::Queue,
+        fonts: &FontSet,
+        ligatures: bool,
+        cell: (f32, f32),
+        ppem: f32,
+        snapshot: &GridSnapshot,
+    ) -> Vec<GlyphInstance> {
+        let (cw, ch) = cell;
+        let ascent = ch * 0.8;
+        let liga: u16 = if ligatures { 1 } else { 0 };
+        let features = [("liga", liga), ("calt", liga)];
+        let mut out = Vec::new();
+        let mut shape_ctx = ShapeContext::new();
+        for row in 0..snapshot.rows {
+            let RowChars { chars, char_col } = row_chars(snapshot, row);
+            // Pre-change behaviour: no interception, so a box char the primary
+            // covers joins the surrounding face-0 run instead of splitting it.
+            let faces: Vec<Option<usize>> = chars
+                .iter()
+                .map(|&c| atlas.resolve(c).map(|key| key.face as usize))
+                .collect();
+            let baseline = row as f32 * ch + ascent;
+            for run in split_runs(&faces) {
+                let Some(face_index) = run.face else { continue };
+                let Some(font) = fonts
+                    .faces()
+                    .get(face_index)
+                    .and_then(|face| FontRef::from_index(&face.data, face.index))
+                else {
+                    continue;
+                };
+                let mut text = String::new();
+                let mut byte_col: Vec<u16> = Vec::new();
+                for i in run.start_char..run.end_char {
+                    let before = text.len();
+                    text.push(chars[i]);
+                    for _ in before..text.len() {
+                        byte_col.push(char_col[i]);
+                    }
+                }
+                let mut shaper = shape_ctx
+                    .builder(font)
+                    .size(ppem)
+                    .features(features.iter().copied())
+                    .build();
+                shaper.add_str(&text);
+                shaper.shape_with(|cluster| {
+                    let src = cluster.source.start as usize;
+                    let col = byte_col.get(src).copied().unwrap_or(0);
+                    // Drop the clusters that are now drawn procedurally — by COLUMN,
+                    // not by face, so the run above stays unsplit and the surviving
+                    // glyphs are placed exactly as they were before interception.
+                    let procedural = snapshot
+                        .cell(col, row)
+                        .map(|c| box_draw::classify(c.ch).is_some())
+                        .unwrap_or(false);
+                    if procedural {
+                        return;
+                    }
+                    let (color, bold, italic) = match snapshot.cell(col, row) {
+                        Some(c) => (
+                            glyph_color(c),
+                            c.attrs.contains(CellAttrs::BOLD),
+                            c.attrs.contains(CellAttrs::ITALIC),
+                        ),
+                        None => ([1.0; 3], false, false),
+                    };
+                    let adv: f32 = cluster.glyphs.iter().map(|g| g.advance).sum();
+                    let offset = center_offset(face_index, cell_span(snapshot, col, row), cw, adv);
+                    let mut pen = col as f32 * cw + offset;
+                    for g in cluster.glyphs {
+                        let key = GlyphKey {
+                            face: face_index as u16,
+                            id: g.id,
+                            bold,
+                            italic,
+                        };
+                        if let Some(entry) = atlas.get_or_insert_styled(queue, key) {
+                            out.push(GlyphInstance {
+                                pos: [pen + g.x + entry.left, baseline - entry.top],
+                                size: [entry.px_w, entry.px_h],
+                                uv0: entry.uv0,
+                                uv1: entry.uv1,
+                                color,
+                                _pad: 0.0,
+                            });
+                        }
+                        pen += g.advance;
+                    }
+                });
+            }
+        }
+        out
+    }
+
+    /// Assert every *shaped* instance in `input`'s row is placed identically to the
+    /// reference path — i.e. that interception moved nothing that still shapes.
+    ///
+    /// Procedural quads are identified by their collapsed UV (`uv0 == uv1`) and
+    /// excluded; everything else must match field for field.
+    fn assert_shaped_output_unchanged(input: &str, cols: u16, ligatures: bool) {
+        let (Some((device, queue)), Some(fonts)) = (headless(), fonts()) else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let mut atlas = Atlas::new(&device, &fonts, 32.0).expect("atlas");
+        let mut t =
+            term_core::Terminal::new(cols, 1, term_core::Color(0xFFFFFF), term_core::Color(0));
+        t.advance(input.as_bytes());
+        let snap = t.snapshot();
+        let cell = (17.0f32, 34.0f32);
+
+        // The whole test rests on the reference shaping an UNSPLIT run: if the
+        // primary face didn't cover the box characters, the pre-change path would
+        // have split there too and this would degenerate into comparing identical
+        // logic. Assert the premise instead of trusting it.
+        let box_chars: Vec<char> = input
+            .chars()
+            .filter(|&c| box_draw::classify(c).is_some())
+            .collect();
+        assert!(
+            !box_chars.is_empty(),
+            "{input:?}: no box character — nothing is being intercepted"
+        );
+        for &c in &box_chars {
+            assert!(
+                atlas.resolve(c).is_some(),
+                "{input:?}: the primary face does not cover {c:?}, so the reference \
+                 run would split anyway and this comparison proves nothing"
+            );
+        }
+
+        let got = build_glyph_instances(&mut atlas, &queue, &fonts, ligatures, cell, 32.0, &snap);
+        let want = reference_instances(&mut atlas, &queue, &fonts, ligatures, cell, 32.0, &snap);
+
+        let shaped: Vec<&GlyphInstance> = got.iter().filter(|i| i.uv0 != i.uv1).collect();
+        // Anti-vacuity: with no shaped glyphs on either side the comparison below
+        // is an empty loop and would "pass" while proving nothing.
+        assert!(
+            !want.is_empty(),
+            "{input:?}: the reference path produced no glyphs — test is vacuous"
+        );
+        assert!(
+            got.iter().any(|i| i.uv0 == i.uv1),
+            "{input:?}: no procedural quad was emitted — nothing was intercepted"
+        );
+        assert_eq!(
+            shaped.len(),
+            want.len(),
+            "{input:?}: shaped glyph count changed"
+        );
+        for (a, b) in shaped.iter().zip(&want) {
+            assert_eq!(a.pos, b.pos, "{input:?}: a shaped glyph moved");
+            assert_eq!(a.size, b.size, "{input:?}");
+            assert_eq!((a.uv0, a.uv1), (b.uv0, b.uv1), "{input:?}");
+            assert_eq!(a.color, b.color, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn ascii_is_unmoved_by_an_intercepted_neighbour() {
+        // R9.1: the byte-identical constraint. Splitting a face-0 run at `─` must
+        // move nothing — `pen` resets per cluster and `center_offset(0, ..)` is 0.0.
+        // Run with ligatures ON, because that is the case where a run split could
+        // in principle change shaping context.
+        assert_shaped_output_unchanged("abc─def", 12, true);
+        assert_shaped_output_unchanged("ab!=cd─ef", 16, true);
+        assert_shaped_output_unchanged("─abc", 8, true);
+        assert_shaped_output_unchanged("abc─", 8, true);
+        assert_shaped_output_unchanged("a─b─c─d", 12, true);
+    }
+
+    #[test]
+    fn ascii_is_unmoved_with_ligatures_off() {
+        // The default configuration (`font.ligatures = false`).
+        assert_shaped_output_unchanged("abc─def", 12, false);
+    }
+
+    #[test]
+    fn hangul_is_unmoved_by_an_intercepted_neighbour() {
+        // R9.2: the guarantee has to cover the fallback chain, not just face 0.
+        // `center_offset` for face > 0 reads the cluster's own advance and the lead
+        // cell's span — both per-cluster — so a new run boundary cannot move it.
+        assert_shaped_output_unchanged("한글─한글", 16, false);
+        assert_shaped_output_unchanged("한─a─글", 16, false);
+    }
+
+    #[test]
+    fn a_diagonal_is_unmoved() {
+        // R9.3: `╱` is the one character in the range still shaped; it must be
+        // placed exactly as before even with procedural neighbours.
+        assert_shaped_output_unchanged("─╱─", 8, false);
+    }
+
+    #[test]
+    fn wide_chars_keep_their_columns_beside_a_box_char() {
+        // R9.4: a double-width char occupies two columns but one `chars` entry, so
+        // a column/char index mix-up in the interception loop would desync every
+        // column after it. Marking `faces[i] = None` (rather than removing the
+        // element) is what prevents that — this pins it.
+        assert_shaped_output_unchanged("한─한", 12, false);
+
+        let Some((got, cw, _)) = instances_for("한─한", 12, 1) else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        // The box quad must land on column 2 — after the wide char's two columns —
+        // not on column 1 (its continuation spacer).
+        let procedural: Vec<&GlyphInstance> = got.iter().filter(|i| i.uv0 == i.uv1).collect();
+        assert!(!procedural.is_empty(), "the stem must draw");
+        for i in &procedural {
+            assert_eq!(
+                i.pos[0],
+                2.0 * cw,
+                "the box quad anchors to its own column, not the spacer's"
+            );
+        }
+    }
+
+    #[test]
+    fn cell_size_is_integral() {
+        // R10.1 / D10: every procedural rect is derived from `(col * cw, row * ch)`
+        // and rounded against `cw`/`ch`. Integral cell dimensions are what make a
+        // stem land on whole pixels and keep its width uniform across the screen.
+        //
+        // This invariant currently holds because `cell_size_px` rounds. The deferred
+        // `font.metrics()`-based cell sizing is exactly the change that could break
+        // it — if this test fails there, box art gets uneven stems, and THAT is the
+        // reason this assertion exists rather than a comment.
+        let mut cfg = Config::default();
+        for pt in [8.0f32, 10.0, 14.0, 18.0, 24.0, 32.0] {
+            for sf in [1.0f64, 2.0] {
+                cfg.font.size_pt = pt;
+                let (cw, ch) = cell_size_px(&cfg, sf);
+                assert_eq!(cw, cw.floor(), "cw not integral at {pt}pt @{sf}x");
+                assert_eq!(ch, ch.floor(), "ch not integral at {pt}pt @{sf}x");
+                assert!(cw >= 1.0 && ch >= 1.0, "degenerate cell at {pt}pt @{sf}x");
+            }
+        }
+    }
+
+    #[test]
+    fn no_box_drawing_config_key_exists() {
+        // R10.2 / D5: the procedural path is unconditional — there is no toggle.
+        //
+        // Expressed as an exhaustive struct literal rather than a parse check: a
+        // toggle would have to be a new `FontConfig` field, and adding one makes
+        // this fail to COMPILE with "missing field". That is a stronger guard than
+        // asserting a config string is rejected at runtime, and it costs the crate
+        // no new dependency.
+        let _no_toggle = common::config::FontConfig {
+            family: String::new(),
+            size_pt: 14.0,
+            ligatures: false,
+        };
+        // And the draw path takes no configuration beyond ligatures, so nothing
+        // could switch interception off even if a key existed.
+        assert!(box_draw::classify('─').is_some());
     }
 
     #[test]
