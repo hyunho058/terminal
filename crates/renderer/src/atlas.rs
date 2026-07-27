@@ -68,6 +68,16 @@ pub struct GlyphEntry {
 const ATLAS_SIZE: u32 = 2048;
 const PAD: u32 = 1;
 
+/// Coverage values backing the shading blocks `░▒▓` (U+2591–2593), i.e. 25% / 50% /
+/// 75% (D6).
+///
+/// These are *alpha*, not color. `glyph.wgsl` returns `vec4(color * a, a)` from the
+/// sampled coverage, so a quad on a 64-coverage block is a correct premultiplied
+/// 25%-alpha fill in the cell's foreground — no shader change, no per-instance alpha
+/// channel, and it composites correctly over an inline image the way a CPU-side
+/// blend toward the cell background would not.
+const SHADE_LEVELS: [u8; 3] = [64, 128, 191];
+
 /// The glyph atlas: a GPU texture + a shelf packer + a per-glyph cache.
 pub struct Atlas {
     texture: wgpu::Texture,
@@ -86,6 +96,9 @@ pub struct Atlas {
     /// reused for underline rules (a solid fill in the glyph pass). Re-reserved
     /// lazily after an eviction bumps the generation.
     solid: Option<(GlyphEntry, u64)>,
+    /// Partial-coverage twins of [`Atlas::solid`], one per shading level, for the
+    /// `░▒▓` block elements (D6). Same lazy re-reservation rule.
+    shades: [Option<(GlyphEntry, u64)>; SHADE_LEVELS.len()],
 }
 
 impl Atlas {
@@ -135,6 +148,7 @@ impl Atlas {
             shelf_h: 0,
             generation: 0,
             solid: None,
+            shades: [None; SHADE_LEVELS.len()],
         })
     }
 
@@ -260,6 +274,37 @@ impl Atlas {
         entry
     }
 
+    /// A packed partial-coverage entry for shading level `level` (0=`░`, 1=`▒`,
+    /// 2=`▓`), the alpha-carrying twin of [`solid_entry`](Atlas::solid_entry) (D6).
+    ///
+    /// A quad using it renders as a `SHADE_LEVELS[level]/255` fill in the instance
+    /// color, because `glyph.wgsl` multiplies the sampled coverage into both the rgb
+    /// and the alpha. That is why `░▒▓` need no shader change and no per-instance
+    /// alpha channel.
+    ///
+    /// Returns `None` — rather than `solid_entry`'s `expect` — on an out-of-range
+    /// level or a pack failure, so the caller drops the quad instead of panicking.
+    /// The project forbids `unwrap`/`expect` outside tests, and `Option` is what
+    /// [`get_or_insert_styled`](Atlas::get_or_insert_styled) already hands back.
+    pub fn shade_entry(&mut self, queue: &wgpu::Queue, level: usize) -> Option<GlyphEntry> {
+        let coverage = *SHADE_LEVELS.get(level)?;
+        if let Some((entry, gen)) = self.shades[level] {
+            if gen == self.generation {
+                return Some(entry);
+            }
+        }
+        let bmp = GlyphBitmap {
+            width: 2,
+            height: 2,
+            left: 0,
+            top: 0,
+            coverage: vec![coverage; 4],
+        };
+        let entry = self.pack(queue, &bmp)?;
+        self.shades[level] = Some((entry, self.generation));
+        Some(entry)
+    }
+
     /// Number of distinct glyphs currently cached (incl. empty). Test/observability.
     pub fn cached_len(&self) -> usize {
         self.cache.len()
@@ -273,6 +318,19 @@ impl Atlas {
     pub(crate) fn degrade_for_test(&mut self) {
         self.rasterizers.truncate(1);
         self.cache.clear();
+    }
+
+    /// Test-only: force the bounded-eviction path — clear the cache, reset the shelf
+    /// cursor, and bump the generation, exactly as [`pack`](Atlas::pack) does when
+    /// the texture fills. Lets the re-reservation rule for `solid`/`shades` be
+    /// exercised without packing 2048² px worth of glyphs to trigger it for real.
+    #[cfg(test)]
+    pub(crate) fn evict_for_test(&mut self) {
+        self.cache.clear();
+        self.shelf_x = 0;
+        self.shelf_y = 0;
+        self.shelf_h = 0;
+        self.generation += 1;
     }
 
     /// Shelf-pack a rasterized bitmap into the texture, uploading its coverage.
@@ -361,5 +419,105 @@ mod tests {
     fn atlas_is_2048_square() {
         // D13/R3.3: capacity headroom for Hangul's glyph count.
         assert_eq!(ATLAS_SIZE, 2048);
+    }
+
+    #[test]
+    fn shade_levels_are_the_quarter_steps() {
+        // D6: 25% / 50% / 75% of 255, the alpha `░▒▓` render at.
+        assert_eq!(SHADE_LEVELS, [64, 128, 191]);
+    }
+
+    /// The atlas needs a real device; adapterless CI skips (D10).
+    fn atlas_for_test() -> Option<(wgpu::Queue, Atlas)> {
+        let (device, queue) = crate::headless()?;
+        let fonts = FontSet::load().ok()?;
+        let atlas = Atlas::new(&device, &fonts, 32.0)?;
+        Some((queue, atlas))
+    }
+
+    #[test]
+    fn shade_entries_are_distinct_and_memoized() {
+        // R7.1: three levels → three distinct entries, and a second request returns
+        // the same one rather than packing again.
+        let Some((queue, mut atlas)) = atlas_for_test() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let first: Vec<GlyphEntry> = (0..3)
+            .map(|l| atlas.shade_entry(&queue, l).expect("a 2x2 block fits"))
+            .collect();
+        let distinct: HashSet<[u32; 2]> = first
+            .iter()
+            .map(|e| [e.uv0[0].to_bits(), e.uv0[1].to_bits()])
+            .collect();
+        assert_eq!(distinct.len(), 3, "each level packs its own block");
+
+        for (l, want) in first.iter().enumerate() {
+            let again = atlas.shade_entry(&queue, l).expect("memoized");
+            assert_eq!(&again, want, "level {l} must not repack");
+        }
+    }
+
+    #[test]
+    fn shade_entry_refuses_an_out_of_range_level() {
+        // R7.3: `None`, not a panic and not a silent wrong level.
+        let Some((queue, mut atlas)) = atlas_for_test() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        assert!(atlas.shade_entry(&queue, 3).is_none());
+        assert!(atlas.shade_entry(&queue, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn shade_entries_are_re_reserved_after_an_eviction() {
+        // R7.2: a generation bump invalidates every UV already handed out, so the
+        // memo must not survive it — the same rule `solid_entry` follows.
+        let Some((queue, mut atlas)) = atlas_for_test() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        // Occupy the first shelf slot so the shade block does NOT land at the
+        // origin — otherwise the post-eviction repack would coincidentally return
+        // the same UV and this test would pass without proving anything.
+        atlas.solid_entry(&queue);
+        let before = atlas.shade_entry(&queue, 1).expect("a 2x2 block fits");
+        assert_ne!(
+            before.uv0[0], 0.0,
+            "the shade block sits past the solid one"
+        );
+        let gen_before = atlas.generation;
+
+        atlas.evict_for_test();
+        assert_ne!(
+            atlas.generation, gen_before,
+            "eviction bumps the generation"
+        );
+
+        let after = atlas.shade_entry(&queue, 1).expect("re-reserved");
+        assert_eq!(
+            atlas.shades[1].map(|(_, g)| g),
+            Some(atlas.generation),
+            "the memo is stamped with the new generation"
+        );
+        // The re-packed block starts a fresh shelf run, so it lands at the origin
+        // rather than wherever it sat before the clear.
+        assert_ne!(
+            (before.uv0[0].to_bits(), before.uv0[1].to_bits()),
+            (after.uv0[0].to_bits(), after.uv0[1].to_bits()),
+            "a stale pre-eviction UV must not be handed back"
+        );
+    }
+
+    #[test]
+    fn solid_entry_still_memoizes() {
+        // R7.4: the underline path is untouched by the shade addition.
+        let Some((queue, mut atlas)) = atlas_for_test() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let a = atlas.solid_entry(&queue);
+        let b = atlas.solid_entry(&queue);
+        assert_eq!(a, b);
     }
 }
