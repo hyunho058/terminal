@@ -16,6 +16,10 @@ use serde_json::Value;
 /// `tab-metadata` worker (D7). Purely additive; uses only `std` + `serde_json`.
 pub mod activity;
 
+/// Stateful session telemetry — the accumulating fold behind the ai-monitor status
+/// dashboard (`telemetry-model`). Pure over its input, bounded, GPU/UI-free (SD2/SD4).
+pub mod telemetry;
+
 /// One parsed log event: who spoke and a one-line summary (D1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AiEvent {
