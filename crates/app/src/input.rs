@@ -56,6 +56,14 @@ pub enum SidebarAction {
     NewTab,
     Collapse,
     Expand,
+    /// Open the card menu for the card at this list index (sticky-tab-title R3.3) — the
+    /// hamburger was pressed. The app resolves the index to a `TabId` and decides the
+    /// item set (`Reset to auto` only for a tab that has a user title, D4).
+    OpenMenu(usize),
+    /// Activate item `i` of the currently open card menu (sticky-tab-title R3.3). The
+    /// renderer knows only the item's position; which action that position means is the
+    /// app's to decide, since the app chose the item set.
+    MenuItem(usize),
     Inert,
 }
 
@@ -82,6 +90,8 @@ pub fn sidebar_press(
     sidebar_layout::hit_test(p, scroll, inp, collapsed).map(|region| match region {
         SidebarRegion::Card(i) => SidebarAction::Switch(i),
         SidebarRegion::WaitingRow(i) => SidebarAction::SwitchWaiting(i),
+        SidebarRegion::MenuButton(i) => SidebarAction::OpenMenu(i),
+        SidebarRegion::MenuItem(i) => SidebarAction::MenuItem(i),
         SidebarRegion::Chrome(ChromeRegion::NewTab) => SidebarAction::NewTab,
         SidebarRegion::Chrome(ChromeRegion::HideSidebar) => SidebarAction::Collapse,
         SidebarRegion::Chrome(ChromeRegion::Restore) => SidebarAction::Expand,
@@ -101,7 +111,49 @@ pub fn sidebar_hover(
     let p = [cursor.0 as f32, cursor.1 as f32];
     match sidebar_layout::hit_test(p, scroll, inp, collapsed) {
         Some(SidebarRegion::Card(i)) => Some(i),
+        // The hamburger sits ON a card and resolves ahead of it (sticky-tab-title R3.1),
+        // so without this arm the card would lose its hover highlight the moment the
+        // pointer reached the very control that card is offering.
+        Some(SidebarRegion::MenuButton(i)) => Some(i),
         _ => None,
+    }
+}
+
+/// Whether a left-press dismisses the open modal surfaces — the card menu **and** the
+/// rename field (sticky-tab-title D8/D8a.1).
+///
+/// One rule for both surfaces, in one testable place. Enforcing it for the menu alone is
+/// what let a press collapse the sidebar while leaving an invisible rename field behind,
+/// still consuming every keystroke — so this is the L2 modal-exclusion invariant made
+/// checkable rather than argued in a comment.
+///
+/// The two menu regions are the exception: pressing the hamburger or picking an item is
+/// *operating* the menu, not dismissing it. Everything else — another card, chrome, the
+/// panel's dead space, or the grid (`None`) — dismisses.
+pub fn press_dismisses_modals(action: Option<SidebarAction>) -> bool {
+    !matches!(
+        action,
+        Some(SidebarAction::MenuItem(_)) | Some(SidebarAction::OpenMenu(_))
+    )
+}
+
+/// How long after a click a second one still counts as a double-click. macOS's own
+/// default interval is 500 ms; matching it is what makes the gesture feel native rather
+/// than tuned to this app.
+pub const DOUBLE_CLICK_MS: u128 = 500;
+
+/// Whether this press is the second half of a double-click on the **same card**
+/// (sticky-tab-title): within [`DOUBLE_CLICK_MS`] of the previous press, on the same row.
+///
+/// Same-row is part of the test, not just timing: two fast clicks on two different cards
+/// are two deliberate tab switches, and treating them as a rename gesture would hijack
+/// quick navigation. `prev` is `None` when nothing has been clicked yet.
+pub fn is_double_click(prev: Option<(usize, u128)>, row: usize, now_ms: u128) -> bool {
+    match prev {
+        Some((prev_row, prev_ms)) => {
+            prev_row == row && now_ms.saturating_sub(prev_ms) <= DOUBLE_CLICK_MS
+        }
+        None => false,
     }
 }
 
@@ -820,7 +872,69 @@ mod tests {
             row_count: count,
             waiting_count,
             metrics: renderer::sidebar_theme::SidebarMetrics::DEFAULT.scaled(1.0),
+            open_menu: None,
         }
+    }
+
+    #[test]
+    fn every_press_but_the_menu_itself_dismisses_the_modals() {
+        // The L2 modal-exclusion invariant, as a test rather than a comment: enforcing it
+        // for the menu but not the field is what once left an INVISIBLE rename field
+        // eating every keystroke after the sidebar was collapsed.
+        for a in [
+            SidebarAction::Switch(0),
+            SidebarAction::SwitchWaiting(0),
+            SidebarAction::NewTab,
+            SidebarAction::Collapse,
+            SidebarAction::Expand,
+            SidebarAction::Inert,
+        ] {
+            assert!(press_dismisses_modals(Some(a)), "{a:?} must dismiss");
+        }
+        // A press over the grid (no sidebar region at all) dismisses too.
+        assert!(press_dismisses_modals(None));
+        // Operating the menu is not dismissing it.
+        assert!(!press_dismisses_modals(Some(SidebarAction::OpenMenu(1))));
+        assert!(!press_dismisses_modals(Some(SidebarAction::MenuItem(0))));
+    }
+
+    #[test]
+    fn double_click_needs_the_same_card_and_a_quick_second_press() {
+        // sticky-tab-title — a second click on the same card opens the rename field.
+        assert!(is_double_click(Some((2, 1_000)), 2, 1_200));
+        // Exactly at the boundary still counts.
+        assert!(is_double_click(
+            Some((2, 1_000)),
+            2,
+            1_000 + DOUBLE_CLICK_MS
+        ));
+        // Too slow — two separate clicks, not a rename gesture.
+        assert!(!is_double_click(
+            Some((2, 1_000)),
+            2,
+            1_001 + DOUBLE_CLICK_MS
+        ));
+        // A DIFFERENT card: two fast clicks on two cards are two deliberate tab switches,
+        // and hijacking that into a rename would break quick navigation.
+        assert!(!is_double_click(Some((2, 1_000)), 3, 1_050));
+        // Nothing clicked yet.
+        assert!(!is_double_click(None, 0, 10));
+    }
+
+    #[test]
+    fn hovering_the_hamburger_keeps_its_own_card_highlighted() {
+        // sticky-tab-title R3.1 — the button resolves ahead of the card it sits on, so
+        // hover must map it back to that card or the highlight drops out from under the
+        // pointer the moment it reaches the control.
+        let inp = layout_input(340.0, 5);
+        let b = renderer::sidebar_layout::menu_button_rect(1, 0.0, &inp);
+        let centre = ((b.x + b.w * 0.5) as f64, (b.y + b.h * 0.5) as f64);
+        assert_eq!(sidebar_hover(centre, &inp, 0.0, false), Some(1));
+        // And the press at that same point still opens the menu rather than switching.
+        assert_eq!(
+            sidebar_press(centre, &inp, 0.0, false),
+            Some(SidebarAction::OpenMenu(1))
+        );
     }
 
     #[test]

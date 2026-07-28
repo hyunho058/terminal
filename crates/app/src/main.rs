@@ -7,10 +7,12 @@
 //! to the UI thread over a channel; an `EventLoopProxy` wakes the event loop so
 //! the render happens on the winit thread (C6 — no free-running loop).
 
+mod card_menu;
 mod clipboard;
 mod copy;
 mod input;
 mod overlay;
+mod rename;
 mod seam;
 mod session;
 mod settings;
@@ -49,6 +51,9 @@ fn main() {
     // Register feature extensions through the SD4 seam (no terminal_app edits):
     // ai-monitor's Cmd+Shift+M overlay, image-paste's Cmd+V handler + inline-image
     // presenter (its DrawLayer draws snapshot images).
+    // sticky-tab-title: the Cmd+Shift+R rename field. Registered at priority 200, ahead
+    // of the ai-monitor's 100, so an open field owns the keyboard (D8a.1).
+    app.register_overlay(Box::new(rename::RenameOverlay::new()));
     app.register_overlay(Box::new(AiMonitorOverlay::new(proxy.clone())));
     app.register_overlay(Box::new(ImagePresenter));
     app.register_handler(Box::new(ClipboardHandler::new()));

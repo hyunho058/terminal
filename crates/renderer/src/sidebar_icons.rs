@@ -34,6 +34,10 @@ pub enum Icon {
     Check,
     /// Waiting-band signal `✕` — a foreground command exited with an error code (D6).
     Cross,
+    /// Per-card menu affordance — the hamburger (sticky-tab-title D4/R3.1). Three plain
+    /// rules, deliberately narrower than [`Filter`](Icon::Filter) and without its knobs,
+    /// so the per-card control never reads as the header's filter control.
+    Hamburger,
 }
 
 /// A stroke primitive in the 24×24 unit box.
@@ -113,6 +117,14 @@ const CROSS: &[Stroke] = &[
     Stroke::Line(17.5, 6.5, 6.5, 17.5),
 ];
 
+// Three plain rules — the per-card menu affordance (☰). Inset further than FILTER's
+// 4→20 so it reads as a smaller, subordinate control on a card rather than header chrome.
+const HAMBURGER: &[Stroke] = &[
+    Stroke::Line(6.0, 7.5, 18.0, 7.5),
+    Stroke::Line(6.0, 12.0, 18.0, 12.0),
+    Stroke::Line(6.0, 16.5, 18.0, 16.5),
+];
+
 fn strokes(icon: Icon) -> &'static [Stroke] {
     match icon {
         Icon::Filter => FILTER,
@@ -124,6 +136,7 @@ fn strokes(icon: Icon) -> &'static [Stroke] {
         Icon::Pause => PAUSE,
         Icon::Check => CHECK,
         Icon::Cross => CROSS,
+        Icon::Hamburger => HAMBURGER,
     }
 }
 

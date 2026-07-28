@@ -43,6 +43,14 @@ const PANEL_BG: [f32; 4] = [0.04, 0.05, 0.07, 0.88]; // translucent dark
 const TEXT_FG: u32 = 0xE6E1CF;
 const PAD: f32 = 10.0;
 
+/// The log pane's rect: the lower 55% of the window, never above `top_inset`. Pure, so
+/// the sizing is unit-tested without a GPU.
+fn panel_rect(viewport: [f32; 2], top_inset: f32) -> [f32; 4] {
+    let (vw, vh) = (viewport[0], viewport[1]);
+    let top = (vh * 0.45).max(top_inset);
+    [0.0, top, vw, vh - top]
+}
+
 /// z-order: above the tab bar (10), a genuine overlay.
 pub const OVERLAY_Z: i32 = 100;
 
@@ -295,9 +303,7 @@ impl DrawLayer for OverlayLayer {
         }
         self.ensure_gpu(ctx);
         let (vw, vh) = (ctx.viewport[0], ctx.viewport[1]);
-        // Bottom panel: lower 55% of the window, below the tab-bar inset.
-        let top = (vh * 0.45).max(ctx.top_inset);
-        let panel = [0.0, top, vw, vh - top];
+        let panel = panel_rect([vw, vh], ctx.top_inset);
 
         let rects = [RectInstance {
             rect: panel,
@@ -457,6 +463,14 @@ mod tests {
         });
         assert!(h.snapshot().visible);
         assert_eq!(h.snapshot().lines.len(), 2);
+    }
+
+    #[test]
+    fn log_pane_is_the_lower_55_percent_below_the_top_inset() {
+        // The ai-monitor's pane: full width, lower 55% of the window.
+        assert_eq!(panel_rect([800.0, 600.0], 0.0), [0.0, 270.0, 800.0, 330.0]);
+        // The top inset wins when it would otherwise overlap the tab bar.
+        assert_eq!(panel_rect([800.0, 600.0], 400.0)[1], 400.0);
     }
 
     #[test]

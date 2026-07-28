@@ -26,6 +26,7 @@ use common::config::SidebarConfig;
 use wgpu::util::DeviceExt;
 
 use crate::sidebar_icons::{push_icon, Icon};
+use crate::sidebar_layout::OpenMenu;
 use crate::sidebar_shapes::{Fill, SidebarShape, SidebarShapePipeline};
 use crate::sidebar_theme::{linear, AgentSkin, SidebarMetrics, SidebarTheme};
 use crate::{DrawLayer, FrameCtx};
@@ -49,11 +50,18 @@ const REPO_LINE2_WIDTH_SHARE: f32 = 0.55;
 pub struct SidebarRow {
     /// The app's `session::TabId` as a plain `u64` — the renderer must not know app types.
     pub tab_id: u64,
+    /// The cwd basename — the bottom of the label chain, and line 2's repo/folder name
+    /// when line 1 is custom.
     pub title: String,
-    /// The user's explicit manual label from an OSC 0/2 title (tab-identity), if any. Takes
-    /// precedence over the auto AI-task label on line 1 (manual > task > cwd `title`), so two
-    /// sessions in the same folder can be given distinct labels. `None` = no manual label.
+    /// The **user's** sticky title for this tab, if any (sticky-tab-title R1.1). Set only
+    /// by an explicit user action — never by the PTY — and outranks every other source on
+    /// line 1, which is what makes a named tab stay named. `None` = never named / reset.
     pub label: Option<String>,
+    /// The last OSC 0/2 title a *program* set on this tab's PTY (zsh precmd, vim, ssh),
+    /// if any (sticky-tab-title D3). Carried so the app can resolve the full chain in its
+    /// `MetaSource::fill`, where the AI-task label is fresh; it ranks below that label
+    /// (D12) and is hidden entirely while `label` is set (D3). `None` = none seen.
+    pub program: Option<String>,
 }
 
 /// The leading mark on a card's first line (D11/D12), drawn as a foundations icon —
@@ -105,11 +113,19 @@ pub struct RowMeta {
     pub branch: Option<String>,
     pub mark: RowMark,
     pub skin: AgentSkin,
-    /// The tab's live "current task" label (tab-identity). `Some` → line 1 shows this
-    /// instead of the cwd title, and the cwd/repo name moves to line 2 alongside the
-    /// branch; `None` → line 1 is the cwd title (plain shell / no agent). Pulled by
-    /// `tab_id` like `branch`, so it refreshes live off the metadata generation.
-    pub task: Option<String>,
+    /// Line 1's text, **already resolved by the app** (sticky-tab-title D7/R1.5) by the
+    /// precedence user-title > AI-task > program-OSC title > cwd. The renderer holds no
+    /// part of that policy: it draws this string. Pulled by `tab_id` like `branch`, so it
+    /// refreshes live off the metadata generation — which is why the app resolves it in
+    /// its `MetaSource::fill` and not when it assembles the rows.
+    ///
+    /// Empty for a `default()` row; the layer falls back to the row's cwd title then.
+    pub line1: String,
+    /// Whether [`line1`](RowMeta::line1) came from something other than the cwd title —
+    /// a user title, an AI task, or a program title. Drives line 2's layout: when line 1
+    /// is custom, the cwd/repo name moves down beside the branch (tab-identity R2.2).
+    /// Decided by the app alongside `line1` so the two can never disagree.
+    pub line1_is_custom: bool,
 }
 
 impl Default for RowMeta {
@@ -118,7 +134,8 @@ impl Default for RowMeta {
             branch: None,
             mark: RowMark::None,
             skin: AgentSkin::Generic,
-            task: None,
+            line1: String::new(),
+            line1_is_custom: false,
         }
     }
 }
@@ -147,6 +164,67 @@ pub struct TabBarModel {
     /// session (already active-tab-excluded by T3). Empty = no band. The app builds these
     /// by joining T3's waiting items to the session titles.
     pub waiting: Vec<WaitingRow>,
+    /// The open card menu (sticky-tab-title D10/R3.2), or `None`. Travels with the model
+    /// — like `waiting` — so the row layer, the header layer, and the app's hit-test all
+    /// read one value and cannot disagree about whether a popup is on screen (SD2). The
+    /// **app** owns both the decision to open it and what it says.
+    pub menu: Option<CardMenu>,
+    /// The in-progress inline rename, if any (sticky-tab-title R2.1). `None` = nobody is
+    /// being renamed.
+    pub edit: Option<CardEdit>,
+}
+
+/// An in-progress inline rename (sticky-tab-title R2.1): the tab being named and the text
+/// typed so far, including any uncommitted IME composition.
+///
+/// Keyed by `tab_id`, not by row index — the same join `RowMeta` uses — so a roster shift
+/// under an open editor cannot retarget it to a different tab.
+///
+/// The renderer draws this **in place of** the resolved line-1 label on that one card. It
+/// is the app's state: the app decides what is being edited and what the text is, and the
+/// renderer only paints it, exactly like [`CardMenu`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CardEdit {
+    /// The tab being renamed (`session::TabId` as a plain `u64` — SD3).
+    pub tab_id: u64,
+    /// The text typed so far, with any IME preedit already inserted by the app.
+    pub text: String,
+    /// The caret's position as a **char** index into `text` (`0..=text.chars().count()`).
+    /// The renderer draws the caret here rather than at the end, which is what lets the
+    /// middle of a name be edited.
+    pub caret: usize,
+    /// Whether the whole text is selected — the state a rename field opens in, so the
+    /// existing name is visible but the next keystroke replaces it wholesale (the Finder
+    /// rename convention). Drawn as a highlight behind the text.
+    pub selected: bool,
+}
+
+/// The open per-card menu as the app hands it over (sticky-tab-title D4/R3.2): which card
+/// it is anchored to, and its item labels top to bottom.
+///
+/// The **labels** live here rather than in [`OpenMenu`] because only drawing needs them;
+/// the geometry and hit-test need just the count, and keeping their input `Copy` keeps
+/// [`hit_test`](crate::sidebar_layout::hit_test) a cheap pure function. `OpenMenu` is
+/// derived from this at frame time, so the two can never disagree about the count.
+///
+/// The app decides the items — `Reset to auto` appears only for a tab that has a user
+/// title, so a menu carries 2 or 3 (D4) — and the renderer draws exactly what it is given.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CardMenu {
+    /// The card index the menu is anchored to.
+    pub row: usize,
+    /// Item labels, top to bottom. Never empty.
+    pub items: Vec<String>,
+}
+
+impl CardMenu {
+    /// The layout/hit-test view of this menu — position + item count, no strings.
+    pub fn layout(&self) -> OpenMenu {
+        OpenMenu {
+            row: self.row,
+            items: self.items.len(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -290,17 +368,80 @@ pub fn truncate_to_width(s: &str, advance: f32, max_w: f32, ellipsis: char) -> S
     out
 }
 
-/// Line 1 of a card (tab-identity): the label to draw, by precedence **manual > task > cwd**.
-/// `manual` is the user's explicit OSC-2 label (R2.1's escape hatch for two sessions in one
-/// folder); `task` is the live AI-task label (R2.1); `cwd_title` is the fallback (R3.2). An
-/// idle agent keeps its last label because the worker persists `task`, so this same branch
-/// renders the afterglow (R3.1) — the renderer invents nothing; it mirrors the pulled state.
-pub(crate) fn card_line1_text<'a>(
-    manual: Option<&'a str>,
-    task: Option<&'a str>,
-    cwd_title: &'a str,
-) -> &'a str {
-    manual.or(task).unwrap_or(cwd_title)
+/// Line 1 of a card: the app-resolved label, or the cwd title when the row has no metadata
+/// yet (sticky-tab-title D7/R1.5).
+///
+/// The precedence itself — user title > AI-task > program-OSC title > cwd — lives app-side
+/// in `sidebar_model::resolve_line1`, the one place that sees all four sources with the
+/// task label fresh. What remains here is the empty-means-no-metadata fallback, so a card
+/// drawn before the first `MetaSource::fill` shows its folder rather than a blank line.
+pub(crate) fn card_line1_text<'a>(resolved: &'a str, cwd_title: &'a str) -> &'a str {
+    if resolved.is_empty() {
+        cwd_title
+    } else {
+        resolved
+    }
+}
+
+/// The caret drawn at the cursor during an inline rename. A thin bar, so it reads as a
+/// text cursor rather than as a character in the name.
+pub(crate) const EDIT_CARET: char = '▏';
+
+/// What to draw on line 1 while a card is being renamed (sticky-tab-title R2.1): the typed
+/// text with the caret **at `caret`**, windowed so the caret is always on screen.
+///
+/// Editing happens in a card barely wider than a word, so a name longer than the card is
+/// the normal case, not the edge case. Two things follow, and both differ from
+/// [`truncate_to_width`]'s label behaviour:
+///
+/// - The caret is inserted at the cursor, not appended — otherwise the middle of a name
+///   could be edited but never *seen* being edited.
+/// - The visible window **follows the caret**. Anchoring on the tail would hide the cursor
+///   the moment the user arrowed back into a long name, which is exactly when they need to
+///   see it. An elision on either side is marked with `ellipsis`.
+pub(crate) fn edit_line_text(
+    text: &str,
+    caret: usize,
+    advance: f32,
+    max_w: f32,
+    ellipsis: char,
+) -> String {
+    if max_w <= 0.0 || advance <= 0.0 {
+        return String::new();
+    }
+    let max_chars = (max_w / advance).floor() as usize;
+    if max_chars == 0 {
+        return String::new();
+    }
+    // The caret is a drawn glyph, so it occupies one of the visible columns.
+    let mut chars: Vec<char> = text.chars().collect();
+    let caret_at = caret.min(chars.len());
+    chars.insert(caret_at, EDIT_CARET);
+    if chars.len() <= max_chars {
+        return chars.into_iter().collect();
+    }
+    // A window of exactly `max_chars`, centred on the caret so there is context on both
+    // sides, clamped to the ends of the string.
+    let half = max_chars / 2;
+    let start = caret_at
+        .saturating_sub(half)
+        .min(chars.len().saturating_sub(max_chars));
+    let end = start + max_chars;
+    let mut window: Vec<char> = chars[start..end].to_vec();
+    // Mark each elided side by REPLACING that edge column — never by adding one, which
+    // would push the window over the card's width. The caret is never overwritten: it is
+    // the one glyph that must survive, since a field whose cursor is off-screen is
+    // exactly the failure this windowing exists to prevent.
+    if start > 0 && window[0] != EDIT_CARET {
+        window[0] = ellipsis;
+    }
+    if end < chars.len() {
+        let last = window.len() - 1;
+        if window[last] != EDIT_CARET {
+            window[last] = ellipsis;
+        }
+    }
+    window.into_iter().collect()
 }
 
 /// The x-origin (physical px) at which line 2's git-branch icon may start after the repo name,
@@ -345,6 +486,12 @@ pub struct SidebarModel {
     pub scroll_px: f32,
     /// Published by the layer after drawing (D7).
     pub layout: Option<SidebarLayout>,
+    /// The open card menu (sticky-tab-title D10/R3.2), written by the app through
+    /// [`TabModelHandle::set`] / [`TabModelHandle::set_menu`]. `None` = none open.
+    pub menu: Option<CardMenu>,
+    /// The in-progress inline rename (sticky-tab-title R2.1), written by the rename
+    /// overlay through [`TabModelHandle::set_edit`]. `None` = nobody is being renamed.
+    pub edit: Option<CardEdit>,
     /// Installed once from `main.rs` (D10). Private: only this module's layer reads it.
     meta_source: Option<Rc<dyn MetaSource>>,
 }
@@ -379,7 +526,47 @@ impl TabModelHandle {
         m.rows = model.titles;
         m.active = model.active;
         m.waiting = model.waiting;
+        m.menu = model.menu;
+        m.edit = model.edit;
         m.rows_rev = m.rows_rev.wrapping_add(1);
+    }
+
+    /// Start / update / end an inline rename (sticky-tab-title R2.1), bumping `rows_rev`
+    /// so the layer repaints. Called on every keystroke, so it deliberately avoids
+    /// `Tabs::titles`' per-tab `proc_pidinfo` — same reasoning as `set_menu`.
+    pub fn set_edit(&self, edit: Option<CardEdit>) {
+        let mut m = self.0.borrow_mut();
+        m.edit = edit;
+        m.rows_rev = m.rows_rev.wrapping_add(1);
+    }
+
+    /// The in-progress inline rename, cloned — so a row resync carries it through `set`
+    /// rather than cancelling the edit the user is in the middle of.
+    pub fn edit(&self) -> Option<CardEdit> {
+        self.0.borrow().edit.clone()
+    }
+
+    /// Open or close a card's menu (sticky-tab-title R3.2), bumping `rows_rev` so the
+    /// layer redraws. The incremental path for the common case — clicking the hamburger
+    /// changes nothing about the tabs themselves, so this avoids `Tabs::titles`' per-tab
+    /// `proc_pidinfo`, exactly as `set_waiting` does for the band.
+    pub fn set_menu(&self, menu: Option<CardMenu>) {
+        let mut m = self.0.borrow_mut();
+        m.menu = menu;
+        m.rows_rev = m.rows_rev.wrapping_add(1);
+    }
+
+    /// The open card menu, cloned (sticky-tab-title R3.2) — so a row resync can carry it
+    /// through `set` without closing it.
+    pub fn menu(&self) -> Option<CardMenu> {
+        self.0.borrow().menu.clone()
+    }
+
+    /// The open menu's layout view (row + item count), or `None` (sticky-tab-title R3.2).
+    /// The one place `SidebarLayoutInput::open_menu` is derived, so the geometry and the
+    /// drawn popup always agree on how many items there are.
+    pub fn open_menu(&self) -> Option<OpenMenu> {
+        self.0.borrow().menu.as_ref().map(CardMenu::layout)
     }
 
     /// Replace only the waiting-band rows, bumping `rows_rev` so the layer refreshes (D9).
@@ -916,7 +1103,7 @@ impl DrawLayer for TabBar {
 
         // Copy everything out of the model under ONE borrow, then release it (D3) before
         // touching the (possibly reentrant) metadata source.
-        let (rows, active, hovered, rows_rev, list_top, scroll_px, waiting, source) =
+        let (rows, active, hovered, rows_rev, list_top, scroll_px, waiting, menu, edit, source) =
             self.model.with(|m| {
                 (
                     m.rows.clone(),
@@ -926,6 +1113,8 @@ impl DrawLayer for TabBar {
                     m.list_top,
                     m.scroll_px,
                     m.waiting.clone(),
+                    m.menu.clone(),
+                    m.edit.clone(),
                     m.meta_source.clone(),
                 )
             });
@@ -1124,27 +1313,113 @@ impl DrawLayer for TabBar {
                     title_x = inner_x + m.mark_px + icon_gap;
                 }
             }
-            // Line 1 by precedence manual > task > cwd (tab-identity): the user's OSC-2
-            // label wins, else the live AI task, else the cwd title (plain shell / no agent).
-            // An idle agent keeps its last label because the worker persists `task` (D3).
-            let title_text = card_line1_text(
-                rows[i].label.as_deref(),
-                meta.task.as_deref(),
-                rows[i].title.as_str(),
+            // Line 1 is resolved app-side (sticky-tab-title D7) by the precedence
+            // user > AI-task > program-OSC > cwd; the renderer draws what it was handed
+            // and owns none of that policy. An empty `line1` means a row with no metadata
+            // yet (`RowMeta::default()`), which falls back to the cwd title.
+            // The per-card menu affordance (sticky-tab-title D4/R3.1) — always drawn, so
+            // the control is discoverable without hovering. Its rect comes from the shared
+            // `menu_button_in` formula fed THIS card's rect, so the drawn button and the
+            // hit-tested one are the same square (SD2).
+            let button = crate::sidebar_layout::menu_button_in(
+                crate::sidebar_layout::Rect {
+                    x: rect[0],
+                    y: rect[1],
+                    w: rect[2],
+                    h: rect[3],
+                },
+                &m,
+                ctx.scale_factor,
             );
-            push_glyphs(
-                &mut text,
-                ctx,
-                title_text,
-                title_x,
-                inner_top,
-                cell,
-                1.0,
-                true,
-                linear(theme.title_fg, 1.0),
-                (right_edge - title_x).max(0.0),
-                ellipsis,
+            push_icon(
+                &mut shapes,
+                Icon::Hamburger,
+                button.x,
+                button.y,
+                button.w,
+                theme.icon_fg,
             );
+            let title_text = card_line1_text(&meta.line1, rows[i].title.as_str());
+            // Line 1 stops short of the hamburger (sticky-tab-title R3.1) — line 2 keeps
+            // the full width, since the button only occupies the title line.
+            let line1_right = (button.x - icon_gap).min(right_edge);
+            // Is THIS card being renamed (sticky-tab-title R2.1)? Joined by `tab_id`, not
+            // by index, so a roster shift cannot move the editor to another tab.
+            let editing = edit.as_ref().filter(|e| e.tab_id == rows[i].tab_id);
+            if let Some(e) = editing {
+                // A field treatment behind the title line, so the card reads as an input
+                // rather than as a label that mysteriously changed.
+                let field = [
+                    title_x - m.card_gap * 0.5,
+                    inner_top - m.card_gap * 0.25,
+                    (line1_right - title_x + m.card_gap).max(0.0),
+                    cell[1] + m.card_gap * 0.5,
+                ];
+                if let Some(bg) = SidebarShape::rounded_box(
+                    field,
+                    m.card_radius * 0.5,
+                    m.border_w,
+                    Fill::solid(linear(theme.panel_bg, 1.0)),
+                    linear(theme.card_border_active, 1.0),
+                ) {
+                    shapes.push(bg);
+                }
+                // Windowed so the CARET stays visible — including when the user has
+                // arrowed back into the middle of a name longer than the card.
+                let line = edit_line_text(
+                    &e.text,
+                    e.caret,
+                    cell[0],
+                    (line1_right - title_x).max(0.0),
+                    ellipsis,
+                );
+                // Select-all highlight (the state the field opens in): a block behind the
+                // text but NOT behind the trailing caret, so the caret stays legible.
+                // `push_glyphs` advances a fixed `cell[0]` per char, so a char-count width
+                // is exact here rather than an approximation.
+                if e.selected {
+                    let chars = line.chars().count().saturating_sub(1); // drop the caret
+                    if chars > 0 {
+                        let sel = [title_x, inner_top, chars as f32 * cell[0], cell[1]];
+                        if let Some(hl) = SidebarShape::rounded_box(
+                            sel,
+                            m.border_w,
+                            0.0,
+                            Fill::solid(linear(theme.accent, 0.40)),
+                            [0.0; 4],
+                        ) {
+                            shapes.push(hl);
+                        }
+                    }
+                }
+                push_glyphs(
+                    &mut text,
+                    ctx,
+                    &line,
+                    title_x,
+                    inner_top,
+                    cell,
+                    1.0,
+                    true,
+                    linear(theme.title_fg, 1.0),
+                    (line1_right - title_x).max(0.0),
+                    ellipsis,
+                );
+            } else {
+                push_glyphs(
+                    &mut text,
+                    ctx,
+                    title_text,
+                    title_x,
+                    inner_top,
+                    cell,
+                    1.0,
+                    true,
+                    linear(theme.title_fg, 1.0),
+                    (line1_right - title_x).max(0.0),
+                    ellipsis,
+                );
+            }
 
             // Line 2 (D6-reserved). When a task label took line 1, the repo/folder name
             // (the cwd title) moves here as the secondary identity, ahead of the git branch
@@ -1155,10 +1430,11 @@ impl DrawLayer for TabBar {
                 let advance = cell[0] * meta_ratio;
                 let branch = meta.branch.as_deref();
                 let mut x = inner_x;
-                // When line 1 is a custom label (manual OSC-2 or the AI task), the cwd/repo
-                // name moves to line 2 as the secondary identity; a plain cwd card keeps the
-                // branch-only line 2 as before.
-                let line1_is_custom = rows[i].label.is_some() || meta.task.is_some();
+                // When line 1 is a custom label (a user title, an AI task, or a program
+                // title), the cwd/repo name moves to line 2 as the secondary identity; a
+                // plain cwd card keeps the branch-only line 2 as before. The app decides
+                // this alongside `line1` so the two can never disagree (sticky-tab-title).
+                let line1_is_custom = meta.line1_is_custom;
                 if line1_is_custom {
                     let repo_budget = repo_line2_budget(right_edge - x, advance, branch.is_some());
                     let repo = truncate_to_width(&rows[i].title, advance, repo_budget, ellipsis);
@@ -1203,6 +1479,61 @@ impl DrawLayer for TabBar {
                         false,
                         linear(theme.meta_fg, 1.0),
                         (right_edge - branch_x).max(0.0),
+                        ellipsis,
+                    );
+                }
+            }
+        }
+
+        // ---- The open card menu (sticky-tab-title D4/D10/R3.1). Drawn LAST so it layers
+        // over the cards it floats above — shapes and glyphs are each submitted in push
+        // order, so "last" is "on top". Its rect comes from the same `menu_rect_for`
+        // formula the hit-test uses, fed the same button rect, so what the user sees and
+        // what a press resolves to cannot disagree (SD2).
+        if let Some(menu) = menu {
+            if let Some(card) = lay.card_rect(menu.row) {
+                let button = crate::sidebar_layout::menu_button_in(
+                    crate::sidebar_layout::Rect {
+                        x: card[0],
+                        y: card[1],
+                        w: card[2],
+                        h: card[3],
+                    },
+                    &m,
+                    ctx.scale_factor,
+                );
+                let popup = crate::sidebar_layout::menu_rect_for(
+                    button,
+                    menu.items.len(),
+                    ctx.viewport,
+                    ctx.scale_factor,
+                );
+                // Panel: the active card's fill (a raised surface) with the selected
+                // card's border, so the popup reads as chrome rather than as a card.
+                if let Some(bg) = SidebarShape::rounded_box(
+                    [popup.x, popup.y, popup.w, popup.h],
+                    crate::sidebar_layout::menu::RADIUS * ctx.scale_factor as f32,
+                    m.border_w,
+                    Fill::solid(linear(theme.card_bg_active, 1.0)),
+                    linear(theme.card_border_active, 1.0),
+                ) {
+                    shapes.push(bg);
+                }
+                for (i, label) in menu.items.iter().enumerate() {
+                    let item = crate::sidebar_layout::menu_item_in(popup, i, ctx.scale_factor);
+                    let text_left = item.x + m.card_pad_x;
+                    let text_top = item.y + ((item.h - cell[1]) * 0.5).max(0.0);
+                    push_glyphs(
+                        &mut text,
+                        ctx,
+                        label,
+                        text_left,
+                        text_top,
+                        cell,
+                        1.0,
+                        false,
+                        linear(theme.title_fg, 1.0),
+                        (item.x + item.w - m.card_pad_x - text_left).max(0.0),
                         ellipsis,
                     );
                 }
@@ -1259,6 +1590,7 @@ mod tests {
                 tab_id: 7,
                 title: "proj".into(),
                 label: None,
+                program: None,
             }],
             active: 0,
             ..Default::default()
@@ -1288,6 +1620,7 @@ mod tests {
                 tab_id: 1,
                 title: "x".into(),
                 label: None,
+                program: None,
             }],
             active: 0,
             ..Default::default()
@@ -1320,6 +1653,7 @@ mod tests {
                 tab_id: 3,
                 title: "a".into(),
                 label: None,
+                program: None,
             }],
             active: 0,
             ..Default::default()
@@ -1467,38 +1801,87 @@ mod tests {
     // ---- T3: tab-identity card line-1 / line-2 decisions (renderer/sidebar_row.rs) ----
 
     #[test]
-    fn card_line1_shows_task_when_present() {
-        // R2.1 — a task label takes line 1 over the cwd title (no manual label).
+    fn card_line1_draws_what_the_app_resolved() {
+        // sticky-tab-title D7/R1.5 — precedence is the app's job (and is tested there, in
+        // `sidebar_model::resolve_line1`). All the renderer promises is to draw the string
+        // it was handed, whichever tier it came from.
+        assert_eq!(card_line1_text("Frontend", "terminal"), "Frontend");
         assert_eq!(
-            card_line1_text(None, Some("refactor the auth module"), "terminal"),
+            card_line1_text("refactor the auth module", "terminal"),
             "refactor the auth module"
         );
     }
 
     #[test]
-    fn card_line1_falls_back_to_cwd_when_no_task() {
-        // R3.2 / R3.1 — no manual label, no task → the cwd title. The same branch renders
-        // the idle afterglow, since the worker keeps `task` Some while idle.
-        assert_eq!(card_line1_text(None, None, "terminal"), "terminal");
+    fn edit_line_draws_the_caret_at_the_cursor() {
+        // sticky-tab-title — the caret goes where the cursor IS, not at the end. Without
+        // this the middle of a name could be edited but not seen being edited.
+        assert_eq!(edit_line_text("Front", 5, 10.0, 200.0, '…'), "Front▏");
+        assert_eq!(edit_line_text("Front", 0, 10.0, 200.0, '…'), "▏Front");
+        assert_eq!(edit_line_text("Front", 2, 10.0, 200.0, '…'), "Fr▏ont");
+        // An empty name still shows a caret, so an opened field is visibly an input.
+        assert_eq!(edit_line_text("", 0, 10.0, 200.0, '…'), "▏");
+        // A caret past the end is clamped rather than panicking.
+        assert_eq!(edit_line_text("ab", 99, 10.0, 200.0, '…'), "ab▏");
     }
 
     #[test]
-    fn card_line1_manual_label_wins_over_task_and_cwd() {
-        // tab-identity — the user's manual OSC-2 label has top precedence, so two sessions
-        // in the same folder can be told apart even when both have an AI task.
-        assert_eq!(
-            card_line1_text(
-                Some("Frontend"),
-                Some("refactor the auth module"),
-                "terminal"
-            ),
-            "Frontend"
+    fn the_visible_window_follows_the_caret_into_a_long_name() {
+        // The reason this is not `truncate_to_width`: a card is barely wider than a word,
+        // so a name longer than the card is NORMAL while editing. Anchoring on the tail
+        // would hide the cursor the moment the user arrowed back — exactly when it matters.
+        let long = "Frontend-service-worker";
+        let w = 80.0; // 8 columns at advance 10
+                      // Caret at the very start: the window shows the HEAD.
+        let head = edit_line_text(long, 0, 10.0, w, '…');
+        assert!(head.starts_with('▏'), "caret visible at the head: {head}");
+        assert!(head.ends_with('…'), "elision marked on the right: {head}");
+        // Caret at the end: the window shows the TAIL.
+        let tail = edit_line_text(long, long.chars().count(), 10.0, w, '…');
+        assert!(tail.ends_with('▏'), "caret visible at the tail: {tail}");
+        assert!(tail.starts_with('…'), "elision marked on the left: {tail}");
+        // Caret in the middle: the caret is on screen and BOTH sides are elided.
+        let mid = edit_line_text(long, 12, 10.0, w, '…');
+        assert!(mid.contains('▏'), "caret visible in the middle: {mid}");
+        assert!(
+            mid.starts_with('…') && mid.ends_with('…'),
+            "both cut: {mid}"
         );
-        // Manual label also wins when there is no task at all.
-        assert_eq!(
-            card_line1_text(Some("Backend"), None, "terminal"),
-            "Backend"
-        );
+        // None of them may overflow the field.
+        for out in [&head, &tail, &mid] {
+            assert!(
+                out.chars().count() as f32 * 10.0 <= w,
+                "never wider than the field: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_line_degenerate_widths_do_not_panic() {
+        assert_eq!(edit_line_text("abc", 3, 10.0, 0.0, '…'), "");
+        assert_eq!(edit_line_text("abc", 3, 0.0, 100.0, '…'), "");
+        // Exactly one glyph of room: show the cursor, not an ellipsis that would hide it.
+        assert_eq!(edit_line_text("abc", 3, 10.0, 10.0, '…'), "▏");
+        // Two columns still has to fit a caret and stay inside the field.
+        let two = edit_line_text("abcdef", 3, 10.0, 20.0, '…');
+        assert!(two.contains('▏'));
+        assert!(two.chars().count() <= 2, "fits 2 columns: {two}");
+    }
+
+    #[test]
+    fn a_hangul_name_windows_without_panicking() {
+        // The window slices a Vec<char>, so a multi-byte name cannot split a codepoint.
+        let name = "한글이름이아주긴경우";
+        let out = edit_line_text(name, 5, 10.0, 60.0, '…');
+        assert!(out.contains('▏'), "caret survives: {out}");
+        assert!(out.chars().count() as f32 * 10.0 <= 60.0);
+    }
+
+    #[test]
+    fn card_line1_falls_back_to_cwd_before_the_first_meta_fill() {
+        // A row drawn before the app's first `MetaSource::fill` has `RowMeta::default()`,
+        // whose `line1` is empty. That must show the folder, never a blank line.
+        assert_eq!(card_line1_text("", "terminal"), "terminal");
     }
 
     #[test]

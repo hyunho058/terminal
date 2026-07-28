@@ -26,11 +26,25 @@ pub struct Session {
     pub pty: Pty,
     pub writer: Box<dyn Write + Send>,
     pub rx: Receiver<Vec<u8>>,
-    title: String,
-    /// Set in [`drain`](Session::drain) when an OSC 0/2 title actually changed the manual
-    /// label, cleared by [`take_title_dirty`](Session::take_title_dirty). Lets the event
-    /// loop resync the tab model so a new label shows immediately, not on the next tab
-    /// switch (tab-identity) — even for a background tab.
+    /// The title the **user** set on this tab (sticky-tab-title D9), or `None` when the
+    /// tab has never been named / was reset to auto. Nothing but an explicit user action
+    /// writes this — never the PTY — which is the whole point: OSC 0/2 is a channel any
+    /// program can write, so it cannot be the user's channel (D1/D3).
+    ///
+    /// Highest precedence on the card: **user > AI-task > program-OSC > cwd** (D5/D12).
+    user_title: Option<String>,
+    /// The most recent OSC 0/2 title any program on this PTY set — zsh's precmd, vim,
+    /// ssh, tmux (sticky-tab-title D3). Recorded even while [`user_title`] hides it, so
+    /// the channel keeps working for a tab that has neither a user title nor an AI task
+    /// (D3); `""` = none seen.
+    ///
+    /// [`user_title`]: Session::user_title
+    program_title: String,
+    /// Set when a change could alter what the card *shows*, cleared by
+    /// [`take_title_dirty`](Session::take_title_dirty). Lets the event loop resync the
+    /// tab model so a new label shows immediately, not on the next tab switch — even for
+    /// a background tab. A program title that lands under a user title sets nothing: it
+    /// is recorded but invisible, so redrawing for it would be pure waste (R1.3).
     title_dirty: bool,
     /// Most-recent OSC 133 command-end event observed on this session's PTY,
     /// keyed implicitly to `id`. Pulled from the terminal in [`drain`] and
@@ -84,7 +98,8 @@ impl Session {
             pty,
             writer,
             rx,
-            title: String::new(),
+            user_title: None,
+            program_title: String::new(),
             title_dirty: false,
             command_end: None,
             _reader: reader_thread,
@@ -105,13 +120,18 @@ impl Session {
         if let Some(ev) = self.terminal.take_command_end() {
             self.command_end = Some(ev);
         }
-        // Pull any OSC 0/2 title the shell or user set (tab-identity manual label). The
-        // latest wins; an empty title clears the label back to the auto/cwd label. Flag a
-        // real change so the event loop resyncs the tab model (the label shows at once).
+        // Pull any OSC 0/2 title a *program* set on this PTY — zsh's precmd, vim, ssh
+        // (sticky-tab-title D3). This is never the user's channel: it lands in
+        // `program_title` only, and can neither overwrite a user title nor masquerade as
+        // one. The latest wins; `""` means the program cleared its title.
+        //
+        // The dirty flag is gated on visibility (R1.3): while a user title is set the
+        // program title is recorded but not shown, so a change to it alters nothing on
+        // screen and must not cost a resync + redraw.
         if let Some(title) = self.terminal.take_osc_title() {
-            if title != self.title {
-                self.title = title;
-                self.title_dirty = true;
+            if title != self.program_title {
+                self.program_title = title;
+                self.title_dirty = program_title_is_visible(self.user_title.as_deref());
             }
         }
         got
@@ -151,19 +171,38 @@ impl Session {
         cwd_of_pid(self.pty.child_pid()?)
     }
 
-    /// The tab's explicit manual label from an OSC 0/2 title (tab-identity), or `""`
-    /// when none/cleared. `tabs::titles` uses it as the highest-precedence card label
-    /// (manual > auto AI-task > cwd), which is how two sessions in the same folder get
-    /// distinct labels (the D4/R5 same-cwd limitation's user-driven escape hatch).
-    pub fn title(&self) -> &str {
-        &self.title
+    /// The title the user set on this tab, or `None` (sticky-tab-title R1.1). Highest
+    /// precedence on the card — it outranks the live AI-task label, which is what makes
+    /// a named tab *stay* named (D3/D5).
+    pub fn user_title(&self) -> Option<&str> {
+        self.user_title.as_deref()
     }
 
-    /// Set the tab title explicitly. The OSC-2 drain in [`drain`](Session::drain) is the
-    /// live source; this stays for programmatic overrides/tests.
+    /// Set or clear the user title (R2.2/R2.3). `Some(name)` names the tab; `None` resets
+    /// it to the live auto label (AI-task, else program title, else cwd). Whitespace-only
+    /// input is normalized to `None` here so every caller — chord, menu, future ones —
+    /// gets the same "empty means reset" rule without repeating it (R2.3).
+    ///
+    /// Flags the tab dirty on a real change so the event loop resyncs + redraws at once,
+    /// including for a background tab. Returns whether anything changed.
+    // Allowed dead until the rename field (T4) and the card menu (T6) call it — the same
+    // convention `seam.rs` uses for a seam landed one task ahead of its first consumer.
     #[allow(dead_code)]
-    pub fn set_title(&mut self, title: String) {
-        self.title = title;
+    pub fn set_user_title(&mut self, title: Option<String>) -> bool {
+        let next = normalize_user_title(title);
+        if next == self.user_title {
+            return false;
+        }
+        self.user_title = next;
+        self.title_dirty = true;
+        true
+    }
+
+    /// The most recent OSC 0/2 title a program set on this PTY, or `""` (R1.1). Ranks
+    /// *below* the AI-task label (D12) and is hidden entirely while a user title is set
+    /// (D3) — it is the label only for a tab that is neither named nor running an agent.
+    pub fn program_title(&self) -> &str {
+        &self.program_title
     }
 }
 
@@ -209,9 +248,50 @@ fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
     std::str::from_utf8(&bytes[..end]).ok().map(PathBuf::from)
 }
 
+/// Normalize a user title on its way in (sticky-tab-title R2.3): a blank or whitespace-only
+/// name is not a name — it is the user clearing the tab back to its auto label. Applied at
+/// the single setter so every entry point (the rename chord, the card menu, anything later)
+/// shares the rule instead of restating it.
+fn normalize_user_title(title: Option<String>) -> Option<String> {
+    title.filter(|t| !t.trim().is_empty())
+}
+
+/// Whether a *program*-set title can currently be seen on the card (sticky-tab-title R1.3).
+/// It cannot while a user title is set — the user title hides it (D3) — so recording one
+/// must not trigger a resync + redraw for a label that did not visibly change.
+fn program_title_is_visible(user_title: Option<&str>) -> bool {
+    user_title.is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_user_title_normalizes_to_a_clear() {
+        // R2.3 — an empty or whitespace-only rename is a reset-to-auto, not a blank name.
+        assert_eq!(
+            normalize_user_title(Some("Frontend".into())),
+            Some("Frontend".into())
+        );
+        assert_eq!(normalize_user_title(Some(String::new())), None);
+        assert_eq!(normalize_user_title(Some("   ".into())), None);
+        assert_eq!(normalize_user_title(Some("\t \n".into())), None);
+        assert_eq!(normalize_user_title(None), None);
+        // Interior/edge whitespace inside a real name is preserved — only all-blank clears.
+        assert_eq!(
+            normalize_user_title(Some(" my tab ".into())),
+            Some(" my tab ".into())
+        );
+    }
+
+    #[test]
+    fn program_title_is_invisible_under_a_user_title() {
+        // R1.3 — a named tab records a program's OSC 2 but shows nothing new, so the
+        // drain must not flag the tab dirty and cost a pointless redraw.
+        assert!(program_title_is_visible(None));
+        assert!(!program_title_is_visible(Some("Frontend")));
+    }
 
     /// Validate the `proc_pidinfo` struct layout: our own pid must resolve to our
     /// own cwd. A wrong offset/size would yield garbage or `None`.

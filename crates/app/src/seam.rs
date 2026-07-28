@@ -23,6 +23,8 @@ use std::path::PathBuf;
 use renderer::DrawLayer;
 use winit::keyboard::{Key, ModifiersState};
 
+use crate::session::TabId;
+
 /// Whether a handler/overlay swallowed a key or lets it fall through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Handled {
@@ -69,7 +71,34 @@ pub struct AppCtx<'a> {
     /// handler on Cmd+C. Populated by `terminal_app` (only when a selection exists,
     /// to avoid a per-keystroke grid clone); `None` by default.
     pub selection_text: Option<String>,
+    /// The active tab's stable id and its current user title (sticky-tab-title R2.1).
+    /// `active` above is an *index*, which is not enough to name a tab: the mutation path
+    /// is keyed by [`TabId`] (R1.4), and the rename chord needs the current title to
+    /// prefill its field. `None` only in tests that build a bare context.
+    pub active_tab: Option<TabId>,
+    /// The active tab's user title, for prefilling the rename field. `None` = unnamed.
+    pub active_user_title: Option<String>,
     redraw: bool,
+    requests: Vec<AppRequest>,
+}
+
+/// A tab mutation an overlay asks the app to perform (sticky-tab-title D9/R1.4).
+///
+/// **Deferred, not immediate, and that is forced by the borrow graph**: `AppCtx` already
+/// holds `&mut` the active session's writer, so it cannot also hold `&mut Tabs`. Handlers
+/// therefore *record* what they want and `terminal_app` applies it after dispatch returns
+/// — the same shape as [`AppCtx::request_redraw`] / [`AppCtx::redraw_requested`], which
+/// solved the identical problem for redraws.
+///
+/// Every variant names a [`TabId`], never an index: the card menu can act on a background
+/// tab, and an index would silently mean a different tab if the roster shifted between
+/// the press and the apply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppRequest {
+    /// Name a tab, or reset it to its auto label with `None` (R2.2/R2.3).
+    SetUserTitle(TabId, Option<String>),
+    /// Close a tab (R3.6). Closing the last one exits the app, exactly as Cmd+W does.
+    CloseTab(TabId),
 }
 
 impl<'a> AppCtx<'a> {
@@ -86,8 +115,18 @@ impl<'a> AppCtx<'a> {
             active_cwd,
             bracketed_paste: false,
             selection_text: None,
+            active_tab: None,
+            active_user_title: None,
             redraw: false,
+            requests: Vec::new(),
         }
+    }
+
+    /// Set the active tab's id + current user title (builder — see `with_bracketed_paste`).
+    pub fn with_active_tab(mut self, id: TabId, user_title: Option<String>) -> Self {
+        self.active_tab = Some(id);
+        self.active_user_title = user_title;
+        self
     }
 
     /// Set the active tab's bracketed-paste mode (builder — keeps `new`'s signature
@@ -112,6 +151,23 @@ impl<'a> AppCtx<'a> {
     pub fn redraw_requested(&self) -> bool {
         self.redraw
     }
+
+    /// Ask the app to set (or with `None`, clear) a tab's user title
+    /// (sticky-tab-title R1.4/R2.2). Applied after dispatch returns — see [`AppRequest`].
+    pub fn set_user_title(&mut self, tab: TabId, title: Option<String>) {
+        self.requests.push(AppRequest::SetUserTitle(tab, title));
+    }
+
+    /// Ask the app to close a tab (sticky-tab-title R3.6). Applied after dispatch returns.
+    pub fn close_tab(&mut self, tab: TabId) {
+        self.requests.push(AppRequest::CloseTab(tab));
+    }
+
+    /// Drain the requests recorded during dispatch, in the order they were made. Called
+    /// by `terminal_app` once the `AppCtx` borrow is released.
+    pub fn take_requests(&mut self) -> Vec<AppRequest> {
+        std::mem::take(&mut self.requests)
+    }
 }
 
 /// A pluggable key handler (e.g. clipboard paste). Registered features implement
@@ -132,7 +188,20 @@ pub trait Overlay {
     fn visible(&self) -> bool;
     fn on_key(&mut self, input: &KeyInput, ctx: &mut AppCtx) -> Handled;
     /// The overlay's draw layer, registered with the renderer.
-    fn layer(&self) -> Box<dyn DrawLayer>;
+    ///
+    /// Default: a no-op layer, for an overlay that draws through **someone else's**
+    /// model rather than a layer of its own — the inline rename field paints onto the
+    /// sidebar card it is renaming, so it owns no surface to register.
+    fn layer(&self) -> Box<dyn DrawLayer> {
+        struct NoLayer;
+        impl DrawLayer for NoLayer {
+            fn z_order(&self) -> i32 {
+                0
+            }
+            fn record(&mut self, _: &mut renderer::FrameCtx<'_>) {}
+        }
+        Box::new(NoLayer)
+    }
     /// Drain any background work (e.g. a log-tail channel) into the overlay's
     /// draw model. Called when a `UserEvent` signals the overlay has pending data.
     /// Returns true if something changed (→ redraw). Default: nothing to do.
@@ -142,6 +211,13 @@ pub trait Overlay {
     /// The active tab changed; re-point anything cwd-derived (ai-monitor R3.1).
     /// Default: no-op.
     fn on_active_changed(&mut self, _cwd: Option<PathBuf>) {}
+
+    /// The app is driving this overlay (sticky-tab-title D13/R3.4) — e.g. the card menu's
+    /// `Rename` item opening the rename field on a specific tab. Return `Consumed` to stop
+    /// the broadcast. Default: no-op passthrough, so no existing overlay changes.
+    fn on_command(&mut self, _cmd: &OverlayCommand) -> Handled {
+        Handled::Passthrough
+    }
 }
 
 /// A `Write` that records whether anything was written through it (terminal-scroll D4).
@@ -265,6 +341,58 @@ impl OverlayHost {
             o.on_active_changed(cwd.clone());
         }
     }
+
+    /// Send a command from the **app to the overlays** (sticky-tab-title D13/R3.4), in
+    /// priority order; the first `Consumed` wins, exactly like [`dispatch`].
+    ///
+    /// This direction did not exist before: the seam could hand overlays keys and
+    /// active-tab changes, and (with `AppRequest`) overlays could ask the app for tab
+    /// mutations — but the app had no way to *drive* an overlay. The card menu needs
+    /// precisely that: choosing `Rename` is a mouse press handled in `terminal_app`, and
+    /// it must open the rename field on a chosen tab in the same event.
+    ///
+    /// [`dispatch`]: OverlayHost::dispatch
+    /// `Cancel` is a **fan-out**: it means "close any open modal surface", so every
+    /// overlay must see it. The others are first-wins like [`dispatch`] — `BeginRename`
+    /// is addressed to whichever overlay owns renaming, and stopping at the first taker
+    /// is correct.
+    ///
+    /// The distinction is load-bearing: short-circuiting `Cancel` would mean a future
+    /// higher-priority overlay that consumes it silently strands an open field below it.
+    pub fn command(&mut self, cmd: &OverlayCommand) -> Handled {
+        let fan_out = matches!(cmd, OverlayCommand::Cancel);
+        let mut handled = Handled::Passthrough;
+        for o in &mut self.overlays {
+            if o.on_command(cmd) == Handled::Consumed {
+                handled = Handled::Consumed;
+                if !fan_out {
+                    break;
+                }
+            }
+        }
+        handled
+    }
+}
+
+/// Something the app asks an overlay to do (sticky-tab-title D13/R3.4). The counterpart
+/// of [`AppRequest`]: that type flows overlay → app, this one app → overlay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OverlayCommand {
+    /// Open the rename field targeting `tab`, prefilled with `current` (its user title,
+    /// or `None` for a tab that has never been named).
+    BeginRename { tab: TabId, current: Option<String> },
+    /// Close any open modal surface without committing anything (R2.5/R3.8) — a tab
+    /// switch, a click elsewhere, or a session that died under an open field.
+    Cancel,
+    /// A committed IME syllable (sticky-tab-title R2.6). Offered to overlays **before**
+    /// the PTY: `Ime::Commit` otherwise writes straight to a session, so with a text field
+    /// open every Hangul syllable would land in zsh while the field received nothing.
+    /// `Consumed` means an overlay took the text and it must NOT reach the shell.
+    ImeCommit(String),
+    /// The in-flight IME composition (sticky-tab-title R2.6) — the uncommitted jamo, so a
+    /// capturing field can show what is being composed instead of appearing frozen until
+    /// the syllable lands. Empty text is winit's clear signal.
+    ImePreedit(String),
 }
 
 #[cfg(test)]
@@ -482,5 +610,142 @@ mod tests {
         assert_eq!(host.layers().len(), 2);
         // Named import kept meaningful; ensures NamedKey path compiles for callers.
         let _named: Key = Key::Named(NamedKey::Escape);
+    }
+
+    // ---- sticky-tab-title: the two new seam directions (R1.4/R3.4) ----
+
+    #[test]
+    fn app_ctx_records_tab_requests_in_order_and_drains_once() {
+        // R1.4 — an overlay cannot hold `&mut Tabs` (the ctx already borrows the active
+        // writer), so it records requests the app applies afterwards.
+        let mut sink = Vec::new();
+        let mut ctx = AppCtx::new(&mut sink, 3, 0, None);
+        ctx.set_user_title(TabId(7), Some("Frontend".into()));
+        ctx.close_tab(TabId(9));
+        ctx.set_user_title(TabId(7), None);
+        let reqs = ctx.take_requests();
+        assert_eq!(
+            reqs,
+            vec![
+                AppRequest::SetUserTitle(TabId(7), Some("Frontend".into())),
+                AppRequest::CloseTab(TabId(9)),
+                AppRequest::SetUserTitle(TabId(7), None),
+            ],
+            "order is preserved — a later set must win over an earlier one"
+        );
+        assert!(
+            ctx.take_requests().is_empty(),
+            "draining twice must not replay a close"
+        );
+    }
+
+    #[test]
+    fn app_ctx_records_nothing_by_default() {
+        // Every existing handler keeps working unchanged: no requests unless one is made.
+        let mut sink = Vec::new();
+        let mut ctx = AppCtx::new(&mut sink, 1, 0, None);
+        assert!(ctx.take_requests().is_empty());
+    }
+
+    /// An overlay that answers `on_command` — the app→overlay direction (R3.4).
+    /// `seen` is shared so a test can count how many overlays a command actually reached.
+    struct Commandable {
+        got: Option<OverlayCommand>,
+        verdict: Handled,
+        seen: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+    impl Overlay for Commandable {
+        fn priority(&self) -> i32 {
+            50
+        }
+        fn visible(&self) -> bool {
+            false
+        }
+        fn on_key(&mut self, _in: &KeyInput, _c: &mut AppCtx) -> Handled {
+            Handled::Passthrough
+        }
+        fn layer(&self) -> Box<dyn DrawLayer> {
+            struct L;
+            impl DrawLayer for L {
+                fn z_order(&self) -> i32 {
+                    0
+                }
+                fn record(&mut self, _: &mut renderer::FrameCtx<'_>) {}
+            }
+            Box::new(L)
+        }
+        fn on_command(&mut self, cmd: &OverlayCommand) -> Handled {
+            self.got = Some(cmd.clone());
+            self.seen.set(self.seen.get() + 1);
+            self.verdict
+        }
+    }
+
+    #[test]
+    fn app_can_command_an_overlay() {
+        // R3.4 — the direction that did not exist: the card menu's `Rename` must be able
+        // to open the rename field on a chosen tab from a mouse press in `terminal_app`.
+        let mut host = OverlayHost::default();
+        host.register(Box::new(Commandable {
+            got: None,
+            verdict: Handled::Consumed,
+            seen: std::rc::Rc::new(std::cell::Cell::new(0)),
+        }));
+        let cmd = OverlayCommand::BeginRename {
+            tab: TabId(4),
+            current: Some("Frontend".into()),
+        };
+        assert_eq!(host.command(&cmd), Handled::Consumed);
+    }
+
+    #[test]
+    fn cancel_reaches_every_overlay_but_begin_rename_stops_at_the_first() {
+        // `Cancel` means "close any open modal surface", so a higher-priority overlay
+        // consuming it must not strand a field below. `BeginRename` is addressed to one
+        // owner, so first-wins is right there.
+        let seen = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut host = OverlayHost::default();
+        for _ in 0..2 {
+            host.register(Box::new(Commandable {
+                got: None,
+                verdict: Handled::Consumed,
+                seen: seen.clone(),
+            }));
+        }
+        assert_eq!(host.command(&OverlayCommand::Cancel), Handled::Consumed);
+        assert_eq!(
+            seen.get(),
+            2,
+            "Cancel fans out to every overlay, not just the first taker"
+        );
+
+        let seen = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut host = OverlayHost::default();
+        for _ in 0..2 {
+            host.register(Box::new(Commandable {
+                got: None,
+                verdict: Handled::Consumed,
+                seen: seen.clone(),
+            }));
+        }
+        let rename = OverlayCommand::BeginRename {
+            tab: TabId(1),
+            current: None,
+        };
+        assert_eq!(host.command(&rename), Handled::Consumed);
+        assert_eq!(seen.get(), 1, "BeginRename stops at the first taker");
+    }
+
+    #[test]
+    fn a_command_no_overlay_wants_is_passthrough() {
+        // The default `on_command` is a no-op, so registering an existing overlay (the
+        // ai-monitor) changes nothing — commands it does not understand fall through.
+        let mut host = OverlayHost::default();
+        host.register(Box::new(Ov {
+            prio: 100,
+            vis: true,
+            verdict: Handled::Consumed, // consumes KEYS, but has no on_command
+        }));
+        assert_eq!(host.command(&OverlayCommand::Cancel), Handled::Passthrough);
     }
 }

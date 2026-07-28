@@ -48,11 +48,13 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
 use crate::input::{
-    encode_key, pixel_to_cell, sidebar_hover, sidebar_press, suppress_key, tab_action, wheel_bytes,
-    wheel_lines, wheel_scroll, SidebarAction, TabAction, WheelDelta,
+    encode_key, is_double_click, pixel_to_cell, press_dismisses_modals, sidebar_hover,
+    sidebar_press, suppress_key, tab_action, wheel_bytes, wheel_lines, wheel_scroll, SidebarAction,
+    TabAction, WheelDelta,
 };
 use crate::seam::{
-    AppCtx, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayHost, WriteProbe,
+    AppCtx, AppRequest, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayCommand,
+    OverlayHost, WriteProbe,
 };
 use crate::session::{Session, TabId};
 use crate::tabmeta::{AgentState, TabMetaSnapshot};
@@ -139,6 +141,19 @@ struct Running {
     /// The sidebar list scroll offset in physical px, app-owned (D10). Published to the
     /// row layer via `set_list_scroll`, clamped whenever `max_scroll` shrinks.
     scroll: f32,
+    /// The last card press: which row, and when (ms since the app's epoch). Drives
+    /// double-click-to-rename (sticky-tab-title) — a second click on the same card within
+    /// `DOUBLE_CLICK_MS` opens the rename field on it. `None` until the first card press.
+    last_card_click: Option<(usize, u128)>,
+    /// The instant the app started, so click times are a plain `u128` of elapsed ms — a
+    /// pure number the double-click rule can be unit-tested against without a clock.
+    epoch: Instant,
+    /// The open card menu's target tab + its item set (sticky-tab-title D10/R3.2).
+    /// App-owned state: the renderer is *told* a menu is open so it can lay the popup out
+    /// and hit-test it, but the decision to open, what it contains, and what a press means
+    /// all live here. Keyed by `TabId`, so a roster shift under an open menu cannot
+    /// retarget it. `None` = no menu open.
+    open_menu: Option<(TabId, Vec<crate::card_menu::MenuItem>)>,
     /// Unspent sub-line remainder of the in-flight wheel gesture over the *grid*, in
     /// lines (terminal-scroll D3). Without it a slow trackpad drag — a few px per event
     /// — would truncate to zero lines every time and the grid would never move.
@@ -315,6 +330,9 @@ impl App {
             overlays,
             mods: ModifiersState::empty(),
             last_cursor: (0.0, 0.0),
+            last_card_click: None,
+            epoch: Instant::now(),
+            open_menu: None,
             dragging: false,
             drag_anchor: (0, 0),
             drag_moved: false,
@@ -377,6 +395,22 @@ impl Running {
                 // the active tab and `Tab`/`Drop` were dead code. Ownership is
                 // released *here*, after the bytes have been placed, and by
                 // `Ime::Disabled` / the start of a new composition.
+                // A visible text field claims the composition first (sticky-tab-title
+                // R2.6). This branch is the whole reason the rename field can accept
+                // Hangul: `Ime::Commit` bypasses `on_key` entirely — the composing gate
+                // withholds the duplicate `KeyboardInput` — so without this the syllable
+                // would go to the shell and the field would receive nothing at all.
+                if !text.is_empty()
+                    && self
+                        .overlays
+                        .command(&OverlayCommand::ImeCommit(text.clone()))
+                        == Handled::Consumed
+                {
+                    self.set_preedit(String::new());
+                    self.composing_tab = None;
+                    self.redraw();
+                    return;
+                }
                 if !text.is_empty() {
                     let composing_tab = self.composing_tab;
                     let target =
@@ -435,7 +469,16 @@ impl Running {
             // Composition in flight. Empty text is winit's synthetic clear signal
             // (view.rs:345), so `!is_empty()` is exactly the composing predicate (R6.6).
             Ime::Preedit(text, _cursor) => {
-                self.set_preedit(text);
+                // Show the in-flight composition inside a capturing field too
+                // (sticky-tab-title R2.6), so typing Hangul into the rename prompt looks
+                // live rather than frozen until the syllable commits. The grid's own
+                // preedit state is still updated: it drives the candidate-window position
+                // and the composing gate, which must keep working either way.
+                let claimed = self
+                    .overlays
+                    .command(&OverlayCommand::ImePreedit(text.clone()))
+                    == Handled::Consumed;
+                self.set_preedit_shown(text, !claimed);
             }
             // Nothing to do: `set_ime_allowed(true)` already put us in the state
             // this announces. Logged so an IME trace is readable end to end.
@@ -457,6 +500,17 @@ impl Running {
     /// `composing_tab` in lockstep, repositions the candidate window, and redraws
     /// (R6.6/R6.8/R8).
     fn set_preedit(&mut self, text: String) {
+        self.set_preedit_shown(text, true);
+    }
+
+    /// As [`set_preedit`](Self::set_preedit), but `show_in_grid == false` keeps the
+    /// composition **out of the grid's inline preedit** (sticky-tab-title R2.6).
+    ///
+    /// Needed because a capturing overlay draws the composition itself: without this the
+    /// same jamo would appear twice — once in the rename field and once at the shell
+    /// cursor underneath it. The composing *state* is still updated either way, since it
+    /// drives the `suppress_key` gate and the candidate-window position.
+    fn set_preedit_shown(&mut self, text: String, show_in_grid: bool) {
         // The transition itself lives in `next_composition_state` so it can be
         // table-tested without a window or an IME (R6.6/R6.7/D11/D12).
         let (composing, owner) = next_composition_state(
@@ -472,7 +526,11 @@ impl Running {
         // at the cursor (R7.1/D9). The layer is re-recorded every frame, so this
         // lands on screen even though the grid snapshot has not moved — the
         // composition never enters `term-core`.
-        self.preedit_handle.set_text(self.preedit.clone());
+        self.preedit_handle.set_text(if show_in_grid {
+            self.preedit.clone()
+        } else {
+            String::new()
+        });
         self.update_ime_cursor_area();
         // A composition change is a real content change, not an idle frame, so use
         // `redraw()` (which marks the snapshot cache stale), never the bare
@@ -564,6 +622,209 @@ impl Running {
         }
     }
 
+    /// Apply the tab mutations recorded during dispatch (sticky-tab-title R1.4/R3.6),
+    /// then resync + redraw if anything actually changed.
+    ///
+    /// Returns `false` when the last tab was closed, so the caller exits the app — the
+    /// same signal `do_tab_action` uses for Cmd+W (D4).
+    ///
+    /// The resync here is what makes a rename visible **at once, on any tab**: an
+    /// app-initiated title change never enters `Session::drain`, so it never sets
+    /// `title_dirty` and never rides the PTY wake path that normally refreshes the
+    /// sidebar (R4.1).
+    fn apply_requests(&mut self, requests: Vec<AppRequest>) -> bool {
+        if requests.is_empty() {
+            return true;
+        }
+        let mut changed = false;
+        for req in requests {
+            match req {
+                AppRequest::SetUserTitle(id, title) => {
+                    if let Some(s) = self.tabs.by_id_mut(id) {
+                        changed |= s.set_user_title(title);
+                    }
+                }
+                AppRequest::CloseTab(id) => {
+                    // Closing a tab kills any modal surface targeting it (R2.5): a field
+                    // still open on a tab that no longer exists would commit into nothing.
+                    // Broadcast before the close so the overlay can still see its target.
+                    self.overlays.command(&OverlayCommand::Cancel);
+                    self.close_card_menu();
+                    if !self.tabs.close(id) {
+                        return false;
+                    }
+                    // A close changes the roster, so it owes the FULL bookkeeping, not
+                    // just a model resync (R5.3 — parity with Cmd+W).
+                    self.after_roster_change();
+                    // Safe ONLY because `after_roster_change` is a strict superset of the
+                    // `if changed` tail below (it syncs and redraws): clearing the flag
+                    // suppresses a redundant second sync, and cannot drop an earlier
+                    // `SetUserTitle` in this batch, since that sync re-reads the mutated
+                    // sessions. If this method ever stops syncing, this line becomes a bug.
+                    changed = false;
+                }
+            }
+        }
+        if changed {
+            self.sync_tab_model();
+            self.redraw();
+        }
+        true
+    }
+
+    /// Open the card menu on the tab at list index `i` (sticky-tab-title R3.6). The item
+    /// set depends on that tab — `Reset to auto` only exists where there is a title to
+    /// reset — so it is derived here and pushed to the renderer as labels.
+    ///
+    /// Re-pressing the hamburger of the tab whose menu is already open closes it, which is
+    /// what makes the button feel like a toggle rather than a dead click.
+    fn open_card_menu(&mut self, i: usize) {
+        let Some(id) = self.row_tab_id(i) else {
+            return;
+        };
+        if self.open_menu.as_ref().is_some_and(|(open, _)| *open == id) {
+            self.close_card_menu();
+            return;
+        }
+        // Opening a menu closes any open rename field (D8a.1 — never two modal surfaces).
+        // Without this, pressing a hamburger while the field is up leaves BOTH on screen
+        // with the field still consuming every key, and silently contradicts D8's "a
+        // sidebar click cancels the edit".
+        self.overlays.command(&OverlayCommand::Cancel);
+        let has_title = self
+            .tabs
+            .by_id(id)
+            .is_some_and(|s| s.user_title().is_some());
+        let items = crate::card_menu::items_for(has_title);
+        self.tab_model
+            .set_menu(Some(renderer::sidebar_row::CardMenu {
+                row: i,
+                items: crate::card_menu::labels(&items),
+            }));
+        self.open_menu = Some((id, items));
+        self.redraw();
+    }
+
+    /// Open the rename field on the card at list index `i`, prefilled with its current
+    /// user title (sticky-tab-title). Shared by the double-click gesture and the card
+    /// menu's `Rename`, so both open the field in exactly the same state — with an
+    /// existing name present and selected, waiting for input.
+    fn begin_rename_row(&mut self, i: usize) {
+        let Some(id) = self.row_tab_id(i) else {
+            return;
+        };
+        let current = self.displayed_label(id);
+        self.overlays
+            .command(&OverlayCommand::BeginRename { tab: id, current });
+        self.redraw();
+    }
+
+    /// The label the card is **currently showing** for `id` — what the user is looking at
+    /// when they start a rename.
+    ///
+    /// Prefilling from `user_title` alone was wrong: a tab that has never been named has
+    /// no user title, so the field opened EMPTY and the name the user could plainly see
+    /// vanished the moment they tried to edit it. You edit the text that is there, so the
+    /// field must start from the resolved label — the same four sources, in the same
+    /// order, that `sidebar_model::fill` draws from.
+    ///
+    /// Returns `None` only when even the cwd is unavailable, which leaves an empty field
+    /// with nothing sensible to prefill.
+    fn displayed_label(&mut self, id: TabId) -> Option<String> {
+        // Refresh the metadata snapshot so the AI-task label is the one on screen, not a
+        // stale one — the sidebar reads it on a per-frame pull, this path does not.
+        if let Some(handle) = crate::tabmeta::global() {
+            handle.sync(&mut self.tabmeta_snapshot);
+        }
+        let session = self.tabs.by_id(id)?;
+        let cwd = session
+            .cwd()
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let task = self
+            .tabmeta_snapshot
+            .get(id)
+            .and_then(|m| m.task.as_deref());
+        let label = crate::sidebar_model::resolve_line1_tier(
+            session.user_title(),
+            task,
+            Some(session.program_title()),
+            &cwd,
+        )
+        .0
+        .to_string();
+        (!label.is_empty()).then_some(label)
+    }
+
+    /// Close the card menu if one is open (R3.8). Idempotent, so every dismissal path —
+    /// an outside click, Esc, a tab chord, choosing an item — can call it unconditionally.
+    fn close_card_menu(&mut self) {
+        if self.open_menu.take().is_some() {
+            self.tab_model.set_menu(None);
+            self.redraw();
+        }
+    }
+
+    /// Act on menu item `i` of the open menu (R3.5/R3.6), then close the menu.
+    ///
+    /// The item's *identity* is resolved through the stored list, never from the index
+    /// alone: position 1 is `Close` on an unnamed tab and `Reset to auto` on a named one,
+    /// so indexing blind would fire the wrong action on half the tabs.
+    ///
+    /// Returns `false` when the app should exit (the last tab was closed).
+    fn activate_menu_item(&mut self, i: usize) -> bool {
+        let Some((id, items)) = self.open_menu.take() else {
+            return true;
+        };
+        // Choosing an item always closes the menu FIRST (D8a.1): the rename field opens in
+        // the same event, and the two modal surfaces must never be open at once.
+        self.tab_model.set_menu(None);
+        let Some(item) = items.get(i).copied() else {
+            self.redraw();
+            return true;
+        };
+        match item {
+            crate::card_menu::MenuItem::Rename => {
+                // The app→overlay direction: the menu can target a BACKGROUND tab, which
+                // the Cmd+Shift+R chord cannot (it always names the active one). Prefilled
+                // from the DISPLAYED label, like every other entry point, so the name you
+                // are looking at is the name you start editing.
+                let current = self.displayed_label(id);
+                self.overlays
+                    .command(&OverlayCommand::BeginRename { tab: id, current });
+            }
+            crate::card_menu::MenuItem::ResetToAuto => {
+                if let Some(s) = self.tabs.by_id_mut(id) {
+                    s.set_user_title(None);
+                }
+                self.sync_tab_model();
+            }
+            crate::card_menu::MenuItem::Close => {
+                self.overlays.command(&OverlayCommand::Cancel);
+                if !self.tabs.close(id) {
+                    return false; // last tab → exit, exactly as Cmd+W does
+                }
+                // Full bookkeeping, not a bare resync (R5.3): closing the ACTIVE tab from
+                // its own menu must leave the app in the same state Cmd+W would — the
+                // ai-monitor re-pointed off the dead session, the scroll re-clamped to the
+                // shorter list, the new active tab's waiting signal acknowledged.
+                self.after_roster_change();
+            }
+        }
+        self.redraw();
+        true
+    }
+
+    /// The `TabId` of the sidebar row at list index `i` (R3.3) — the app-side join the
+    /// renderer cannot do, since it speaks only in row indices. Same pattern as
+    /// `waiting_row_tab_index`. `None` if the row vanished between draw and press.
+    fn row_tab_id(&self, i: usize) -> Option<TabId> {
+        self.tab_model
+            .with(|m| m.rows.get(i).map(|r| TabId(r.tab_id)))
+    }
+
     /// Push the current tab rows + active index into the sidebar layer. `Tabs::titles()`
     /// also pushes the metadata roster to the worker (tab-metadata seam).
     fn sync_tab_model(&mut self) {
@@ -573,6 +834,14 @@ impl Running {
             titles,
             active: self.tabs.active_index(),
             waiting,
+            // The open card menu survives a row resync (sticky-tab-title R3.2): a tab's
+            // title changing underneath an open menu must not close it. T6 owns opening
+            // and closing it; `set` only carries the current value through.
+            menu: self.tab_model.menu(),
+            // An in-flight inline rename survives a row resync too (R2.1): a background
+            // tab's title changing must not wipe the name the user is mid-way through
+            // typing on another card.
+            edit: self.tab_model.edit(),
         });
     }
 
@@ -693,6 +962,9 @@ impl Running {
             row_count: count,
             waiting_count,
             metrics: SidebarMetrics::DEFAULT.scaled(scale),
+            // The open menu is layout input, not renderer state (sticky-tab-title R3.2):
+            // the app owns the decision, the renderer lays it out and hit-tests it.
+            open_menu: self.tab_model.open_menu(),
         }
     }
 
@@ -763,6 +1035,15 @@ impl Running {
         // Named key + modifier, so it sails straight through the composing gate
         // (R6.3) and is reachable by keyboard, not just by a sidebar click.
         self.cancel_composition();
+        // A tab switch also abandons an in-flight RENAME (sticky-tab-title R2.5/D8):
+        // the user's attention moved, so the half-typed name is discarded rather than
+        // committed. Same funnel as the composition cancel above — every switch (chord,
+        // click, Cmd+number, waiting row) passes through here, so there is one place this
+        // rule has to hold. The switch itself still proceeds; the chord is not swallowed.
+        self.overlays.command(&OverlayCommand::Cancel);
+        // …and dismisses an open card menu (R3.8), for the same reason: a popup anchored
+        // to a card the user just navigated away from is stale chrome.
+        self.close_card_menu();
         // A tab switch ends the in-flight wheel gesture, so the unspent sub-line
         // remainder does not follow the user into the next tab (terminal-scroll D3).
         // Load-bearing, not hygiene: an unspent +0.9 from here would make the very
@@ -784,12 +1065,44 @@ impl Running {
             TabAction::Prev => self.tabs.prev(),
             TabAction::Jump(i) => self.tabs.jump(i),
         }
+        self.after_roster_change();
+        true
+    }
+
+    /// Common tail for "a registered overlay or handler consumed this key" — shared by
+    /// BOTH dispatch branches so the D8a.1 invariant is enforced in one place, not in one
+    /// of two symmetric sites.
+    ///
+    /// If a key was claimed while a card menu was open, that claim opened or owns a modal
+    /// interaction, and a stale popup underneath it is exactly the two-modal state D8a
+    /// forbids. Unconditional on `consumed` rather than sniffing which chord it was: an
+    /// overlay that takes a key is asserting it owns the interaction. (Ordinary typing is
+    /// `Passthrough` and leaves the menu up — R3.8 names only outside-click, Esc and tab
+    /// chords as dismissals.)
+    fn finish_consumed_key(&mut self, menu_was_open: bool, wants_redraw: bool) {
+        if menu_was_open {
+            self.close_card_menu();
+        }
+        if wants_redraw {
+            self.redraw();
+        }
+    }
+
+    /// The bookkeeping every roster/active-tab change owes (extracted so the card menu's
+    /// `Close` cannot drift from Cmd+W — sticky-tab-title R5.3, which D4 promises parity
+    /// with). Called by `do_tab_action` and by every close-by-id path.
+    ///
+    /// Skipping any of this is silently harmful rather than obviously broken: without the
+    /// re-point, the ai-monitor keeps tailing a **dead session's** cwd; without the
+    /// re-clamp, the sidebar keeps a scroll offset the shrunken list no longer has;
+    /// without the acknowledge, the newly-active tab's waiting signal never clears.
+    fn after_roster_change(&mut self) {
         // Becoming the active tab is the "confirmation" that clears its waiting signals
         // (D12/R2.1). Every path that changes the active tab — click, chord, Cmd+number
         // jump, or a click on a waiting row — funnels through here. Acknowledge BEFORE
         // rebuilding the model so the just-activated session's item is already gone from
-        // the band (clicking a waiting row makes it disappear, R2.1). `do_tab_action` ends
-        // in `redraw()`, so the cleared band repaints.
+        // the band (clicking a waiting row makes it disappear, R2.1). This ends in
+        // `redraw()`, so the cleared band repaints.
         self.waiting.acknowledge(self.tabs.active().id);
         self.sync_tab_model();
         // Reveal the (possibly newly-appended or below-the-fold) active tab and re-clamp
@@ -802,7 +1115,6 @@ impl Running {
         let cwd = self.tabs.active_cwd();
         self.overlays.notify_active_changed(cwd);
         self.redraw();
-        true
     }
 
     /// Map the latest cursor position to a live-viewport cell, or `None` over the
@@ -945,6 +1257,23 @@ impl Running {
     /// Dispatch a key through the seam, then default input (R3.3/R4). Returns
     /// false if the app should exit.
     fn on_key(&mut self, input: KeyInput) -> bool {
+        // Esc dismisses an open card menu before anything else sees it
+        // (sticky-tab-title R3.8) — ahead of the overlays and of `encode_key`, which
+        // would otherwise send the ESC on to the shell while the popup stayed up.
+        if self.open_menu.is_some()
+            && matches!(
+                input.key,
+                winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
+            )
+        {
+            self.close_card_menu();
+            return true;
+        }
+        // Any OTHER key that an overlay claims also dismisses the menu (D8a.1). A chord
+        // that opens a modal surface — Cmd+Shift+R, Cmd+Shift+M — would otherwise stack
+        // it on top of a live popup. Checked after dispatch below via `menu_was_open`,
+        // because whether a key is claimed is only known once the overlays have seen it.
+        let menu_was_open = self.open_menu.is_some();
         // Seam data for handlers, read from the active tab BEFORE the mutable
         // `writer` borrow (D9): bracketed-paste mode (text-paste) + the selection
         // text (copy-clipboard). The full-grid `snapshot()` clone is paid ONLY when
@@ -967,20 +1296,39 @@ impl Running {
             let active = self.tabs.active_index();
             let count = self.tabs.len();
             let cwd = self.tabs.active_cwd();
+            // The active tab's identity + the label it is CURRENTLY SHOWING, for the
+            // rename chord (R2.1) — read before the mutable writer borrow, like
+            // `bracketed`/`selection_text`. The displayed label, not `user_title`: a tab
+            // that was never named still shows a name, and that is what you edit.
+            let active_tab = self.tabs.active().id;
+            // Resolving the displayed label costs a `proc_pidinfo` (for the cwd) plus a
+            // metadata sync, so it is NOT paid per keystroke: the rename chord is
+            // Cmd+Shift+R, so anything without both modifiers cannot be it. The gate is a
+            // modifier test, no syscall.
+            let active_user_title = if input.mods.super_key() && input.mods.shift_key() {
+                self.displayed_label(active_tab)
+            } else {
+                None
+            };
             let mut probe = WriteProbe::new(&mut self.tabs.active_mut().writer);
             let mut ctx = AppCtx::new(&mut probe, count, active, cwd)
+                .with_active_tab(active_tab, active_user_title)
                 .with_bracketed_paste(bracketed)
                 .with_selection_text(selection_text.clone());
             let consumed = self.overlays.dispatch(&input, &mut ctx) == Handled::Consumed;
             let wants_redraw = ctx.redraw_requested();
+            // Tab mutations an overlay asked for (sticky-tab-title R1.4) — collected here
+            // and applied below, once the `&mut Tabs` borrow this block holds is released.
+            let requests = ctx.take_requests();
             let wrote = probe.wrote();
             if wrote {
                 self.snap_active_after_input();
             }
+            if !self.apply_requests(requests) {
+                return false; // the last tab closed — the app exits
+            }
             if consumed {
-                if wants_redraw {
-                    self.redraw();
-                }
+                self.finish_consumed_key(menu_was_open, wants_redraw);
                 return true;
             }
         }
@@ -989,20 +1337,37 @@ impl Running {
             let active = self.tabs.active_index();
             let count = self.tabs.len();
             let cwd = self.tabs.active_cwd();
+            // The active tab's identity + the label it is CURRENTLY SHOWING, for the
+            // rename chord (R2.1) — read before the mutable writer borrow, like
+            // `bracketed`/`selection_text`. The displayed label, not `user_title`: a tab
+            // that was never named still shows a name, and that is what you edit.
+            let active_tab = self.tabs.active().id;
+            // Resolving the displayed label costs a `proc_pidinfo` (for the cwd) plus a
+            // metadata sync, so it is NOT paid per keystroke: the rename chord is
+            // Cmd+Shift+R, so anything without both modifiers cannot be it. The gate is a
+            // modifier test, no syscall.
+            let active_user_title = if input.mods.super_key() && input.mods.shift_key() {
+                self.displayed_label(active_tab)
+            } else {
+                None
+            };
             let mut probe = WriteProbe::new(&mut self.tabs.active_mut().writer);
             let mut ctx = AppCtx::new(&mut probe, count, active, cwd)
+                .with_active_tab(active_tab, active_user_title)
                 .with_bracketed_paste(bracketed)
                 .with_selection_text(selection_text);
             let consumed = self.router.dispatch(&input, &mut ctx) == Handled::Consumed;
             let wants_redraw = ctx.redraw_requested();
+            let requests = ctx.take_requests();
             let wrote = probe.wrote();
             if wrote {
                 self.snap_active_after_input();
             }
+            if !self.apply_requests(requests) {
+                return false; // the last tab closed — the app exits
+            }
             if consumed {
-                if wants_redraw {
-                    self.redraw();
-                }
+                self.finish_consumed_key(menu_was_open, wants_redraw);
                 return true;
             }
         }
@@ -1199,13 +1564,38 @@ impl ApplicationHandler<UserEvent> for App {
                 // path as chords (D2); hide/restore toggle; inert regions are swallowed.
                 let inp = inner.sidebar_input();
                 let collapsed = inner.collapsed();
-                if let Some(action) =
-                    sidebar_press(inner.last_cursor, &inp, inner.scroll, collapsed)
-                {
+                let action = sidebar_press(inner.last_cursor, &inp, inner.scroll, collapsed);
+                // Any press that is not ON the open menu dismisses it (sticky-tab-title
+                // R3.8) — including a press over the grid, which resolves to no sidebar
+                // action at all. The press still does its own job afterwards: dismissing
+                // is not swallowing, the same rule D8a.2 gives tab chords.
+                if press_dismisses_modals(action) {
+                    inner.close_card_menu();
+                    // …and the rename field, which D8 gives the same rule ("a sidebar
+                    // click cancels the edit"). Enforcing it only for the menu left the
+                    // field open behind a press that dismissed everything else — and
+                    // collapsing the sidebar then hid a field that was still consuming
+                    // EVERY keystroke, with nothing on screen to explain why. One press,
+                    // one dismissal rule, both surfaces.
+                    //
+                    // Safe for the double-click path: this runs BEFORE the action, and
+                    // `begin_rename_row` opens the field afterwards.
+                    inner.overlays.command(&OverlayCommand::Cancel);
+                }
+                if let Some(action) = action {
                     match action {
                         SidebarAction::Switch(i) => {
+                            // A second click on the SAME card opens the rename field on it
+                            // (sticky-tab-title): the title is edited by clicking the title,
+                            // not only through the menu. The first click still switches —
+                            // this adds a gesture, it does not replace one.
+                            let now = inner.epoch.elapsed().as_millis();
+                            let double = is_double_click(inner.last_card_click, i, now);
+                            inner.last_card_click = Some((i, now));
                             if !inner.do_tab_action(TabAction::Jump(i)) {
                                 event_loop.exit();
+                            } else if double {
+                                inner.begin_rename_row(i);
                             }
                         }
                         SidebarAction::SwitchWaiting(i) => {
@@ -1225,6 +1615,12 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         SidebarAction::Collapse => inner.toggle_sidebar(true),
                         SidebarAction::Expand => inner.toggle_sidebar(false),
+                        SidebarAction::OpenMenu(i) => inner.open_card_menu(i),
+                        SidebarAction::MenuItem(i) => {
+                            if !inner.activate_menu_item(i) {
+                                event_loop.exit();
+                            }
+                        }
                         SidebarAction::Inert => {}
                     }
                 } else if let Some(cell) = inner.cursor_cell() {
