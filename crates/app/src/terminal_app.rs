@@ -48,8 +48,9 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
 use crate::input::{
-    encode_key, pixel_to_cell, sidebar_hover, sidebar_press, suppress_key, tab_action, wheel_bytes,
-    wheel_lines, wheel_scroll, SidebarAction, TabAction, WheelDelta,
+    encode_key, is_double_click, pixel_to_cell, press_dismisses_modals, sidebar_hover,
+    sidebar_press, suppress_key, tab_action, wheel_bytes, wheel_lines, wheel_scroll, SidebarAction,
+    TabAction, WheelDelta,
 };
 use crate::seam::{
     AppCtx, AppRequest, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayCommand,
@@ -140,6 +141,13 @@ struct Running {
     /// The sidebar list scroll offset in physical px, app-owned (D10). Published to the
     /// row layer via `set_list_scroll`, clamped whenever `max_scroll` shrinks.
     scroll: f32,
+    /// The last card press: which row, and when (ms since the app's epoch). Drives
+    /// double-click-to-rename (sticky-tab-title) — a second click on the same card within
+    /// `DOUBLE_CLICK_MS` opens the rename field on it. `None` until the first card press.
+    last_card_click: Option<(usize, u128)>,
+    /// The instant the app started, so click times are a plain `u128` of elapsed ms — a
+    /// pure number the double-click rule can be unit-tested against without a clock.
+    epoch: Instant,
     /// The open card menu's target tab + its item set (sticky-tab-title D10/R3.2).
     /// App-owned state: the renderer is *told* a menu is open so it can lay the popup out
     /// and hit-test it, but the decision to open, what it contains, and what a press means
@@ -322,6 +330,8 @@ impl App {
             overlays,
             mods: ModifiersState::empty(),
             last_cursor: (0.0, 0.0),
+            last_card_click: None,
+            epoch: Instant::now(),
             open_menu: None,
             dragging: false,
             drag_anchor: (0, 0),
@@ -695,6 +705,59 @@ impl Running {
         self.redraw();
     }
 
+    /// Open the rename field on the card at list index `i`, prefilled with its current
+    /// user title (sticky-tab-title). Shared by the double-click gesture and the card
+    /// menu's `Rename`, so both open the field in exactly the same state — with an
+    /// existing name present and selected, waiting for input.
+    fn begin_rename_row(&mut self, i: usize) {
+        let Some(id) = self.row_tab_id(i) else {
+            return;
+        };
+        let current = self.displayed_label(id);
+        self.overlays
+            .command(&OverlayCommand::BeginRename { tab: id, current });
+        self.redraw();
+    }
+
+    /// The label the card is **currently showing** for `id` — what the user is looking at
+    /// when they start a rename.
+    ///
+    /// Prefilling from `user_title` alone was wrong: a tab that has never been named has
+    /// no user title, so the field opened EMPTY and the name the user could plainly see
+    /// vanished the moment they tried to edit it. You edit the text that is there, so the
+    /// field must start from the resolved label — the same four sources, in the same
+    /// order, that `sidebar_model::fill` draws from.
+    ///
+    /// Returns `None` only when even the cwd is unavailable, which leaves an empty field
+    /// with nothing sensible to prefill.
+    fn displayed_label(&mut self, id: TabId) -> Option<String> {
+        // Refresh the metadata snapshot so the AI-task label is the one on screen, not a
+        // stale one — the sidebar reads it on a per-frame pull, this path does not.
+        if let Some(handle) = crate::tabmeta::global() {
+            handle.sync(&mut self.tabmeta_snapshot);
+        }
+        let session = self.tabs.by_id(id)?;
+        let cwd = session
+            .cwd()
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let task = self
+            .tabmeta_snapshot
+            .get(id)
+            .and_then(|m| m.task.as_deref());
+        let label = crate::sidebar_model::resolve_line1_tier(
+            session.user_title(),
+            task,
+            Some(session.program_title()),
+            &cwd,
+        )
+        .0
+        .to_string();
+        (!label.is_empty()).then_some(label)
+    }
+
     /// Close the card menu if one is open (R3.8). Idempotent, so every dismissal path —
     /// an outside click, Esc, a tab chord, choosing an item — can call it unconditionally.
     fn close_card_menu(&mut self) {
@@ -724,13 +787,11 @@ impl Running {
         };
         match item {
             crate::card_menu::MenuItem::Rename => {
-                let current = self
-                    .tabs
-                    .by_id(id)
-                    .and_then(|s| s.user_title())
-                    .map(str::to_string);
                 // The app→overlay direction: the menu can target a BACKGROUND tab, which
-                // the Cmd+Shift+R chord cannot (it always names the active one).
+                // the Cmd+Shift+R chord cannot (it always names the active one). Prefilled
+                // from the DISPLAYED label, like every other entry point, so the name you
+                // are looking at is the name you start editing.
+                let current = self.displayed_label(id);
                 self.overlays
                     .command(&OverlayCommand::BeginRename { tab: id, current });
             }
@@ -1235,10 +1296,20 @@ impl Running {
             let active = self.tabs.active_index();
             let count = self.tabs.len();
             let cwd = self.tabs.active_cwd();
-            // The active tab's identity + current name, for the rename chord (R2.1):
-            // read before the mutable writer borrow, like `bracketed`/`selection_text`.
+            // The active tab's identity + the label it is CURRENTLY SHOWING, for the
+            // rename chord (R2.1) — read before the mutable writer borrow, like
+            // `bracketed`/`selection_text`. The displayed label, not `user_title`: a tab
+            // that was never named still shows a name, and that is what you edit.
             let active_tab = self.tabs.active().id;
-            let active_user_title = self.tabs.active().user_title().map(str::to_string);
+            // Resolving the displayed label costs a `proc_pidinfo` (for the cwd) plus a
+            // metadata sync, so it is NOT paid per keystroke: the rename chord is
+            // Cmd+Shift+R, so anything without both modifiers cannot be it. The gate is a
+            // modifier test, no syscall.
+            let active_user_title = if input.mods.super_key() && input.mods.shift_key() {
+                self.displayed_label(active_tab)
+            } else {
+                None
+            };
             let mut probe = WriteProbe::new(&mut self.tabs.active_mut().writer);
             let mut ctx = AppCtx::new(&mut probe, count, active, cwd)
                 .with_active_tab(active_tab, active_user_title)
@@ -1266,10 +1337,20 @@ impl Running {
             let active = self.tabs.active_index();
             let count = self.tabs.len();
             let cwd = self.tabs.active_cwd();
-            // The active tab's identity + current name, for the rename chord (R2.1):
-            // read before the mutable writer borrow, like `bracketed`/`selection_text`.
+            // The active tab's identity + the label it is CURRENTLY SHOWING, for the
+            // rename chord (R2.1) — read before the mutable writer borrow, like
+            // `bracketed`/`selection_text`. The displayed label, not `user_title`: a tab
+            // that was never named still shows a name, and that is what you edit.
             let active_tab = self.tabs.active().id;
-            let active_user_title = self.tabs.active().user_title().map(str::to_string);
+            // Resolving the displayed label costs a `proc_pidinfo` (for the cwd) plus a
+            // metadata sync, so it is NOT paid per keystroke: the rename chord is
+            // Cmd+Shift+R, so anything without both modifiers cannot be it. The gate is a
+            // modifier test, no syscall.
+            let active_user_title = if input.mods.super_key() && input.mods.shift_key() {
+                self.displayed_label(active_tab)
+            } else {
+                None
+            };
             let mut probe = WriteProbe::new(&mut self.tabs.active_mut().writer);
             let mut ctx = AppCtx::new(&mut probe, count, active, cwd)
                 .with_active_tab(active_tab, active_user_title)
@@ -1488,17 +1569,33 @@ impl ApplicationHandler<UserEvent> for App {
                 // R3.8) — including a press over the grid, which resolves to no sidebar
                 // action at all. The press still does its own job afterwards: dismissing
                 // is not swallowing, the same rule D8a.2 gives tab chords.
-                if !matches!(
-                    action,
-                    Some(SidebarAction::MenuItem(_)) | Some(SidebarAction::OpenMenu(_))
-                ) {
+                if press_dismisses_modals(action) {
                     inner.close_card_menu();
+                    // …and the rename field, which D8 gives the same rule ("a sidebar
+                    // click cancels the edit"). Enforcing it only for the menu left the
+                    // field open behind a press that dismissed everything else — and
+                    // collapsing the sidebar then hid a field that was still consuming
+                    // EVERY keystroke, with nothing on screen to explain why. One press,
+                    // one dismissal rule, both surfaces.
+                    //
+                    // Safe for the double-click path: this runs BEFORE the action, and
+                    // `begin_rename_row` opens the field afterwards.
+                    inner.overlays.command(&OverlayCommand::Cancel);
                 }
                 if let Some(action) = action {
                     match action {
                         SidebarAction::Switch(i) => {
+                            // A second click on the SAME card opens the rename field on it
+                            // (sticky-tab-title): the title is edited by clicking the title,
+                            // not only through the menu. The first click still switches —
+                            // this adds a gesture, it does not replace one.
+                            let now = inner.epoch.elapsed().as_millis();
+                            let double = is_double_click(inner.last_card_click, i, now);
+                            inner.last_card_click = Some((i, now));
                             if !inner.do_tab_action(TabAction::Jump(i)) {
                                 event_loop.exit();
+                            } else if double {
+                                inner.begin_rename_row(i);
                             }
                         }
                         SidebarAction::SwitchWaiting(i) => {

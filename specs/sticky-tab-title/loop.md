@@ -59,6 +59,12 @@ contract, and the spec.
   committed, a chord dismisses AND acts" actually true on every path?
 - **Naming / readability** — are the new seam types (`AppRequest`, `OverlayCommand`,
   `CardMenu`, `OpenMenu`) clear at their call sites?
+- **Cursor semantics** (added for the cursor-movement fix) — is every edit operation
+  expressed against the cursor position rather than the end of the string: insertion,
+  Backspace vs Delete, Home/End, and the collapse of a selection to an edge? Are char
+  boundaries respected (no byte-index slicing that can panic on 한글)?
+- **Caret visibility** — when the name is longer than the card, does the visible window
+  follow the CURSOR rather than always showing the tail?
 
 ```
 <item>: <score>/10

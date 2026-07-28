@@ -119,6 +119,44 @@ pub fn sidebar_hover(
     }
 }
 
+/// Whether a left-press dismisses the open modal surfaces — the card menu **and** the
+/// rename field (sticky-tab-title D8/D8a.1).
+///
+/// One rule for both surfaces, in one testable place. Enforcing it for the menu alone is
+/// what let a press collapse the sidebar while leaving an invisible rename field behind,
+/// still consuming every keystroke — so this is the L2 modal-exclusion invariant made
+/// checkable rather than argued in a comment.
+///
+/// The two menu regions are the exception: pressing the hamburger or picking an item is
+/// *operating* the menu, not dismissing it. Everything else — another card, chrome, the
+/// panel's dead space, or the grid (`None`) — dismisses.
+pub fn press_dismisses_modals(action: Option<SidebarAction>) -> bool {
+    !matches!(
+        action,
+        Some(SidebarAction::MenuItem(_)) | Some(SidebarAction::OpenMenu(_))
+    )
+}
+
+/// How long after a click a second one still counts as a double-click. macOS's own
+/// default interval is 500 ms; matching it is what makes the gesture feel native rather
+/// than tuned to this app.
+pub const DOUBLE_CLICK_MS: u128 = 500;
+
+/// Whether this press is the second half of a double-click on the **same card**
+/// (sticky-tab-title): within [`DOUBLE_CLICK_MS`] of the previous press, on the same row.
+///
+/// Same-row is part of the test, not just timing: two fast clicks on two different cards
+/// are two deliberate tab switches, and treating them as a rename gesture would hijack
+/// quick navigation. `prev` is `None` when nothing has been clicked yet.
+pub fn is_double_click(prev: Option<(usize, u128)>, row: usize, now_ms: u128) -> bool {
+    match prev {
+        Some((prev_row, prev_ms)) => {
+            prev_row == row && now_ms.saturating_sub(prev_ms) <= DOUBLE_CLICK_MS
+        }
+        None => false,
+    }
+}
+
 /// The new scroll offset after a wheel event (D10). Gated by `hit_test` (not `x <
 /// sidebar_w`, D1): a wheel over the terminal leaves the list unmoved. A line delta
 /// advances one card (`row_stride`); the sign follows winit (positive y = content down =
@@ -836,6 +874,51 @@ mod tests {
             metrics: renderer::sidebar_theme::SidebarMetrics::DEFAULT.scaled(1.0),
             open_menu: None,
         }
+    }
+
+    #[test]
+    fn every_press_but_the_menu_itself_dismisses_the_modals() {
+        // The L2 modal-exclusion invariant, as a test rather than a comment: enforcing it
+        // for the menu but not the field is what once left an INVISIBLE rename field
+        // eating every keystroke after the sidebar was collapsed.
+        for a in [
+            SidebarAction::Switch(0),
+            SidebarAction::SwitchWaiting(0),
+            SidebarAction::NewTab,
+            SidebarAction::Collapse,
+            SidebarAction::Expand,
+            SidebarAction::Inert,
+        ] {
+            assert!(press_dismisses_modals(Some(a)), "{a:?} must dismiss");
+        }
+        // A press over the grid (no sidebar region at all) dismisses too.
+        assert!(press_dismisses_modals(None));
+        // Operating the menu is not dismissing it.
+        assert!(!press_dismisses_modals(Some(SidebarAction::OpenMenu(1))));
+        assert!(!press_dismisses_modals(Some(SidebarAction::MenuItem(0))));
+    }
+
+    #[test]
+    fn double_click_needs_the_same_card_and_a_quick_second_press() {
+        // sticky-tab-title — a second click on the same card opens the rename field.
+        assert!(is_double_click(Some((2, 1_000)), 2, 1_200));
+        // Exactly at the boundary still counts.
+        assert!(is_double_click(
+            Some((2, 1_000)),
+            2,
+            1_000 + DOUBLE_CLICK_MS
+        ));
+        // Too slow — two separate clicks, not a rename gesture.
+        assert!(!is_double_click(
+            Some((2, 1_000)),
+            2,
+            1_001 + DOUBLE_CLICK_MS
+        ));
+        // A DIFFERENT card: two fast clicks on two cards are two deliberate tab switches,
+        // and hijacking that into a rename would break quick navigation.
+        assert!(!is_double_click(Some((2, 1_000)), 3, 1_050));
+        // Nothing clicked yet.
+        assert!(!is_double_click(None, 0, 10));
     }
 
     #[test]

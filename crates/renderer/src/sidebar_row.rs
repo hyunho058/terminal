@@ -187,8 +187,16 @@ pub struct TabBarModel {
 pub struct CardEdit {
     /// The tab being renamed (`session::TabId` as a plain `u64` — SD3).
     pub tab_id: u64,
-    /// The text typed so far, with any IME preedit already appended by the app.
+    /// The text typed so far, with any IME preedit already inserted by the app.
     pub text: String,
+    /// The caret's position as a **char** index into `text` (`0..=text.chars().count()`).
+    /// The renderer draws the caret here rather than at the end, which is what lets the
+    /// middle of a name be edited.
+    pub caret: usize,
+    /// Whether the whole text is selected — the state a rename field opens in, so the
+    /// existing name is visible but the next keystroke replaces it wholesale (the Finder
+    /// rename convention). Drawn as a highlight behind the text.
+    pub selected: bool,
 }
 
 /// The open per-card menu as the app hands it over (sticky-tab-title D4/R3.2): which card
@@ -375,19 +383,29 @@ pub(crate) fn card_line1_text<'a>(resolved: &'a str, cwd_title: &'a str) -> &'a 
     }
 }
 
-/// The caret drawn at the end of an inline rename. A thin bar, so it reads as a text
-/// cursor rather than as a character in the name.
+/// The caret drawn at the cursor during an inline rename. A thin bar, so it reads as a
+/// text cursor rather than as a character in the name.
 pub(crate) const EDIT_CARET: char = '▏';
 
 /// What to draw on line 1 while a card is being renamed (sticky-tab-title R2.1): the typed
-/// text with the caret appended, **tail-anchored** so the caret is always visible.
+/// text with the caret **at `caret`**, windowed so the caret is always on screen.
 ///
 /// Editing happens in a card barely wider than a word, so a name longer than the card is
-/// the normal case, not the edge case. Truncating from the end — what
-/// [`truncate_to_width`] does for labels — would hide the very characters being typed, so
-/// this keeps the END of the string and drops from the front, marking the elision with a
-/// leading ellipsis.
-pub(crate) fn edit_line_text(text: &str, advance: f32, max_w: f32, ellipsis: char) -> String {
+/// the normal case, not the edge case. Two things follow, and both differ from
+/// [`truncate_to_width`]'s label behaviour:
+///
+/// - The caret is inserted at the cursor, not appended — otherwise the middle of a name
+///   could be edited but never *seen* being edited.
+/// - The visible window **follows the caret**. Anchoring on the tail would hide the cursor
+///   the moment the user arrowed back into a long name, which is exactly when they need to
+///   see it. An elision on either side is marked with `ellipsis`.
+pub(crate) fn edit_line_text(
+    text: &str,
+    caret: usize,
+    advance: f32,
+    max_w: f32,
+    ellipsis: char,
+) -> String {
     if max_w <= 0.0 || advance <= 0.0 {
         return String::new();
     }
@@ -395,24 +413,35 @@ pub(crate) fn edit_line_text(text: &str, advance: f32, max_w: f32, ellipsis: cha
     if max_chars == 0 {
         return String::new();
     }
-    let mut out: String = text.chars().collect();
-    out.push(EDIT_CARET);
-    let len = out.chars().count();
-    if len <= max_chars {
-        return out;
+    // The caret is a drawn glyph, so it occupies one of the visible columns.
+    let mut chars: Vec<char> = text.chars().collect();
+    let caret_at = caret.min(chars.len());
+    chars.insert(caret_at, EDIT_CARET);
+    if chars.len() <= max_chars {
+        return chars.into_iter().collect();
     }
-    // Keep the last `max_chars - 1` chars (the caret among them) and mark the cut. With
-    // room for a single glyph there is nothing to mark — an ellipsis alone would say
-    // "something is here" while hiding the cursor, so the caret wins.
-    let keep = max_chars - 1;
-    if keep == 0 {
-        return EDIT_CARET.to_string();
+    // A window of exactly `max_chars`, centred on the caret so there is context on both
+    // sides, clamped to the ends of the string.
+    let half = max_chars / 2;
+    let start = caret_at
+        .saturating_sub(half)
+        .min(chars.len().saturating_sub(max_chars));
+    let end = start + max_chars;
+    let mut window: Vec<char> = chars[start..end].to_vec();
+    // Mark each elided side by REPLACING that edge column — never by adding one, which
+    // would push the window over the card's width. The caret is never overwritten: it is
+    // the one glyph that must survive, since a field whose cursor is off-screen is
+    // exactly the failure this windowing exists to prevent.
+    if start > 0 && window[0] != EDIT_CARET {
+        window[0] = ellipsis;
     }
-    let tail: String = out.chars().skip(len - keep).collect();
-    let mut trimmed = String::with_capacity(tail.len() + ellipsis.len_utf8());
-    trimmed.push(ellipsis);
-    trimmed.push_str(&tail);
-    trimmed
+    if end < chars.len() {
+        let last = window.len() - 1;
+        if window[last] != EDIT_CARET {
+            window[last] = ellipsis;
+        }
+    }
+    window.into_iter().collect()
 }
 
 /// The x-origin (physical px) at which line 2's git-branch icon may start after the repo name,
@@ -1335,9 +1364,34 @@ impl DrawLayer for TabBar {
                 ) {
                     shapes.push(bg);
                 }
-                // Tail-anchored so the caret stays visible while typing a long name.
-                let line =
-                    edit_line_text(&e.text, cell[0], (line1_right - title_x).max(0.0), ellipsis);
+                // Windowed so the CARET stays visible — including when the user has
+                // arrowed back into the middle of a name longer than the card.
+                let line = edit_line_text(
+                    &e.text,
+                    e.caret,
+                    cell[0],
+                    (line1_right - title_x).max(0.0),
+                    ellipsis,
+                );
+                // Select-all highlight (the state the field opens in): a block behind the
+                // text but NOT behind the trailing caret, so the caret stays legible.
+                // `push_glyphs` advances a fixed `cell[0]` per char, so a char-count width
+                // is exact here rather than an approximation.
+                if e.selected {
+                    let chars = line.chars().count().saturating_sub(1); // drop the caret
+                    if chars > 0 {
+                        let sel = [title_x, inner_top, chars as f32 * cell[0], cell[1]];
+                        if let Some(hl) = SidebarShape::rounded_box(
+                            sel,
+                            m.border_w,
+                            0.0,
+                            Fill::solid(linear(theme.accent, 0.40)),
+                            [0.0; 4],
+                        ) {
+                            shapes.push(hl);
+                        }
+                    }
+                }
                 push_glyphs(
                     &mut text,
                     ctx,
@@ -1759,39 +1813,68 @@ mod tests {
     }
 
     #[test]
-    fn edit_line_shows_the_caret_at_the_end() {
-        // sticky-tab-title R2.1 — the inline field is the card's own title line, so the
-        // caret has to be part of the drawn string.
-        assert_eq!(edit_line_text("Front", 10.0, 200.0, '…'), "Front▏");
+    fn edit_line_draws_the_caret_at_the_cursor() {
+        // sticky-tab-title — the caret goes where the cursor IS, not at the end. Without
+        // this the middle of a name could be edited but not seen being edited.
+        assert_eq!(edit_line_text("Front", 5, 10.0, 200.0, '…'), "Front▏");
+        assert_eq!(edit_line_text("Front", 0, 10.0, 200.0, '…'), "▏Front");
+        assert_eq!(edit_line_text("Front", 2, 10.0, 200.0, '…'), "Fr▏ont");
         // An empty name still shows a caret, so an opened field is visibly an input.
-        assert_eq!(edit_line_text("", 10.0, 200.0, '…'), "▏");
+        assert_eq!(edit_line_text("", 0, 10.0, 200.0, '…'), "▏");
+        // A caret past the end is clamped rather than panicking.
+        assert_eq!(edit_line_text("ab", 99, 10.0, 200.0, '…'), "ab▏");
     }
 
     #[test]
-    fn edit_line_keeps_the_tail_visible_when_the_name_outgrows_the_card() {
-        // The whole reason this is not `truncate_to_width`: a sidebar card is barely
-        // wider than a word, so a name longer than the card is NORMAL while typing.
-        // Truncating from the end would hide the characters being typed and the caret.
+    fn the_visible_window_follows_the_caret_into_a_long_name() {
+        // The reason this is not `truncate_to_width`: a card is barely wider than a word,
+        // so a name longer than the card is NORMAL while editing. Anchoring on the tail
+        // would hide the cursor the moment the user arrowed back — exactly when it matters.
         let long = "Frontend-service-worker";
-        // 6 chars fit at advance 10 in 60px.
-        let out = edit_line_text(long, 10.0, 60.0, '…');
-        assert!(out.ends_with('▏'), "caret stays visible: {out}");
-        assert!(out.starts_with('…'), "elision marked at the FRONT: {out}");
+        let w = 80.0; // 8 columns at advance 10
+                      // Caret at the very start: the window shows the HEAD.
+        let head = edit_line_text(long, 0, 10.0, w, '…');
+        assert!(head.starts_with('▏'), "caret visible at the head: {head}");
+        assert!(head.ends_with('…'), "elision marked on the right: {head}");
+        // Caret at the end: the window shows the TAIL.
+        let tail = edit_line_text(long, long.chars().count(), 10.0, w, '…');
+        assert!(tail.ends_with('▏'), "caret visible at the tail: {tail}");
+        assert!(tail.starts_with('…'), "elision marked on the left: {tail}");
+        // Caret in the middle: the caret is on screen and BOTH sides are elided.
+        let mid = edit_line_text(long, 12, 10.0, w, '…');
+        assert!(mid.contains('▏'), "caret visible in the middle: {mid}");
         assert!(
-            out.chars().count() as f32 * 10.0 <= 60.0,
-            "never wider than the field"
+            mid.starts_with('…') && mid.ends_with('…'),
+            "both cut: {mid}"
         );
-        // It is the tail of the name that survives, not the head.
-        assert!(out.contains("rker"), "kept the end of the string: {out}");
-        assert!(!out.contains("Front"), "dropped the head: {out}");
+        // None of them may overflow the field.
+        for out in [&head, &tail, &mid] {
+            assert!(
+                out.chars().count() as f32 * 10.0 <= w,
+                "never wider than the field: {out}"
+            );
+        }
     }
 
     #[test]
     fn edit_line_degenerate_widths_do_not_panic() {
-        assert_eq!(edit_line_text("abc", 10.0, 0.0, '…'), "");
-        assert_eq!(edit_line_text("abc", 0.0, 100.0, '…'), "");
-        // Exactly one char of room: the caret alone wins, since it is the tail.
-        assert_eq!(edit_line_text("abc", 10.0, 10.0, '…'), "▏");
+        assert_eq!(edit_line_text("abc", 3, 10.0, 0.0, '…'), "");
+        assert_eq!(edit_line_text("abc", 3, 0.0, 100.0, '…'), "");
+        // Exactly one glyph of room: show the cursor, not an ellipsis that would hide it.
+        assert_eq!(edit_line_text("abc", 3, 10.0, 10.0, '…'), "▏");
+        // Two columns still has to fit a caret and stay inside the field.
+        let two = edit_line_text("abcdef", 3, 10.0, 20.0, '…');
+        assert!(two.contains('▏'));
+        assert!(two.chars().count() <= 2, "fits 2 columns: {two}");
+    }
+
+    #[test]
+    fn a_hangul_name_windows_without_panicking() {
+        // The window slices a Vec<char>, so a multi-byte name cannot split a codepoint.
+        let name = "한글이름이아주긴경우";
+        let out = edit_line_text(name, 5, 10.0, 60.0, '…');
+        assert!(out.contains('▏'), "caret survives: {out}");
+        assert!(out.chars().count() as f32 * 10.0 <= 60.0);
     }
 
     #[test]
