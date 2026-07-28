@@ -59,8 +59,21 @@ pub fn resolve_log(cwd: &Path) -> Option<PathBuf> {
     resolve_log_in(&claude_projects_dir()?, cwd)
 }
 
+/// The project directory Claude Code writes `cwd`'s session logs into, whether or
+/// not it exists yet. `None` only when there is no `~/.claude/projects` at all.
+pub fn project_dir(cwd: &Path) -> Option<PathBuf> {
+    Some(claude_projects_dir()?.join(encode_cwd(cwd)))
+}
+
 /// The most-recently-modified `*.jsonl` in `dir`, if any.
-fn newest_jsonl(dir: &Path) -> Option<PathBuf> {
+///
+/// This is a **directory**-level heuristic with no binding to any process: a live
+/// `claude` holds no open fd on its own log (it opens, appends, closes), so there is
+/// nothing to attribute a file to a PTY's descendant by. Callers must treat the
+/// result as "the session that most recently wrote here", not "this tab's session"
+/// — see [`LogWatcher::spawn`], which re-resolves, and the app's floor rule, which
+/// refuses to present one that stopped writing before the window existed.
+pub fn newest_jsonl(dir: &Path) -> Option<PathBuf> {
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
@@ -187,21 +200,55 @@ impl LogWatcher {
     /// the caller can wake its event loop and drain. `wake` runs on the watch thread
     /// — keep it cheap (e.g. an `EventLoopProxy::send_event`).
     pub fn spawn(
-        log: PathBuf,
+        dir: PathBuf,
+        log: Option<PathBuf>,
         mut telemetry: SessionTelemetry,
         start_offset: u64,
+        floor_ms: u64,
         wake: impl Fn() + Send + 'static,
     ) -> Option<LogWatcher> {
-        let dir = log.parent()?.to_path_buf();
+        let watch_dir = dir.clone();
         let (tx, rx) = mpsc::channel::<Arc<TelemetrySnapshot>>();
         let mut offset = start_offset;
         let mut partial = String::new();
-        let target = log.clone();
+        let mut target = log;
+        // Set once our own target appends lines that postdate `floor_ms` — the
+        // caller's window-start time. Until then the attachment is only a guess
+        // (newest-by-mtime), so a different file appearing may well be the tab's own
+        // session writing for the first time, and we re-resolve to it. After it we
+        // STAY: a log being written *since this window opened* is as close to proof
+        // of ownership as this data allows, and without the latch two concurrently
+        // active sessions in one project would steal the attachment from each other
+        // on every line, resetting the accumulator and re-reading the whole file
+        // each time.
+        //
+        // The floor is what keeps the latch from being a trap. Latching on *any*
+        // fold would let a stale log flushing old-timestamped lines pin the watcher
+        // to a session the display layer then refuses to show — a permanently blank
+        // panel that re-resolution can no longer rescue. `floor_ms == 0` disables the
+        // condition, matching the display layer's own disabling value.
+        let mut latched = false;
 
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(ev) = res else { return };
+            let mut switched = false;
+            if !latched {
+                // A new session's first line lands here: the file did not exist when
+                // the overlay opened, so no amount of tailing the old target would
+                // ever find it.
+                if let Some(newest) = newest_jsonl(&dir) {
+                    if Some(&newest) != target.as_ref() {
+                        target = Some(newest);
+                        offset = 0;
+                        partial.clear();
+                        telemetry = SessionTelemetry::new();
+                        switched = true;
+                    }
+                }
+            }
+            let Some(target) = target.clone() else { return };
             let name = target.file_name();
-            if !ev.paths.iter().any(|p| p.file_name() == name) {
+            if !switched && !ev.paths.iter().any(|p| p.file_name() == name) {
                 return;
             }
             // Read everything past our offset; parse whole lines, buffer a partial.
@@ -251,12 +298,60 @@ impl LogWatcher {
             // snapshot would be sent, leaving the UI showing the PREVIOUS session's
             // totals as though live. Bytes read with no complete line (a buffered
             // partial) correctly send nothing: no state changed.
-            if (folded > 0 || reset) && tx.send(Arc::new(telemetry.snapshot())).is_ok() {
+            // ONE snapshot, not two: it deep-clones five rings plus the task map
+            // and sorts, on every append batch.
+            let snap = Arc::new(telemetry.snapshot());
+            if folded > 0 {
+                // `is_some_and`, NOT `is_none_or`: an undated fold must not latch.
+                // The display layer refuses an undated log for the same reason (it
+                // cannot be shown to postdate the window), so latching on one would
+                // pin the watcher to a session that will never be rendered and
+                // disable the re-resolution that could rescue it.
+                //
+                // Sticky, because `last_event_ms` is last-seen rather than max: a
+                // single out-of-order timestamp would otherwise un-latch a live
+                // session mid-flight and hand the attachment to another file,
+                // discarding the totals accumulated so far.
+                latched = latched || snap.last_event_ms.is_some_and(|last| last >= floor_ms);
+            }
+            if (folded > 0 || reset || switched) && tx.send(snap).is_ok() {
                 wake();
             }
         })
         .ok()?;
-        watcher.watch(&dir, RecursiveMode::NonRecursive).ok()?;
+        // The DIRECTORY, not the file: a session that has not written yet has no
+        // file to watch, and that is exactly the case this exists to cover.
+        //
+        // If the project directory does not exist either — the first Claude session
+        // ever run in this cwd, the purest form of the same case — `watch` errors on
+        // the missing path and the overlay would never arm at all, with nothing to
+        // retry it. Fall back to the nearest existing ancestor, **recursively**, so
+        // the directory's creation and the appends to the log inside it are both
+        // seen; a non-recursive watch on `~/.claude/projects` reports only its direct
+        // children, so it would notice the new directory and then go deaf to every
+        // write in it. Creating the directory ourselves would be simpler and is
+        // deliberately not done: it is a write under `~/.claude`, which this contract
+        // fences off.
+        //
+        // The cost is events from other projects while this one is empty. It is
+        // bounded — the re-resolution each triggers is one `read_dir` of a single
+        // directory, it stops once the target latches, and the watcher exists only
+        // while the panel is open.
+        let (watch_path, mode) = if watch_dir.is_dir() {
+            (watch_dir, RecursiveMode::NonRecursive)
+        } else {
+            // Exactly one level up — the projects root — and no further. If that is
+            // missing too then no Claude session has ever run anywhere, and arming a
+            // recursive watch on `$HOME` to wait for the first one is not a trade
+            // worth making: every write in the user's home directory would wake this
+            // callback for as long as the panel stayed open.
+            let root = watch_dir.parent()?;
+            if !root.is_dir() {
+                return None;
+            }
+            (root.to_path_buf(), RecursiveMode::Recursive)
+        };
+        watcher.watch(&watch_path, mode).ok()?;
         Some(LogWatcher {
             _watcher: watcher,
             rx,
@@ -335,7 +430,7 @@ mod tests {
         let log = dir.join("s.jsonl");
         std::fs::write(&log, "").unwrap();
         let (t, off) = backfill_telemetry(&log);
-        let w = LogWatcher::spawn(log.clone(), t, off, || {}).expect("spawn");
+        let w = LogWatcher::spawn(dir.clone(), Some(log.clone()), t, off, 0, || {}).expect("spawn");
 
         let append = |line: &str| {
             let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
@@ -366,6 +461,303 @@ mod tests {
     }
 
     #[test]
+    fn a_newer_log_appearing_takes_over_the_watch() {
+        // The reported defect: a brand-new session had written NO log when the
+        // overlay opened, so the newest file in the directory was an unrelated
+        // session and tailing it could never find the real one. The watch is on the
+        // directory, so the new file's first line switches the target.
+        use std::io::Write;
+        use std::time::Duration;
+
+        let dir = temp_dir("reresolve");
+        let old = dir.join("old.jsonl");
+        std::fs::write(
+            &old,
+            "{\"type\":\"assistant\",\"requestId\":\"o\",\"message\":{\"id\":\"o\",\"usage\":{\"output_tokens\":700}}}\n",
+        )
+        .unwrap();
+        let (t, off) = backfill_telemetry(&old);
+        assert_eq!(
+            t.snapshot().total_output,
+            700,
+            "attached to the old session"
+        );
+        let w = LogWatcher::spawn(dir.clone(), Some(old.clone()), t, off, 0, || {}).expect("spawn");
+
+        // The tab's own session finally writes its first line, into a NEW file.
+        let fresh = dir.join("fresh.jsonl");
+        let mut f = std::fs::File::create(&fresh).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","requestId":"n","message":{{"id":"n","usage":{{"output_tokens":3}}}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let snap =
+            w.rx.recv_timeout(Duration::from_secs(10))
+                .expect("switched");
+        assert_eq!(
+            snap.total_output, 3,
+            "the NEW file's totals, with no residue of the old session"
+        );
+    }
+
+    #[test]
+    fn a_missing_project_directory_still_arms_the_watch() {
+        // The first Claude session ever run in a cwd: the project directory does not
+        // exist, so watching it directly errors and the overlay would never arm at
+        // all — with nothing to retry it. The watch falls back to the nearest
+        // existing ancestor, and the log is picked up when it finally appears.
+        use std::io::Write;
+        use std::time::Duration;
+
+        let root = temp_dir("nodir"); // stands in for ~/.claude/projects
+        let missing = root.join("-Users-x-brand-new");
+        assert!(!missing.exists());
+
+        let w = LogWatcher::spawn(missing.clone(), None, SessionTelemetry::new(), 0, 0, || {})
+            .expect("arms on an ancestor rather than giving up");
+
+        std::fs::create_dir_all(&missing).unwrap();
+        let mut f = std::fs::File::create(missing.join("first.jsonl")).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","requestId":"n","message":{{"id":"n","usage":{{"output_tokens":42}}}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let snap =
+            w.rx.recv_timeout(Duration::from_secs(10))
+                .expect("attached");
+        assert_eq!(snap.total_output, 42);
+    }
+
+    #[test]
+    fn a_fold_of_only_pre_floor_lines_does_not_latch() {
+        // Latching on ANY fold would let a stale log flushing old-timestamped lines
+        // pin the watcher to a session the display layer then refuses to show — a
+        // permanently blank panel that re-resolution can no longer rescue.
+        use std::io::Write;
+        use std::time::Duration;
+
+        let dir = temp_dir("floorlatch");
+        let stale = dir.join("stale.jsonl");
+        std::fs::write(&stale, "").unwrap();
+        let (t, off) = backfill_telemetry(&stale);
+        // Window opened well after the stale session's timestamps.
+        let floor = 1_785_226_000_000;
+        let w = LogWatcher::spawn(dir.clone(), Some(stale.clone()), t, off, floor, || {})
+            .expect("spawn");
+
+        // The stale log appends a line dated BEFORE the window opened.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&stale)
+                .unwrap();
+            writeln!(
+                f,
+                r#"{{"type":"assistant","timestamp":"2020-01-01T00:00:00.000Z","requestId":"o","message":{{"id":"o","usage":{{"output_tokens":700}}}}}}"#
+            )
+            .unwrap();
+        }
+        let _ = w.rx.recv_timeout(Duration::from_secs(10));
+
+        // Unlatched, so the tab's own session still wins when it appears.
+        let mine = dir.join("mine.jsonl");
+        let mut f = std::fs::File::create(&mine).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","requestId":"n","message":{{"id":"n","usage":{{"output_tokens":9}}}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let mut last = None;
+        while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(3)) {
+            last = Some(s);
+        }
+        assert_eq!(
+            last.expect("switched").total_output,
+            9,
+            "the pre-floor fold must not have pinned us to the stale log"
+        );
+    }
+
+    #[test]
+    fn no_projects_root_means_no_watch_rather_than_a_home_wide_one() {
+        // The fallback climbs exactly one level. If ~/.claude/projects itself is
+        // absent, no session has ever run anywhere, and arming a recursive watch on
+        // $HOME to wait for the first one would wake this callback on every write in
+        // the user's home directory for as long as the panel stayed open.
+        let root = temp_dir("noroot");
+        let nowhere = root.join("gone").join("-Users-x-proj");
+        assert!(
+            LogWatcher::spawn(nowhere, None, SessionTelemetry::new(), 0, 0, || {}).is_none(),
+            "declines to arm rather than watching an ancestor outside the projects root"
+        );
+    }
+
+    #[test]
+    fn an_undated_fold_does_not_latch() {
+        // The display layer refuses an undated log (it cannot be shown to postdate
+        // the window), so latching on one would pin the watcher to a session that
+        // will never be rendered — a permanently blank panel that re-resolution can
+        // no longer rescue. This is the `is_some_and` / `is_none_or` polarity.
+        use std::io::Write;
+        use std::time::Duration;
+
+        let dir = temp_dir("undated");
+        let old = dir.join("old.jsonl");
+        std::fs::write(&old, "").unwrap();
+        let (t, off) = backfill_telemetry(&old);
+        let w = LogWatcher::spawn(
+            dir.clone(),
+            Some(old.clone()),
+            t,
+            off,
+            1_785_226_000_000,
+            || {},
+        )
+        .expect("spawn");
+
+        // A line with NO timestamp at all.
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&old).unwrap();
+            writeln!(
+                f,
+                r#"{{"type":"assistant","requestId":"o","message":{{"id":"o","usage":{{"output_tokens":700}}}}}}"#
+            )
+            .unwrap();
+        }
+        let _ = w.rx.recv_timeout(Duration::from_secs(10));
+
+        // Still unlatched, so the tab's own session takes over when it appears.
+        let mut f = std::fs::File::create(dir.join("mine.jsonl")).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","requestId":"n","message":{{"id":"n","usage":{{"output_tokens":9}}}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let mut last = None;
+        while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(3)) {
+            last = Some(s);
+        }
+        assert_eq!(
+            last.expect("switched").total_output,
+            9,
+            "an undated fold must not have latched"
+        );
+    }
+
+    #[test]
+    fn the_latch_survives_an_out_of_order_timestamp() {
+        // `last_event_ms` is last-seen, not max, so a single backdated line would
+        // otherwise un-latch a live session mid-flight and hand the attachment to
+        // another file — discarding everything accumulated so far.
+        use std::io::Write;
+        use std::time::Duration;
+
+        let dir = temp_dir("sticky");
+        let mine = dir.join("mine.jsonl");
+        std::fs::write(&mine, "").unwrap();
+        let (t, off) = backfill_telemetry(&mine);
+        let floor = 1_600_000_000_000; // 2020-09-13
+        let w = LogWatcher::spawn(dir.clone(), Some(mine.clone()), t, off, floor, || {})
+            .expect("spawn");
+
+        let append = |line: &str| {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&mine)
+                .unwrap();
+            writeln!(f, "{line}").unwrap();
+        };
+        // A post-floor line latches us.
+        append(
+            r#"{"type":"assistant","timestamp":"2026-07-28T18:00:00.000Z","requestId":"a","message":{"id":"a","usage":{"output_tokens":10}}}"#,
+        );
+        assert_eq!(
+            w.rx.recv_timeout(Duration::from_secs(10))
+                .expect("latched")
+                .total_output,
+            10
+        );
+        // Then one dated before the floor, which must NOT un-latch us.
+        append(
+            r#"{"type":"assistant","timestamp":"2019-01-01T00:00:00.000Z","requestId":"b","message":{"id":"b","usage":{"output_tokens":5}}}"#,
+        );
+        let _ = w.rx.recv_timeout(Duration::from_secs(10));
+
+        // A rival file appears; we keep our own accumulated totals.
+        let mut f = std::fs::File::create(dir.join("other.jsonl")).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","requestId":"z","message":{{"id":"z","usage":{{"output_tokens":999}}}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let mut last = None;
+        while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(3)) {
+            last = Some(s);
+        }
+        if let Some(s) = last {
+            assert_eq!(s.total_output, 15, "never reset, never stolen");
+        }
+    }
+
+    #[test]
+    fn an_attached_log_that_is_being_written_is_not_stolen() {
+        // Once our own target proves it is live, a second session writing in the same
+        // project must not steal the attachment — without the latch the two would
+        // trade it on every line, resetting the accumulator each time.
+        use std::io::Write;
+        use std::time::Duration;
+
+        let dir = temp_dir("latch");
+        let mine = dir.join("mine.jsonl");
+        std::fs::write(&mine, "").unwrap();
+        let (t, off) = backfill_telemetry(&mine);
+        let w =
+            LogWatcher::spawn(dir.clone(), Some(mine.clone()), t, off, 0, || {}).expect("spawn");
+
+        let append = |path: &std::path::Path, id: &str, out: u64| {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            writeln!(
+                f,
+                r#"{{"type":"assistant","requestId":"{id}","message":{{"id":"{id}","usage":{{"output_tokens":{out}}}}}}}"#
+            )
+            .unwrap();
+        };
+
+        append(&mine, "a", 10);
+        let first = w.rx.recv_timeout(Duration::from_secs(10)).expect("latched");
+        assert_eq!(first.total_output, 10);
+
+        // Another session writes a newer file. We stay on ours.
+        append(&dir.join("other.jsonl"), "z", 999);
+        append(&mine, "b", 5);
+        let mut last = None;
+        while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(3)) {
+            last = Some(s);
+        }
+        let last = last.expect("still receiving from our own log");
+        assert_eq!(
+            last.total_output, 15,
+            "our own cumulative total — never the other session's 999, and never reset"
+        );
+    }
+
+    #[test]
     fn rotation_resets_the_accumulator_and_emits() {
         // A rotation truncates to zero, so no complete line follows. Under a
         // "\u{2265}1 line folded" send condition nothing would be emitted and the UI would
@@ -377,7 +769,7 @@ mod tests {
         let log = dir.join("s.jsonl");
         std::fs::write(&log, "").unwrap();
         let (t, off) = backfill_telemetry(&log);
-        let w = LogWatcher::spawn(log.clone(), t, off, || {}).expect("spawn");
+        let w = LogWatcher::spawn(dir.clone(), Some(log.clone()), t, off, 0, || {}).expect("spawn");
 
         {
             let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
@@ -425,7 +817,7 @@ mod tests {
         let log = dir.join("s.jsonl");
         std::fs::write(&log, "").unwrap();
         let (t, off) = backfill_telemetry(&log);
-        let w = LogWatcher::spawn(log.clone(), t, off, || {}).expect("spawn");
+        let w = LogWatcher::spawn(dir.clone(), Some(log.clone()), t, off, 0, || {}).expect("spawn");
 
         let write = |bytes: &str| {
             let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();

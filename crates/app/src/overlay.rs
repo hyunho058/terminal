@@ -11,8 +11,8 @@ use std::path::PathBuf;
 
 use std::sync::Arc;
 
-use ai_monitor::telemetry::TelemetrySnapshot;
-use ai_monitor::{backfill_telemetry, resolve_log, LogWatcher};
+use ai_monitor::telemetry::{SessionTelemetry, TelemetrySnapshot};
+use ai_monitor::{backfill_telemetry, newest_jsonl, project_dir, LogWatcher};
 use renderer::overlay_layer::{OverlayHandle, OverlayLayer, OverlayModel};
 use renderer::DrawLayer;
 use winit::event_loop::EventLoopProxy;
@@ -33,6 +33,13 @@ pub struct AiMonitorOverlay {
     cwd: Option<PathBuf>,
     watcher: Option<LogWatcher>,
     proxy: EventLoopProxy<UserEvent>,
+    /// This window's start time, and the floor the dashboard applies: a log whose
+    /// last event precedes it stopped being written before the window existed, so it
+    /// belongs to some other session. Captured here rather than at open, because
+    /// open happens *after* the tab's own session may have started writing.
+    started_ms: u64,
+    /// `[ai_monitor] context_window`, re-read on each open.
+    context_window: Option<u64>,
 }
 
 impl AiMonitorOverlay {
@@ -44,6 +51,8 @@ impl AiMonitorOverlay {
             cwd: None,
             watcher: None,
             proxy,
+            started_ms: now_ms(),
+            context_window: None,
         }
     }
 
@@ -57,19 +66,35 @@ impl AiMonitorOverlay {
 
     /// Open on `cwd`: resolve the log, backfill, and start tailing (D1/D6).
     fn open(&mut self, cwd: Option<PathBuf>) {
+        // Re-read on open rather than holding a live handle: `settings::apply` does
+        // not reach the overlays, and a value that takes effect the next time the
+        // panel is opened is honest about that. A malformed config keeps the table.
+        self.context_window = common::config::Config::load()
+            .ok()
+            .and_then(|c| c.ai_monitor.context_window);
         self.cwd = cwd.clone();
         self.latest = None;
         self.watcher = None;
 
-        if let Some(log) = cwd.as_deref().and_then(resolve_log) {
+        if let Some(dir) = cwd.as_deref().and_then(project_dir) {
+            // Resolve to the newest log *here* rather than latching one for the
+            // watcher's lifetime: it may not be this tab's session, and the tab's own
+            // session may not have written a file yet. The watcher re-resolves.
+            let log = newest_jsonl(&dir);
             // Seed on THIS thread, exactly where `backfill` ran before: publish the
             // seeded snapshot first, then hand the accumulator to the watch thread.
-            let (telemetry, offset) = backfill_telemetry(&log);
+            let (telemetry, offset) = match log.as_deref() {
+                Some(p) => backfill_telemetry(p),
+                None => (SessionTelemetry::new(), 0),
+            };
             self.latest = Some(Arc::new(telemetry.snapshot()));
             let proxy = self.proxy.clone();
-            self.watcher = LogWatcher::spawn(log, telemetry, offset, move || {
-                let _ = proxy.send_event(UserEvent::OverlayPending);
-            });
+            // The same floor the dashboard applies, so the watcher does not latch
+            // onto a log the display layer will then refuse to show.
+            self.watcher =
+                LogWatcher::spawn(dir, log, telemetry, offset, self.started_ms, move || {
+                    let _ = proxy.send_event(UserEvent::OverlayPending);
+                });
         }
         self.visible = true;
         self.refresh_model();
@@ -87,7 +112,12 @@ impl AiMonitorOverlay {
     /// All layout lives in [`crate::dashboard`] (F5) — this is wiring: supply the
     /// clock, hand over the snapshot, publish the result.
     fn refresh_model(&self) {
-        let lines = dashboard::compose(self.latest.as_deref(), now_ms());
+        let env = dashboard::Env {
+            now_ms: now_ms(),
+            floor_ms: self.started_ms,
+            context_window: self.context_window,
+        };
+        let lines = dashboard::compose(self.latest.as_deref(), &env);
         self.handle.set(OverlayModel {
             visible: self.visible,
             lines,

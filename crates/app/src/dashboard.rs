@@ -91,6 +91,20 @@ const MODEL_WINDOWS: &[(&str, u64)] = &[
     ("claude-fable-", 200_000),
 ];
 
+/// Everything the composer needs that the snapshot does not carry. Injected rather
+/// than read, which is what keeps [`compose`] pure and the snapshots byte-stable.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Env {
+    /// Wall clock, epoch millis.
+    pub now_ms: u64,
+    /// This window's own start time. A log whose last event precedes it stopped
+    /// being written before the window existed, so it cannot be this window's
+    /// session — see [`compose`]. Zero disables the rule.
+    pub floor_ms: u64,
+    /// `[ai_monitor] context_window` from the TOML config, overriding the table.
+    pub context_window: Option<u64>,
+}
+
 /// The window for `model`, or `None` when no prefix matches.
 ///
 /// `None` is load-bearing: the caller omits the percentage entirely rather than
@@ -120,17 +134,57 @@ pub fn context_window(model: &str) -> Option<u64> {
 /// sits below Other Tools deliberately — on the file-heavy session that motivates
 /// the "Other Tools" name, the reverse order would spend a guaranteed-visible slot
 /// on an empty section while decapitating the populated one above it.
-pub fn compose(snap: Option<&TelemetrySnapshot>, now_ms: u64) -> Vec<String> {
+pub fn compose(snap: Option<&TelemetrySnapshot>, env: &Env) -> Vec<String> {
     let empty = TelemetrySnapshot::default();
-    let t = snap.unwrap_or(&empty);
+    // Which log a tab owns is not knowable — a live `claude` holds no open fd on its
+    // own log, so the resolver can only offer "whatever wrote here most recently".
+    // One thing IS knowable: a log that stopped being written before this window
+    // existed cannot belong to a session started in it. Refusing that case is a
+    // fact, not a staleness heuristic — it never hides a session that has been
+    // active at any point since launch, including one idle for hours, which is
+    // exactly what an idle timeout would get wrong.
+    let detached = snap.and_then(|t| Detached::of(t, env));
+    let t = match snap {
+        Some(t) if detached.is_none() => t,
+        _ => &empty,
+    };
     let mut lines = Vec::with_capacity(28);
     lines.extend(tasks(t));
-    lines.extend(skills(t, now_ms));
+    lines.extend(skills(t, env.now_ms));
     lines.extend(other_tools(t));
     lines.extend(file_activity(t));
-    lines.extend(agents(t, now_ms));
-    lines.extend(summary(t, now_ms));
+    lines.extend(agents(t, env.now_ms));
+    lines.extend(summary(t, env, detached));
     lines
+}
+
+/// Why a resolved log is not being shown as this window's session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Detached {
+    /// Its last event predates the window. Carries that time, so the row can say
+    /// how stale the log it declined actually is.
+    StaleSince(u64),
+    /// It has content but no parseable timestamp, so it cannot be shown to have
+    /// been written since the window opened. An ownership check has to fail
+    /// **closed**: "no clock" is not evidence of freshness, and treating it as
+    /// such is how a foreign session's spend and context render as this tab's.
+    Undated,
+}
+
+impl Detached {
+    fn of(t: &TelemetrySnapshot, env: &Env) -> Option<Detached> {
+        if env.floor_ms == 0 {
+            return None; // rule disabled
+        }
+        match t.last_event_ms {
+            Some(last) if last < env.floor_ms => Some(Detached::StaleSince(last)),
+            Some(_) => None,
+            // An entirely empty snapshot is the ordinary "nothing folded yet" state,
+            // not a log we are refusing — it has nothing to misattribute.
+            None if *t != TelemetrySnapshot::default() => Some(Detached::Undated),
+            None => None,
+        }
+    }
 }
 
 /// Tasks — newest-*updated* first (B6c).
@@ -310,24 +364,38 @@ fn section(label: &str, empty_state: &str, total: usize, rows: Vec<String>) -> V
 /// `overlay-dashboard-boxes` composes this LAST, beneath its sections — the panel
 /// keeps the *tail* of the output, so a summary placed first is the first thing
 /// clipped on a short window.
-pub fn summary(t: &TelemetrySnapshot, now_ms: u64) -> Vec<String> {
+/// `detached` carries the last-event time of a log the floor rule rejected, so the
+/// session row can say *why* it is showing nothing rather than looking merely empty.
+pub fn summary(t: &TelemetrySnapshot, env: &Env, detached: Option<Detached>) -> Vec<String> {
     let mut lines = Vec::with_capacity(4);
     lines.push(rule("ai-monitor"));
 
     // session id · model · context%
-    let mut ident = vec![
-        t.session_id
-            .as_deref()
-            .map(|s| s.chars().take(8).collect::<String>())
-            .unwrap_or_else(|| DASH.to_string()),
-        t.model.clone().unwrap_or_else(|| DASH.to_string()),
-    ];
-    // Omitted entirely — label and all — when the model is unmatched or the gauge
-    // is zero. A fresh session's occupancy is unknown, not 0%.
-    if let Some(pct) = context_pct(t) {
-        ident.push(format!("context {pct}%"));
-    }
-    lines.push(row("session", &ident.join(" · "), None));
+    let session = match detached {
+        // Naming the gap is the point: "empty" alone would read as "nothing has
+        // happened", when in fact a log was found and deliberately not believed.
+        Some(Detached::StaleSince(last)) => format!(
+            "(no active session — newest log idle {})",
+            dur(env.now_ms.saturating_sub(last))
+        ),
+        Some(Detached::Undated) => "(no active session — newest log is undated)".to_string(),
+        None => {
+            let mut ident = vec![
+                t.session_id
+                    .as_deref()
+                    .map(|s| s.chars().take(8).collect::<String>())
+                    .unwrap_or_else(|| DASH.to_string()),
+                t.model.clone().unwrap_or_else(|| DASH.to_string()),
+            ];
+            // Omitted entirely — label and all — when the model is unmatched or the
+            // gauge is zero. A fresh session's occupancy is unknown, not 0%.
+            if let Some(pct) = context_label(t, env) {
+                ident.push(pct);
+            }
+            ident.join(" · ")
+        }
+    };
+    lines.push(row("session", &session, None));
 
     // Cumulative COST counters, never presented as occupancy: cache-read is
     // re-billed every turn, so these run ~16x the live context on a real session.
@@ -347,8 +415,8 @@ pub fn summary(t: &TelemetrySnapshot, now_ms: u64) -> Vec<String> {
     let activity = match (t.first_event_ms, t.last_event_ms) {
         (Some(f), Some(l)) => format!(
             "up {} · idle {}",
-            dur(now_ms.saturating_sub(f)),
-            dur(now_ms.saturating_sub(l))
+            dur(env.now_ms.saturating_sub(f)),
+            dur(env.now_ms.saturating_sub(l))
         ),
         _ => DASH.to_string(),
     };
@@ -356,12 +424,34 @@ pub fn summary(t: &TelemetrySnapshot, now_ms: u64) -> Vec<String> {
     lines
 }
 
+/// The rendered `context N%` field, or `None` when occupancy cannot be stated.
+///
+/// Above 100% it reads `>100%` rather than the number. A percentage over 100 is
+/// self-evidently impossible and reads as a broken dashboard; what it actually means
+/// is that the *window* is wrong — a 1M-context session logs the same bare model id
+/// as a 200k one — so the clamp reports the one thing that is certain (the assumed
+/// window is too small) instead of a figure that cannot be true. `[ai_monitor]
+/// context_window` is how a user resolves it.
+pub fn context_label(t: &TelemetrySnapshot, env: &Env) -> Option<String> {
+    let pct = context_pct(t, env)?;
+    Some(if pct > 100 {
+        "context >100%".to_string()
+    } else {
+        format!("context {pct}%")
+    })
+}
+
 /// Context occupancy as a whole percentage, or `None` when it cannot be stated.
-pub fn context_pct(t: &TelemetrySnapshot) -> Option<u64> {
+pub fn context_pct(t: &TelemetrySnapshot, env: &Env) -> Option<u64> {
     if t.context_used == 0 {
         return None;
     }
-    let window = context_window(t.model.as_deref()?)?;
+    // The configured window wins over the table: the table can only guess from a
+    // model id that does not record the window.
+    let window = match env.context_window {
+        Some(w) => w,
+        None => context_window(t.model.as_deref()?)?,
+    };
     if window == 0 {
         return None;
     }
@@ -601,6 +691,16 @@ pub fn dur(ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A default environment at `now`: no floor (nothing is ever detached) and no
+    /// configured window, so every pre-existing expectation keeps its meaning.
+    fn env(now: u64) -> Env {
+        Env {
+            now_ms: now,
+            floor_ms: 0,
+            context_window: None,
+        }
+    }
+
     use super::*;
     use ai_monitor::telemetry::{CompletedTool, FileActivity, SkillEntry, Subagent};
 
@@ -799,13 +899,13 @@ mod tests {
     #[test]
     fn populated_summary_matches_its_pinned_form() {
         let (t, now) = populated();
-        insta::assert_snapshot!(summary(&t, now).join("\n"));
+        insta::assert_snapshot!(summary(&t, &env(now), None).join("\n"));
     }
 
     #[test]
     fn empty_snapshot_renders_the_frame_with_placeholders() {
         let t = TelemetrySnapshot::default();
-        insta::assert_snapshot!(summary(&t, 1_785_226_000_000).join("\n"));
+        insta::assert_snapshot!(summary(&t, &env(1_785_226_000_000), None).join("\n"));
     }
 
     #[test]
@@ -814,10 +914,10 @@ mod tests {
         // reader. Never a blank panel.
         let now = 1_785_226_000_000;
         assert_eq!(
-            compose(None, now),
-            compose(Some(&TelemetrySnapshot::default()), now)
+            compose(None, &env(now)),
+            compose(Some(&TelemetrySnapshot::default()), &env(now))
         );
-        let lines = compose(None, now);
+        let lines = compose(None, &env(now));
         assert_eq!(
             lines.len(),
             9,
@@ -825,16 +925,16 @@ mod tests {
         );
         assert_eq!(
             &lines[5..],
-            &summary(&TelemetrySnapshot::default(), now)[..]
+            &summary(&TelemetrySnapshot::default(), &env(now), None)[..]
         );
     }
 
     #[test]
     fn every_rule_is_exactly_rule_cols_wide() {
         let (t, now) = full();
-        for line in compose(Some(&t), now)
+        for line in compose(Some(&t), &env(now))
             .iter()
-            .chain(compose(None, now).iter())
+            .chain(compose(None, &env(now)).iter())
             .filter(|l| l.starts_with("──"))
         {
             assert_eq!(line.chars().count(), RULE_COLS, "{line}");
@@ -868,7 +968,7 @@ mod tests {
     fn an_unmatched_model_omits_the_percentage_entirely() {
         let (mut t, now) = populated();
         t.model = Some("<synthetic>".into());
-        let s = summary(&t, now).join("\n");
+        let s = summary(&t, &env(now), None).join("\n");
         assert!(!s.contains("context"), "no label, not 0% and not —%:\n{s}");
         assert!(s.contains("<synthetic>"), "the model is still named");
     }
@@ -877,23 +977,27 @@ mod tests {
     fn a_zero_gauge_omits_the_percentage() {
         let (mut t, now) = populated();
         t.context_used = 0;
-        assert!(!summary(&t, now).join("\n").contains("context"));
+        assert!(!summary(&t, &env(now), None).join("\n").contains("context"));
     }
 
     #[test]
     fn context_percent_rounds_to_the_nearest_whole() {
         let (mut t, _) = populated();
-        assert_eq!(context_pct(&t), Some(59), "117066/200000 = 58.5%");
+        assert_eq!(context_pct(&t, &env(0)), Some(59), "117066/200000 = 58.5%");
         t.context_used = 100_000;
-        assert_eq!(context_pct(&t), Some(50));
+        assert_eq!(context_pct(&t, &env(0)), Some(50));
         t.context_used = 1;
-        assert_eq!(context_pct(&t), Some(1), "a non-zero gauge never reads 0%");
+        assert_eq!(
+            context_pct(&t, &env(0)),
+            Some(1),
+            "a non-zero gauge never reads 0%"
+        );
     }
 
     #[test]
     fn spend_is_labelled_billed_and_is_never_a_percentage() {
         let (t, now) = populated();
-        let s = summary(&t, now).join("\n");
+        let s = summary(&t, &env(now), None).join("\n");
         assert!(s.contains("(billed)"));
         // cache = read + creation, summed because both are billed
         assert!(s.contains("cache 1.9M"), "{s}");
@@ -904,7 +1008,7 @@ mod tests {
     #[test]
     fn activity_carries_the_staleness_qualifier() {
         let (t, now) = populated();
-        let s = summary(&t, now).join("\n");
+        let s = summary(&t, &env(now), None).join("\n");
         assert!(s.contains("up 45m12s · idle 2m03s"));
         assert!(s.contains("(as of last update)"), "not a live counter");
     }
@@ -914,7 +1018,7 @@ mod tests {
         let (mut t, now) = populated();
         t.first_event_ms = None;
         t.last_event_ms = None;
-        let s = summary(&t, now).join("\n");
+        let s = summary(&t, &env(now), None).join("\n");
         assert!(s.contains(&format!("activity {DASH}")) || s.contains(DASH));
         assert!(!s.contains("up "), "no epoch-derived duration:\n{s}");
     }
@@ -924,7 +1028,7 @@ mod tests {
         // Same inputs -> byte-identical output. This is what makes the snapshots
         // stable, and it only holds because the clock is a parameter.
         let (t, now) = populated();
-        assert_eq!(summary(&t, now), summary(&t, now));
+        assert_eq!(summary(&t, &env(now), None), summary(&t, &env(now), None));
     }
 
     #[test]
@@ -956,12 +1060,12 @@ mod tests {
     #[test]
     fn the_populated_dashboard_matches_its_pinned_form() {
         let (t, now) = full();
-        insta::assert_snapshot!(compose(Some(&t), now).join("\n"));
+        insta::assert_snapshot!(compose(Some(&t), &env(now)).join("\n"));
     }
 
     #[test]
     fn the_empty_dashboard_matches_its_pinned_form() {
-        insta::assert_snapshot!(compose(None, 1_785_226_000_000).join("\n"));
+        insta::assert_snapshot!(compose(None, &env(1_785_226_000_000)).join("\n"));
     }
 
     // R8.1 — one snapshot per section, each store holding more than its cap, so a
@@ -1004,8 +1108,8 @@ mod tests {
         // B1/B2 — the two numbers the caps were chosen against. If a cap moves, this
         // is the assertion that says so.
         let (t, now) = full();
-        assert_eq!(compose(Some(&t), now).len(), 28);
-        assert_eq!(compose(None, now).len(), 9);
+        assert_eq!(compose(Some(&t), &env(now)).len(), 28);
+        assert_eq!(compose(None, &env(now)).len(), 9);
     }
 
     #[test]
@@ -1013,7 +1117,7 @@ mod tests {
         // R1.2 — the renderer keeps the LAST max_lines, so "composed last" is what
         // makes the summary the content that never gets clipped.
         let (t, now) = full();
-        let lines = compose(Some(&t), now);
+        let lines = compose(Some(&t), &env(now));
         let tail: Vec<&String> = lines.iter().rev().take(14).collect();
         for expected in ["ai-monitor", "session ", "spend ", "activity "] {
             assert!(
@@ -1021,13 +1125,13 @@ mod tests {
                 "{expected} clipped at 14 lines"
             );
         }
-        assert_eq!(&lines[lines.len() - 4..], &summary(&t, now)[..]);
+        assert_eq!(&lines[lines.len() - 4..], &summary(&t, &env(now), None)[..]);
     }
 
     #[test]
     fn the_section_order_is_fixed() {
         let (t, now) = full();
-        let rules: Vec<&String> = compose(Some(&t), now)
+        let rules: Vec<&String> = compose(Some(&t), &env(now))
             .iter()
             .filter(|l| l.starts_with("──"))
             .cloned()
@@ -1259,7 +1363,7 @@ mod tests {
             name: "k".repeat(300),
             start_ms: Some(0),
         }];
-        for line in compose(Some(&t), now) {
+        for line in compose(Some(&t), &env(now)) {
             assert!(line.chars().count() <= RULE_COLS, "{line}");
         }
     }
@@ -1308,15 +1412,203 @@ mod tests {
     #[test]
     fn no_row_overruns_the_rule() {
         let (t, now) = full();
-        for line in compose(Some(&t), now) {
+        for line in compose(Some(&t), &env(now)) {
             assert!(line.chars().count() <= RULE_COLS, "{line}");
         }
+    }
+
+    // ---- session attachment (the floor rule) ---------------------------------
+
+    #[test]
+    fn a_log_that_stopped_before_this_window_existed_is_not_shown_as_the_session() {
+        // The reported defect: a fresh window attached to an unrelated session's log
+        // and rendered `up 114h37m` as if it were the new tab's. The log's last event
+        // predates the window, so it cannot be this window's session.
+        let (t, now) = full();
+        let launched = now - 30 * 60 * 1000; // window opened 30m ago
+        let stale = Env {
+            now_ms: now,
+            floor_ms: launched,
+            // last_event_ms is 2m03s before `now` in `populated()`, i.e. AFTER launch,
+            // so move it to before the launch to trigger the rule.
+            ..env(now)
+        };
+        let mut t = t;
+        t.last_event_ms = Some(launched - 110 * 60 * 1000); // idle 1h50m, pre-launch
+        let out = compose(Some(&t), &stale).join("\n");
+
+        assert!(out.contains("(no active session"), "{out}");
+        assert!(out.contains("idle 2h20m"), "says how stale it is:\n{out}");
+        // and none of the foreign session's data leaks through
+        assert!(!out.contains("claude-opus-5"), "{out}");
+        assert!(
+            !out.contains("up "),
+            "no uptime from a session we disowned:\n{out}"
+        );
+        assert!(!out.contains("19.3K"), "no spend either:\n{out}");
+        assert!(out.contains("(no tasks)") && out.contains("(no agents yet)"));
+    }
+
+    #[test]
+    fn a_log_active_since_the_window_opened_is_shown_even_when_long_idle() {
+        // The case a plain idle-timeout would break: my own session, untouched for
+        // hours, but it wrote *after* this window started — so it is mine.
+        let (mut t, now) = populated();
+        let launched = now - 6 * 3_600_000;
+        t.last_event_ms = Some(launched + 1_000);
+        t.first_event_ms = Some(launched + 500);
+        let out = compose(
+            Some(&t),
+            &Env {
+                now_ms: now,
+                floor_ms: launched,
+                context_window: None,
+            },
+        )
+        .join("\n");
+        assert!(out.contains("claude-opus-5"), "still attached:\n{out}");
+        assert!(!out.contains("no active session"), "{out}");
+        assert!(
+            out.contains("idle 5h59m"),
+            "idle is reported, not acted on:\n{out}"
+        );
+    }
+
+    #[test]
+    fn an_absent_log_is_detached_without_claiming_staleness() {
+        // Nothing resolved at all: there is no "newest log" to report an age for, so
+        // the frame renders its plain empty state rather than inventing one.
+        let out = compose(
+            None,
+            &Env {
+                now_ms: 1_000,
+                floor_ms: 500,
+                context_window: None,
+            },
+        )
+        .join("\n");
+        assert!(!out.contains("no active session"), "{out}");
+        assert!(out.contains(" session  — · —"), "{out}");
+    }
+
+    #[test]
+    fn a_log_with_no_timestamps_fails_closed() {
+        // F2 — "no clock" is not evidence of freshness. A snapshot with content but
+        // no parseable event time cannot be shown to have been written since the
+        // window opened, so its spend and context must not render as this tab's.
+        let (mut t, now) = populated();
+        t.first_event_ms = None;
+        t.last_event_ms = None;
+        let out = compose(
+            Some(&t),
+            &Env {
+                now_ms: now,
+                floor_ms: now - 1000,
+                context_window: None,
+            },
+        )
+        .join("\n");
+        assert!(
+            out.contains("(no active session — newest log is undated)"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("claude-opus-5") && !out.contains("19.3K"),
+            "{out}"
+        );
+
+        // But an entirely empty snapshot is the ordinary "nothing folded yet" state
+        // — there is nothing to misattribute, so it is not a refusal.
+        let out = compose(
+            Some(&TelemetrySnapshot::default()),
+            &Env {
+                now_ms: now,
+                floor_ms: now - 1000,
+                context_window: None,
+            },
+        )
+        .join("\n");
+        assert!(!out.contains("no active session"), "{out}");
+    }
+
+    #[test]
+    fn a_detached_row_stays_within_the_rule() {
+        // F4 — the detached string is built outside `fit_row`, so its width is
+        // asserted rather than assumed.
+        let (mut t, now) = populated();
+        t.last_event_ms = Some(0);
+        for line in compose(
+            Some(&t),
+            &Env {
+                now_ms: now,
+                floor_ms: now,
+                context_window: None,
+            },
+        ) {
+            assert!(line.chars().count() <= RULE_COLS, "{line}");
+        }
+    }
+
+    // ---- context window ------------------------------------------------------
+
+    #[test]
+    fn an_occupancy_over_the_window_reads_greater_than_100_not_a_number() {
+        // The measured case: 256,551 tokens against an assumed 200k window rendered
+        // `context 128%`. A percentage over 100 is impossible on its face; what it
+        // really means is the window is wrong.
+        let (mut t, now) = populated();
+        t.context_used = 256_551;
+        let out = compose(Some(&t), &env(now)).join("\n");
+        assert!(out.contains("context >100%"), "{out}");
+        assert!(!out.contains("128"), "never the impossible number:\n{out}");
+    }
+
+    #[test]
+    fn the_configured_window_overrides_the_model_table() {
+        // Which is the fix for the case above: the same 256,551 tokens against the
+        // 1M window the session actually had.
+        let (mut t, now) = populated();
+        t.context_used = 256_551;
+        let out = compose(
+            Some(&t),
+            &Env {
+                now_ms: now,
+                floor_ms: 0,
+                context_window: Some(1_000_000),
+            },
+        )
+        .join("\n");
+        assert!(out.contains("context 26%"), "{out}");
+    }
+
+    #[test]
+    fn the_configured_window_applies_to_an_unmatched_model_too() {
+        // `<synthetic>` matches no prefix, so the table yields nothing — but an
+        // explicit window is knowledge, not a guess, and does apply.
+        let (mut t, now) = populated();
+        t.model = Some("<synthetic>".into());
+        assert_eq!(
+            context_pct(
+                &t,
+                &Env {
+                    now_ms: now,
+                    floor_ms: 0,
+                    context_window: Some(200_000)
+                }
+            ),
+            Some(59)
+        );
+        assert_eq!(
+            context_pct(&t, &env(now)),
+            None,
+            "without it, still omitted"
+        );
     }
 
     #[test]
     fn the_whole_dashboard_is_pure() {
         // R8.2 — same inputs, byte-identical output, twice.
         let (t, now) = full();
-        assert_eq!(compose(Some(&t), now), compose(Some(&t), now));
+        assert_eq!(compose(Some(&t), &env(now)), compose(Some(&t), &env(now)));
     }
 }
