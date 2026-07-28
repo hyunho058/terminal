@@ -906,21 +906,134 @@ impl Running {
             return false;
         };
         handle.sync(&mut self.tabmeta_snapshot);
+        self.push_agent_states()
+    }
+
+    /// Recompute every tab's agent level from the CURRENT tabmeta snapshot plus each tab's
+    /// own screen, and feed it to the waiting model. Does not re-sync tabmeta — callers
+    /// driven by PTY output use this, since the metadata cannot have changed and the point
+    /// is the screen.
+    ///
+    /// **Why the screen is consulted at all.** While a tool-permission dialog is open,
+    /// Claude Code appends NOTHING to its session log, so the log-derived
+    /// `meta.agent.state` reads `Busy` for as long as the human takes. The dialog is on the
+    /// tab's own grid, which we own, so it is read there (`crate::prompt`). Gated on a
+    /// detected agent, so a shell that merely prints similar text can never raise an item.
+    fn push_agent_states(&mut self) -> bool {
+        self.push_agent_states_inner(None)
+    }
+
+    /// As [`push_agent_states`](Self::push_agent_states) but for a single tab — used by the
+    /// PTY-output path, where only the originating tab's screen can have changed and the
+    /// others' metadata is the same snapshot. `on_agent_states` treats tabs independently,
+    /// so this is equivalent to the full sweep for that tab and skips N-1 screen scans per
+    /// chunk (a high-throughput tab would otherwise multiply the scan by the tab count).
+    fn push_agent_states_for(&mut self, only: TabId) -> bool {
+        self.push_agent_states_inner(Some(only))
+    }
+
+    fn push_agent_states_inner(&mut self, only: Option<TabId>) -> bool {
         let active = self.tabs.active().id;
         // A tab with no live agent maps to `Unknown` (not `Waiting`), so an agent
         // that finished (`agent: None`) is seen as leaving Waiting — a falling edge.
-        let states: Vec<(TabId, AgentState)> = self
+        let base: Vec<(TabId, AgentState, bool)> = self
             .tabmeta_snapshot
             .iter()
+            .filter(|(id, _)| only.is_none_or(|want| *id == want))
             .map(|(id, meta)| {
                 (
                     id,
                     meta.agent.map(|a| a.state).unwrap_or(AgentState::Unknown),
+                    meta.agent.is_some(),
                 )
             })
             .collect();
-        self.waiting
-            .on_agent_states(&states, active, Instant::now())
+        let states: Vec<(TabId, AgentState)> = base
+            .into_iter()
+            .map(|(id, state, has_agent)| {
+                if !has_agent {
+                    tracing::debug!(tab = id.0, ?state, "waiting-scan: no agent on tab");
+                    return (id, state);
+                }
+                let detected = self.tab_shows_blocking_prompt(id);
+                // The one diagnostic that has paid for itself here: when an agent tab is
+                // scanned and NOT detected, dump what was on screen. Guessing at which
+                // layer was wrong cost two wrong fixes; the tail text says directly whether
+                // the dialog was absent, scrolled, or merely unmatched.
+                //
+                // Explicitly gated rather than relying on the macro's field laziness: this
+                // runs per PTY chunk, and `tab_scan_tail` builds a String. An eager
+                // evaluation here would be a real cost in release builds with logging off.
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    let tail = self.tab_scan_tail(id);
+                    tracing::debug!(
+                        tab = id.0,
+                        ?state,
+                        detected,
+                        active = (id == active),
+                        tail = %tail,
+                        "waiting-scan"
+                    );
+                }
+                if detected {
+                    (id, AgentState::Waiting)
+                } else {
+                    (id, state)
+                }
+            })
+            .collect();
+        let changed = self
+            .waiting
+            .on_agent_states(&states, active, Instant::now());
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                ?states,
+                active = active.0,
+                changed,
+                items = self.waiting.items().len(),
+                "waiting-model"
+            );
+        }
+        changed
+    }
+
+    /// The exact text the prompt matcher saw for `id`, condensed to one line for a log.
+    /// Debug-only aid; never called unless the `debug` level is enabled.
+    fn tab_scan_tail(&mut self, id: TabId) -> String {
+        let Some(s) = self.tabs.by_id_mut(id) else {
+            return "<no session>".into();
+        };
+        let off = s.terminal.view_offset();
+        let tail = s.terminal.viewport_tail_text(crate::prompt::TAIL_ROWS);
+        let last: Vec<&str> = tail.lines().rev().take(6).collect();
+        let last: Vec<&str> = last.into_iter().rev().collect();
+        format!("off={off} | {}", last.join(" ⏎ "))
+    }
+
+    /// Whether tab `id`'s visible screen currently shows a prompt that blocks on a human
+    /// (see [`crate::prompt`]).
+    ///
+    /// Deliberately a **level**, not an event: it is re-evaluated on every trigger, so
+    /// answering the prompt makes the dialog disappear and the tab leaves `Waiting` through
+    /// the existing falling edge. Nothing to latch, expire, or replay.
+    ///
+    /// Uses `viewport_tail_text` rather than a full snapshot: this runs per PTY chunk, and
+    /// cloning the grid at that rate would be the G1 idle-CPU debt all over again.
+    fn tab_shows_blocking_prompt(&mut self, id: TabId) -> bool {
+        self.tabs
+            .by_id_mut(id)
+            .map(|s| {
+                // Only the LIVE bottom can hold a live dialog. A tab parked in scrollback
+                // is showing history, and history may well contain a dialog that was
+                // answered long ago — reading that as "waiting now" is a false positive
+                // that would not self-clear (nothing scrolls it away). Also skips the scan
+                // entirely for scrolled tabs.
+                s.terminal.view_offset() == 0
+                    && crate::prompt::shows_blocking_prompt(
+                        &s.terminal.viewport_tail_text(crate::prompt::TAIL_ROWS),
+                    )
+            })
+            .unwrap_or(false)
     }
 
     /// The ordered waiting items for the sidebar band — T4's read point (D2/R1.5).
@@ -1104,6 +1217,13 @@ impl Running {
         // the band (clicking a waiting row makes it disappear, R2.1). This ends in
         // `redraw()`, so the cleared band repaints.
         self.waiting.acknowledge(self.tabs.active().id);
+        // Re-evaluate every tab's level now that the active tab changed. Load-bearing for
+        // the common flow: you are WATCHING a tab when its permission dialog opens, so the
+        // rising edge is suppressed (D15) and left pending; switching away is what makes it
+        // raisable. An agent blocked on that dialog emits no further output and changes no
+        // metadata, so this is the ONLY event that fires — without it the tab-you-just-left
+        // stays invisible for as long as it is blocked.
+        self.push_agent_states();
         self.sync_tab_model();
         // Reveal the (possibly newly-appended or below-the-fold) active tab and re-clamp
         // the offset — a tab close shrinks the content (D6/D10). Then re-resolve hover.
@@ -1467,6 +1587,25 @@ impl ApplicationHandler<UserEvent> for App {
                     {
                         band_changed = true;
                     }
+                }
+                // Re-evaluate the screen-derived waiting level for THIS tab's new output.
+                //
+                // This trigger is load-bearing, not belt-and-braces. The other caller of
+                // `push_agent_states` runs on `OverlayPending`, which the tabmeta worker
+                // only sends when `TabMeta` actually CHANGED (`publish_if_changed` skips the
+                // wake otherwise, deliberately — an unconditional 2 Hz wake was the G1
+                // idle-CPU debt). A pending permission dialog changes no metadata by
+                // definition — the log is exactly what it is blind to — so that path stays
+                // silent for as long as the prompt is up. PTY output is the one event that
+                // does fire when the dialog appears, because drawing it IS the output.
+                //
+                // Gated on `advanced`, which `Session::drain` sets for any bytes received
+                // (not "cells changed") — deliberately the permissive direction: a dialog
+                // is always drawn by bytes, so it can never be gated out. Do NOT tighten
+                // `drain` to a cell-diff without revisiting this, or the silent-trigger bug
+                // comes straight back.
+                if advanced && inner.push_agent_states_for(id) {
+                    band_changed = true;
                 }
                 // Republish the band (rows + shifted list_top) before the redraw (T4).
                 if band_changed {

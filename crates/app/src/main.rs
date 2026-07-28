@@ -12,6 +12,7 @@ mod clipboard;
 mod copy;
 mod input;
 mod overlay;
+mod prompt;
 mod rename;
 mod seam;
 mod session;

@@ -989,6 +989,71 @@ impl Grid {
         self.selection
     }
 
+    /// The last `rows` non-blank-terminated rows of the visible viewport as text.
+    ///
+    /// Same visible-row mapping as [`GridSnapshot::from_grid`](crate::GridSnapshot) — it
+    /// honours `view_offset`, so a scrolled-back viewport yields what is actually on
+    /// screen — but it clones no cells and walks up from the bottom, stopping as soon as it
+    /// has `rows` rows of content. Trailing blank rows (the padding every partly-filled
+    /// screen carries) are skipped first, so "the last N rows" means the last N rows that
+    /// have something on them.
+    ///
+    /// Cheap enough to call per PTY chunk, which is the point: callers that only care about
+    /// the bottom of the screen should not pay for a full-grid clone.
+    pub fn viewport_tail_text(&self, rows: usize) -> String {
+        if rows == 0 {
+            return String::new();
+        }
+        let hist = self.history.len();
+        let offset = self.view_offset;
+        let row_text = |row: u16| {
+            // Global row index over [history .. history+rows); offset scrolls up.
+            let global = hist as isize - offset as isize + row as isize;
+            let mut line = String::with_capacity(self.cols as usize);
+            for col in 0..self.cols {
+                let cell = if global >= 0 && (global as usize) < hist {
+                    self.history_row(global as usize)
+                        .and_then(|r| r.get(col as usize).copied())
+                } else {
+                    let live = (global - hist as isize).max(0) as u16;
+                    self.cell(col, live).copied()
+                };
+                match cell {
+                    // Skip a double-width char's trailing spacer, exactly like `to_text`.
+                    Some(c) if c.is_continuation() => {}
+                    Some(c) => line.push(c.ch),
+                    None => line.push(' '),
+                }
+            }
+            while line.ends_with(' ') {
+                line.pop();
+            }
+            line
+        };
+
+        let mut collected: Vec<String> = Vec::with_capacity(rows);
+        let mut seen_content = false;
+        for row in (0..self.rows).rev() {
+            let line = row_text(row);
+            if !seen_content {
+                if line.is_empty() {
+                    continue; // trailing padding below the last written row
+                }
+                seen_content = true;
+            }
+            collected.push(line);
+            if collected.len() >= rows {
+                break;
+            }
+        }
+        collected.reverse();
+        let mut out = collected.join("\n");
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out
+    }
+
     /// Record the most-recent OSC 133 command-end event (parser → grid). A newer
     /// event overwrites an unconsumed one — only the latest matters (spec D17:
     /// one waiting item per session).

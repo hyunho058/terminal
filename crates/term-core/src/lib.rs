@@ -210,11 +210,66 @@ impl Terminal {
     pub fn take_osc_title(&mut self) -> Option<String> {
         self.grid.take_osc_title()
     }
+
+    /// The last `rows` **non-blank-terminated** rows of the visible viewport as text, one
+    /// row per line, trailing blank rows dropped.
+    ///
+    /// A cheap alternative to `snapshot().to_text()` for callers that only need the bottom
+    /// of the screen: it clones no cells and builds a string bounded by `rows * cols`,
+    /// so it is safe to call on every PTY chunk. A viewport is padded with blank rows to
+    /// the full grid height, so those are trimmed first — otherwise "the last N rows" of a
+    /// half-full screen is mostly padding.
+    ///
+    /// Raw text only. What any of it *means* is the caller's business (spec D21).
+    pub fn viewport_tail_text(&self, rows: usize) -> String {
+        self.grid.viewport_tail_text(rows)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewport_tail_text_trims_padding_and_bounds_rows() {
+        // A 20-row viewport with 3 written rows: the tail must be those 3, not 17 blanks
+        // plus them. This is the property the caller depends on — a dialog that ends well
+        // above the last row would otherwise fall outside any "last N rows" window.
+        let mut t = Terminal::new(30, 20, Color(0xE0E0E0), Color(0x101010));
+        t.advance(b"alpha\r\nbeta\r\ngamma\r\n");
+        assert_eq!(t.viewport_tail_text(10), "alpha\nbeta\ngamma\n");
+        // Bounded: asking for fewer rows returns the LAST ones.
+        assert_eq!(t.viewport_tail_text(2), "beta\ngamma\n");
+        assert_eq!(t.viewport_tail_text(1), "gamma\n");
+    }
+
+    #[test]
+    fn viewport_tail_text_is_empty_on_a_blank_screen() {
+        let t = Terminal::new(30, 10, Color(0xE0E0E0), Color(0x101010));
+        assert_eq!(t.viewport_tail_text(5), "");
+    }
+
+    #[test]
+    fn viewport_tail_text_follows_the_scrollback_viewport() {
+        // Honours `view_offset` like `GridSnapshot::from_grid`: scrolled back, it reports
+        // what is on screen, not the live bottom.
+        let mut t = Terminal::new(30, 4, Color(0xE0E0E0), Color(0x101010));
+        for i in 0..12 {
+            t.advance(format!("line{i}\r\n").as_bytes());
+        }
+        let live = t.viewport_tail_text(4);
+        assert!(
+            live.contains("line11"),
+            "live view shows the newest: {live:?}"
+        );
+        t.scroll_up(6);
+        let scrolled = t.viewport_tail_text(4);
+        assert!(
+            !scrolled.contains("line11"),
+            "scrolled view must not show the live bottom: {scrolled:?}"
+        );
+        assert!(scrolled.contains("line5"), "shows history: {scrolled:?}");
+    }
 
     #[test]
     fn take_command_end_exposes_osc133_and_drains() {

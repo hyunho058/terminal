@@ -150,17 +150,28 @@ impl WaitingState {
             let slot = self.tabs.entry(tab).or_default();
             let was_waiting = slot.prev_agent == Some(AgentState::Waiting);
             let is_waiting = state == AgentState::Waiting;
-            slot.prev_agent = Some(state);
             if is_waiting && !was_waiting {
-                // Rising edge into Waiting → raise it, unless this is the tab the
-                // user is already looking at (D15/R2.3).
                 if tab != active {
+                    // Rising edge into Waiting on a tab the user is not watching → raise,
+                    // and record the transition as consumed.
                     slot.raise(WaitingKind::Waiting, now);
+                    slot.prev_agent = Some(state);
                 }
-            } else if was_waiting && !is_waiting {
-                // Left Waiting → the pending Waiting signal is gone (unless it was
-                // already acknowledged, in which case this is already `None`).
-                slot.waiting = None;
+                // Otherwise the edge happened on the tab the user is already looking at.
+                // No item (D15/R2.3) — but `prev_agent` is deliberately NOT advanced, so
+                // the edge stays PENDING. Recording it here would consume it invisibly:
+                // the user would then switch away from a still-blocked agent and the tab
+                // could never be raised, because every later poll would see
+                // `was_waiting == is_waiting` and find no edge at all. Leaving it pending
+                // is what lets the switch-away re-evaluation raise it (see
+                // `waiting_seen_while_active_raises_after_switching_away`).
+            } else {
+                if was_waiting && !is_waiting {
+                    // Left Waiting → the pending Waiting signal is gone (unless it was
+                    // already acknowledged, in which case this is already `None`).
+                    slot.waiting = None;
+                }
+                slot.prev_agent = Some(state);
             }
         }
         self.items() != before
@@ -384,6 +395,63 @@ mod tests {
         assert!(w.on_agent_states(&[(tab, AgentState::Waiting)], active, t(base, 40)));
         assert_eq!(w.items().len(), 1);
         assert_eq!(w.items()[0].since, t(base, 40));
+    }
+
+    #[test]
+    fn waiting_seen_while_active_raises_after_switching_away() {
+        // THE dominant real flow, and a shipped-broken bug once: you are WATCHING the tab
+        // when its permission dialog opens. The rising edge must not be consumed while it
+        // is invisible — otherwise switching away leaves a still-blocked agent that can
+        // never be raised, because every later poll sees `was_waiting == is_waiting`.
+        let base = Instant::now();
+        let mut w = WaitingState::new();
+        let (tab, other) = (TabId(1), TabId(2));
+        // Dialog opens while `tab` is the active tab → no item (D15), edge left pending.
+        assert!(!w.on_agent_states(&[(tab, AgentState::Waiting)], tab, t(base, 10)));
+        assert!(w.items().is_empty());
+        // Repeated polls while still active must not consume it either.
+        assert!(!w.on_agent_states(&[(tab, AgentState::Waiting)], tab, t(base, 20)));
+        assert!(w.items().is_empty());
+        // User switches to `other`; the re-evaluation on switch now raises it.
+        assert!(w.on_agent_states(&[(tab, AgentState::Waiting)], other, t(base, 30)));
+        let items = w.items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].tab_id, tab);
+        assert_eq!(items[0].kind, WaitingKind::Waiting);
+    }
+
+    #[test]
+    fn resolved_while_active_does_not_raise_on_switch_away() {
+        // The other half: if you actually DEAL with it while watching, leaving must not
+        // resurrect it. The pending edge is discharged by the state going back to Busy.
+        let base = Instant::now();
+        let mut w = WaitingState::new();
+        let (tab, other) = (TabId(1), TabId(2));
+        w.on_agent_states(&[(tab, AgentState::Waiting)], tab, t(base, 10));
+        // Answered → back to work while still active.
+        w.on_agent_states(&[(tab, AgentState::Busy)], tab, t(base, 20));
+        // Switch away → nothing pending.
+        assert!(!w.on_agent_states(&[(tab, AgentState::Busy)], other, t(base, 30)));
+        assert!(w.items().is_empty());
+    }
+
+    #[test]
+    fn acknowledged_tab_does_not_reappear_on_switch_away() {
+        // Guards the fix against over-firing: a tab raised while INACTIVE, then visited
+        // (acknowledged) and left with the agent still Waiting, must stay gone — the edge
+        // was genuinely consumed and seen. Only a real new transition brings it back.
+        let base = Instant::now();
+        let mut w = WaitingState::new();
+        let (tab, other) = (TabId(1), TabId(2));
+        // Raised while the user was elsewhere.
+        assert!(w.on_agent_states(&[(tab, AgentState::Waiting)], other, t(base, 10)));
+        // User visits it.
+        w.acknowledge(tab);
+        w.on_agent_states(&[(tab, AgentState::Waiting)], tab, t(base, 20));
+        assert!(w.items().is_empty());
+        // …and leaves again, agent still Waiting → must NOT reappear.
+        assert!(!w.on_agent_states(&[(tab, AgentState::Waiting)], other, t(base, 30)));
+        assert!(w.items().is_empty());
     }
 
     #[test]
