@@ -8,9 +8,12 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 
 use notify::{RecursiveMode, Watcher};
 use serde_json::Value;
+
+use crate::telemetry::{SessionTelemetry, TelemetrySnapshot};
 
 /// Bounded tail read of a session log — the activity signal consumed by the sidebar's
 /// `tab-metadata` worker (D7). Purely additive; uses only `std` + `serde_json`.
@@ -143,26 +146,54 @@ pub fn backfill(log: &Path, n: usize) -> (Vec<AiEvent>, u64) {
     (events, len)
 }
 
-/// A running tail on a log file. Dropping it stops the watch thread. New events
-/// arrive on the [`Receiver`]; the caller wakes its event loop and drains them.
+/// Fold the whole of `log` into a fresh [`SessionTelemetry`], returning it plus the
+/// file's current byte length — the offset to tail from.
+///
+/// `notify` signals only *future* appends, so opening the overlay must seed the
+/// accumulator from what is already in the file. This runs where [`backfill`] runs:
+/// on the caller's thread at open, which already reads and parses the whole file
+/// today, so folding instead of building `AiEvent`s is the same order of cost.
+/// Missing file → empty state, offset 0, no error.
+pub fn backfill_telemetry(log: &Path) -> (SessionTelemetry, u64) {
+    let mut t = SessionTelemetry::new();
+    let Ok(bytes) = std::fs::read(log) else {
+        return (t, 0);
+    };
+    let len = bytes.len() as u64;
+    for line in String::from_utf8_lossy(&bytes).lines() {
+        t.apply(line);
+    }
+    (t, len)
+}
+
+/// A running tail on a log file. Dropping it stops the watch thread.
+///
+/// The thread OWNS the [`SessionTelemetry`] and sends an immutable snapshot per
+/// append batch (SD5) — not the raw line (which would move JSON parsing onto the UI
+/// thread) and not a per-line event (which is what discarded the data this feature
+/// exists to accumulate). `Arc` because Claude Code appends line-by-line, so "one
+/// send per batch" is in practice one send per line, and a bare snapshot would deep
+/// clone ~112 ring entries plus the tasks map every time.
 pub struct LogWatcher {
     _watcher: notify::RecommendedWatcher,
-    pub rx: Receiver<AiEvent>,
+    pub rx: Receiver<Arc<TelemetrySnapshot>>,
 }
 
 impl LogWatcher {
-    /// Start tailing `log` from `start_offset` (usually the length returned by
-    /// [`backfill`]). Emits each newly-appended parseable line as an [`AiEvent`]
-    /// on [`rx`](LogWatcher::rx) and calls `wake` once per batch so the caller can
-    /// wake its event loop and drain. `wake` runs on the watch thread — keep it
-    /// cheap (e.g. an `EventLoopProxy::send_event`).
+    /// Start tailing `log` from `start_offset`, folding each newly-appended complete
+    /// line into `telemetry` (seed it with [`backfill_telemetry`]).
+    ///
+    /// Sends ONE `Arc<TelemetrySnapshot>` per append batch and calls `wake` once, so
+    /// the caller can wake its event loop and drain. `wake` runs on the watch thread
+    /// — keep it cheap (e.g. an `EventLoopProxy::send_event`).
     pub fn spawn(
         log: PathBuf,
+        mut telemetry: SessionTelemetry,
         start_offset: u64,
         wake: impl Fn() + Send + 'static,
     ) -> Option<LogWatcher> {
         let dir = log.parent()?.to_path_buf();
-        let (tx, rx) = mpsc::channel::<AiEvent>();
+        let (tx, rx) = mpsc::channel::<Arc<TelemetrySnapshot>>();
         let mut offset = start_offset;
         let mut partial = String::new();
         let target = log.clone();
@@ -180,10 +211,16 @@ impl LogWatcher {
             let Ok(size) = f.metadata().map(|m| m.len()) else {
                 return;
             };
+            let mut reset = false;
             if size < offset {
-                // File shrank/rotated — restart from the top.
+                // File shrank/rotated — restart from the top AND drop the
+                // accumulator. Until there was accumulated state a rewind was
+                // enough; continuing to fold a different session's lines into the
+                // previous session's totals would silently produce nonsense.
                 offset = 0;
                 partial.clear();
+                telemetry = SessionTelemetry::new();
+                reset = true;
             }
             if f.seek(SeekFrom::Start(offset)).is_err() {
                 return;
@@ -199,16 +236,22 @@ impl LogWatcher {
             };
             offset += n as u64;
             partial.push_str(&String::from_utf8_lossy(&buf));
-            let mut emitted = false;
+            let mut folded = 0usize;
             while let Some(nl) = partial.find('\n') {
                 let line: String = partial.drain(..=nl).collect();
-                if let Some(ev) = parse_line(&line) {
-                    if tx.send(ev).is_ok() {
-                        emitted = true;
-                    }
-                }
+                telemetry.apply(&line);
+                folded += 1;
             }
-            if emitted {
+            // ONE snapshot per batch, not per line: snapshots are cumulative, so
+            // every one but the last is stale before the UI thread wakes.
+            //
+            // A RESET must emit too, even with nothing folded. A rotation typically
+            // truncates to zero first, so the callback fires, the state resets, the
+            // read yields no complete line — and under a "≥1 line" condition no
+            // snapshot would be sent, leaving the UI showing the PREVIOUS session's
+            // totals as though live. Bytes read with no complete line (a buffered
+            // partial) correctly send nothing: no state changed.
+            if (folded > 0 || reset) && tx.send(Arc::new(telemetry.snapshot())).is_ok() {
                 wake();
             }
         })
@@ -281,32 +324,148 @@ mod tests {
 
     #[test]
     fn tail_emits_each_append_exactly_once() {
+        // Retained from the AiEvent era with its ASSERTIONS rewritten against
+        // snapshot fields — the no-duplicate property it guards is the whole reason
+        // the read loop advances the offset by bytes actually consumed rather than
+        // by a possibly-stale `size`.
         use std::io::Write;
         use std::time::Duration;
 
         let dir = temp_dir("tail");
         let log = dir.join("s.jsonl");
         std::fs::write(&log, "").unwrap();
-        let w = LogWatcher::spawn(log.clone(), 0, || {}).expect("spawn");
+        let (t, off) = backfill_telemetry(&log);
+        let w = LogWatcher::spawn(log.clone(), t, off, || {}).expect("spawn");
 
         let append = |line: &str| {
             let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
             writeln!(f, "{line}").unwrap();
         };
+        let usage = |id: &str, out: u64| {
+            format!(
+                r#"{{"type":"assistant","requestId":"{id}","message":{{"id":"{id}","usage":{{"output_tokens":{out}}}}}}}"#
+            )
+        };
 
-        append(r#"{"type":"user","message":{"content":[{"type":"text","text":"one"}]}}"#);
-        let e1 = w.rx.recv_timeout(Duration::from_secs(10)).expect("first");
-        assert_eq!(e1.summary, "one");
+        append(&usage("m1", 10));
+        let s1 = w.rx.recv_timeout(Duration::from_secs(10)).expect("first");
+        assert_eq!(s1.total_output, 10);
 
-        append(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"two"}]}}"#);
-        let e2 = w.rx.recv_timeout(Duration::from_secs(10)).expect("second");
-        assert_eq!(e2.summary, "two");
+        append(&usage("m2", 5));
+        let s2 = w.rx.recv_timeout(Duration::from_secs(10)).expect("second");
+        assert_eq!(
+            s2.total_output, 15,
+            "cumulative, and m1 counted exactly once"
+        );
 
-        // Offset advances by bytes consumed, so nothing is re-emitted (BUG 1 guard).
+        // Nothing re-emitted: a stale-size offset would re-read and re-fold m1/m2.
         assert!(
             w.rx.recv_timeout(Duration::from_millis(400)).is_err(),
-            "no duplicate events"
+            "no duplicate snapshots"
         );
+    }
+
+    #[test]
+    fn rotation_resets_the_accumulator_and_emits() {
+        // A rotation truncates to zero, so no complete line follows. Under a
+        // "\u{2265}1 line folded" send condition nothing would be emitted and the UI would
+        // keep showing the PREVIOUS session's totals as though live.
+        use std::io::Write;
+        use std::time::Duration;
+
+        let dir = temp_dir("rotate");
+        let log = dir.join("s.jsonl");
+        std::fs::write(&log, "").unwrap();
+        let (t, off) = backfill_telemetry(&log);
+        let w = LogWatcher::spawn(log.clone(), t, off, || {}).expect("spawn");
+
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+            writeln!(
+                f,
+                r#"{{"type":"assistant","requestId":"a","message":{{"id":"a","usage":{{"output_tokens":99}}}}}}"#
+            )
+            .unwrap();
+        }
+        let before =
+            w.rx.recv_timeout(Duration::from_secs(10))
+                .expect("pre-rotation");
+        assert_eq!(before.total_output, 99);
+
+        // Truncate: a new session in the same path.
+        std::fs::write(&log, "").unwrap();
+        let after =
+            w.rx.recv_timeout(Duration::from_secs(10))
+                .expect("a reset must emit even with no line to fold");
+        assert_eq!(after.total_output, 0, "previous session's totals dropped");
+
+        // ...and the fresh accumulator folds the NEW session from zero.
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+            writeln!(
+                f,
+                r#"{{"type":"assistant","requestId":"b","message":{{"id":"b","usage":{{"output_tokens":4}}}}}}"#
+            )
+            .unwrap();
+        }
+        let fresh =
+            w.rx.recv_timeout(Duration::from_secs(10))
+                .expect("new session line");
+        assert_eq!(fresh.total_output, 4, "only the new session's tokens");
+    }
+
+    #[test]
+    fn a_partial_line_folds_nothing_and_sends_nothing() {
+        // R3.3 — bytes with no terminating newline are buffered, not folded. Sending
+        // a snapshot here would publish a state that did not change.
+        use std::io::Write;
+        use std::time::Duration;
+
+        let dir = temp_dir("partial");
+        let log = dir.join("s.jsonl");
+        std::fs::write(&log, "").unwrap();
+        let (t, off) = backfill_telemetry(&log);
+        let w = LogWatcher::spawn(log.clone(), t, off, || {}).expect("spawn");
+
+        let write = |bytes: &str| {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+            f.write_all(bytes.as_bytes()).unwrap();
+        };
+
+        // no trailing newline -> incomplete record
+        write(
+            r#"{"type":"assistant","requestId":"a","message":{"id":"a","usage":{"output_tokens":7}}}"#,
+        );
+        assert!(
+            w.rx.recv_timeout(Duration::from_millis(600)).is_err(),
+            "a buffered partial must not emit"
+        );
+
+        // completing it flushes exactly one snapshot carrying the folded line
+        write("\n");
+        let s =
+            w.rx.recv_timeout(Duration::from_secs(10))
+                .expect("flush on newline");
+        assert_eq!(s.total_output, 7);
+    }
+
+    #[test]
+    fn backfill_telemetry_seeds_from_the_existing_file() {
+        let dir = temp_dir("seed");
+        let log = dir.join("s.jsonl");
+        std::fs::write(
+            &log,
+            "{\"type\":\"assistant\",\"requestId\":\"a\",\"message\":{\"id\":\"a\",\"usage\":{\"output_tokens\":42}}}\n",
+        )
+        .unwrap();
+        let (t, off) = backfill_telemetry(&log);
+        assert_eq!(t.snapshot().total_output, 42);
+        assert!(off > 0, "offset is the file length, to tail from");
+
+        // Missing file: empty state, offset 0, no panic.
+        let (t2, off2) = backfill_telemetry(Path::new("/definitely/not/here.jsonl"));
+        assert_eq!(t2.snapshot().total_output, 0);
+        assert_eq!(off2, 0);
     }
 
     #[test]
