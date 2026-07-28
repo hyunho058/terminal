@@ -18,6 +18,7 @@ use renderer::DrawLayer;
 use winit::event_loop::EventLoopProxy;
 use winit::keyboard::Key;
 
+use crate::dashboard;
 use crate::seam::{AppCtx, Handled, KeyInput, Overlay};
 use crate::terminal_app::UserEvent;
 
@@ -81,48 +82,30 @@ impl AiMonitorOverlay {
         self.refresh_model();
     }
 
-    /// Push the current visibility + rendered lines into the draw layer.
+    /// Push the current visibility + composed lines into the draw layer.
     ///
-    /// PLACEHOLDER RENDERING. This is deliberately not a layout — it exists to prove
-    /// the fold -> channel -> UI pipeline end to end by eye, and
-    /// `overlay-dashboard-frame` replaces it wholesale with the real box-drawn
-    /// dashboard. Do not mistake it for the intended design.
+    /// All layout lives in [`crate::dashboard`] (F5) — this is wiring: supply the
+    /// clock, hand over the snapshot, publish the result.
     fn refresh_model(&self) {
-        let lines = match &self.latest {
-            None => vec!["ai-monitor: no session log for this tab".to_string()],
-            Some(t) => vec![
-                format!("session  {}", t.session_id.as_deref().unwrap_or("—")),
-                format!("model    {}", t.model.as_deref().unwrap_or("—")),
-                format!(
-                    "tokens   in {} · out {} · cache {}",
-                    t.total_input,
-                    t.total_output,
-                    t.total_cache_read + t.total_cache_creation
-                ),
-                format!("context  {}", t.context_used),
-                format!(
-                    "events   first {:?} · last {:?}",
-                    t.first_event_ms, t.last_event_ms
-                ),
-                format!(
-                    "activity tools {} · skills {} · files {} · agents {} · tasks {}",
-                    t.tools.len(),
-                    t.skills.len(),
-                    t.files.len(),
-                    t.subagents.len(),
-                    t.tasks.len()
-                ),
-                format!(
-                    "diag     parse {} · conflicts {} · orphans {}",
-                    t.parse_errors, t.usage_conflicts, t.orphan_tool_results
-                ),
-            ],
-        };
+        let lines = dashboard::compose(self.latest.as_deref(), now_ms());
         self.handle.set(OverlayModel {
             visible: self.visible,
             lines,
         });
     }
+}
+
+/// Wall-clock millis since the epoch, saturating.
+///
+/// Both failure modes are impossible-in-practice but neither may `unwrap`: a clock
+/// set before 1970 yields `0`, and a `u128` past `u64::MAX` millis (year 584942417)
+/// clamps. Either way the dashboard reads a `now_ms` at or below `first_event_ms`,
+/// which saturating subtraction renders as `0s` rather than a wrapped duration.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 /// Drain a snapshot channel, keeping only the newest value.

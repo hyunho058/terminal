@@ -10,6 +10,7 @@
 mod card_menu;
 mod clipboard;
 mod copy;
+mod dashboard;
 mod input;
 mod overlay;
 mod prompt;

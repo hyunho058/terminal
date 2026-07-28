@@ -24,3 +24,9 @@ term-core.workspace = true
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 winit = "0.30.13"
+
+[dev-dependencies]
+# Dashboard layout is text, so it is pinned with snapshots (F6). Same version
+# `term-core` already uses — no new crate enters the tree, and `/insta-review`
+# works on these too.
+insta = "1.48.0"
