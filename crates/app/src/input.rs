@@ -56,6 +56,14 @@ pub enum SidebarAction {
     NewTab,
     Collapse,
     Expand,
+    /// Open the card menu for the card at this list index (sticky-tab-title R3.3) — the
+    /// hamburger was pressed. The app resolves the index to a `TabId` and decides the
+    /// item set (`Reset to auto` only for a tab that has a user title, D4).
+    OpenMenu(usize),
+    /// Activate item `i` of the currently open card menu (sticky-tab-title R3.3). The
+    /// renderer knows only the item's position; which action that position means is the
+    /// app's to decide, since the app chose the item set.
+    MenuItem(usize),
     Inert,
 }
 
@@ -82,6 +90,8 @@ pub fn sidebar_press(
     sidebar_layout::hit_test(p, scroll, inp, collapsed).map(|region| match region {
         SidebarRegion::Card(i) => SidebarAction::Switch(i),
         SidebarRegion::WaitingRow(i) => SidebarAction::SwitchWaiting(i),
+        SidebarRegion::MenuButton(i) => SidebarAction::OpenMenu(i),
+        SidebarRegion::MenuItem(i) => SidebarAction::MenuItem(i),
         SidebarRegion::Chrome(ChromeRegion::NewTab) => SidebarAction::NewTab,
         SidebarRegion::Chrome(ChromeRegion::HideSidebar) => SidebarAction::Collapse,
         SidebarRegion::Chrome(ChromeRegion::Restore) => SidebarAction::Expand,
@@ -101,6 +111,10 @@ pub fn sidebar_hover(
     let p = [cursor.0 as f32, cursor.1 as f32];
     match sidebar_layout::hit_test(p, scroll, inp, collapsed) {
         Some(SidebarRegion::Card(i)) => Some(i),
+        // The hamburger sits ON a card and resolves ahead of it (sticky-tab-title R3.1),
+        // so without this arm the card would lose its hover highlight the moment the
+        // pointer reached the very control that card is offering.
+        Some(SidebarRegion::MenuButton(i)) => Some(i),
         _ => None,
     }
 }
@@ -820,7 +834,24 @@ mod tests {
             row_count: count,
             waiting_count,
             metrics: renderer::sidebar_theme::SidebarMetrics::DEFAULT.scaled(1.0),
+            open_menu: None,
         }
+    }
+
+    #[test]
+    fn hovering_the_hamburger_keeps_its_own_card_highlighted() {
+        // sticky-tab-title R3.1 — the button resolves ahead of the card it sits on, so
+        // hover must map it back to that card or the highlight drops out from under the
+        // pointer the moment it reaches the control.
+        let inp = layout_input(340.0, 5);
+        let b = renderer::sidebar_layout::menu_button_rect(1, 0.0, &inp);
+        let centre = ((b.x + b.w * 0.5) as f64, (b.y + b.h * 0.5) as f64);
+        assert_eq!(sidebar_hover(centre, &inp, 0.0, false), Some(1));
+        // And the press at that same point still opens the menu rather than switching.
+        assert_eq!(
+            sidebar_press(centre, &inp, 0.0, false),
+            Some(SidebarAction::OpenMenu(1))
+        );
     }
 
     #[test]

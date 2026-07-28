@@ -198,14 +198,15 @@ impl DrawLayer for SidebarChromeLayer {
 
         // Row count feeds the input; the header/restore geometry does not use row_h, so a
         // missing published card layout (collapsed session) is harmless.
-        let (row_h, row_count, waiting_count) = TabModelHandle::shared().with(|m| {
+        let (row_h, row_count, waiting_count, open_menu) = TabModelHandle::shared().with(|m| {
             (
                 m.layout.as_ref().map(|l| l.card_h).unwrap_or(0.0),
                 m.rows.len(),
                 m.waiting.len(),
+                m.menu.as_ref().map(crate::sidebar_row::CardMenu::layout),
             )
         });
-        let inp = SidebarLayoutInput::from_frame(ctx, row_h, row_count, waiting_count);
+        let inp = SidebarLayoutInput::from_frame(ctx, row_h, row_count, waiting_count, open_menu);
         let hover = self
             .handle
             .cursor()
@@ -249,6 +250,7 @@ mod tests {
             row_count: 5,
             waiting_count: 0,
             metrics: SidebarMetrics::DEFAULT.scaled(scale),
+            open_menu: None,
         }
     }
 

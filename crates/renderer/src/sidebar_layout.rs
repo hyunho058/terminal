@@ -78,8 +78,49 @@ pub enum SidebarRegion {
     /// A pinned waiting-band row (0-based, top = oldest wait). Only the ≤5 real
     /// session rows are live; the "+N more" summary row is swallowed as `Panel`.
     WaitingRow(usize),
+    /// The per-card menu button (the hamburger) on card `i` (sticky-tab-title D10/R3.1).
+    /// Resolved *before* [`Card`](SidebarRegion::Card) so pressing the button opens the
+    /// menu instead of switching to the tab it sits on.
+    MenuButton(usize),
+    /// Item `i` (0-based, top to bottom) of the currently open card menu
+    /// (sticky-tab-title D10/R3.1). Resolved before everything in the list, because an
+    /// open popup floats over the cards below it — a press there must never fall through
+    /// to whatever card the popup happens to cover.
+    MenuItem(usize),
     Card(usize),
     Panel,
+}
+
+/// Which card's menu is open and how many items it has (sticky-tab-title D10/R3.2).
+///
+/// This is **layout input, not renderer state**: the app decides whether a menu is open
+/// and what it contains — `Reset to auto` is offered only for a tab that has a user
+/// title, so the item count is 2 or 3 — and passes it down so this module can lay the
+/// popup out and hit-test it. The renderer never toggles it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenMenu {
+    /// The card index the menu is anchored to.
+    pub row: usize,
+    /// How many items the menu draws (≥ 1). The app owns which items those are.
+    pub items: usize,
+}
+
+/// Card-menu layout tokens, logical px (scaled at the point of use, like [`tokens`]).
+pub mod menu {
+    /// The hamburger's touch/hit square, logical px — the icon plus its padding.
+    pub const BUTTON_PX: f32 = 22.0;
+    /// Gap between the hamburger's right edge and the card's inner right edge.
+    pub const BUTTON_INSET: f32 = 2.0;
+    /// The popup's width, logical px — wide enough for "Reset to auto".
+    pub const WIDTH: f32 = 150.0;
+    /// One menu item's height, logical px.
+    pub const ITEM_H: f32 = 28.0;
+    /// Padding above the first item and below the last, logical px.
+    pub const PAD_Y: f32 = 5.0;
+    /// Gap between the hamburger and the popup's top edge, logical px.
+    pub const GAP: f32 = 3.0;
+    /// The popup's corner radius, logical px.
+    pub const RADIUS: f32 = 10.0;
 }
 
 /// Waiting-band layout tokens, logical px (multiplied by `scale` at the point of use,
@@ -117,6 +158,11 @@ pub struct SidebarLayoutInput {
     pub waiting_count: usize,
     /// **Already scaled**: `SidebarMetrics::scaled(scale)`, never `SidebarMetrics::DEFAULT`.
     pub metrics: SidebarMetrics,
+    /// The open card menu, if any (sticky-tab-title D10/R3.2) — pushed by the app exactly
+    /// as `waiting_count` is. `None` = no menu open, and then no `MenuItem` region can be
+    /// produced. Keeps [`hit_test`] a pure function of its inputs while the *decision* to
+    /// open stays app-side.
+    pub open_menu: Option<OpenMenu>,
 }
 
 impl SidebarLayoutInput {
@@ -127,6 +173,7 @@ impl SidebarLayoutInput {
         row_h: f32,
         row_count: usize,
         waiting_count: usize,
+        open_menu: Option<OpenMenu>,
     ) -> SidebarLayoutInput {
         SidebarLayoutInput {
             sidebar_w: ctx.left_inset,
@@ -136,6 +183,7 @@ impl SidebarLayoutInput {
             row_count,
             waiting_count,
             metrics: SidebarMetrics::DEFAULT.scaled(ctx.scale_factor),
+            open_menu,
         }
     }
 }
@@ -342,6 +390,97 @@ pub fn row_rect(i: usize, s: f32, inp: &SidebarLayoutInput) -> Rect {
     }
 }
 
+/// The hamburger's rect **inside a given card rect** (sticky-tab-title R3.1): a square at
+/// the card's top-right, within the card padding, vertically centred on line 1.
+///
+/// Takes the card rect rather than an index because the two callers reach a card rect by
+/// different routes — the hit-test via [`row_rect`], the row layer via its own published
+/// `SidebarLayout::card_rect` — and this keeps ONE formula for where the button sits
+/// inside a card (SD2). Feed it either; they already agree on card rects, and now the
+/// button cannot drift from the card it belongs to.
+pub fn menu_button_in(card: Rect, metrics: &SidebarMetrics, scale: f64) -> Rect {
+    let side = menu::BUTTON_PX * scale as f32;
+    let inset = menu::BUTTON_INSET * scale as f32;
+    Rect {
+        x: card.x + card.w - metrics.card_pad_x - side + inset,
+        y: card.y + metrics.card_pad_y + (metrics.title_px - side) * 0.5,
+        w: side,
+        h: side,
+    }
+}
+
+/// The hamburger's rect on card `i` — the hit-test's route into [`menu_button_in`].
+pub fn menu_button_rect(i: usize, s: f32, inp: &SidebarLayoutInput) -> Rect {
+    menu_button_in(row_rect(i, s, inp), &inp.metrics, inp.scale)
+}
+
+/// The popup's rect for a given hamburger rect (sticky-tab-title R3.1/R3.2) — the shared
+/// formula behind [`menu_rect`], so the drawn popup and the hit-tested one are the same
+/// rectangle even though the two callers reach the button by different routes (SD2).
+///
+/// Anchored under the button, right-aligned to it, and **clamped into the viewport**: a
+/// menu on the last card would otherwise hang off the bottom of the window, so it flips
+/// to sit above its button instead.
+pub fn menu_rect_for(button: Rect, items: usize, viewport: [f32; 2], scale: f64) -> Rect {
+    let s = scale as f32;
+    let w = menu::WIDTH * s;
+    let h = items as f32 * menu::ITEM_H * s + 2.0 * menu::PAD_Y * s;
+    let gap = menu::GAP * s;
+    // Right-align with the button, then keep it inside the window's left edge (a narrow
+    // sidebar would otherwise push it negative).
+    let x = (button.x + button.w - w).max(0.0);
+    let below = button.y + button.h + gap;
+    // Prefer below the button; flip above when that would overflow the bottom.
+    let preferred = if below + h <= viewport[1] {
+        below
+    } else {
+        button.y - gap - h
+    };
+    // Then clamp unconditionally. The flip alone is not enough: a card scrolled far past
+    // the bottom of a short window has no room on EITHER side, and a popup drawn off the
+    // window is a popup the user cannot reach. Clamping keeps it on screen in every case
+    // (and collapses to the top edge when the menu is taller than the window).
+    let y = preferred.clamp(0.0, (viewport[1] - h).max(0.0));
+    Rect { x, y, w, h }
+}
+
+/// Item `i`'s rect inside a popup rect — the shared formula behind [`menu_item_rect`].
+pub fn menu_item_in(popup: Rect, i: usize, scale: f64) -> Rect {
+    let item_h = menu::ITEM_H * scale as f32;
+    Rect {
+        x: popup.x,
+        y: popup.y + menu::PAD_Y * scale as f32 + i as f32 * item_h,
+        w: popup.w,
+        h: item_h,
+    }
+}
+
+/// The open menu's popup rect (sticky-tab-title R3.1/R3.2), or `None` when no menu is
+/// open — the hit-test's route into [`menu_rect_for`].
+pub fn menu_rect(s: f32, inp: &SidebarLayoutInput) -> Option<Rect> {
+    let open = inp.open_menu?;
+    let button = menu_button_rect(open.row, s, inp);
+    Some(menu_rect_for(button, open.items, inp.viewport, inp.scale))
+}
+
+/// Item `i`'s rect inside the open popup (sticky-tab-title R3.1), or `None` when no menu
+/// is open or `i` is past the item count.
+pub fn menu_item_rect(i: usize, s: f32, inp: &SidebarLayoutInput) -> Option<Rect> {
+    let open = inp.open_menu?;
+    if i >= open.items {
+        return None;
+    }
+    Some(menu_item_in(menu_rect(s, inp)?, i, inp.scale))
+}
+
+/// The menu item at physical `p`, or `None` when no menu is open or the point misses
+/// every item (sticky-tab-title R3.1). The popup's own padding resolves to `None` — the
+/// caller swallows it as `Panel` rather than letting it fall through to a card.
+fn menu_item_at(p: [f32; 2], s: f32, inp: &SidebarLayoutInput) -> Option<usize> {
+    let open = inp.open_menu?;
+    (0..open.items).find(|&i| menu_item_rect(i, s, inp).is_some_and(|r| r.contains(p)))
+}
+
 /// The card at list-relative `y` — **stride-tiling**, so the inter-card gap belongs to
 /// the nearer card and there is no dead zone (D8). `None` past the last row.
 pub fn row_at(y: f32, s: f32, inp: &SidebarLayoutInput) -> Option<usize> {
@@ -417,6 +556,21 @@ pub fn hit_test(
             .contains(p)
             .then_some(SidebarRegion::Chrome(ChromeRegion::Restore));
     }
+    // 1.5. An OPEN CARD MENU floats above everything in the sidebar, so it resolves
+    // before the band/header/list — otherwise a press on an item would fall through to
+    // whatever the popup happens to cover (sticky-tab-title D10/R3.1). Its own padding
+    // resolves to `Panel`: swallowed, not leaked to the card underneath.
+    //
+    // Deliberately ahead of the "outside the sidebar band" test below, because the popup
+    // is right-aligned to a card and may extend past `sidebar_w` over the terminal.
+    if let Some(popup) = menu_rect(s, inp) {
+        if popup.contains(p) {
+            return Some(match menu_item_at(p, s, inp) {
+                Some(i) => SidebarRegion::MenuItem(i),
+                None => SidebarRegion::Panel,
+            });
+        }
+    }
     // 2. Outside the sidebar band.
     if p[0] < 0.0 || p[0] >= inp.sidebar_w || p[1] < 0.0 || p[1] >= inp.viewport[1] {
         return None;
@@ -438,8 +592,11 @@ pub fn hit_test(
             None => SidebarRegion::Panel,
         });
     }
-    // 4. The list: a card, else Panel (dead space is swallowed, not leaked).
+    // 4. The list: a card, else Panel (dead space is swallowed, not leaked). The card's
+    // hamburger resolves ahead of the card itself (sticky-tab-title R3.1) — pressing the
+    // button must open the menu, not switch to the tab it sits on.
     Some(match row_at(p[1], s, inp) {
+        Some(i) if menu_button_rect(i, s, inp).contains(p) => SidebarRegion::MenuButton(i),
         Some(i) => SidebarRegion::Card(i),
         None => SidebarRegion::Panel,
     })
@@ -468,6 +625,15 @@ mod tests {
             row_count,
             waiting_count,
             metrics: SidebarMetrics::DEFAULT.scaled(scale),
+            open_menu: None,
+        }
+    }
+
+    /// An input with card `row`'s menu open, carrying `items` items.
+    fn input_menu(row: usize, items: usize) -> SidebarLayoutInput {
+        SidebarLayoutInput {
+            open_menu: Some(OpenMenu { row, items }),
+            ..input(340.0, 900.0, 1.0, 5)
         }
     }
 
@@ -770,5 +936,161 @@ mod tests {
             hit_test([170.0, 190.0], 0.0, &inp, false),
             Some(SidebarRegion::WaitingRow(4))
         );
+    }
+
+    // ---- sticky-tab-title: the per-card menu (R3.1/R3.2) ----
+
+    #[test]
+    fn menu_button_sits_inside_its_card_top_right() {
+        // R3.1 — the hamburger belongs to the card: inside its right padding, on line 1.
+        let inp = input(340.0, 900.0, 1.0, 5);
+        let card = row_rect(2, 0.0, &inp);
+        let b = menu_button_rect(2, 0.0, &inp);
+        assert!(b.x > card.x + card.w * 0.5, "right-aligned within the card");
+        assert!(b.x + b.w <= card.x + card.w, "never overhangs the card");
+        assert!(
+            b.y >= card.y && b.y + b.h <= card.y + card.h,
+            "vertically inside"
+        );
+    }
+
+    #[test]
+    fn menu_button_beats_the_card_it_sits_on() {
+        // R3.1 — the whole point of ordering it ahead of `Card(i)`: pressing the button
+        // must open the menu, not switch to the tab underneath it.
+        let inp = input(340.0, 900.0, 1.0, 5);
+        let b = menu_button_rect(1, 0.0, &inp);
+        let centre = [b.x + b.w * 0.5, b.y + b.h * 0.5];
+        assert_eq!(
+            hit_test(centre, 0.0, &inp, false),
+            Some(SidebarRegion::MenuButton(1))
+        );
+        // A point on the same card but away from the button is still the card.
+        let card = row_rect(1, 0.0, &inp);
+        assert_eq!(
+            hit_test([card.x + 8.0, centre[1]], 0.0, &inp, false),
+            Some(SidebarRegion::Card(1))
+        );
+    }
+
+    #[test]
+    fn open_menu_items_beat_the_cards_they_float_over() {
+        // R3.1 — a popup floats above the list; a press on an item must never fall through
+        // to whatever card happens to be underneath.
+        let inp = input_menu(0, 3);
+        for i in 0..3 {
+            let item = menu_item_rect(i, 0.0, &inp).expect("item exists");
+            let p = [item.x + item.w * 0.5, item.y + item.h * 0.5];
+            assert_eq!(
+                hit_test(p, 0.0, &inp, false),
+                Some(SidebarRegion::MenuItem(i))
+            );
+        }
+    }
+
+    #[test]
+    fn menu_padding_is_swallowed_not_leaked() {
+        // R3.1 — the popup's own padding is inside the popup, so it must resolve to Panel
+        // (a no-op), never to the card it covers.
+        let inp = input_menu(0, 2);
+        let popup = menu_rect(0.0, &inp).expect("menu open");
+        let in_pad = [popup.x + popup.w * 0.5, popup.y + 1.0];
+        assert_eq!(
+            hit_test(in_pad, 0.0, &inp, false),
+            Some(SidebarRegion::Panel)
+        );
+    }
+
+    #[test]
+    fn no_menu_open_yields_no_menu_regions() {
+        // R3.2 — `open_menu: None` means no popup exists, so no point can resolve to a
+        // MenuItem. The app owning the state is what makes this true.
+        let inp = input(340.0, 900.0, 1.0, 5);
+        assert_eq!(menu_rect(0.0, &inp), None);
+        assert_eq!(menu_item_rect(0, 0.0, &inp), None);
+    }
+
+    #[test]
+    fn menu_item_count_bounds_the_items() {
+        // R3.2 — the app decides 2 or 3 items (Reset-to-auto is conditional); asking for
+        // one past the count is None, never a phantom rect.
+        let inp = input_menu(1, 2);
+        assert!(menu_item_rect(0, 0.0, &inp).is_some());
+        assert!(menu_item_rect(1, 0.0, &inp).is_some());
+        assert_eq!(menu_item_rect(2, 0.0, &inp), None);
+    }
+
+    #[test]
+    fn menu_items_stack_without_gaps_inside_the_popup() {
+        // R3.1 — items tile the popup's inner height in order, so there is no dead strip
+        // between two items where a press would silently do nothing.
+        let inp = input_menu(0, 3);
+        let popup = menu_rect(0.0, &inp).expect("menu open");
+        let r0 = menu_item_rect(0, 0.0, &inp).unwrap();
+        let r1 = menu_item_rect(1, 0.0, &inp).unwrap();
+        let r2 = menu_item_rect(2, 0.0, &inp).unwrap();
+        assert_eq!(r1.y, r0.y + r0.h);
+        assert_eq!(r2.y, r1.y + r1.h);
+        assert!(
+            r0.y >= popup.y,
+            "first item starts below the popup's top pad"
+        );
+        assert!(
+            r2.y + r2.h <= popup.y + popup.h,
+            "last item ends above the bottom pad"
+        );
+    }
+
+    #[test]
+    fn menu_flips_above_its_button_when_it_would_overflow_the_window() {
+        // R3.1 — a card low in a short window: the popup flips above its button instead
+        // of hanging off the bottom.
+        let short = SidebarLayoutInput {
+            open_menu: Some(OpenMenu { row: 2, items: 3 }),
+            ..input(340.0, 300.0, 1.0, 5)
+        };
+        let button = menu_button_rect(2, 0.0, &short);
+        let popup = menu_rect(0.0, &short).expect("menu open");
+        assert!(
+            popup.y + popup.h <= short.viewport[1],
+            "popup stays inside the window"
+        );
+        assert!(popup.y < button.y, "flipped above its button");
+    }
+
+    #[test]
+    fn menu_is_clamped_on_screen_even_with_no_room_either_side() {
+        // R3.1 — the flip alone cannot save a card scrolled far past the bottom of a short
+        // window (no room below, and above is off-screen too). The popup must still land
+        // somewhere reachable rather than being drawn outside the window.
+        let offscreen = SidebarLayoutInput {
+            open_menu: Some(OpenMenu { row: 4, items: 3 }),
+            ..input(340.0, 300.0, 1.0, 5)
+        };
+        let popup = menu_rect(0.0, &offscreen).expect("menu open");
+        assert!(popup.y >= 0.0);
+        assert!(popup.y + popup.h <= offscreen.viewport[1]);
+    }
+
+    #[test]
+    fn menu_stays_inside_the_left_edge() {
+        // R3.1 — right-aligning to the button on a narrow sidebar must not push the popup
+        // off-screen to the left.
+        let narrow = SidebarLayoutInput {
+            open_menu: Some(OpenMenu { row: 0, items: 3 }),
+            ..input(90.0, 900.0, 1.0, 3)
+        };
+        let popup = menu_rect(0.0, &narrow).expect("menu open");
+        assert!(popup.x >= 0.0, "never negative x");
+    }
+
+    #[test]
+    fn menu_scrolls_with_its_card() {
+        // R3.1 — the popup is anchored to a card, so scrolling the list moves both; a
+        // stale popup floating over a different card would mis-target the action.
+        let inp = input_menu(2, 2);
+        let a = menu_rect(0.0, &inp).expect("menu open");
+        let b = menu_rect(40.0, &inp).expect("menu open");
+        assert_eq!(b.y, a.y - 40.0);
     }
 }

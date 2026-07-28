@@ -68,6 +68,12 @@ impl Tabs {
         self.sessions.iter_mut().find(|s| s.id == id)
     }
 
+    /// Read-only lookup by stable id (sticky-tab-title R3.6) — the card menu reads a
+    /// background tab's user title to decide its item set and to prefill the rename field.
+    pub fn by_id(&self, id: TabId) -> Option<&Session> {
+        self.sessions.iter().find(|s| s.id == id)
+    }
+
     /// Whether `id` is the active tab (so background output skips redraw, R1.2).
     /// Bounds-safe: after the last tab closes (the app is exiting) a still-queued
     /// PTY wake must not index an empty set (C3 — clean exit).
@@ -95,6 +101,33 @@ impl Tabs {
         }
         self.sessions.remove(self.active);
         self.active = active_after_close(self.active, self.sessions.len());
+        true
+    }
+
+    /// Close the tab with this id, whichever tab is active (sticky-tab-title R3.6/R3.7).
+    /// Returns `false` when the last tab was closed (the app should exit) — the same
+    /// contract as [`close_active`](Tabs::close_active), so the card menu's `Close` and
+    /// Cmd+W agree on what closing the final tab means (D4).
+    ///
+    /// Unknown id → `true` (nothing closed, keep running): the tab may have exited
+    /// between the click and the apply.
+    pub fn close(&mut self, id: TabId) -> bool {
+        let Some(i) = self.sessions.iter().position(|s| s.id == id) else {
+            return true;
+        };
+        if self.sessions.len() <= 1 {
+            self.sessions.clear();
+            return false;
+        }
+        self.sessions.remove(i);
+        // The ACTIVE tab keeps its identity (R3.7) — closing a background tab must not
+        // switch tabs. Only its index moves, and only when the closed tab sat before it.
+        // Closing the active tab itself falls back to the Cmd+W rule.
+        self.active = if i == self.active {
+            active_after_close(self.active, self.sessions.len())
+        } else {
+            active_after_close_other(i, self.active)
+        };
         true
     }
 
@@ -165,16 +198,19 @@ impl Tabs {
                     .and_then(|p| p.file_name())
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| format!("Tab {}", i + 1));
-                // A non-empty OSC 0/2 title is the user's explicit manual label
-                // (tab-identity): highest precedence on the card's line 1, so two sessions
-                // in one folder can be told apart. Empty → no manual label (auto/cwd wins).
-                let label = Some(s.title())
-                    .filter(|t| !t.is_empty())
-                    .map(str::to_string);
+                // The two title sources travel separately (sticky-tab-title D9/R1.1): the
+                // user's sticky title, which outranks everything, and the last title a
+                // program set, which ranks below the AI-task label and is hidden entirely
+                // while a user title exists. They are NOT collapsed here — the chain is
+                // resolved in `sidebar_model::fill`, the only place the AI-task label
+                // between them is fresh (R1.2).
                 SidebarRow {
                     tab_id: s.id.0,
                     title,
-                    label,
+                    label: s.user_title().map(str::to_string),
+                    program: Some(s.program_title())
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string),
                 }
             })
             .collect()
@@ -183,6 +219,17 @@ impl Tabs {
     /// The active tab's live working directory (ai-monitor log resolution).
     pub fn active_cwd(&self) -> Option<PathBuf> {
         self.active().cwd()
+    }
+}
+
+/// The active index after closing a **different** tab (sticky-tab-title R3.7): the active
+/// session keeps its identity, so its index shifts down by one only when the closed tab
+/// sat before it. Pure, so the off-by-one that would silently switch tabs is unit-tested.
+fn active_after_close_other(closed: usize, active: usize) -> usize {
+    if closed < active {
+        active - 1
+    } else {
+        active
     }
 }
 
@@ -228,6 +275,21 @@ mod tests {
         assert_eq!(wrap_next(0, 1), 0);
         assert_eq!(wrap_prev(0, 1), 0);
         assert_eq!(wrap_next(0, 0), 0);
+    }
+
+    #[test]
+    fn closing_another_tab_keeps_the_active_tab_pointing_at_the_same_session() {
+        // sticky-tab-title R3.7 — the card menu can close a BACKGROUND tab. The active
+        // session must not change underneath the user; only its index moves, and only
+        // when the closed tab sat before it.
+        // [0,1,2] active=2, close 0 → the active session is now at index 1.
+        assert_eq!(active_after_close_other(0, 2), 1);
+        // close 1 (still before) → index 1.
+        assert_eq!(active_after_close_other(1, 2), 1);
+        // close 3 (after the active) → the active index is untouched.
+        assert_eq!(active_after_close_other(3, 2), 2);
+        // Closing the tab right after the active one changes nothing.
+        assert_eq!(active_after_close_other(1, 0), 0);
     }
 
     #[test]

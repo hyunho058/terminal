@@ -26,6 +26,7 @@ use common::config::SidebarConfig;
 use wgpu::util::DeviceExt;
 
 use crate::sidebar_icons::{push_icon, Icon};
+use crate::sidebar_layout::OpenMenu;
 use crate::sidebar_shapes::{Fill, SidebarShape, SidebarShapePipeline};
 use crate::sidebar_theme::{linear, AgentSkin, SidebarMetrics, SidebarTheme};
 use crate::{DrawLayer, FrameCtx};
@@ -49,11 +50,18 @@ const REPO_LINE2_WIDTH_SHARE: f32 = 0.55;
 pub struct SidebarRow {
     /// The app's `session::TabId` as a plain `u64` — the renderer must not know app types.
     pub tab_id: u64,
+    /// The cwd basename — the bottom of the label chain, and line 2's repo/folder name
+    /// when line 1 is custom.
     pub title: String,
-    /// The user's explicit manual label from an OSC 0/2 title (tab-identity), if any. Takes
-    /// precedence over the auto AI-task label on line 1 (manual > task > cwd `title`), so two
-    /// sessions in the same folder can be given distinct labels. `None` = no manual label.
+    /// The **user's** sticky title for this tab, if any (sticky-tab-title R1.1). Set only
+    /// by an explicit user action — never by the PTY — and outranks every other source on
+    /// line 1, which is what makes a named tab stay named. `None` = never named / reset.
     pub label: Option<String>,
+    /// The last OSC 0/2 title a *program* set on this tab's PTY (zsh precmd, vim, ssh),
+    /// if any (sticky-tab-title D3). Carried so the app can resolve the full chain in its
+    /// `MetaSource::fill`, where the AI-task label is fresh; it ranks below that label
+    /// (D12) and is hidden entirely while `label` is set (D3). `None` = none seen.
+    pub program: Option<String>,
 }
 
 /// The leading mark on a card's first line (D11/D12), drawn as a foundations icon —
@@ -105,11 +113,19 @@ pub struct RowMeta {
     pub branch: Option<String>,
     pub mark: RowMark,
     pub skin: AgentSkin,
-    /// The tab's live "current task" label (tab-identity). `Some` → line 1 shows this
-    /// instead of the cwd title, and the cwd/repo name moves to line 2 alongside the
-    /// branch; `None` → line 1 is the cwd title (plain shell / no agent). Pulled by
-    /// `tab_id` like `branch`, so it refreshes live off the metadata generation.
-    pub task: Option<String>,
+    /// Line 1's text, **already resolved by the app** (sticky-tab-title D7/R1.5) by the
+    /// precedence user-title > AI-task > program-OSC title > cwd. The renderer holds no
+    /// part of that policy: it draws this string. Pulled by `tab_id` like `branch`, so it
+    /// refreshes live off the metadata generation — which is why the app resolves it in
+    /// its `MetaSource::fill` and not when it assembles the rows.
+    ///
+    /// Empty for a `default()` row; the layer falls back to the row's cwd title then.
+    pub line1: String,
+    /// Whether [`line1`](RowMeta::line1) came from something other than the cwd title —
+    /// a user title, an AI task, or a program title. Drives line 2's layout: when line 1
+    /// is custom, the cwd/repo name moves down beside the branch (tab-identity R2.2).
+    /// Decided by the app alongside `line1` so the two can never disagree.
+    pub line1_is_custom: bool,
 }
 
 impl Default for RowMeta {
@@ -118,7 +134,8 @@ impl Default for RowMeta {
             branch: None,
             mark: RowMark::None,
             skin: AgentSkin::Generic,
-            task: None,
+            line1: String::new(),
+            line1_is_custom: false,
         }
     }
 }
@@ -147,6 +164,39 @@ pub struct TabBarModel {
     /// session (already active-tab-excluded by T3). Empty = no band. The app builds these
     /// by joining T3's waiting items to the session titles.
     pub waiting: Vec<WaitingRow>,
+    /// The open card menu (sticky-tab-title D10/R3.2), or `None`. Travels with the model
+    /// — like `waiting` — so the row layer, the header layer, and the app's hit-test all
+    /// read one value and cannot disagree about whether a popup is on screen (SD2). The
+    /// **app** owns both the decision to open it and what it says.
+    pub menu: Option<CardMenu>,
+}
+
+/// The open per-card menu as the app hands it over (sticky-tab-title D4/R3.2): which card
+/// it is anchored to, and its item labels top to bottom.
+///
+/// The **labels** live here rather than in [`OpenMenu`] because only drawing needs them;
+/// the geometry and hit-test need just the count, and keeping their input `Copy` keeps
+/// [`hit_test`](crate::sidebar_layout::hit_test) a cheap pure function. `OpenMenu` is
+/// derived from this at frame time, so the two can never disagree about the count.
+///
+/// The app decides the items — `Reset to auto` appears only for a tab that has a user
+/// title, so a menu carries 2 or 3 (D4) — and the renderer draws exactly what it is given.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CardMenu {
+    /// The card index the menu is anchored to.
+    pub row: usize,
+    /// Item labels, top to bottom. Never empty.
+    pub items: Vec<String>,
+}
+
+impl CardMenu {
+    /// The layout/hit-test view of this menu — position + item count, no strings.
+    pub fn layout(&self) -> OpenMenu {
+        OpenMenu {
+            row: self.row,
+            items: self.items.len(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -290,17 +340,19 @@ pub fn truncate_to_width(s: &str, advance: f32, max_w: f32, ellipsis: char) -> S
     out
 }
 
-/// Line 1 of a card (tab-identity): the label to draw, by precedence **manual > task > cwd**.
-/// `manual` is the user's explicit OSC-2 label (R2.1's escape hatch for two sessions in one
-/// folder); `task` is the live AI-task label (R2.1); `cwd_title` is the fallback (R3.2). An
-/// idle agent keeps its last label because the worker persists `task`, so this same branch
-/// renders the afterglow (R3.1) — the renderer invents nothing; it mirrors the pulled state.
-pub(crate) fn card_line1_text<'a>(
-    manual: Option<&'a str>,
-    task: Option<&'a str>,
-    cwd_title: &'a str,
-) -> &'a str {
-    manual.or(task).unwrap_or(cwd_title)
+/// Line 1 of a card: the app-resolved label, or the cwd title when the row has no metadata
+/// yet (sticky-tab-title D7/R1.5).
+///
+/// The precedence itself — user title > AI-task > program-OSC title > cwd — lives app-side
+/// in `sidebar_model::resolve_line1`, the one place that sees all four sources with the
+/// task label fresh. What remains here is the empty-means-no-metadata fallback, so a card
+/// drawn before the first `MetaSource::fill` shows its folder rather than a blank line.
+pub(crate) fn card_line1_text<'a>(resolved: &'a str, cwd_title: &'a str) -> &'a str {
+    if resolved.is_empty() {
+        cwd_title
+    } else {
+        resolved
+    }
 }
 
 /// The x-origin (physical px) at which line 2's git-branch icon may start after the repo name,
@@ -345,6 +397,9 @@ pub struct SidebarModel {
     pub scroll_px: f32,
     /// Published by the layer after drawing (D7).
     pub layout: Option<SidebarLayout>,
+    /// The open card menu (sticky-tab-title D10/R3.2), written by the app through
+    /// [`TabModelHandle::set`] / [`TabModelHandle::set_menu`]. `None` = none open.
+    pub menu: Option<CardMenu>,
     /// Installed once from `main.rs` (D10). Private: only this module's layer reads it.
     meta_source: Option<Rc<dyn MetaSource>>,
 }
@@ -379,7 +434,31 @@ impl TabModelHandle {
         m.rows = model.titles;
         m.active = model.active;
         m.waiting = model.waiting;
+        m.menu = model.menu;
         m.rows_rev = m.rows_rev.wrapping_add(1);
+    }
+
+    /// Open or close a card's menu (sticky-tab-title R3.2), bumping `rows_rev` so the
+    /// layer redraws. The incremental path for the common case — clicking the hamburger
+    /// changes nothing about the tabs themselves, so this avoids `Tabs::titles`' per-tab
+    /// `proc_pidinfo`, exactly as `set_waiting` does for the band.
+    pub fn set_menu(&self, menu: Option<CardMenu>) {
+        let mut m = self.0.borrow_mut();
+        m.menu = menu;
+        m.rows_rev = m.rows_rev.wrapping_add(1);
+    }
+
+    /// The open card menu, cloned (sticky-tab-title R3.2) — so a row resync can carry it
+    /// through `set` without closing it.
+    pub fn menu(&self) -> Option<CardMenu> {
+        self.0.borrow().menu.clone()
+    }
+
+    /// The open menu's layout view (row + item count), or `None` (sticky-tab-title R3.2).
+    /// The one place `SidebarLayoutInput::open_menu` is derived, so the geometry and the
+    /// drawn popup always agree on how many items there are.
+    pub fn open_menu(&self) -> Option<OpenMenu> {
+        self.0.borrow().menu.as_ref().map(CardMenu::layout)
     }
 
     /// Replace only the waiting-band rows, bumping `rows_rev` so the layer refreshes (D9).
@@ -916,7 +995,7 @@ impl DrawLayer for TabBar {
 
         // Copy everything out of the model under ONE borrow, then release it (D3) before
         // touching the (possibly reentrant) metadata source.
-        let (rows, active, hovered, rows_rev, list_top, scroll_px, waiting, source) =
+        let (rows, active, hovered, rows_rev, list_top, scroll_px, waiting, menu, source) =
             self.model.with(|m| {
                 (
                     m.rows.clone(),
@@ -926,6 +1005,7 @@ impl DrawLayer for TabBar {
                     m.list_top,
                     m.scroll_px,
                     m.waiting.clone(),
+                    m.menu.clone(),
                     m.meta_source.clone(),
                 )
             });
@@ -1124,14 +1204,36 @@ impl DrawLayer for TabBar {
                     title_x = inner_x + m.mark_px + icon_gap;
                 }
             }
-            // Line 1 by precedence manual > task > cwd (tab-identity): the user's OSC-2
-            // label wins, else the live AI task, else the cwd title (plain shell / no agent).
-            // An idle agent keeps its last label because the worker persists `task` (D3).
-            let title_text = card_line1_text(
-                rows[i].label.as_deref(),
-                meta.task.as_deref(),
-                rows[i].title.as_str(),
+            // Line 1 is resolved app-side (sticky-tab-title D7) by the precedence
+            // user > AI-task > program-OSC > cwd; the renderer draws what it was handed
+            // and owns none of that policy. An empty `line1` means a row with no metadata
+            // yet (`RowMeta::default()`), which falls back to the cwd title.
+            // The per-card menu affordance (sticky-tab-title D4/R3.1) — always drawn, so
+            // the control is discoverable without hovering. Its rect comes from the shared
+            // `menu_button_in` formula fed THIS card's rect, so the drawn button and the
+            // hit-tested one are the same square (SD2).
+            let button = crate::sidebar_layout::menu_button_in(
+                crate::sidebar_layout::Rect {
+                    x: rect[0],
+                    y: rect[1],
+                    w: rect[2],
+                    h: rect[3],
+                },
+                &m,
+                ctx.scale_factor,
             );
+            push_icon(
+                &mut shapes,
+                Icon::Hamburger,
+                button.x,
+                button.y,
+                button.w,
+                theme.icon_fg,
+            );
+            let title_text = card_line1_text(&meta.line1, rows[i].title.as_str());
+            // Line 1 stops short of the hamburger (sticky-tab-title R3.1) — line 2 keeps
+            // the full width, since the button only occupies the title line.
+            let line1_right = (button.x - icon_gap).min(right_edge);
             push_glyphs(
                 &mut text,
                 ctx,
@@ -1142,7 +1244,7 @@ impl DrawLayer for TabBar {
                 1.0,
                 true,
                 linear(theme.title_fg, 1.0),
-                (right_edge - title_x).max(0.0),
+                (line1_right - title_x).max(0.0),
                 ellipsis,
             );
 
@@ -1155,10 +1257,11 @@ impl DrawLayer for TabBar {
                 let advance = cell[0] * meta_ratio;
                 let branch = meta.branch.as_deref();
                 let mut x = inner_x;
-                // When line 1 is a custom label (manual OSC-2 or the AI task), the cwd/repo
-                // name moves to line 2 as the secondary identity; a plain cwd card keeps the
-                // branch-only line 2 as before.
-                let line1_is_custom = rows[i].label.is_some() || meta.task.is_some();
+                // When line 1 is a custom label (a user title, an AI task, or a program
+                // title), the cwd/repo name moves to line 2 as the secondary identity; a
+                // plain cwd card keeps the branch-only line 2 as before. The app decides
+                // this alongside `line1` so the two can never disagree (sticky-tab-title).
+                let line1_is_custom = meta.line1_is_custom;
                 if line1_is_custom {
                     let repo_budget = repo_line2_budget(right_edge - x, advance, branch.is_some());
                     let repo = truncate_to_width(&rows[i].title, advance, repo_budget, ellipsis);
@@ -1203,6 +1306,61 @@ impl DrawLayer for TabBar {
                         false,
                         linear(theme.meta_fg, 1.0),
                         (right_edge - branch_x).max(0.0),
+                        ellipsis,
+                    );
+                }
+            }
+        }
+
+        // ---- The open card menu (sticky-tab-title D4/D10/R3.1). Drawn LAST so it layers
+        // over the cards it floats above — shapes and glyphs are each submitted in push
+        // order, so "last" is "on top". Its rect comes from the same `menu_rect_for`
+        // formula the hit-test uses, fed the same button rect, so what the user sees and
+        // what a press resolves to cannot disagree (SD2).
+        if let Some(menu) = menu {
+            if let Some(card) = lay.card_rect(menu.row) {
+                let button = crate::sidebar_layout::menu_button_in(
+                    crate::sidebar_layout::Rect {
+                        x: card[0],
+                        y: card[1],
+                        w: card[2],
+                        h: card[3],
+                    },
+                    &m,
+                    ctx.scale_factor,
+                );
+                let popup = crate::sidebar_layout::menu_rect_for(
+                    button,
+                    menu.items.len(),
+                    ctx.viewport,
+                    ctx.scale_factor,
+                );
+                // Panel: the active card's fill (a raised surface) with the selected
+                // card's border, so the popup reads as chrome rather than as a card.
+                if let Some(bg) = SidebarShape::rounded_box(
+                    [popup.x, popup.y, popup.w, popup.h],
+                    crate::sidebar_layout::menu::RADIUS * ctx.scale_factor as f32,
+                    m.border_w,
+                    Fill::solid(linear(theme.card_bg_active, 1.0)),
+                    linear(theme.card_border_active, 1.0),
+                ) {
+                    shapes.push(bg);
+                }
+                for (i, label) in menu.items.iter().enumerate() {
+                    let item = crate::sidebar_layout::menu_item_in(popup, i, ctx.scale_factor);
+                    let text_left = item.x + m.card_pad_x;
+                    let text_top = item.y + ((item.h - cell[1]) * 0.5).max(0.0);
+                    push_glyphs(
+                        &mut text,
+                        ctx,
+                        label,
+                        text_left,
+                        text_top,
+                        cell,
+                        1.0,
+                        false,
+                        linear(theme.title_fg, 1.0),
+                        (item.x + item.w - m.card_pad_x - text_left).max(0.0),
                         ellipsis,
                     );
                 }
@@ -1259,6 +1417,7 @@ mod tests {
                 tab_id: 7,
                 title: "proj".into(),
                 label: None,
+                program: None,
             }],
             active: 0,
             ..Default::default()
@@ -1288,6 +1447,7 @@ mod tests {
                 tab_id: 1,
                 title: "x".into(),
                 label: None,
+                program: None,
             }],
             active: 0,
             ..Default::default()
@@ -1320,6 +1480,7 @@ mod tests {
                 tab_id: 3,
                 title: "a".into(),
                 label: None,
+                program: None,
             }],
             active: 0,
             ..Default::default()
@@ -1467,38 +1628,22 @@ mod tests {
     // ---- T3: tab-identity card line-1 / line-2 decisions (renderer/sidebar_row.rs) ----
 
     #[test]
-    fn card_line1_shows_task_when_present() {
-        // R2.1 — a task label takes line 1 over the cwd title (no manual label).
+    fn card_line1_draws_what_the_app_resolved() {
+        // sticky-tab-title D7/R1.5 — precedence is the app's job (and is tested there, in
+        // `sidebar_model::resolve_line1`). All the renderer promises is to draw the string
+        // it was handed, whichever tier it came from.
+        assert_eq!(card_line1_text("Frontend", "terminal"), "Frontend");
         assert_eq!(
-            card_line1_text(None, Some("refactor the auth module"), "terminal"),
+            card_line1_text("refactor the auth module", "terminal"),
             "refactor the auth module"
         );
     }
 
     #[test]
-    fn card_line1_falls_back_to_cwd_when_no_task() {
-        // R3.2 / R3.1 — no manual label, no task → the cwd title. The same branch renders
-        // the idle afterglow, since the worker keeps `task` Some while idle.
-        assert_eq!(card_line1_text(None, None, "terminal"), "terminal");
-    }
-
-    #[test]
-    fn card_line1_manual_label_wins_over_task_and_cwd() {
-        // tab-identity — the user's manual OSC-2 label has top precedence, so two sessions
-        // in the same folder can be told apart even when both have an AI task.
-        assert_eq!(
-            card_line1_text(
-                Some("Frontend"),
-                Some("refactor the auth module"),
-                "terminal"
-            ),
-            "Frontend"
-        );
-        // Manual label also wins when there is no task at all.
-        assert_eq!(
-            card_line1_text(Some("Backend"), None, "terminal"),
-            "Backend"
-        );
+    fn card_line1_falls_back_to_cwd_before_the_first_meta_fill() {
+        // A row drawn before the app's first `MetaSource::fill` has `RowMeta::default()`,
+        // whose `line1` is empty. That must show the folder, never a blank line.
+        assert_eq!(card_line1_text("", "terminal"), "terminal");
     }
 
     #[test]
