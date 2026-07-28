@@ -7,6 +7,7 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
@@ -65,14 +66,97 @@ pub fn project_dir(cwd: &Path) -> Option<PathBuf> {
     Some(claude_projects_dir()?.join(encode_cwd(cwd)))
 }
 
+/// How many candidate logs a resolution will tail-read.
+///
+/// `mtime >= last_event` always holds — writing a line sets the mtime — so ranking
+/// by mtime ranks by an *upper bound* on the answer. That makes the shortlist a
+/// strong heuristic, **not** a proof: a winner is excluded only if 16 other logs
+/// were all touched after its last event while none of them recorded a later event.
+/// That needs 16 concurrently-written sessions in one project directory, so the
+/// bound holds in practice — but it is a bound, and worth saying so rather than
+/// claiming the exclusion is impossible.
+const RESOLVE_CANDIDATES: usize = 16;
+
+/// The log in `dir` whose newest parseable event is the most recent — the session
+/// that most recently *did something*.
+///
+/// **Not the newest mtime.** A log's mtime advances on any write, including writes
+/// that carry no timestamp, so mtime answers "was this file written to" where the
+/// question is "is this session active". Measured on a real project directory: the
+/// mtime-newest log's last event was 15 minutes stale while a second log — older by
+/// mtime — was the one being worked in. 16 of 94 lines in one real log carry no
+/// timestamp, so this is routine rather than exotic.
+///
+/// Cost is bounded twice over: at most [`RESOLVE_CANDIDATES`] files, and at most
+/// [`activity::TAIL_CAP`] bytes read from each. Returns the path and that event
+/// time, so the caller can apply its own freshness rule without re-reading.
+pub fn most_recent_session(dir: &Path) -> Option<(PathBuf, Option<u64>)> {
+    let mut by_mtime: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .map(|e| {
+            let m = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            (m, e.path())
+        })
+        .collect();
+    by_mtime.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
+    by_mtime.truncate(RESOLVE_CANDIDATES);
+
+    let mut best: Option<(Option<u64>, PathBuf)> = None;
+    for (_, path) in by_mtime {
+        let last = last_event_in_tail(&path);
+        // A log with no parseable event in its tail still beats nothing at all, but
+        // loses to any log that has one — `None` sorts below every `Some`.
+        let better = match &best {
+            None => true,
+            Some((b, _)) => last > *b,
+        };
+        if better {
+            best = Some((last, path));
+        }
+    }
+    best.map(|(last, path)| (path, last))
+}
+
+/// The newest parseable `timestamp` in the final [`activity::TAIL_CAP`] bytes of
+/// `log`, in epoch millis. `None` if the file is unreadable, empty, or has no
+/// timestamped line in that window.
+fn last_event_in_tail(log: &Path) -> Option<u64> {
+    let mut f = std::fs::File::open(log).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(activity::TAIL_CAP);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.take(activity::TAIL_CAP).read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    // No need to drop the first line after seeking: a record cut mid-way fails to
+    // parse anyway, and skipping unconditionally would discard a COMPLETE line
+    // whenever the seek happens to land on a newline — losing the only timestamp in
+    // the window, which reads as "this session is undated". `activity::tail_state`
+    // does not skip either.
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| {
+            v.get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(telemetry::parse_ts)
+        })
+        .max()
+}
+
 /// The most-recently-modified `*.jsonl` in `dir`, if any.
 ///
 /// This is a **directory**-level heuristic with no binding to any process: a live
 /// `claude` holds no open fd on its own log (it opens, appends, closes), so there is
 /// nothing to attribute a file to a PTY's descendant by. Callers must treat the
 /// result as "the session that most recently wrote here", not "this tab's session"
-/// — see [`LogWatcher::spawn`], which re-resolves, and the app's floor rule, which
-/// refuses to present one that stopped writing before the window existed.
+/// — see [`LogWatcher::spawn`], which re-resolves until the caller says it has
+/// attached, and the app's attach rule, which refuses to present a log that stopped
+/// writing before the window existed.
 pub fn newest_jsonl(dir: &Path) -> Option<PathBuf> {
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
@@ -204,7 +288,7 @@ impl LogWatcher {
         log: Option<PathBuf>,
         mut telemetry: SessionTelemetry,
         start_offset: u64,
-        floor_ms: u64,
+        attached: Arc<AtomicBool>,
         wake: impl Fn() + Send + 'static,
     ) -> Option<LogWatcher> {
         let watch_dir = dir.clone();
@@ -212,31 +296,29 @@ impl LogWatcher {
         let mut offset = start_offset;
         let mut partial = String::new();
         let mut target = log;
-        // Set once our own target appends lines that postdate `floor_ms` — the
-        // caller's window-start time. Until then the attachment is only a guess
-        // (newest-by-mtime), so a different file appearing may well be the tab's own
-        // session writing for the first time, and we re-resolve to it. After it we
-        // STAY: a log being written *since this window opened* is as close to proof
-        // of ownership as this data allows, and without the latch two concurrently
-        // active sessions in one project would steal the attachment from each other
-        // on every line, resetting the accumulator and re-reading the whole file
-        // each time.
+        // Whether to keep re-resolving is the CALLER's decision, shared by handle.
         //
-        // The floor is what keeps the latch from being a trap. Latching on *any*
-        // fold would let a stale log flushing old-timestamped lines pin the watcher
-        // to a session the display layer then refuses to show — a permanently blank
-        // panel that re-resolution can no longer rescue. `floor_ms == 0` disables the
-        // condition, matching the display layer's own disabling value.
-        let mut latched = false;
+        // It is the same question as "is this log this window's session", and that
+        // question is answered in exactly one place — `app::overlay::proves_ownership`
+        // — because the last time it was implemented twice the two copies disagreed
+        // and pinned the watcher to a log the display would never show. This crate
+        // does not re-derive it; it reads the answer.
+        //
+        // Until the caller attaches, a different file appearing may well be the tab's
+        // own session writing for the first time, so we re-resolve to it. Once the
+        // caller has attached, we stay: two concurrently active sessions in one
+        // project would otherwise trade the attachment on every line, resetting the
+        // accumulator and re-reading the whole file each time — and, worse, replacing
+        // data already on screen.
 
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(ev) = res else { return };
             let mut switched = false;
-            if !latched {
+            if !attached.load(Ordering::Relaxed) {
                 // A new session's first line lands here: the file did not exist when
                 // the overlay opened, so no amount of tailing the old target would
                 // ever find it.
-                if let Some(newest) = newest_jsonl(&dir) {
+                if let Some((newest, _)) = most_recent_session(&dir) {
                     if Some(&newest) != target.as_ref() {
                         target = Some(newest);
                         offset = 0;
@@ -293,27 +375,17 @@ impl LogWatcher {
             // every one but the last is stale before the UI thread wakes.
             //
             // A RESET must emit too, even with nothing folded. A rotation typically
-            // truncates to zero first, so the callback fires, the state resets, the
-            // read yields no complete line — and under a "≥1 line" condition no
-            // snapshot would be sent, leaving the UI showing the PREVIOUS session's
-            // totals as though live. Bytes read with no complete line (a buffered
+            // truncates to zero first, so the callback fires, the state resets and the
+            // read yields no complete line; under a "≥1 line" condition nothing would
+            // be sent and this crate would have silently dropped a state change. What
+            // the CALLER does with an empty snapshot is the caller's decision — the
+            // app deliberately refuses it rather than blank a panel someone is
+            // reading. Reporting the change and deciding on it are different jobs.
+            // Bytes read with no complete line (a buffered
             // partial) correctly send nothing: no state changed.
             // ONE snapshot, not two: it deep-clones five rings plus the task map
             // and sorts, on every append batch.
             let snap = Arc::new(telemetry.snapshot());
-            if folded > 0 {
-                // `is_some_and`, NOT `is_none_or`: an undated fold must not latch.
-                // The display layer refuses an undated log for the same reason (it
-                // cannot be shown to postdate the window), so latching on one would
-                // pin the watcher to a session that will never be rendered and
-                // disable the re-resolution that could rescue it.
-                //
-                // Sticky, because `last_event_ms` is last-seen rather than max: a
-                // single out-of-order timestamp would otherwise un-latch a live
-                // session mid-flight and hand the attachment to another file,
-                // discarding the totals accumulated so far.
-                latched = latched || snap.last_event_ms.is_some_and(|last| last >= floor_ms);
-            }
             if (folded > 0 || reset || switched) && tx.send(snap).is_ok() {
                 wake();
             }
@@ -334,9 +406,10 @@ impl LogWatcher {
         // fences off.
         //
         // The cost is events from other projects while this one is empty. It is
-        // bounded — the re-resolution each triggers is one `read_dir` of a single
-        // directory, it stops once the target latches, and the watcher exists only
-        // while the panel is open.
+        // bounded — each triggers one `read_dir` plus at most RESOLVE_CANDIDATES
+        // bounded tail reads (<= 128 KiB), it stops the moment the caller attaches,
+        // it runs on the watch thread rather than the render thread, and the watcher
+        // exists only while the panel is open.
         let (watch_path, mode) = if watch_dir.is_dir() {
             (watch_dir, RecursiveMode::NonRecursive)
         } else {
@@ -362,6 +435,11 @@ impl LogWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A caller that has not attached yet: the watcher is free to re-resolve.
+    fn unattached() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let mut base = std::env::temp_dir();
@@ -430,7 +508,8 @@ mod tests {
         let log = dir.join("s.jsonl");
         std::fs::write(&log, "").unwrap();
         let (t, off) = backfill_telemetry(&log);
-        let w = LogWatcher::spawn(dir.clone(), Some(log.clone()), t, off, 0, || {}).expect("spawn");
+        let w = LogWatcher::spawn(dir.clone(), Some(log.clone()), t, off, unattached(), || {})
+            .expect("spawn");
 
         let append = |line: &str| {
             let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
@@ -461,6 +540,90 @@ mod tests {
     }
 
     #[test]
+    fn resolution_ranks_by_last_event_not_by_mtime() {
+        // The measured case. In a real project directory `539f86bf` had the newest
+        // mtime (12:48) but a 15-minute-stale newest event (12:33), while the session
+        // actually being worked in, `c422a74e`, was SECOND by mtime with the newest
+        // event (12:44). Ranking by mtime picks the wrong one — and then the app's
+        // freshness rule disowns it and blanks a live panel.
+        use std::time::Duration;
+
+        let dir = temp_dir("rank");
+        let live = dir.join("live.jsonl");
+        let touched = dir.join("touched.jsonl");
+        std::fs::write(
+            &live,
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T19:44:29.553Z\",\"message\":{\"id\":\"a\"}}\n",
+        )
+        .unwrap();
+        // Written LATER (so: newer mtime) but carrying an OLDER event — exactly what a
+        // timestamp-less write does to a log.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(
+            &touched,
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T19:33:02.860Z\",\"message\":{\"id\":\"b\"}}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            newest_jsonl(&dir).as_deref(),
+            Some(touched.as_path()),
+            "mtime ranking picks the merely-touched log (the defect)"
+        );
+        let (picked, last) = most_recent_session(&dir).expect("resolves");
+        assert_eq!(picked, live, "event ranking picks the live session");
+        assert_eq!(last, Some(1_785_267_869_553), "and reports its last event");
+    }
+
+    #[test]
+    fn resolution_reads_a_bounded_tail_of_a_bounded_candidate_set() {
+        // Cost has to be bounded twice over: this runs on the watch thread on every
+        // event until a target latches.
+        let dir = temp_dir("bounded");
+        // 40 logs, each far larger than the tail cap.
+        let filler = "{\"type\":\"system\",\"pad\":\"".to_string() + &"x".repeat(4096) + "\"}\n";
+        for i in 0..40 {
+            let mut body = filler.repeat(8); // ~32 KiB, 4x TAIL_CAP
+            body.push_str(&format!(
+                "{{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T{:02}:00:00.000Z\",\"message\":{{}}}}\n",
+                i % 24
+            ));
+            std::fs::write(dir.join(format!("s{i:02}.jsonl")), body).unwrap();
+        }
+        const { assert!(RESOLVE_CANDIDATES <= 16) };
+        const { assert!(activity::TAIL_CAP <= 8 * 1024) };
+        // Resolves without reading the ~1.3 MB of log bodies: only the last 8 KiB of
+        // at most 16 files, i.e. <= 128 KiB.
+        let (picked, last) = most_recent_session(&dir).expect("resolves");
+        assert!(picked.starts_with(&dir));
+        assert!(last.is_some(), "the timestamp sits inside the tail window");
+    }
+
+    #[test]
+    fn a_log_with_no_event_in_its_tail_loses_to_one_that_has_one() {
+        let dir = temp_dir("undatedrank");
+        std::fs::write(dir.join("undated.jsonl"), "{\"type\":\"system\"}\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(
+            dir.join("dated.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T19:44:29.553Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        let (picked, _) = most_recent_session(&dir).expect("resolves");
+        assert_eq!(picked.file_name().unwrap(), "dated.jsonl");
+
+        // ... and with nothing dated at all, the newest-touched wins rather than
+        // nothing being resolved.
+        let dir2 = temp_dir("allundated");
+        std::fs::write(dir2.join("a.jsonl"), "{\"type\":\"system\"}\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir2.join("b.jsonl"), "{\"type\":\"system\"}\n").unwrap();
+        let (picked, last) = most_recent_session(&dir2).expect("resolves");
+        assert_eq!(picked.file_name().unwrap(), "b.jsonl");
+        assert_eq!(last, None);
+    }
+
+    #[test]
     fn a_newer_log_appearing_takes_over_the_watch() {
         // The reported defect: a brand-new session had written NO log when the
         // overlay opened, so the newest file in the directory was an unrelated
@@ -482,7 +645,8 @@ mod tests {
             700,
             "attached to the old session"
         );
-        let w = LogWatcher::spawn(dir.clone(), Some(old.clone()), t, off, 0, || {}).expect("spawn");
+        let w = LogWatcher::spawn(dir.clone(), Some(old.clone()), t, off, unattached(), || {})
+            .expect("spawn");
 
         // The tab's own session finally writes its first line, into a NEW file.
         let fresh = dir.join("fresh.jsonl");
@@ -516,8 +680,15 @@ mod tests {
         let missing = root.join("-Users-x-brand-new");
         assert!(!missing.exists());
 
-        let w = LogWatcher::spawn(missing.clone(), None, SessionTelemetry::new(), 0, 0, || {})
-            .expect("arms on an ancestor rather than giving up");
+        let w = LogWatcher::spawn(
+            missing.clone(),
+            None,
+            SessionTelemetry::new(),
+            0,
+            unattached(),
+            || {},
+        )
+        .expect("arms on an ancestor rather than giving up");
 
         std::fs::create_dir_all(&missing).unwrap();
         let mut f = std::fs::File::create(missing.join("first.jsonl")).unwrap();
@@ -535,58 +706,6 @@ mod tests {
     }
 
     #[test]
-    fn a_fold_of_only_pre_floor_lines_does_not_latch() {
-        // Latching on ANY fold would let a stale log flushing old-timestamped lines
-        // pin the watcher to a session the display layer then refuses to show — a
-        // permanently blank panel that re-resolution can no longer rescue.
-        use std::io::Write;
-        use std::time::Duration;
-
-        let dir = temp_dir("floorlatch");
-        let stale = dir.join("stale.jsonl");
-        std::fs::write(&stale, "").unwrap();
-        let (t, off) = backfill_telemetry(&stale);
-        // Window opened well after the stale session's timestamps.
-        let floor = 1_785_226_000_000;
-        let w = LogWatcher::spawn(dir.clone(), Some(stale.clone()), t, off, floor, || {})
-            .expect("spawn");
-
-        // The stale log appends a line dated BEFORE the window opened.
-        {
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&stale)
-                .unwrap();
-            writeln!(
-                f,
-                r#"{{"type":"assistant","timestamp":"2020-01-01T00:00:00.000Z","requestId":"o","message":{{"id":"o","usage":{{"output_tokens":700}}}}}}"#
-            )
-            .unwrap();
-        }
-        let _ = w.rx.recv_timeout(Duration::from_secs(10));
-
-        // Unlatched, so the tab's own session still wins when it appears.
-        let mine = dir.join("mine.jsonl");
-        let mut f = std::fs::File::create(&mine).unwrap();
-        writeln!(
-            f,
-            r#"{{"type":"assistant","requestId":"n","message":{{"id":"n","usage":{{"output_tokens":9}}}}}}"#
-        )
-        .unwrap();
-        drop(f);
-
-        let mut last = None;
-        while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(3)) {
-            last = Some(s);
-        }
-        assert_eq!(
-            last.expect("switched").total_output,
-            9,
-            "the pre-floor fold must not have pinned us to the stale log"
-        );
-    }
-
-    #[test]
     fn no_projects_root_means_no_watch_rather_than_a_home_wide_one() {
         // The fallback climbs exactly one level. If ~/.claude/projects itself is
         // absent, no session has ever run anywhere, and arming a recursive watch on
@@ -595,138 +714,37 @@ mod tests {
         let root = temp_dir("noroot");
         let nowhere = root.join("gone").join("-Users-x-proj");
         assert!(
-            LogWatcher::spawn(nowhere, None, SessionTelemetry::new(), 0, 0, || {}).is_none(),
+            LogWatcher::spawn(
+                nowhere,
+                None,
+                SessionTelemetry::new(),
+                0,
+                unattached(),
+                || {}
+            )
+            .is_none(),
             "declines to arm rather than watching an ancestor outside the projects root"
         );
     }
 
     #[test]
-    fn an_undated_fold_does_not_latch() {
-        // The display layer refuses an undated log (it cannot be shown to postdate
-        // the window), so latching on one would pin the watcher to a session that
-        // will never be rendered — a permanently blank panel that re-resolution can
-        // no longer rescue. This is the `is_some_and` / `is_none_or` polarity.
+    fn an_attached_caller_freezes_the_target() {
+        // Once the caller says it has attached, another session writing in the same
+        // project must not steal the watch — that would reset the accumulator and
+        // replace data already on screen, which is exactly what the panel must never
+        // do. The watcher holds no copy of the ownership rule; it reads this flag.
         use std::io::Write;
         use std::time::Duration;
 
-        let dir = temp_dir("undated");
-        let old = dir.join("old.jsonl");
-        std::fs::write(&old, "").unwrap();
-        let (t, off) = backfill_telemetry(&old);
-        let w = LogWatcher::spawn(
-            dir.clone(),
-            Some(old.clone()),
-            t,
-            off,
-            1_785_226_000_000,
-            || {},
-        )
-        .expect("spawn");
-
-        // A line with NO timestamp at all.
-        {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&old).unwrap();
-            writeln!(
-                f,
-                r#"{{"type":"assistant","requestId":"o","message":{{"id":"o","usage":{{"output_tokens":700}}}}}}"#
-            )
-            .unwrap();
-        }
-        let _ = w.rx.recv_timeout(Duration::from_secs(10));
-
-        // Still unlatched, so the tab's own session takes over when it appears.
-        let mut f = std::fs::File::create(dir.join("mine.jsonl")).unwrap();
-        writeln!(
-            f,
-            r#"{{"type":"assistant","requestId":"n","message":{{"id":"n","usage":{{"output_tokens":9}}}}}}"#
-        )
-        .unwrap();
-        drop(f);
-
-        let mut last = None;
-        while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(3)) {
-            last = Some(s);
-        }
-        assert_eq!(
-            last.expect("switched").total_output,
-            9,
-            "an undated fold must not have latched"
-        );
-    }
-
-    #[test]
-    fn the_latch_survives_an_out_of_order_timestamp() {
-        // `last_event_ms` is last-seen, not max, so a single backdated line would
-        // otherwise un-latch a live session mid-flight and hand the attachment to
-        // another file — discarding everything accumulated so far.
-        use std::io::Write;
-        use std::time::Duration;
-
-        let dir = temp_dir("sticky");
+        let dir = temp_dir("frozen");
         let mine = dir.join("mine.jsonl");
         std::fs::write(&mine, "").unwrap();
         let (t, off) = backfill_telemetry(&mine);
-        let floor = 1_600_000_000_000; // 2020-09-13
-        let w = LogWatcher::spawn(dir.clone(), Some(mine.clone()), t, off, floor, || {})
+        let attached = Arc::new(AtomicBool::new(true)); // the caller already attached
+        let w = LogWatcher::spawn(dir.clone(), Some(mine.clone()), t, off, attached, || {})
             .expect("spawn");
 
-        let append = |line: &str| {
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&mine)
-                .unwrap();
-            writeln!(f, "{line}").unwrap();
-        };
-        // A post-floor line latches us.
-        append(
-            r#"{"type":"assistant","timestamp":"2026-07-28T18:00:00.000Z","requestId":"a","message":{"id":"a","usage":{"output_tokens":10}}}"#,
-        );
-        assert_eq!(
-            w.rx.recv_timeout(Duration::from_secs(10))
-                .expect("latched")
-                .total_output,
-            10
-        );
-        // Then one dated before the floor, which must NOT un-latch us.
-        append(
-            r#"{"type":"assistant","timestamp":"2019-01-01T00:00:00.000Z","requestId":"b","message":{"id":"b","usage":{"output_tokens":5}}}"#,
-        );
-        let _ = w.rx.recv_timeout(Duration::from_secs(10));
-
-        // A rival file appears; we keep our own accumulated totals.
-        let mut f = std::fs::File::create(dir.join("other.jsonl")).unwrap();
-        writeln!(
-            f,
-            r#"{{"type":"assistant","requestId":"z","message":{{"id":"z","usage":{{"output_tokens":999}}}}}}"#
-        )
-        .unwrap();
-        drop(f);
-
-        let mut last = None;
-        while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(3)) {
-            last = Some(s);
-        }
-        if let Some(s) = last {
-            assert_eq!(s.total_output, 15, "never reset, never stolen");
-        }
-    }
-
-    #[test]
-    fn an_attached_log_that_is_being_written_is_not_stolen() {
-        // Once our own target proves it is live, a second session writing in the same
-        // project must not steal the attachment — without the latch the two would
-        // trade it on every line, resetting the accumulator each time.
-        use std::io::Write;
-        use std::time::Duration;
-
-        let dir = temp_dir("latch");
-        let mine = dir.join("mine.jsonl");
-        std::fs::write(&mine, "").unwrap();
-        let (t, off) = backfill_telemetry(&mine);
-        let w =
-            LogWatcher::spawn(dir.clone(), Some(mine.clone()), t, off, 0, || {}).expect("spawn");
-
-        let append = |path: &std::path::Path, id: &str, out: u64| {
+        let append = |path: &std::path::Path, id: &str, out: u64, ts: &str| {
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -734,27 +752,119 @@ mod tests {
                 .unwrap();
             writeln!(
                 f,
-                r#"{{"type":"assistant","requestId":"{id}","message":{{"id":"{id}","usage":{{"output_tokens":{out}}}}}}}"#
+                r#"{{"type":"assistant","timestamp":"{ts}","requestId":"{id}","message":{{"id":"{id}","usage":{{"output_tokens":{out}}}}}}}"#
             )
             .unwrap();
         };
 
-        append(&mine, "a", 10);
-        let first = w.rx.recv_timeout(Duration::from_secs(10)).expect("latched");
-        assert_eq!(first.total_output, 10);
+        append(&mine, "a", 10, "2026-07-28T19:44:29.553Z");
+        assert_eq!(
+            w.rx.recv_timeout(Duration::from_secs(10))
+                .expect("our own append")
+                .total_output,
+            10
+        );
 
-        // Another session writes a newer file. We stay on ours.
-        append(&dir.join("other.jsonl"), "z", 999);
-        append(&mine, "b", 5);
+        // A rival session writes a STRICTLY newer event — so an unfrozen watcher
+        // would certainly switch to it, and this test would certainly notice.
+        append(
+            &dir.join("other.jsonl"),
+            "z",
+            999,
+            "2026-07-28T23:59:59.999Z",
+        );
+        append(&mine, "b", 5, "2026-07-28T19:44:30.000Z");
         let mut last = None;
         while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(3)) {
             last = Some(s);
         }
-        let last = last.expect("still receiving from our own log");
         assert_eq!(
-            last.total_output, 15,
-            "our own cumulative total — never the other session's 999, and never reset"
+            last.expect("still ours").total_output,
+            15,
+            "cumulative on OUR log — never reset, never the rival's 999"
         );
+    }
+
+    #[test]
+    fn attaching_mid_flight_stops_the_re_resolution() {
+        // The caller attaches while the watcher is running (it opened the panel before
+        // its session had written). From that instant the target is frozen.
+        use std::io::Write;
+        use std::time::Duration;
+
+        let dir = temp_dir("midflight");
+        let a = dir.join("a.jsonl");
+        std::fs::write(
+            &a,
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T19:00:00.000Z\",\"requestId\":\"a\",\"message\":{\"id\":\"a\",\"usage\":{\"output_tokens\":1}}}\n",
+        )
+        .unwrap();
+        let (t, off) = backfill_telemetry(&a);
+        let attached = Arc::new(AtomicBool::new(false));
+        let w = LogWatcher::spawn(
+            dir.clone(),
+            Some(a.clone()),
+            t,
+            off,
+            attached.clone(),
+            || {},
+        )
+        .expect("spawn");
+
+        // Unattached: a newer-evented file takes over.
+        let b = dir.join("b.jsonl");
+        let mut f = std::fs::File::create(&b).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","timestamp":"2026-07-28T19:30:00.000Z","requestId":"b","message":{{"id":"b","usage":{{"output_tokens":7}}}}}}"#
+        )
+        .unwrap();
+        drop(f);
+        let mut seen = None;
+        while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(3)) {
+            seen = Some(s);
+        }
+        assert_eq!(
+            seen.expect("switched").total_output,
+            7,
+            "took over while free"
+        );
+
+        // The caller now attaches; a third, newer-evented file must NOT take over.
+        attached.store(true, Ordering::Relaxed);
+        let c = dir.join("c.jsonl");
+        let mut f = std::fs::File::create(&c).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","timestamp":"2026-07-28T19:59:00.000Z","requestId":"c","message":{{"id":"c","usage":{{"output_tokens":500}}}}}}"#
+        )
+        .unwrap();
+        drop(f);
+        let mut after = None;
+        while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(3)) {
+            after = Some(s);
+        }
+        if let Some(s) = after {
+            assert_eq!(s.total_output, 7, "frozen on b — c never adopted");
+        }
+    }
+
+    #[test]
+    fn a_dated_incumbent_outranks_an_undated_newcomer() {
+        // Consequence of ranking by event rather than mtime, pinned deliberately: a
+        // new session whose first lines carry no timestamp does not take over until it
+        // writes a dated one. Real logs date their assistant/user lines, so the delay
+        // is one line long — but it is a behaviour change worth stating.
+        let dir = temp_dir("incumbent");
+        std::fs::write(
+            dir.join("dated.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T19:00:00.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.join("undated.jsonl"), "{\"type\":\"system\"}\n").unwrap();
+        let (picked, _) = most_recent_session(&dir).expect("resolves");
+        assert_eq!(picked.file_name().unwrap(), "dated.jsonl");
     }
 
     #[test]
@@ -769,7 +879,8 @@ mod tests {
         let log = dir.join("s.jsonl");
         std::fs::write(&log, "").unwrap();
         let (t, off) = backfill_telemetry(&log);
-        let w = LogWatcher::spawn(dir.clone(), Some(log.clone()), t, off, 0, || {}).expect("spawn");
+        let w = LogWatcher::spawn(dir.clone(), Some(log.clone()), t, off, unattached(), || {})
+            .expect("spawn");
 
         {
             let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
@@ -817,7 +928,8 @@ mod tests {
         let log = dir.join("s.jsonl");
         std::fs::write(&log, "").unwrap();
         let (t, off) = backfill_telemetry(&log);
-        let w = LogWatcher::spawn(dir.clone(), Some(log.clone()), t, off, 0, || {}).expect("spawn");
+        let w = LogWatcher::spawn(dir.clone(), Some(log.clone()), t, off, unattached(), || {})
+            .expect("spawn");
 
         let write = |bytes: &str| {
             let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();

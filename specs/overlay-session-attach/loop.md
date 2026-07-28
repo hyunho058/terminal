@@ -1,26 +1,34 @@
 # loop.md — Loop Contract: overlay-session-attach
 
+> Round 2. Round 1's contract (re-resolve + floor + clamp) shipped as `83f4518` and
+> introduced the regression this round fixes. Its Lessons are preserved below.
+
 ## Goal
-Stop the ai-monitor overlay presenting an unrelated session's history as the active tab's telemetry, and stop it reporting a context percentage above 100.
+The overlay must attach to the tab's *actually active* session and, once attached, **never lose the data it has accumulated** for as long as the panel stays open.
 
-## The defect (measured, 2026-07-28)
-`resolve_log` → `newest_jsonl` (`crates/ai-monitor/src/lib.rs:63`) picks the most-recently-modified `*.jsonl` in the cwd-encoded project directory. That is a **directory**-level heuristic with no binding to the process running in the tab. Measured on the reported case: the app launched at 11:38 local; nothing in `~/.claude/projects/-Users-hyunhokim-IdeaProjects-terminal/` had been written since 11:02, because the tab's brand-new Claude Code session had not yet produced a log at all. The overlay therefore attached to `54e576c2` — last event `2026-07-28T16:52:57Z`, first event ~5 days earlier — backfilled its whole history, and rendered `up 114h37m · idle 1h50m` as if it were the new session.
+## The defects (measured, 2026-07-28, from the reported screenshot)
+A tab running a live Claude Code session showed every section empty and `session (no active session — newest log idle 19m39s)`. Two independent causes:
 
-Two facts bound the fix:
-- **There is no exact binding available.** A live `claude` process holds no open fd on its own `.jsonl` (`lsof -c claude` → 0 matches; it opens, appends, closes), so the log cannot be attributed to a PTY's descendant from outside.
-- **`idle 1h50m` was already on screen.** The data needed to disbelieve the panel was being rendered and nothing acted on it.
+**A — the ranking key is wrong.** `newest_jsonl` ranks candidates by file **mtime**, but mtime advances without a new event. Measured in `~/.claude/projects/-Users-hyunhokim-IdeaProjects-terminal`:
 
-Separately, `context 128%` is real: that session's last usage line totals 256,551 tokens against an assumed 200k window. The fold is correct; the window is wrong (a 1M-context session logs as a bare `claude-opus-4-8`, the Known Gap in `specs/overlay-dashboard-frame/spec.md`).
+| file | mtime | last event |
+|------|-------|------------|
+| `539f86bf` | 12:48:58 | 19:33:02Z (12:33) |
+| `c422a74e` | 12:44:29 | **19:44:29Z (12:44)** |
 
-## Approach (human-approved 2026-07-28)
-1. **Re-resolve, don't latch.** Watch the project *directory* rather than one file, and switch to a newer `*.jsonl` the moment one appears — so the tab's own session is picked up as soon as it writes its first line.
-2. **A session that stopped writing before this window existed is not this window's session.** The floor is the app's own start time, injected like `now_ms`. It is a *fact*, not a threshold: it never hides a session that has been active at any point since launch — including one idle for hours — which a plain idle-timeout would.
-3. **Clamp the percentage and allow an override.** Over 100% renders `>100%`, and `[ai_monitor] context_window` in the TOML config overrides the per-model table.
+mtime picks `539f86bf`; the live session is `c422a74e`. mtime measures "the file was written to"; only the last **event** measures "this session is active". 16 of 94 lines in one file carry no timestamp at all, so a write that advances mtime routinely fails to advance the last event.
+
+**B — round 1's floor rule blanks accumulated data.** `compose` re-evaluated `last_event_ms < floor_ms` on *every* call and swapped the whole snapshot for `&empty`. So a panel that was showing a session emptied the moment its held snapshot aged past the window start. This is the regression the user reported: "기존 내용이 없어졌는데".
+
+## Approach (human-approved 2026-07-28, round 2)
+1. **Rank by last event, not mtime.** Pick the candidate whose newest parseable `timestamp` is greatest, via a bounded tail read per file (the `activity::tail_state` precedent — at most `TAIL_CAP` bytes each), over at most the 16 most-recently-touched logs. `mtime >= last_event` always holds, so the mtime shortlist cannot exclude a plausible winner.
+2. **Attachment is decided ONCE and latches.** The floor (this window's start) decides *whether to attach*, not what to display. The decision lives in exactly one place — `overlay.rs` — and is sticky: `attached = attached || snapshot.last_event_ms >= started_ms`. Round 1's bug was the same predicate implemented in two places with opposite polarity (Lesson L1); this round it exists once.
+3. **Once attached, nothing is ever blanked.** `dashboard::compose` takes `attached: bool` and renders what it is given. It no longer computes staleness, no longer swaps in an empty snapshot, and cannot un-attach. Data persists until the panel is closed or the tab changes.
 
 ## Scope & non-goals
-- In: `crates/ai-monitor/src/lib.rs`, `crates/app/src/overlay.rs`, `crates/app/src/dashboard.rs`, `crates/common/src/config.rs`
-- Out: `crates/app/src/terminal_app.rs`, `seam.rs`, `settings.rs`, `crates/renderer/**`. No `OverlayModel` change, no colour.
-- Known limitation to document, not fix: a *foreign* session that has been active since app start can still be picked. Only per-tab binding would fix that, and it is unavailable (above).
+- In: `crates/ai-monitor/src/lib.rs`, `crates/app/src/overlay.rs`, `crates/app/src/dashboard.rs`
+- Out: `terminal_app.rs`, `seam.rs`, `settings.rs`, `crates/renderer/**`, `crates/common/**` (round 1's config work is done and stays).
+- Accepted consequence of the approved persistence rule: if the user ends the session and starts a new one in the same tab, the panel keeps showing the previous session's numbers until the panel is closed and reopened.
 
 ---
 
@@ -38,30 +46,30 @@ Separately, `context 128%` is real: that session's last usage line totals 256,55
 | Metric | Threshold | How measured |
 |--------|-----------|--------------|
 | test failures | `== 0` | `cargo test --workspace` |
-| stale log blocked | a log whose last event precedes the floor renders the detached state, **not** its session data | named test, seen as `... ok` in run output |
-| live log kept | a log whose last event is at/after the floor renders normally, even when idle for hours | named test |
-| re-resolve | a newer `*.jsonl` appearing in the watched dir switches the watcher and emits a snapshot from the **new** file | named test |
-| percentage clamp | `context_used` above the window renders `>100%` — no numeral above 100 anywhere | named test |
-| config override | `[ai_monitor] context_window` beats the model table | named test |
-| no regression | the 2 frame + 7 boxes snapshots unchanged; whole suite green | `cargo test --workspace` |
+| ranking (A) | given the measured pair — one file newer by mtime, another newer by last event — the resolver picks the **last-event** winner | named test |
+| bounded I/O | resolution reads `<= TAIL_CAP` bytes per candidate and examines `<= 16` candidates | named test over a dir of 40 logs |
+| persistence (B) | once attached, a later compose with an arbitrarily old `last_event_ms` still renders the full data — never the empty state | named test |
+| no un-attach | attachment is set in exactly **one** place and is monotonic | named test + `grep -c` on the predicate |
+| attach still gated | a window whose only log went quiet before it opened does **not** attach | named test (round 1's case, must not regress) |
+| snapshots | the 9 `.snap` files unchanged | `git status --porcelain crates/app/src/snapshots/` |
 
 ## Gate 3 — Qualitative
-- **Policy/mechanism split (SD4)** — the floor, the clamp and the window override are app-side; only directory watching and re-resolution live in `ai-monitor`.
-- **Dependency direction** — `ai-monitor` still imports no `wgpu`/`winit`/`renderer`/`app`.
-- **Honest degradation** — the detached state says *why* it is detached (and how stale the newest log is); it never silently blanks and never presents a foreign session as live.
-- **Purity** — `dashboard::compose` still reads no clock and no filesystem; the floor is injected exactly like `now_ms`.
-- **No panic path** — a missing project directory, an unreadable log, or a log deleted mid-watch degrades, never aborts the terminal's own process.
+- **The predicate exists once (Lesson L1)** — "has this log written since the window opened" is implemented in a single place; no second site can disagree with it.
+- **Data preservation is structural, not incidental** — it must not be possible for `compose` to blank an attached session, whatever the snapshot contains.
+- **Policy/mechanism split (SD4)** — the floor and the wording stay app-side; ranking and bounded I/O in `ai-monitor`.
+- **Cost is bounded and stated** — resolution is O(candidates) bounded tail reads, and the bound is a named constant, not a hope.
+- **No panic path** — unreadable/truncated/missing logs degrade.
 
 ---
 
 ## Autonomy Boundary
-**✅ Auto-fix:** anything within the four declared files, including changing `compose`'s signature and re-accepting snapshots whose content is unchanged.
+**✅ Auto-fix:** anything within the three declared files.
 **🛑 STOP — escalate:**
-- Editing `terminal_app.rs`, `seam.rs`, `settings.rs` or `crates/renderer/**` (out of surface) — including adding a per-tab spawn-time channel, which is the *better* floor but needs seam plumbing.
+- Editing `terminal_app.rs`, `seam.rs`, `settings.rs`, `crates/renderer/**`.
 - Adding any crate dependency.
-- Any write to a session log, or any change to `~/.claude`.
-- Changing `OverlayModel` (SD3).
-- Anything that would make the overlay guess which session a tab owns rather than state what it knows.
+- Any write to a session log or under `~/.claude`.
+- Reading a whole log file during resolution (the bounded tail is the point).
+- Any change that lets an attached session's data be cleared while the panel is open — the approved requirement.
 
 ## Exit criteria
 Every gate passes and the Evidence Report is emitted.
@@ -70,32 +78,31 @@ Every gate passes and the Evidence Report is emitted.
 
 ## Lessons  (self-learning — carried across runs of THIS contract)
 
-<!-- Recorded 2026-07-28 after a 3-iteration run. `source: human-approved` — the
-     human was asked and approved recording these. -->
+<!-- Recorded 2026-07-28 after a 3-iteration run. `source: human-approved`. -->
 
 ### L1 — two fixes to the same fail-open must agree on their polarity
 - cause: gate-fail
 - source: human-approved
 - form: gate3-item
 - status: active
-- check: When a rule is enforced in two places (here: the watcher's latch and the display's floor), state the shared predicate once in words, then check each site against that sentence. "Cannot be shown to postdate the window" must mean the same thing on both sides.
-- note: the display layer was taught to REFUSE an undated log (`Detached::Undated`) in the same iteration the watcher was taught to LATCH on one (`is_none_or` where `is_some_and` was meant). The result was worse than either bug alone: the watcher pinned itself to a log the display would never render, disabling the re-resolution that could have rescued it. Both edits were made minutes apart by the same author and neither test caught it — the checker did.
+- check: When a rule is enforced in two places (here: the watcher's latch and the display's floor), state the shared predicate once in words, then check each site against that sentence. Better: implement it once.
+- note: the display layer was taught to REFUSE an undated log in the same iteration the watcher was taught to LATCH on one (`is_none_or` where `is_some_and` was meant). Round 2 removes the duplication entirely rather than keeping two sites in sync.
 
 ### L2 — a "last seen" field is not a "maximum" field
 - cause: gate-fail
 - source: human-approved
 - form: gate3-item
 - status: active
-- check: Before comparing an accumulated timestamp against a threshold, confirm how it is written. `SessionTelemetry` assigns `last_event_ms` unconditionally, so it can move BACKWARD on an out-of-order line. Any latch or gate keyed on it must be monotonic on its own (`latched = latched || …`).
-- note: the first latch recomputed itself on every fold, so a single backdated timestamp would un-latch a live session mid-flight, hand the attachment to another file, and discard everything accumulated. The comment above it promised "after it we STAY"; the code did not.
+- check: Before comparing an accumulated timestamp against a threshold, confirm how it is written. `SessionTelemetry` assigns `last_event_ms` unconditionally, so it can move BACKWARD. Any latch keyed on it must be monotonic on its own.
+- note: a single backdated timestamp would otherwise un-latch a live session mid-flight and discard everything accumulated.
 
 ### L3 — a fallback that walks up a path must have a stated stopping point
 - cause: gate-fail
 - source: human-approved
 - form: gate3-item
 - status: active
-- check: Any "nearest existing ancestor" walk needs an explicit boundary, and a test asserting it declines rather than escaping. Name the last acceptable directory in the code.
-- note: falling back to the nearest existing directory in order to watch for a project dir that does not exist yet climbed to `$HOME` for a user who has never run Claude Code — and then watched it RECURSIVELY for the panel's lifetime. The fix climbs exactly one level, to the projects root, and returns `None` beyond it.
+- check: Any "nearest existing ancestor" walk needs an explicit boundary and a test asserting it declines rather than escaping.
+- note: it climbed to `$HOME` and watched it recursively. The fix climbs exactly one level, to the projects root.
 
 ### L4 — the exact-binding idea was refuted by one command; run it first
 - cause: other
@@ -103,7 +110,7 @@ Every gate passes and the Evidence Report is emitted.
 - form: context
 - status: active
 - check: —
-- note: the obvious fix for "which log belongs to this tab" is to find the tab's `claude` process and ask which file it has open. `lsof -c claude | grep .jsonl` returns 0 matches — Claude Code opens, appends and closes, so there is no fd to attribute. Thirty seconds of measurement removed the whole design branch. Everything downstream of it (the floor rule, the latch, the documented limitation) exists *because* that binding is unavailable.
+- note: `lsof -c claude | grep .jsonl` returns 0 matches — Claude Code opens, appends, closes. Thirty seconds of measurement removed a whole design branch.
 
 ### L5 — the panel was already showing the evidence it needed
 - cause: other
@@ -111,4 +118,36 @@ Every gate passes and the Evidence Report is emitted.
 - form: context
 - status: active
 - check: —
-- note: the misattributed session rendered `idle 1h50m` on a window seconds old. The data that disproved the attachment was on screen and nothing acted on it. When a display can compute a fact that contradicts its own framing, the fact should gate the framing — not sit next to it.
+- note: the misattributed session rendered `idle 1h50m` on a window seconds old. When a display can compute a fact that contradicts its own framing, the fact should gate the framing.
+
+### L6 — mtime answers "was this file written", not "is this session active"
+- cause: gate-fail
+- source: auto-unattended
+- form: gate3-item
+- status: active
+- check: Any "most recent session" ranking must key on the newest parseable event *inside* the file, never on the filesystem mtime. Assert with a fixture where the two orders disagree.
+- note: measured — `539f86bf` had the newest mtime (12:48) and a 15-minute-old newest event (12:33), while the genuinely live session `c422a74e` was second by mtime. 16 of 94 lines in one real log carry no timestamp, so writes that bump mtime without advancing the last event are routine, not exotic.
+
+### L7 — a display filter is not an attachment filter
+- cause: gate-fail
+- source: auto-unattended
+- form: gate3-item
+- status: active
+- check: A rule that decides *which source to trust* must run when the source is chosen, and its result must be stored. If it is re-evaluated inside the renderer, it will eventually re-decide against data already on screen and erase it.
+- note: round 1 put the floor rule inside `compose`, so every repaint re-litigated the attachment and blanked a live panel the moment the held snapshot aged past the window start. The user's requirement — data preserved from session start to session end — is only expressible as a latched attachment decision, never as a per-frame predicate.
+
+### L8 — a flag shared across threads is a check-then-act, not a latch
+- cause: gate-fail
+- source: human-approved
+- form: gate3-item
+- status: active
+- check: When one thread publishes a decision another thread reads, ask what happens to work *already in flight* when the flag flips. If the answer matters, the reader must be able to **reject the result**, not merely to decline starting new work. No memory ordering closes this — it is not a visibility bug.
+- note: moving the ownership rule into a single `Arc<AtomicBool>` correctly removed the duplicate predicate, but the watcher loads it at the top of its callback, so a callback that began unattached could still finish a re-resolution — resetting the accumulator and sending a rival session's data — a moment after the app attached. `attached` then accepted it, since it was neither empty nor stale. Closed by also refusing a snapshot whose `session_id` differs from the attached one: declining to switch and refusing what a switch produced are two different guarantees, and the requirement needed both.
+
+### L9 — a test that re-implements the rule in its own body tests nothing
+- cause: gate-fail
+- source: human-approved
+- form: gate3-item
+- status: active
+- check: A test must call the production path. If the code under test is unreachable from a test (needs a window, a proxy, a GPU), extract the rule into a plain struct or function rather than restating it in the assertions.
+- note: `attachment_is_monotonic_within_an_open` wrote `attached = attached || proves_ownership(...)` in the test body and asserted monotonicity of *that* expression — true by construction, and it would have passed had production been rewritten as a bare `store()`. The rule now lives in `Attachment::admit`, which the test drives directly. Both guards are mutation-checked: deleting either makes exactly its own test fail.

@@ -771,7 +771,7 @@ fn task_id_key(id: &str) -> (u64, String) {
 /// milliseconds, using `std` only (SD6 — no date crate for one known shape).
 /// Returns `None` on anything that does not match, so a bad timestamp leaves the
 /// clock untouched rather than defaulting to "now".
-fn parse_ts(s: &str) -> Option<u64> {
+pub(crate) fn parse_ts(s: &str) -> Option<u64> {
     let b = s.as_bytes();
     if b.len() < 20
         || b[4] != b'-'

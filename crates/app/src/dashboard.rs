@@ -97,10 +97,11 @@ const MODEL_WINDOWS: &[(&str, u64)] = &[
 pub struct Env {
     /// Wall clock, epoch millis.
     pub now_ms: u64,
-    /// This window's own start time. A log whose last event precedes it stopped
-    /// being written before the window existed, so it cannot be this window's
-    /// session — see [`compose`]. Zero disables the rule.
-    pub floor_ms: u64,
+    /// Whether a session has been attached — decided once, in `overlay.rs`, and
+    /// latched there. This module does not re-derive it: a freshness predicate
+    /// evaluated per frame re-litigates an attachment already on screen and blanks a
+    /// live panel. Once true, the accumulated data renders unconditionally.
+    pub attached: bool,
     /// `[ai_monitor] context_window` from the TOML config, overriding the table.
     pub context_window: Option<u64>,
 }
@@ -137,15 +138,20 @@ pub fn context_window(model: &str) -> Option<u64> {
 pub fn compose(snap: Option<&TelemetrySnapshot>, env: &Env) -> Vec<String> {
     let empty = TelemetrySnapshot::default();
     // Which log a tab owns is not knowable — a live `claude` holds no open fd on its
-    // own log, so the resolver can only offer "whatever wrote here most recently".
-    // One thing IS knowable: a log that stopped being written before this window
-    // existed cannot belong to a session started in it. Refusing that case is a
-    // fact, not a staleness heuristic — it never hides a session that has been
-    // active at any point since launch, including one idle for hours, which is
-    // exactly what an idle timeout would get wrong.
-    let detached = snap.and_then(|t| Detached::of(t, env));
+    // own log, so the resolver can only offer "whichever session here did something
+    // most recently". Whether to believe it is decided once, at attach, by the
+    // overlay; this function is told the answer and never second-guesses it. That is
+    // what makes the data durable: with the check here instead, every repaint could
+    // and eventually did erase a panel that was showing a live session.
+    let detached = match (snap, env.attached) {
+        (_, true) => None,
+        (Some(t), false) => Some(Detached::of(t)),
+        // No log resolved for this tab at all. Still says so — "nothing known" and
+        // "nothing here" should not be two different-looking blank frames.
+        (None, false) => Some(Detached::NoLog),
+    };
     let t = match snap {
-        Some(t) if detached.is_none() => t,
+        Some(t) if env.attached => t,
         _ => &empty,
     };
     let mut lines = Vec::with_capacity(28);
@@ -169,20 +175,23 @@ pub enum Detached {
     /// **closed**: "no clock" is not evidence of freshness, and treating it as
     /// such is how a foreign session's spend and context render as this tab's.
     Undated,
+    /// Nothing resolved at all. Distinct from the two above because it must not
+    /// claim anything about a log that does not exist.
+    NoLog,
 }
 
 impl Detached {
-    fn of(t: &TelemetrySnapshot, env: &Env) -> Option<Detached> {
-        if env.floor_ms == 0 {
-            return None; // rule disabled
+    /// Why the *not yet attached* state is showing. Reporting only — the decision
+    /// itself was made in `overlay.rs`; this turns it into words.
+    fn of(t: &TelemetrySnapshot) -> Detached {
+        // Read from the RESOLVED snapshot, before `compose` swaps in the empty one —
+        // testing the emptied value here would make every case look like `NoLog`.
+        if *t == TelemetrySnapshot::default() {
+            return Detached::NoLog;
         }
         match t.last_event_ms {
-            Some(last) if last < env.floor_ms => Some(Detached::StaleSince(last)),
-            Some(_) => None,
-            // An entirely empty snapshot is the ordinary "nothing folded yet" state,
-            // not a log we are refusing — it has nothing to misattribute.
-            None if *t != TelemetrySnapshot::default() => Some(Detached::Undated),
-            None => None,
+            Some(last) => Detached::StaleSince(last),
+            None => Detached::Undated,
         }
     }
 }
@@ -364,8 +373,9 @@ fn section(label: &str, empty_state: &str, total: usize, rows: Vec<String>) -> V
 /// `overlay-dashboard-boxes` composes this LAST, beneath its sections — the panel
 /// keeps the *tail* of the output, so a summary placed first is the first thing
 /// clipped on a short window.
-/// `detached` carries the last-event time of a log the floor rule rejected, so the
-/// session row can say *why* it is showing nothing rather than looking merely empty.
+/// `detached` is set when no session has been attached, so the session row can say
+/// *why* it is showing nothing rather than looking merely empty. The decision itself
+/// is `overlay.rs`'s; this only puts it into words.
 pub fn summary(t: &TelemetrySnapshot, env: &Env, detached: Option<Detached>) -> Vec<String> {
     let mut lines = Vec::with_capacity(4);
     lines.push(rule("ai-monitor"));
@@ -379,6 +389,7 @@ pub fn summary(t: &TelemetrySnapshot, env: &Env, detached: Option<Detached>) -> 
             dur(env.now_ms.saturating_sub(last))
         ),
         Some(Detached::Undated) => "(no active session — newest log is undated)".to_string(),
+        Some(Detached::NoLog) => "(no active session)".to_string(),
         None => {
             let mut ident = vec![
                 t.session_id
@@ -691,12 +702,12 @@ pub fn dur(ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    /// A default environment at `now`: no floor (nothing is ever detached) and no
+    /// A default environment at `now`: attached (so nothing is detached) and no
     /// configured window, so every pre-existing expectation keeps its meaning.
     fn env(now: u64) -> Env {
         Env {
             now_ms: now,
-            floor_ms: 0,
+            attached: true,
             context_window: None,
         }
     }
@@ -1417,131 +1428,114 @@ mod tests {
         }
     }
 
-    // ---- session attachment (the floor rule) ---------------------------------
+    // ---- attachment rendering ------------------------------------------------
 
     #[test]
-    fn a_log_that_stopped_before_this_window_existed_is_not_shown_as_the_session() {
-        // The reported defect: a fresh window attached to an unrelated session's log
-        // and rendered `up 114h37m` as if it were the new tab's. The log's last event
-        // predates the window, so it cannot be this window's session.
+    fn an_unattached_snapshot_shows_none_of_its_data() {
+        // Before attaching, whatever the resolver happened to find must not be
+        // presented as this tab's session.
         let (t, now) = full();
-        let launched = now - 30 * 60 * 1000; // window opened 30m ago
-        let stale = Env {
-            now_ms: now,
-            floor_ms: launched,
-            // last_event_ms is 2m03s before `now` in `populated()`, i.e. AFTER launch,
-            // so move it to before the launch to trigger the rule.
-            ..env(now)
-        };
-        let mut t = t;
-        t.last_event_ms = Some(launched - 110 * 60 * 1000); // idle 1h50m, pre-launch
-        let out = compose(Some(&t), &stale).join("\n");
-
+        let out = compose(
+            Some(&t),
+            &Env {
+                now_ms: now,
+                attached: false,
+                context_window: None,
+            },
+        )
+        .join("\n");
         assert!(out.contains("(no active session"), "{out}");
-        assert!(out.contains("idle 2h20m"), "says how stale it is:\n{out}");
-        // and none of the foreign session's data leaks through
-        assert!(!out.contains("claude-opus-5"), "{out}");
-        assert!(
-            !out.contains("up "),
-            "no uptime from a session we disowned:\n{out}"
-        );
-        assert!(!out.contains("19.3K"), "no spend either:\n{out}");
+        assert!(!out.contains("claude-opus-5"), "no model leak:\n{out}");
+        assert!(!out.contains("19.3K"), "no spend leak:\n{out}");
+        assert!(!out.contains("up "), "no uptime leak:\n{out}");
         assert!(out.contains("(no tasks)") && out.contains("(no agents yet)"));
     }
 
     #[test]
-    fn a_log_active_since_the_window_opened_is_shown_even_when_long_idle() {
-        // The case a plain idle-timeout would break: my own session, untouched for
-        // hours, but it wrote *after* this window started — so it is mine.
+    fn an_attached_session_is_never_blanked_however_stale_it_looks() {
+        // THE requirement: data is preserved from session start to session end. Once
+        // attached, no property of the snapshot may empty the panel — this is why the
+        // freshness question is answered once, in `overlay.rs`, and not re-asked here.
+        let (mut t, now) = full();
+        // As stale as it gets: the last event at the epoch, and no event times at all.
+        for last in [Some(0), None] {
+            t.last_event_ms = last;
+            t.first_event_ms = last;
+            let out = compose(
+                Some(&t),
+                &Env {
+                    now_ms: now,
+                    attached: true,
+                    context_window: None,
+                },
+            )
+            .join("\n");
+            assert!(!out.contains("no active session"), "{out}");
+            assert!(out.contains("claude-opus-5"), "data intact:\n{out}");
+            assert!(out.contains("Fold usage per message id"), "tasks intact");
+            assert!(out.contains("harness-ops:loop"), "skills intact");
+            assert!(out.contains("1.9M"), "spend intact");
+        }
+    }
+
+    #[test]
+    fn the_unattached_row_reports_which_case_it_is() {
         let (mut t, now) = populated();
-        let launched = now - 6 * 3_600_000;
-        t.last_event_ms = Some(launched + 1_000);
-        t.first_event_ms = Some(launched + 500);
-        let out = compose(
-            Some(&t),
-            &Env {
-                now_ms: now,
-                floor_ms: launched,
-                context_window: None,
-            },
-        )
-        .join("\n");
-        assert!(out.contains("claude-opus-5"), "still attached:\n{out}");
-        assert!(!out.contains("no active session"), "{out}");
+        let unattached = |t: &TelemetrySnapshot| {
+            compose(
+                Some(t),
+                &Env {
+                    now_ms: now,
+                    attached: false,
+                    context_window: None,
+                },
+            )
+            .join("\n")
+        };
+        // A log that went quiet: say how long ago.
+        t.last_event_ms = Some(now - 110 * 60 * 1000);
         assert!(
-            out.contains("idle 5h59m"),
-            "idle is reported, not acted on:\n{out}"
+            unattached(&t).contains("newest log idle 1h50m"),
+            "{}",
+            unattached(&t)
+        );
+        // A log with content but no clock: say that instead of inventing an age.
+        t.last_event_ms = None;
+        assert!(unattached(&t).contains("newest log is undated"));
+        // No log at all: claim nothing about a log.
+        let none = unattached(&TelemetrySnapshot::default());
+        assert!(none.contains("(no active session)"), "{none}");
+        assert!(
+            !none.contains("undated") && !none.contains("idle"),
+            "{none}"
         );
     }
 
     #[test]
-    fn an_absent_log_is_detached_without_claiming_staleness() {
-        // Nothing resolved at all: there is no "newest log" to report an age for, so
-        // the frame renders its plain empty state rather than inventing one.
+    fn no_log_at_all_while_unattached_renders_the_frame() {
+        // Reachable whenever a cwd resolves no project directory. Must be a frame
+        // with a reason, never a blank panel.
         let out = compose(
             None,
             &Env {
-                now_ms: 1_000,
-                floor_ms: 500,
+                now_ms: 1_785_226_000_000,
+                attached: false,
                 context_window: None,
             },
-        )
-        .join("\n");
-        assert!(!out.contains("no active session"), "{out}");
-        assert!(out.contains(" session  — · —"), "{out}");
+        );
+        assert_eq!(out.len(), 9, "five empty sections + the summary block");
+        assert!(out.join("\n").contains("(no active session)"));
     }
 
     #[test]
-    fn a_log_with_no_timestamps_fails_closed() {
-        // F2 — "no clock" is not evidence of freshness. A snapshot with content but
-        // no parseable event time cannot be shown to have been written since the
-        // window opened, so its spend and context must not render as this tab's.
-        let (mut t, now) = populated();
-        t.first_event_ms = None;
-        t.last_event_ms = None;
-        let out = compose(
-            Some(&t),
-            &Env {
-                now_ms: now,
-                floor_ms: now - 1000,
-                context_window: None,
-            },
-        )
-        .join("\n");
-        assert!(
-            out.contains("(no active session — newest log is undated)"),
-            "{out}"
-        );
-        assert!(
-            !out.contains("claude-opus-5") && !out.contains("19.3K"),
-            "{out}"
-        );
-
-        // But an entirely empty snapshot is the ordinary "nothing folded yet" state
-        // — there is nothing to misattribute, so it is not a refusal.
-        let out = compose(
-            Some(&TelemetrySnapshot::default()),
-            &Env {
-                now_ms: now,
-                floor_ms: now - 1000,
-                context_window: None,
-            },
-        )
-        .join("\n");
-        assert!(!out.contains("no active session"), "{out}");
-    }
-
-    #[test]
-    fn a_detached_row_stays_within_the_rule() {
-        // F4 — the detached string is built outside `fit_row`, so its width is
-        // asserted rather than assumed.
+    fn an_unattached_row_stays_within_the_rule() {
         let (mut t, now) = populated();
         t.last_event_ms = Some(0);
         for line in compose(
             Some(&t),
             &Env {
                 now_ms: now,
-                floor_ms: now,
+                attached: false,
                 context_window: None,
             },
         ) {
@@ -1573,7 +1567,7 @@ mod tests {
             Some(&t),
             &Env {
                 now_ms: now,
-                floor_ms: 0,
+                attached: true,
                 context_window: Some(1_000_000),
             },
         )
@@ -1592,7 +1586,7 @@ mod tests {
                 &t,
                 &Env {
                     now_ms: now,
-                    floor_ms: 0,
+                    attached: true,
                     context_window: Some(200_000)
                 }
             ),
