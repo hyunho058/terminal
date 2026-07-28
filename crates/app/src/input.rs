@@ -4,6 +4,7 @@
 //! chord table is unit-tested without a window.
 
 use renderer::sidebar_layout::{self, ChromeRegion, SidebarLayoutInput, SidebarRegion};
+use term_core::MouseEncoding;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 /// A tab-management action triggered by a Cmd chord (D5). Intercepted before
@@ -168,6 +169,46 @@ pub fn wheel_lines(delta: WheelDelta, cell_h: f32, accum: &mut f32) -> i32 {
     *accum -= whole;
     // Saturates on overflow; `scroll_up`/`scroll_down` clamp on the other side.
     whole as i32
+}
+
+/// Encode one wheel notch as a mouse report for an application that asked for
+/// tracking (`alt-screen-scroll`).
+///
+/// `col`/`row` are 0-based grid cells; the wire format is 1-based. `up` picks the
+/// button code: wheel-up is 64, wheel-down is 65 (bit 6 marks a wheel button, and
+/// wheel events are press-only — there is no release report).
+///
+/// Two encodings, chosen by `?1006`:
+/// - [`MouseEncoding::Sgr`] → `ESC [ < b ; col ; row M`. No coordinate ceiling.
+/// - [`MouseEncoding::Legacy`] → `ESC [ M` then `b + 32`, `col + 32`, `row + 32` as
+///   raw bytes. A coordinate past 223 cannot be expressed, so the report is
+///   **dropped** rather than sent with a wrapped byte that the app would read as a
+///   click somewhere else entirely.
+pub fn encode_wheel_report(
+    encoding: MouseEncoding,
+    up: bool,
+    col: u16,
+    row: u16,
+) -> Option<Vec<u8>> {
+    let button: u16 = if up { 64 } else { 65 };
+    let (cx, cy) = (col.saturating_add(1), row.saturating_add(1));
+    match encoding {
+        MouseEncoding::Sgr => Some(format!("\x1b[<{button};{cx};{cy}M").into_bytes()),
+        MouseEncoding::Legacy => {
+            // Each field is offset by 32 and must fit one byte.
+            if cx > 223 || cy > 223 {
+                return None;
+            }
+            Some(vec![
+                0x1b,
+                b'[',
+                b'M',
+                (button + 32) as u8,
+                (cx + 32) as u8,
+                (cy + 32) as u8,
+            ])
+        }
+    }
 }
 
 /// Which escape-sequence family a cursor/navigation/function key belongs to
@@ -1005,5 +1046,194 @@ mod tests {
         assert!(n > 0, "a huge scroll goes up, got {n}");
         let n = wheel_lines(WheelDelta::Pixels(-1e30), 16.0, &mut acc);
         assert!(n < 0, "and a huge reverse scroll goes down, got {n}");
+    }
+}
+
+#[cfg(test)]
+mod alt_screen_scroll_tests {
+    use super::*;
+
+    fn s(b: Vec<u8>) -> String {
+        String::from_utf8_lossy(&b).replace('\x1b', "ESC")
+    }
+
+    #[test]
+    fn sgr_wheel_reports_use_button_64_and_65_with_1_based_coords() {
+        // Wheel-up is button 64, wheel-down 65; SGR coordinates are 1-based, so the
+        // 0-based cell (0,0) reports as 1;1. Press-only — always the `M` final byte.
+        assert_eq!(
+            s(encode_wheel_report(MouseEncoding::Sgr, true, 0, 0).unwrap()),
+            "ESC[<64;1;1M"
+        );
+        assert_eq!(
+            s(encode_wheel_report(MouseEncoding::Sgr, false, 0, 0).unwrap()),
+            "ESC[<65;1;1M"
+        );
+        assert_eq!(
+            s(encode_wheel_report(MouseEncoding::Sgr, true, 41, 12).unwrap()),
+            "ESC[<64;42;13M"
+        );
+        // SGR has no coordinate ceiling — this is why apps ask for `?1006`.
+        assert_eq!(
+            s(encode_wheel_report(MouseEncoding::Sgr, false, 999, 500).unwrap()),
+            "ESC[<65;1000;501M"
+        );
+    }
+
+    #[test]
+    fn legacy_wheel_reports_offset_every_field_by_32() {
+        // `ESC [ M` then three raw bytes, each value + 32.
+        let b = encode_wheel_report(MouseEncoding::Legacy, true, 0, 0).unwrap();
+        assert_eq!(b, vec![0x1b, b'[', b'M', 64 + 32, 1 + 32, 1 + 32]);
+        let b = encode_wheel_report(MouseEncoding::Legacy, false, 9, 4).unwrap();
+        assert_eq!(b, vec![0x1b, b'[', b'M', 65 + 32, 10 + 32, 5 + 32]);
+    }
+
+    #[test]
+    fn legacy_drops_a_report_it_cannot_encode() {
+        // Past 223 the byte would wrap and the app would read a click somewhere else
+        // entirely — dropping is the only honest option. SGR has no such limit.
+        assert!(encode_wheel_report(MouseEncoding::Legacy, true, 300, 0).is_none());
+        assert!(encode_wheel_report(MouseEncoding::Legacy, true, 0, 300).is_none());
+        assert!(encode_wheel_report(MouseEncoding::Sgr, true, 300, 300).is_some());
+    }
+}
+
+/// Where a wheel gesture over the grid should go (alt-screen-scroll).
+///
+/// Extracted as a pure function so the routing rule is unit-testable without a
+/// window, a GPU, or a PTY.
+///
+/// **Only mouse tracking diverts the wheel.** Translating it to arrow keys for an
+/// untracked alt-screen app (iTerm2's `alternateScrollMode`) is deliberately NOT
+/// done: `terminal-scroll` D5 weighed and rejected it because it writes to the PTY,
+/// which `scrollback` D4 forbids outright, and it would break `terminal-scroll`
+/// R5.1 — under `?1049h` the wheel must still reveal the frozen primary history.
+/// Sending a report to an app that *asked* for one is a different matter: it is
+/// additive, and revives a gesture that was previously dead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WheelRoute {
+    /// The app asked for mouse events — send a report per line.
+    Report,
+    /// Nobody asked — the terminal's own scrollback viewport, alt screen included.
+    Viewport,
+}
+
+pub fn wheel_route(mouse_tracking: bool, _alt_screen: bool) -> WheelRoute {
+    if mouse_tracking {
+        WheelRoute::Report
+    } else {
+        WheelRoute::Viewport
+    }
+}
+
+#[cfg(test)]
+mod wheel_route_tests {
+    use super::*;
+
+    #[test]
+    fn tracking_wins_over_alt_screen() {
+        // The case that motivated the feature: Claude Code is on the alt screen AND
+        // has tracking on. It must get reports — arrows would move its input cursor
+        // instead of scrolling the transcript.
+        assert_eq!(wheel_route(true, true), WheelRoute::Report);
+        // Tracking on the primary screen (rare, but legal) also wins.
+        assert_eq!(wheel_route(true, false), WheelRoute::Report);
+    }
+
+    #[test]
+    fn alt_screen_without_tracking_still_uses_the_scrollback_viewport() {
+        // `terminal-scroll` R5.1: under `?1049h` the wheel must keep revealing the
+        // frozen primary history. An earlier revision routed this to arrow keys
+        // (iTerm2's alternateScrollMode) — which `terminal-scroll` D5 had already
+        // weighed and rejected, because it writes to the PTY and `scrollback` D4
+        // forbids scrolling from writing at all. This pins the rejection.
+        assert_eq!(wheel_route(false, true), WheelRoute::Viewport);
+    }
+
+    #[test]
+    fn primary_screen_without_tracking_keeps_the_scrollback_viewport() {
+        // The regression direction that matters most: the shipped terminal-scroll
+        // behavior must be untouched, and nothing may be written to the PTY.
+        assert_eq!(wheel_route(false, false), WheelRoute::Viewport);
+    }
+}
+
+/// The bytes a wheel gesture should write to the PTY, or `None` when the terminal
+/// keeps the gesture for its own scrollback viewport (alt-screen-scroll).
+///
+/// This is the whole decision — routing *and* encoding — in one pure function, so
+/// `TerminalApp::wheel_to_app` is reduced to "ask, then write" and the behavior is
+/// testable without a window, a GPU or a PTY.
+///
+/// `None` means the caller must fall through to the viewport. That covers both "no
+/// app asked for the wheel" and "the legacy encoding cannot express this column",
+/// because in each case scrolling the viewport is better than silently eating the
+/// gesture.
+pub fn wheel_bytes(
+    mouse_tracking: bool,
+    encoding: MouseEncoding,
+    n: i32,
+    (col, row): (u16, u16),
+) -> Option<Vec<u8>> {
+    if n == 0 || wheel_route(mouse_tracking, false) != WheelRoute::Report {
+        return None;
+    }
+    let up = n > 0;
+    // Clamped: a pathological delta must not emit thousands of reports in one
+    // gesture. Real winit deltas give n <= ~10.
+    let lines = n.unsigned_abs().min(50);
+    let one = encode_wheel_report(encoding, up, col, row)?;
+    let mut out = Vec::with_capacity(one.len() * lines as usize);
+    for _ in 0..lines {
+        out.extend_from_slice(&one);
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod wheel_bytes_tests {
+    use super::*;
+
+    fn s(b: Vec<u8>) -> String {
+        String::from_utf8_lossy(&b).replace('\x1b', "ESC")
+    }
+
+    #[test]
+    fn claude_codes_mode_set_produces_sgr_reports() {
+        // The end-to-end decision for the reported symptom: tracking on + SGR
+        // encoding → one report per line, at the pointer cell.
+        let b = wheel_bytes(true, MouseEncoding::Sgr, 3, (41, 12)).expect("reports");
+        assert_eq!(s(b), "ESC[<64;42;13MESC[<64;42;13MESC[<64;42;13M");
+        let b = wheel_bytes(true, MouseEncoding::Sgr, -1, (0, 0)).expect("reports");
+        assert_eq!(s(b), "ESC[<65;1;1M", "negative n is wheel-down");
+    }
+
+    #[test]
+    fn no_tracking_keeps_the_gesture_for_the_viewport() {
+        // The regression direction that matters most: with no app asking, the wheel
+        // must produce NO bytes at all, so the caller scrolls scrollback instead.
+        assert!(wheel_bytes(false, MouseEncoding::Sgr, 3, (0, 0)).is_none());
+        assert!(wheel_bytes(false, MouseEncoding::Legacy, -3, (0, 0)).is_none());
+    }
+
+    #[test]
+    fn a_zero_delta_writes_nothing() {
+        assert!(wheel_bytes(true, MouseEncoding::Sgr, 0, (0, 0)).is_none());
+    }
+
+    #[test]
+    fn an_unencodable_column_falls_back_to_the_viewport() {
+        // Legacy encoding past 223 columns: returning None makes the caller scroll
+        // rather than swallowing the gesture, which would leave the right-hand side
+        // of a wide window inert for no visible reason.
+        assert!(wheel_bytes(true, MouseEncoding::Legacy, 1, (300, 0)).is_none());
+        assert!(wheel_bytes(true, MouseEncoding::Sgr, 1, (300, 0)).is_some());
+    }
+
+    #[test]
+    fn the_per_gesture_line_count_is_clamped() {
+        let b = wheel_bytes(true, MouseEncoding::Sgr, 100_000, (0, 0)).expect("reports");
+        assert_eq!(b.len(), "\x1b[<64;1;1M".len() * 50, "clamped at 50 reports");
     }
 }
