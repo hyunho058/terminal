@@ -32,13 +32,15 @@ const MEMO_TTL_TICKS: u64 = 120;
 const MEMO_MAX: usize = 64;
 
 /// Pure: the activity rule (D7 + D16). The `last` meaningful-message classification is the
-/// precise input-waiting signal and wins when present: an assistant `end_turn` → `Waiting`
-/// (the agent handed the turn back), every other classification → `Busy`. When there is no
-/// robust `last` signal (no meaningful line, or the newest record was truncated by the tail
-/// cap) we fall back to the existing recency rule — `Busy` if the log was appended within
-/// `BUSY_WINDOW`, **or** the last line's role is `"user"` and younger than `STALE_LIMIT`,
-/// else `Idle`. The fallback never yields `Waiting`: a false "waiting" is the worst failure
-/// (conservative bias, R3.x quality bar).
+/// precise input-waiting signal and wins when present. TWO classifications mean the agent
+/// has handed control to the human and so map to `Waiting`: an assistant `end_turn` (the
+/// turn is over) and an assistant `AssistantAsksUser` (it called a blocking tool such as
+/// `AskUserQuestion` and cannot proceed until answered). Every other classification →
+/// `Busy`. When there is no robust `last` signal (no meaningful line, or the newest record
+/// was truncated by the tail cap) we fall back to the existing recency rule — `Busy` if the
+/// log was appended within `BUSY_WINDOW`, **or** the last line's role is `"user"` and
+/// younger than `STALE_LIMIT`, else `Idle`. The fallback never yields `Waiting`: a false
+/// "waiting" is the worst failure (conservative bias, R3.x quality bar).
 pub(crate) fn state_from(
     last: Option<LastMessage>,
     role: &str,
@@ -46,7 +48,10 @@ pub(crate) fn state_from(
     now: SystemTime,
 ) -> AgentState {
     match last {
-        Some(LastMessage::AssistantEndTurn) => return AgentState::Waiting, // D16 → R3.1
+        // Both precise signals mean "the human owns the next move" (D16 → R3.1).
+        Some(LastMessage::AssistantEndTurn) | Some(LastMessage::AssistantAsksUser) => {
+            return AgentState::Waiting
+        }
         Some(LastMessage::AssistantBusy)
         | Some(LastMessage::UserToolResult)
         | Some(LastMessage::UserPrompt) => return AgentState::Busy, // D16 → R3.2/R3.3/R3.4
@@ -346,6 +351,26 @@ mod tests {
     }
 
     #[test]
+    fn state_from_asks_user_is_waiting() {
+        // The agent called a blocking tool (AskUserQuestion / ExitPlanMode) — control is
+        // with the human, so this is the second precise Waiting signal. Like end_turn it
+        // beats recency: a just-appended log still reads Waiting, not Busy.
+        let m = SystemTime::UNIX_EPOCH;
+        for age in [0, 2, 60, 300] {
+            assert_eq!(
+                state_from(
+                    Some(LastMessage::AssistantAsksUser),
+                    "assistant",
+                    m,
+                    at(m, age)
+                ),
+                AgentState::Waiting,
+                "AssistantAsksUser → Waiting at age {age}s"
+            );
+        }
+    }
+
+    #[test]
     fn state_from_busy_signals_are_busy_not_waiting() {
         // R3.2/R3.3/R3.4 — tool_use, tool_result, and a fresh human prompt all → Busy,
         // even when the log is old enough that the recency fallback would say Idle.
@@ -564,6 +589,60 @@ mod tests {
         );
         assert_eq!(
             state_of_fixture("d16-prompt", "/proj/d16-prompt", &body),
+            AgentState::Busy
+        );
+    }
+
+    /// The real `AskUserQuestion` record, transcribed verbatim from a live session log:
+    /// `stop_reason: "tool_use"` plus a `tool_use` content block naming the tool.
+    const ASK_USER_QUESTION_LINE: &str = concat!(
+        r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","#,
+        r#""content":[{"type":"tool_use","id":"toolu_01","name":"AskUserQuestion","#,
+        r#""input":{"questions":[]}}]}}"#
+    );
+
+    #[test]
+    fn ask_user_question_session_reads_waiting() {
+        // ROOT-CAUSE regression: an agent blocked on AskUserQuestion used to read Busy
+        // (its stop_reason is "tool_use"), so `waiting.rs` never saw a rising edge and the
+        // sidebar never surfaced the question. End-to-end: real jsonl shape → Waiting.
+        let _g = super::super::probe::serial();
+        let body = format!("{CONVO_PREFIX}{ASK_USER_QUESTION_LINE}\n");
+        assert_eq!(
+            state_of_fixture("d16-askuser", "/proj/d16-askuser", &body),
+            AgentState::Waiting
+        );
+    }
+
+    #[test]
+    fn answered_question_session_reads_busy_again() {
+        // The falling edge `waiting.rs` needs to clear the band item: once the human
+        // answers, the tool_result line is newest and the tab leaves Waiting.
+        let _g = super::super::probe::serial();
+        let body = format!(
+            "{CONVO_PREFIX}{ASK_USER_QUESTION_LINE}\n{}\n",
+            r#"{"type":"user","message":{"role":"user"},"toolUseResult":{"answer":"ok"}}"#
+        );
+        assert_eq!(
+            state_of_fixture("d16-answered", "/proj/d16-answered", &body),
+            AgentState::Busy
+        );
+    }
+
+    #[test]
+    fn ordinary_tool_call_session_still_reads_busy() {
+        // The closed list must not widen: a normal tool call is unchanged: Busy, never
+        // Waiting. This is the guard against the fix manufacturing false "waiting"s.
+        let _g = super::super::probe::serial();
+        let body = format!(
+            "{CONVO_PREFIX}{}\n",
+            concat!(
+                r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","#,
+                r#""content":[{"type":"tool_use","id":"toolu_09","name":"Bash","input":{}}]}}"#
+            )
+        );
+        assert_eq!(
+            state_of_fixture("d16-bash", "/proj/d16-bash", &body),
             AgentState::Busy
         );
     }
