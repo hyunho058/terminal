@@ -63,6 +63,11 @@ pub struct AppCtx<'a> {
     pub active: usize,
     /// The active tab's live working directory (ai-monitor log resolution).
     pub active_cwd: Option<PathBuf>,
+    /// The active tab's shell pid. The log directory records no application, window
+    /// or tab, so this process tree is the only way to tell this tab's Claude session
+    /// from one another app is running in the same project. `None` if the shell has
+    /// exited. Populated by `terminal_app`.
+    pub active_shell_pid: Option<u32>,
     /// Whether the active tab has bracketed-paste mode on (DECSET 2004). Read by
     /// the text-paste handler to wrap a paste in `ESC[200~`/`ESC[201~`. Populated
     /// by `terminal_app` from `Terminal::bracketed_paste`; `false` by default.
@@ -113,6 +118,7 @@ impl<'a> AppCtx<'a> {
             tab_count,
             active,
             active_cwd,
+            active_shell_pid: None,
             bracketed_paste: false,
             selection_text: None,
             active_tab: None,
@@ -126,6 +132,12 @@ impl<'a> AppCtx<'a> {
     pub fn with_active_tab(mut self, id: TabId, user_title: Option<String>) -> Self {
         self.active_tab = Some(id);
         self.active_user_title = user_title;
+        self
+    }
+
+    /// Attach the active tab's shell pid (ai-monitor tab binding).
+    pub fn with_shell_pid(mut self, pid: Option<u32>) -> Self {
+        self.active_shell_pid = pid;
         self
     }
 
@@ -209,8 +221,9 @@ pub trait Overlay {
         false
     }
     /// The active tab changed; re-point anything cwd-derived (ai-monitor R3.1).
-    /// Default: no-op.
-    fn on_active_changed(&mut self, _cwd: Option<PathBuf>) {}
+    /// Carries the new tab's shell pid alongside its cwd, since the two together are
+    /// what identify a session. Default: no-op.
+    fn on_active_changed(&mut self, _cwd: Option<PathBuf>, _shell_pid: Option<u32>) {}
 
     /// The app is driving this overlay (sticky-tab-title D13/R3.4) — e.g. the card menu's
     /// `Rename` item opening the rename field on a specific tab. Return `Consumed` to stop
@@ -336,9 +349,9 @@ impl OverlayHost {
     }
 
     /// Tell every overlay the active tab changed (ai-monitor re-point, R3.1).
-    pub fn notify_active_changed(&mut self, cwd: Option<PathBuf>) {
+    pub fn notify_active_changed(&mut self, cwd: Option<PathBuf>, shell_pid: Option<u32>) {
         for o in &mut self.overlays {
-            o.on_active_changed(cwd.clone());
+            o.on_active_changed(cwd.clone(), shell_pid);
         }
     }
 

@@ -21,6 +21,7 @@ mod settings;
 mod sidebar_model;
 mod tabmeta;
 mod tabs;
+mod tabsession;
 mod terminal_app;
 mod waiting;
 

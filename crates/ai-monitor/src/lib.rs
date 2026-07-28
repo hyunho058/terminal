@@ -90,27 +90,128 @@ const RESOLVE_CANDIDATES: usize = 16;
 /// Cost is bounded twice over: at most [`RESOLVE_CANDIDATES`] files, and at most
 /// [`activity::TAIL_CAP`] bytes read from each. Returns the path and that event
 /// time, so the caller can apply its own freshness rule without re-reading.
-pub fn most_recent_session(dir: &Path) -> Option<(PathBuf, Option<u64>)> {
-    let mut by_mtime: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
-        .map(|e| {
-            let m = e
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::UNIX_EPOCH);
-            (m, e.path())
+/// What the caller knows about which session it is looking for.
+///
+/// Empty means "no idea" — resolution then falls back to ranking the directory,
+/// which is all three previous rounds of this feature could ever do.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Wanted {
+    /// The session id, when the caller could name it outright.
+    pub session_id: Option<String>,
+    /// When the caller's process started. A session it began has its first event
+    /// just after this.
+    pub since_ms: Option<u64>,
+}
+
+/// A resolved log, and whether it was *confirmed* to be the caller's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolved {
+    pub path: PathBuf,
+    pub last_event_ms: Option<u64>,
+    /// True when the [`Wanted`] hint identified this log — by name, or by a first
+    /// event that follows the caller's own start. False when it is merely the most
+    /// recently active log in the directory, which may belong to any application.
+    pub owned: bool,
+}
+
+/// How long after a `claude` process starts its session's first event may appear.
+/// Generous on purpose: the cost of being too tight is failing to recognise the
+/// tab's own session, which is the whole point; the cost of being loose is admitting
+/// a session that started in the same minute in the same directory from another app,
+/// which the id path already covers whenever it is available.
+const FIRST_EVENT_SLACK_MS: u64 = 120_000;
+
+/// Resolve the log for `dir`, preferring one the caller can prove is theirs.
+///
+/// The directory records no application, window or tab — Warp, iTerm and every other
+/// mac-terminal window writing in the same project all append here — so `want` is
+/// the only thing that can separate them. Without it this degrades exactly to
+/// [`most_recent_session`].
+pub fn resolve_session(dir: &Path, want: &Wanted) -> Option<Resolved> {
+    // Named outright: nothing to rank.
+    if let Some(id) = want.session_id.as_deref() {
+        let path = dir.join(format!("{id}.jsonl"));
+        if path.is_file() {
+            return Some(Resolved {
+                last_event_ms: last_event_in_tail(&path),
+                path,
+                owned: true,
+            });
+        }
+    }
+    // Dated: the caller's process started at `since`, so its session's FIRST event
+    // follows shortly after. Another app's long-running session fails this by days.
+    if let Some(since) = want.since_ms {
+        let owned = candidates(dir)
+            .into_iter()
+            .filter_map(|p| {
+                let first = first_event(&p)?;
+                (first + FIRST_EVENT_SLACK_MS >= since).then_some((first, p))
+            })
+            // Nearest to the process start, not merely the earliest qualifying one:
+            // with two tabs open on the same project every one of their sessions
+            // qualifies, and the earliest would hand them all the same log.
+            .min_by_key(|(first, _)| first.abs_diff(since));
+        if let Some((_, path)) = owned {
+            return Some(Resolved {
+                last_event_ms: last_event_in_tail(&path),
+                path,
+                owned: true,
+            });
+        }
+    }
+    most_recent_session(dir).map(|(path, last_event_ms)| Resolved {
+        path,
+        last_event_ms,
+        owned: false,
+    })
+}
+
+/// The first parseable event time in `log`, read from the head — bounded like the
+/// tail read, since only the opening records matter.
+fn first_event(log: &Path) -> Option<u64> {
+    let f = std::fs::File::open(log).ok()?;
+    let mut buf = Vec::new();
+    f.take(activity::TAIL_CAP).read_to_end(&mut buf).ok()?;
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| {
+            v.get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(telemetry::parse_ts)
         })
-        .collect();
+        .min()
+}
+
+/// The `*.jsonl` files worth considering, newest-touched first and capped.
+fn candidates(dir: &Path) -> Vec<PathBuf> {
+    let mut by_mtime: Vec<(std::time::SystemTime, PathBuf)> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .map(|e| {
+                let m = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                (m, e.path())
+            })
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
     by_mtime.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
     by_mtime.truncate(RESOLVE_CANDIDATES);
+    by_mtime.into_iter().map(|(_, p)| p).collect()
+}
 
+pub fn most_recent_session(dir: &Path) -> Option<(PathBuf, Option<u64>)> {
     let mut best: Option<(Option<u64>, PathBuf)> = None;
-    for (_, path) in by_mtime {
+    for path in candidates(dir) {
         let last = last_event_in_tail(&path);
         // A log with no parseable event in its tail still beats nothing at all, but
-        // loses to any log that has one — `None` sorts below every `Some`.
+        // loses to any log that has one — `None` sorts below every `Some`. Ties keep
+        // the first seen, and candidates arrive newest-touched first.
         let better = match &best {
             None => true,
             Some((b, _)) => last > *b,
@@ -273,7 +374,35 @@ pub fn backfill_telemetry(log: &Path) -> (SessionTelemetry, u64) {
 /// clone ~112 ring entries plus the tasks map every time.
 pub struct LogWatcher {
     _watcher: notify::RecommendedWatcher,
-    pub rx: Receiver<Arc<TelemetrySnapshot>>,
+    pub rx: Receiver<Update>,
+}
+
+/// What to watch, and what the caller already knows about it.
+///
+/// A struct rather than five parameters: they are one decision — *which* session this
+/// watch is for — and passing them separately invites a call site that gets the
+/// pairing wrong.
+pub struct Watch {
+    /// The project directory to watch.
+    pub dir: PathBuf,
+    /// The log resolved so far, if any.
+    pub log: Option<PathBuf>,
+    /// What the caller knows about which session it wants, used on re-resolution.
+    pub want: Wanted,
+    /// Whether `log` was confirmed to be the caller's.
+    pub owned: bool,
+    /// Set by the caller once it has attached; the watcher then stops re-resolving.
+    pub attached: Arc<AtomicBool>,
+}
+
+/// One snapshot, and whether the log it came from was confirmed to be the caller's.
+#[derive(Clone, Debug)]
+pub struct Update {
+    pub snap: Arc<TelemetrySnapshot>,
+    /// See [`Resolved::owned`]. Carried per update because re-resolution can turn an
+    /// unowned attachment into an owned one — the moment the tab's own session
+    /// finally writes.
+    pub owned: bool,
 }
 
 impl LogWatcher {
@@ -284,15 +413,20 @@ impl LogWatcher {
     /// the caller can wake its event loop and drain. `wake` runs on the watch thread
     /// — keep it cheap (e.g. an `EventLoopProxy::send_event`).
     pub fn spawn(
-        dir: PathBuf,
-        log: Option<PathBuf>,
+        watch: Watch,
         mut telemetry: SessionTelemetry,
         start_offset: u64,
-        attached: Arc<AtomicBool>,
         wake: impl Fn() + Send + 'static,
     ) -> Option<LogWatcher> {
+        let Watch {
+            dir,
+            log,
+            want,
+            mut owned,
+            attached,
+        } = watch;
         let watch_dir = dir.clone();
-        let (tx, rx) = mpsc::channel::<Arc<TelemetrySnapshot>>();
+        let (tx, rx) = mpsc::channel::<Update>();
         let mut offset = start_offset;
         let mut partial = String::new();
         let mut target = log;
@@ -318,8 +452,14 @@ impl LogWatcher {
                 // A new session's first line lands here: the file did not exist when
                 // the overlay opened, so no amount of tailing the old target would
                 // ever find it.
-                if let Some((newest, _)) = most_recent_session(&dir) {
+                if let Some(Resolved {
+                    path: newest,
+                    owned: newly_owned,
+                    ..
+                }) = resolve_session(&dir, &want)
+                {
                     if Some(&newest) != target.as_ref() {
+                        owned = newly_owned;
                         target = Some(newest);
                         offset = 0;
                         partial.clear();
@@ -386,7 +526,7 @@ impl LogWatcher {
             // ONE snapshot, not two: it deep-clones five rings plus the task map
             // and sorts, on every append batch.
             let snap = Arc::new(telemetry.snapshot());
-            if (folded > 0 || reset || switched) && tx.send(snap).is_ok() {
+            if (folded > 0 || reset || switched) && tx.send(Update { snap, owned }).is_ok() {
                 wake();
             }
         })
@@ -508,8 +648,19 @@ mod tests {
         let log = dir.join("s.jsonl");
         std::fs::write(&log, "").unwrap();
         let (t, off) = backfill_telemetry(&log);
-        let w = LogWatcher::spawn(dir.clone(), Some(log.clone()), t, off, unattached(), || {})
-            .expect("spawn");
+        let w = LogWatcher::spawn(
+            Watch {
+                dir: dir.clone(),
+                log: Some(log.clone()),
+                want: Wanted::default(),
+                owned: false,
+                attached: unattached(),
+            },
+            t,
+            off,
+            || {},
+        )
+        .expect("spawn");
 
         let append = |line: &str| {
             let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
@@ -523,12 +674,12 @@ mod tests {
 
         append(&usage("m1", 10));
         let s1 = w.rx.recv_timeout(Duration::from_secs(10)).expect("first");
-        assert_eq!(s1.total_output, 10);
+        assert_eq!(s1.snap.total_output, 10);
 
         append(&usage("m2", 5));
         let s2 = w.rx.recv_timeout(Duration::from_secs(10)).expect("second");
         assert_eq!(
-            s2.total_output, 15,
+            s2.snap.total_output, 15,
             "cumulative, and m1 counted exactly once"
         );
 
@@ -537,6 +688,131 @@ mod tests {
             w.rx.recv_timeout(Duration::from_millis(400)).is_err(),
             "no duplicate snapshots"
         );
+    }
+
+    #[test]
+    fn a_named_session_wins_outright() {
+        // `claude --resume <id>` puts the answer on the command line, so there is
+        // nothing to rank: the id names the file.
+        let dir = temp_dir("named");
+        let id = "54e576c2-bd76-4acd-8eed-bda54f60a155";
+        std::fs::write(
+            dir.join(format!("{id}.jsonl")),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-23T10:00:00.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        // A far more recently active log in the same directory must NOT win.
+        std::fs::write(
+            dir.join("other.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T19:59:00.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+
+        let r = resolve_session(
+            &dir,
+            &Wanted {
+                session_id: Some(id.to_string()),
+                since_ms: None,
+            },
+        )
+        .expect("resolves");
+        assert_eq!(r.path.file_name().unwrap(), format!("{id}.jsonl").as_str());
+        assert!(r.owned, "named by the process, so confirmed");
+    }
+
+    #[test]
+    fn a_session_started_by_this_tab_beats_a_more_active_foreign_one() {
+        // The reported case, in miniature: another application's session is live in
+        // the same project directory and has the newer event, but it began days
+        // before this tab's shell existed. Ranking alone picks it; the hint does not.
+        let dir = temp_dir("owned");
+        // Warp's: first event five days ago, still writing.
+        std::fs::write(
+            dir.join("foreign.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-23T17:06:00.000Z\",\"message\":{}}\n\
+             {\"type\":\"assistant\",\"timestamp\":\"2026-07-28T20:44:00.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        // Ours: started just after the tab's claude process did, quieter.
+        std::fs::write(
+            dir.join("mine.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T20:40:00.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+
+        // Ranking alone: the foreign log, because it is genuinely the most active.
+        let (ranked, _) = most_recent_session(&dir).expect("ranks");
+        assert_eq!(ranked.file_name().unwrap(), "foreign.jsonl");
+
+        // With the tab's process start time, ours — and it is marked confirmed.
+        let claude_started = 1_785_271_140_000; // 2026-07-28T20:39:00Z
+        let r = resolve_session(
+            &dir,
+            &Wanted {
+                session_id: None,
+                since_ms: Some(claude_started),
+            },
+        )
+        .expect("resolves");
+        assert_eq!(r.path.file_name().unwrap(), "mine.jsonl");
+        assert!(r.owned);
+    }
+
+    #[test]
+    fn two_tabs_on_one_project_get_their_own_sessions() {
+        // Both tabs' sessions qualify on "started after my process did", so the match
+        // has to be the nearest one rather than the earliest.
+        let dir = temp_dir("twotabs");
+        std::fs::write(
+            dir.join("first.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T20:47:00.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("second.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T20:52:00.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+
+        let pick = |since: u64| {
+            resolve_session(
+                &dir,
+                &Wanted {
+                    session_id: None,
+                    since_ms: Some(since),
+                },
+            )
+            .map(|r| r.path.file_name().unwrap().to_string_lossy().into_owned())
+        };
+        // tab 1's claude started 20:46:30, tab 2's at 20:51:30.
+        assert_eq!(pick(1_785_271_590_000).as_deref(), Some("first.jsonl"));
+        assert_eq!(pick(1_785_271_890_000).as_deref(), Some("second.jsonl"));
+    }
+
+    #[test]
+    fn an_empty_hint_degrades_to_ranking_and_claims_nothing() {
+        // No claude process, no permission, a sandbox: resolution must be no worse
+        // than not having looked, and must not pretend the result is confirmed.
+        let dir = temp_dir("nohint");
+        std::fs::write(
+            dir.join("a.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T19:00:00.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        let r = resolve_session(&dir, &Wanted::default()).expect("still resolves");
+        assert_eq!(r.path.file_name().unwrap(), "a.jsonl");
+        assert!(!r.owned, "a guess is never reported as confirmed");
+
+        // A named session that does not exist also degrades rather than failing.
+        let r = resolve_session(
+            &dir,
+            &Wanted {
+                session_id: Some("00000000-0000-0000-0000-000000000000".into()),
+                since_ms: None,
+            },
+        )
+        .expect("degrades");
+        assert!(!r.owned);
     }
 
     #[test]
@@ -645,8 +921,19 @@ mod tests {
             700,
             "attached to the old session"
         );
-        let w = LogWatcher::spawn(dir.clone(), Some(old.clone()), t, off, unattached(), || {})
-            .expect("spawn");
+        let w = LogWatcher::spawn(
+            Watch {
+                dir: dir.clone(),
+                log: Some(old.clone()),
+                want: Wanted::default(),
+                owned: false,
+                attached: unattached(),
+            },
+            t,
+            off,
+            || {},
+        )
+        .expect("spawn");
 
         // The tab's own session finally writes its first line, into a NEW file.
         let fresh = dir.join("fresh.jsonl");
@@ -662,7 +949,7 @@ mod tests {
             w.rx.recv_timeout(Duration::from_secs(10))
                 .expect("switched");
         assert_eq!(
-            snap.total_output, 3,
+            snap.snap.total_output, 3,
             "the NEW file's totals, with no residue of the old session"
         );
     }
@@ -681,11 +968,15 @@ mod tests {
         assert!(!missing.exists());
 
         let w = LogWatcher::spawn(
-            missing.clone(),
-            None,
+            Watch {
+                dir: missing.clone(),
+                log: None,
+                want: Wanted::default(),
+                owned: false,
+                attached: unattached(),
+            },
             SessionTelemetry::new(),
             0,
-            unattached(),
             || {},
         )
         .expect("arms on an ancestor rather than giving up");
@@ -702,7 +993,7 @@ mod tests {
         let snap =
             w.rx.recv_timeout(Duration::from_secs(10))
                 .expect("attached");
-        assert_eq!(snap.total_output, 42);
+        assert_eq!(snap.snap.total_output, 42);
     }
 
     #[test]
@@ -715,11 +1006,15 @@ mod tests {
         let nowhere = root.join("gone").join("-Users-x-proj");
         assert!(
             LogWatcher::spawn(
-                nowhere,
-                None,
+                Watch {
+                    dir: nowhere,
+                    log: None,
+                    want: Wanted::default(),
+                    owned: false,
+                    attached: unattached()
+                },
                 SessionTelemetry::new(),
                 0,
-                unattached(),
                 || {}
             )
             .is_none(),
@@ -741,8 +1036,19 @@ mod tests {
         std::fs::write(&mine, "").unwrap();
         let (t, off) = backfill_telemetry(&mine);
         let attached = Arc::new(AtomicBool::new(true)); // the caller already attached
-        let w = LogWatcher::spawn(dir.clone(), Some(mine.clone()), t, off, attached, || {})
-            .expect("spawn");
+        let w = LogWatcher::spawn(
+            Watch {
+                dir: dir.clone(),
+                log: Some(mine.clone()),
+                want: Wanted::default(),
+                owned: false,
+                attached,
+            },
+            t,
+            off,
+            || {},
+        )
+        .expect("spawn");
 
         let append = |path: &std::path::Path, id: &str, out: u64, ts: &str| {
             let mut f = std::fs::OpenOptions::new()
@@ -761,6 +1067,7 @@ mod tests {
         assert_eq!(
             w.rx.recv_timeout(Duration::from_secs(10))
                 .expect("our own append")
+                .snap
                 .total_output,
             10
         );
@@ -779,7 +1086,7 @@ mod tests {
             last = Some(s);
         }
         assert_eq!(
-            last.expect("still ours").total_output,
+            last.expect("still ours").snap.total_output,
             15,
             "cumulative on OUR log — never reset, never the rival's 999"
         );
@@ -802,11 +1109,15 @@ mod tests {
         let (t, off) = backfill_telemetry(&a);
         let attached = Arc::new(AtomicBool::new(false));
         let w = LogWatcher::spawn(
-            dir.clone(),
-            Some(a.clone()),
+            Watch {
+                dir: dir.clone(),
+                log: Some(a.clone()),
+                want: Wanted::default(),
+                owned: false,
+                attached: attached.clone(),
+            },
             t,
             off,
-            attached.clone(),
             || {},
         )
         .expect("spawn");
@@ -825,7 +1136,7 @@ mod tests {
             seen = Some(s);
         }
         assert_eq!(
-            seen.expect("switched").total_output,
+            seen.expect("switched").snap.total_output,
             7,
             "took over while free"
         );
@@ -845,7 +1156,7 @@ mod tests {
             after = Some(s);
         }
         if let Some(s) = after {
-            assert_eq!(s.total_output, 7, "frozen on b — c never adopted");
+            assert_eq!(s.snap.total_output, 7, "frozen on b — c never adopted");
         }
     }
 
@@ -879,8 +1190,19 @@ mod tests {
         let log = dir.join("s.jsonl");
         std::fs::write(&log, "").unwrap();
         let (t, off) = backfill_telemetry(&log);
-        let w = LogWatcher::spawn(dir.clone(), Some(log.clone()), t, off, unattached(), || {})
-            .expect("spawn");
+        let w = LogWatcher::spawn(
+            Watch {
+                dir: dir.clone(),
+                log: Some(log.clone()),
+                want: Wanted::default(),
+                owned: false,
+                attached: unattached(),
+            },
+            t,
+            off,
+            || {},
+        )
+        .expect("spawn");
 
         {
             let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
@@ -893,14 +1215,17 @@ mod tests {
         let before =
             w.rx.recv_timeout(Duration::from_secs(10))
                 .expect("pre-rotation");
-        assert_eq!(before.total_output, 99);
+        assert_eq!(before.snap.total_output, 99);
 
         // Truncate: a new session in the same path.
         std::fs::write(&log, "").unwrap();
         let after =
             w.rx.recv_timeout(Duration::from_secs(10))
                 .expect("a reset must emit even with no line to fold");
-        assert_eq!(after.total_output, 0, "previous session's totals dropped");
+        assert_eq!(
+            after.snap.total_output, 0,
+            "previous session's totals dropped"
+        );
 
         // ...and the fresh accumulator folds the NEW session from zero.
         {
@@ -914,7 +1239,7 @@ mod tests {
         let fresh =
             w.rx.recv_timeout(Duration::from_secs(10))
                 .expect("new session line");
-        assert_eq!(fresh.total_output, 4, "only the new session's tokens");
+        assert_eq!(fresh.snap.total_output, 4, "only the new session's tokens");
     }
 
     #[test]
@@ -928,8 +1253,19 @@ mod tests {
         let log = dir.join("s.jsonl");
         std::fs::write(&log, "").unwrap();
         let (t, off) = backfill_telemetry(&log);
-        let w = LogWatcher::spawn(dir.clone(), Some(log.clone()), t, off, unattached(), || {})
-            .expect("spawn");
+        let w = LogWatcher::spawn(
+            Watch {
+                dir: dir.clone(),
+                log: Some(log.clone()),
+                want: Wanted::default(),
+                owned: false,
+                attached: unattached(),
+            },
+            t,
+            off,
+            || {},
+        )
+        .expect("spawn");
 
         let write = |bytes: &str| {
             let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
@@ -950,7 +1286,7 @@ mod tests {
         let s =
             w.rx.recv_timeout(Duration::from_secs(10))
                 .expect("flush on newline");
-        assert_eq!(s.total_output, 7);
+        assert_eq!(s.snap.total_output, 7);
     }
 
     #[test]

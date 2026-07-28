@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ai_monitor::telemetry::{SessionTelemetry, TelemetrySnapshot};
-use ai_monitor::{backfill_telemetry, most_recent_session, project_dir, LogWatcher};
+use ai_monitor::{backfill_telemetry, project_dir, resolve_session, LogWatcher, Wanted, Watch};
 use renderer::overlay_layer::{OverlayHandle, OverlayLayer, OverlayModel};
 use renderer::DrawLayer;
 use winit::event_loop::EventLoopProxy;
@@ -21,6 +21,7 @@ use winit::keyboard::Key;
 
 use crate::dashboard;
 use crate::seam::{AppCtx, Handled, KeyInput, Overlay};
+use crate::tabsession;
 use crate::terminal_app::UserEvent;
 
 pub struct AiMonitorOverlay {
@@ -32,6 +33,8 @@ pub struct AiMonitorOverlay {
     /// "opened but nothing folded yet".
     latest: Option<Arc<TelemetrySnapshot>>,
     cwd: Option<PathBuf>,
+    /// The tab's shell pid, root of the process tree that identifies its session.
+    shell_pid: Option<u32>,
     watcher: Option<LogWatcher>,
     proxy: EventLoopProxy<UserEvent>,
     /// This window's start time. A log whose last event precedes it stopped being
@@ -63,6 +66,7 @@ impl AiMonitorOverlay {
             handle: OverlayHandle::default(),
             latest: None,
             cwd: None,
+            shell_pid: None,
             watcher: None,
             proxy,
             started_ms: now_ms(),
@@ -81,7 +85,7 @@ impl AiMonitorOverlay {
     }
 
     /// Open on `cwd`: resolve the log, backfill, and start tailing (D1/D6).
-    fn open(&mut self, cwd: Option<PathBuf>) {
+    fn open(&mut self, cwd: Option<PathBuf>, shell_pid: Option<u32>) {
         // Re-read on open rather than holding a live handle: `settings::apply` does
         // not reach the overlays, and a value that takes effect the next time the
         // panel is opened is honest about that. A malformed config keeps the table.
@@ -89,6 +93,11 @@ impl AiMonitorOverlay {
             .ok()
             .and_then(|c| c.ai_monitor.context_window);
         self.cwd = cwd.clone();
+        self.shell_pid = shell_pid;
+        // Ask the tab's own process tree which session it is running. This is the
+        // only signal that distinguishes it from a session another application is
+        // running in the same project directory.
+        let hint = shell_pid.and_then(tabsession::hint_for).unwrap_or_default();
         self.latest = None;
         self.attach = Attachment::default();
         // A fresh flag rather than a store: the previous watcher may still be
@@ -99,26 +108,44 @@ impl AiMonitorOverlay {
         if let Some(dir) = cwd.as_deref().and_then(project_dir) {
             // Resolve *here* rather than latching one log for the watcher's lifetime:
             // it may not be this tab's session, and the tab's own session may not have
-            // written a file yet. The watcher re-resolves.
-            let log = most_recent_session(&dir).map(|(p, _)| p);
+            // written a file yet. The watcher re-resolves with the same hint.
+            let want = match hint.is_empty() {
+                // No claude process under this tab: nothing to confirm with, so
+                // resolution degrades to ranking the directory.
+                true => Wanted::default(),
+                false => Wanted {
+                    session_id: hint.session_id.clone(),
+                    since_ms: hint.started_ms,
+                },
+            };
+            let resolved = resolve_session(&dir, &want);
+            let owned = resolved.as_ref().is_some_and(|r| r.owned);
+            let log = resolved.map(|r| r.path);
             // Seed on THIS thread, exactly where `backfill` ran before: publish the
             // seeded snapshot first, then hand the accumulator to the watch thread.
             let (telemetry, offset) = match log.as_deref() {
                 Some(p) => backfill_telemetry(p),
                 None => (SessionTelemetry::new(), 0),
             };
-            self.note(Arc::new(telemetry.snapshot()));
+            self.note(Arc::new(telemetry.snapshot()), owned);
             let proxy = self.proxy.clone();
             // The watcher re-resolves only until this flag says we are attached — it
             // holds no copy of the rule. Seeded from the backfill decision just made
             // above, which is the case that used to disagree: work for a while, then
             // open the panel, and the app was attached while the watcher was not.
             self.watcher = LogWatcher::spawn(
-                dir,
-                log,
+                Watch {
+                    dir,
+                    log,
+                    want,
+                    owned,
+                    // The watcher re-resolves only until this flag says we are
+                    // attached — it holds no copy of the rule. Seeded from the
+                    // backfill decision just made above.
+                    attached: self.attached_flag.clone(),
+                },
                 telemetry,
                 offset,
-                self.attached_flag.clone(),
                 move || {
                     let _ = proxy.send_event(UserEvent::OverlayPending);
                 },
@@ -133,8 +160,8 @@ impl AiMonitorOverlay {
     /// `attached` only ever goes false -> true within an open. `last_event_ms` is a
     /// last-seen value, not a maximum, so a single out-of-order timestamp would
     /// otherwise revoke an attachment mid-session and blank the panel.
-    fn note(&mut self, snap: Arc<TelemetrySnapshot>) {
-        if !self.attach.admit(&snap, self.started_ms) {
+    fn note(&mut self, snap: Arc<TelemetrySnapshot>, owned: bool) {
+        if !self.attach.admit(&snap, self.started_ms, owned) {
             return;
         }
         self.attached_flag
@@ -194,16 +221,30 @@ struct Attachment {
     attached: bool,
     /// The session we attached to, when it named itself.
     session_id: Option<String>,
+    /// Whether the attached log was *confirmed* to be this tab's, by the process
+    /// tree. An unconfirmed attachment is the best guess available at the time and
+    /// yields to a confirmed one; a confirmed attachment yields to nothing.
+    owned: bool,
 }
 
 impl Attachment {
     /// Does this snapshot replace what is on screen? Updates the attachment.
-    fn admit(&mut self, snap: &TelemetrySnapshot, started_ms: u64) -> bool {
+    fn admit(&mut self, snap: &TelemetrySnapshot, started_ms: u64, owned: bool) -> bool {
         if !self.attached {
             if proves_ownership(snap, started_ms) {
                 self.attached = true;
                 self.session_id = snap.session_id.clone();
+                self.owned = owned;
             }
+            return true;
+        }
+        // A CONFIRMED session displaces an unconfirmed one. Without this the panel
+        // could lock onto another application's session — one running in the same
+        // project directory, legitimately active — and never let go, which is how a
+        // brand-new tab came to show `up 116h40m` from a session in Warp.
+        if owned && !self.owned {
+            self.session_id = snap.session_id.clone();
+            self.owned = true;
             return true;
         }
         // An EMPTY snapshot never erases real data. The watcher resets its
@@ -273,7 +314,7 @@ impl Overlay for AiMonitorOverlay {
             if self.visible {
                 self.close();
             } else {
-                self.open(ctx.active_cwd.clone());
+                self.open(ctx.active_cwd.clone(), ctx.active_shell_pid);
             }
             ctx.request_redraw();
             return Handled::Consumed; // R2.1 — never reaches the shell
@@ -292,17 +333,19 @@ impl Overlay for AiMonitorOverlay {
         };
         let newest = drain_to_newest(&watcher.rx);
         let changed = newest.is_some();
-        if let Some(snap) = newest {
-            self.note(snap);
+        if let Some(update) = newest {
+            self.note(update.snap, update.owned);
             self.refresh_model();
         }
         changed
     }
 
-    fn on_active_changed(&mut self, cwd: Option<PathBuf>) {
-        // Re-point only while open, and only if the session actually changed (R3.1).
-        if self.visible && cwd != self.cwd {
-            self.open(cwd);
+    fn on_active_changed(&mut self, cwd: Option<PathBuf>, shell_pid: Option<u32>) {
+        // Re-point only while open, and only if the tab actually changed (R3.1).
+        // Keyed on the shell pid as well as the cwd: two tabs in the SAME directory
+        // are different sessions, and that is exactly the case tab binding exists for.
+        if self.visible && (cwd != self.cwd || shell_pid != self.shell_pid) {
+            self.open(cwd, shell_pid);
         }
     }
 }
@@ -364,16 +407,16 @@ mod tests {
         // watcher emits an empty snapshot when a log is truncated under it.
         let launched = 1_785_226_000_000;
         let mut a = Attachment::default();
-        assert!(a.admit(&snap_of("s1", Some(launched + 1)), launched));
+        assert!(a.admit(&snap_of("s1", Some(launched + 1)), launched, false));
         assert!(a.attached);
         assert!(
-            !a.admit(&TelemetrySnapshot::default(), launched),
+            !a.admit(&TelemetrySnapshot::default(), launched, false),
             "dropped — the data on screen survives"
         );
 
         // Unattached there is nothing to lose, and this is how the empty frame renders.
         let mut b = Attachment::default();
-        assert!(b.admit(&TelemetrySnapshot::default(), launched));
+        assert!(b.admit(&TelemetrySnapshot::default(), launched, false));
     }
 
     #[test]
@@ -384,15 +427,53 @@ mod tests {
         // the result.
         let launched = 1_785_226_000_000;
         let mut a = Attachment::default();
-        assert!(a.admit(&snap_of("mine", Some(launched + 1)), launched));
+        assert!(a.admit(&snap_of("mine", Some(launched + 1)), launched, false));
         assert!(
-            !a.admit(&snap_of("rival", Some(launched + 9_000)), launched),
+            !a.admit(&snap_of("rival", Some(launched + 9_000)), launched, false),
             "a rival session's data must not take the panel"
         );
         assert!(
-            a.admit(&snap_of("mine", Some(launched + 20_000)), launched),
+            a.admit(&snap_of("mine", Some(launched + 20_000)), launched, false),
             "our own later snapshots still flow"
         );
+    }
+
+    #[test]
+    fn a_confirmed_session_displaces_an_unconfirmed_one() {
+        // The reported case: the panel attached to a live session belonging to
+        // ANOTHER application (Warp) in the same project directory, and the freeze
+        // that protects data made it permanent. A session confirmed by the tab's own
+        // process tree must be able to take it back.
+        let launched = 1_785_226_000_000;
+        let mut a = Attachment::default();
+        assert!(a.admit(&snap_of("warp", Some(launched + 1)), launched, false));
+        assert!(a.attached && !a.owned, "attached, but only as a guess");
+
+        assert!(
+            a.admit(&snap_of("mine", Some(launched + 2)), launched, true),
+            "the tab's own session takes the panel"
+        );
+        assert!(a.owned);
+        assert_eq!(a.session_id.as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn a_confirmed_attachment_yields_to_nothing() {
+        // The other direction: once confirmed, neither a rival session nor an empty
+        // snapshot can take it — the data-preservation guarantee is strongest here.
+        let launched = 1_785_226_000_000;
+        let mut a = Attachment::default();
+        assert!(a.admit(&snap_of("mine", Some(launched + 1)), launched, true));
+        assert!(a.owned);
+        assert!(
+            !a.admit(&snap_of("rival", Some(launched + 9_000)), launched, false),
+            "an unconfirmed rival cannot displace a confirmed attachment"
+        );
+        assert!(
+            !a.admit(&TelemetrySnapshot::default(), launched, true),
+            "nor can an empty snapshot, however it is labelled"
+        );
+        assert_eq!(a.session_id.as_deref(), Some("mine"));
     }
 
     #[test]
@@ -403,7 +484,7 @@ mod tests {
         let launched = 1_785_226_000_000;
         let mut a = Attachment::default();
         for last in [Some(launched + 5_000), Some(launched - 900_000), None] {
-            a.admit(&snap_of("mine", last), launched);
+            a.admit(&snap_of("mine", last), launched, false);
             assert!(a.attached, "never revoked once granted (last={last:?})");
         }
     }
@@ -414,9 +495,9 @@ mod tests {
         // find the right session.
         let launched = 1_785_226_000_000;
         let mut a = Attachment::default();
-        assert!(a.admit(&snap_of("old", Some(launched - 1)), launched));
+        assert!(a.admit(&snap_of("old", Some(launched - 1)), launched, false));
         assert!(!a.attached);
-        assert!(a.admit(&snap_of("new", Some(launched)), launched));
+        assert!(a.admit(&snap_of("new", Some(launched)), launched, false));
         assert!(a.attached);
     }
 

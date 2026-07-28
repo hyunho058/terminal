@@ -171,6 +171,14 @@ impl Session {
         cwd_of_pid(self.pty.child_pid()?)
     }
 
+    /// The pid of this tab's shell. The root of the process tree the ai-monitor
+    /// overlay searches to find *this tab's* Claude session — the only thing that
+    /// distinguishes it from a session another application is running in the same
+    /// project directory.
+    pub fn shell_pid(&self) -> Option<u32> {
+        self.pty.child_pid()
+    }
+
     /// The title the user set on this tab, or `None` (sticky-tab-title R1.1). Highest
     /// precedence on the card — it outranks the live AI-task label, which is what makes
     /// a named tab *stay* named (D3/D5).

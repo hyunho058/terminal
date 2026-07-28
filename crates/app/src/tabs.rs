@@ -220,6 +220,11 @@ impl Tabs {
     pub fn active_cwd(&self) -> Option<PathBuf> {
         self.active().cwd()
     }
+
+    /// The active tab's shell pid (ai-monitor tab binding).
+    pub fn active_shell_pid(&self) -> Option<u32> {
+        self.active().shell_pid()
+    }
 }
 
 /// The active index after closing a **different** tab (sticky-tab-title R3.7): the active
