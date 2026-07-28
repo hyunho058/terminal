@@ -777,6 +777,10 @@ impl Running {
             // title changing underneath an open menu must not close it. T6 owns opening
             // and closing it; `set` only carries the current value through.
             menu: self.tab_model.menu(),
+            // An in-flight inline rename survives a row resync too (R2.1): a background
+            // tab's title changing must not wipe the name the user is mid-way through
+            // typing on another card.
+            edit: self.tab_model.edit(),
         });
     }
 

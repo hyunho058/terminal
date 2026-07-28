@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use ai_monitor::{backfill, resolve_log, AiEvent, LogWatcher};
-use renderer::overlay_layer::{OverlayHandle, OverlayLayer, OverlayModel, Placement};
+use renderer::overlay_layer::{OverlayHandle, OverlayLayer, OverlayModel};
 use renderer::DrawLayer;
 use winit::event_loop::EventLoopProxy;
 use winit::keyboard::Key;
@@ -84,9 +84,6 @@ impl AiMonitorOverlay {
         self.handle.set(OverlayModel {
             visible: self.visible,
             lines,
-            // The log pane keeps its bottom-panel placement (sticky-tab-title only added
-            // the choice; it did not change this overlay).
-            placement: Placement::default(),
         });
     }
 }

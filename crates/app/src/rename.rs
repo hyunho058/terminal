@@ -14,8 +14,7 @@
 //! A tab switch cancels the edit and lets the switch happen; a dead target closes it.
 //! Nothing half-typed is ever committed.
 
-use renderer::overlay_layer::{OverlayHandle, OverlayLayer, OverlayModel, Placement};
-use renderer::DrawLayer;
+use renderer::sidebar_row::{CardEdit, TabModelHandle};
 use winit::keyboard::{Key, NamedKey};
 
 use crate::seam::{AppCtx, Handled, KeyInput, Overlay, OverlayCommand};
@@ -27,14 +26,14 @@ use crate::session::TabId;
 /// over it.
 const PRIORITY: i32 = 200;
 
-/// The caret drawn after the text. A block, so it reads as a text cursor at any font size.
-const CARET: char = '▏';
-
 /// The rename field's state. `None` = closed; the field is modal, so at most one is open
 /// and it always knows which tab it is naming (D8a.3 — the card menu can target a tab
 /// that is not active).
 pub struct RenameOverlay {
-    handle: OverlayHandle,
+    /// The sidebar model — the edit is drawn **on the card itself**, in place of that
+    /// tab's line-1 label, rather than in a floating panel. Renaming happens where the
+    /// name lives.
+    model: TabModelHandle,
     open: Option<Editing>,
 }
 
@@ -53,7 +52,7 @@ struct Editing {
 impl RenameOverlay {
     pub fn new() -> RenameOverlay {
         RenameOverlay {
-            handle: OverlayHandle::default(),
+            model: TabModelHandle::shared(),
             open: None,
         }
     }
@@ -95,20 +94,18 @@ impl RenameOverlay {
         self.refresh_model();
     }
 
-    /// Push the current visibility + rendered lines into the draw layer.
+    /// Push the current edit onto the card being renamed (or clear it).
+    ///
+    /// The IME preedit is appended to the text here rather than carried separately: the
+    /// card draws one string, and an uncommitted composition should appear at the caret
+    /// exactly as typed. It is still not part of the *value* — `commit` reads
+    /// `editing.text` alone, so cancelling mid-composition cannot leave half a jamo in a
+    /// title.
     fn refresh_model(&self) {
-        let lines = match &self.open {
-            Some(editing) => vec![
-                "Rename tab  —  Enter to save, Esc to cancel, empty to reset".to_string(),
-                format!("{}{}{CARET}", editing.text, editing.preedit),
-            ],
-            None => Vec::new(),
-        };
-        self.handle.set(OverlayModel {
-            visible: self.open.is_some(),
-            lines,
-            placement: Placement::CenteredPrompt,
-        });
+        self.model.set_edit(self.open.as_ref().map(|e| CardEdit {
+            tab_id: e.tab.0,
+            text: format!("{}{}", e.text, e.preedit),
+        }));
     }
 
     /// Apply one keystroke to the open field. Returns whether the edit is finished
@@ -202,9 +199,8 @@ impl Overlay for RenameOverlay {
         Handled::Consumed
     }
 
-    fn layer(&self) -> Box<dyn DrawLayer> {
-        Box::new(OverlayLayer::from_handle(self.handle.clone()))
-    }
+    // No `layer()` override: this overlay draws through the sidebar's model, onto the card
+    // it is renaming, so it registers no surface of its own (the seam's default no-op).
 
     fn on_command(&mut self, cmd: &OverlayCommand) -> Handled {
         match cmd {

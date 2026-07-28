@@ -169,6 +169,26 @@ pub struct TabBarModel {
     /// read one value and cannot disagree about whether a popup is on screen (SD2). The
     /// **app** owns both the decision to open it and what it says.
     pub menu: Option<CardMenu>,
+    /// The in-progress inline rename, if any (sticky-tab-title R2.1). `None` = nobody is
+    /// being renamed.
+    pub edit: Option<CardEdit>,
+}
+
+/// An in-progress inline rename (sticky-tab-title R2.1): the tab being named and the text
+/// typed so far, including any uncommitted IME composition.
+///
+/// Keyed by `tab_id`, not by row index — the same join `RowMeta` uses — so a roster shift
+/// under an open editor cannot retarget it to a different tab.
+///
+/// The renderer draws this **in place of** the resolved line-1 label on that one card. It
+/// is the app's state: the app decides what is being edited and what the text is, and the
+/// renderer only paints it, exactly like [`CardMenu`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CardEdit {
+    /// The tab being renamed (`session::TabId` as a plain `u64` — SD3).
+    pub tab_id: u64,
+    /// The text typed so far, with any IME preedit already appended by the app.
+    pub text: String,
 }
 
 /// The open per-card menu as the app hands it over (sticky-tab-title D4/R3.2): which card
@@ -355,6 +375,46 @@ pub(crate) fn card_line1_text<'a>(resolved: &'a str, cwd_title: &'a str) -> &'a 
     }
 }
 
+/// The caret drawn at the end of an inline rename. A thin bar, so it reads as a text
+/// cursor rather than as a character in the name.
+pub(crate) const EDIT_CARET: char = '▏';
+
+/// What to draw on line 1 while a card is being renamed (sticky-tab-title R2.1): the typed
+/// text with the caret appended, **tail-anchored** so the caret is always visible.
+///
+/// Editing happens in a card barely wider than a word, so a name longer than the card is
+/// the normal case, not the edge case. Truncating from the end — what
+/// [`truncate_to_width`] does for labels — would hide the very characters being typed, so
+/// this keeps the END of the string and drops from the front, marking the elision with a
+/// leading ellipsis.
+pub(crate) fn edit_line_text(text: &str, advance: f32, max_w: f32, ellipsis: char) -> String {
+    if max_w <= 0.0 || advance <= 0.0 {
+        return String::new();
+    }
+    let max_chars = (max_w / advance).floor() as usize;
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out: String = text.chars().collect();
+    out.push(EDIT_CARET);
+    let len = out.chars().count();
+    if len <= max_chars {
+        return out;
+    }
+    // Keep the last `max_chars - 1` chars (the caret among them) and mark the cut. With
+    // room for a single glyph there is nothing to mark — an ellipsis alone would say
+    // "something is here" while hiding the cursor, so the caret wins.
+    let keep = max_chars - 1;
+    if keep == 0 {
+        return EDIT_CARET.to_string();
+    }
+    let tail: String = out.chars().skip(len - keep).collect();
+    let mut trimmed = String::with_capacity(tail.len() + ellipsis.len_utf8());
+    trimmed.push(ellipsis);
+    trimmed.push_str(&tail);
+    trimmed
+}
+
 /// The x-origin (physical px) at which line 2's git-branch icon may start after the repo name,
 /// or `None` when even the icon (`meta_px` wide) would overrun `right_edge` (tab-identity,
 /// R2.2 — the repo has priority, so a branch that can't fit is dropped rather than clipped).
@@ -400,6 +460,9 @@ pub struct SidebarModel {
     /// The open card menu (sticky-tab-title D10/R3.2), written by the app through
     /// [`TabModelHandle::set`] / [`TabModelHandle::set_menu`]. `None` = none open.
     pub menu: Option<CardMenu>,
+    /// The in-progress inline rename (sticky-tab-title R2.1), written by the rename
+    /// overlay through [`TabModelHandle::set_edit`]. `None` = nobody is being renamed.
+    pub edit: Option<CardEdit>,
     /// Installed once from `main.rs` (D10). Private: only this module's layer reads it.
     meta_source: Option<Rc<dyn MetaSource>>,
 }
@@ -435,7 +498,23 @@ impl TabModelHandle {
         m.active = model.active;
         m.waiting = model.waiting;
         m.menu = model.menu;
+        m.edit = model.edit;
         m.rows_rev = m.rows_rev.wrapping_add(1);
+    }
+
+    /// Start / update / end an inline rename (sticky-tab-title R2.1), bumping `rows_rev`
+    /// so the layer repaints. Called on every keystroke, so it deliberately avoids
+    /// `Tabs::titles`' per-tab `proc_pidinfo` — same reasoning as `set_menu`.
+    pub fn set_edit(&self, edit: Option<CardEdit>) {
+        let mut m = self.0.borrow_mut();
+        m.edit = edit;
+        m.rows_rev = m.rows_rev.wrapping_add(1);
+    }
+
+    /// The in-progress inline rename, cloned — so a row resync carries it through `set`
+    /// rather than cancelling the edit the user is in the middle of.
+    pub fn edit(&self) -> Option<CardEdit> {
+        self.0.borrow().edit.clone()
     }
 
     /// Open or close a card's menu (sticky-tab-title R3.2), bumping `rows_rev` so the
@@ -995,7 +1074,7 @@ impl DrawLayer for TabBar {
 
         // Copy everything out of the model under ONE borrow, then release it (D3) before
         // touching the (possibly reentrant) metadata source.
-        let (rows, active, hovered, rows_rev, list_top, scroll_px, waiting, menu, source) =
+        let (rows, active, hovered, rows_rev, list_top, scroll_px, waiting, menu, edit, source) =
             self.model.with(|m| {
                 (
                     m.rows.clone(),
@@ -1006,6 +1085,7 @@ impl DrawLayer for TabBar {
                     m.scroll_px,
                     m.waiting.clone(),
                     m.menu.clone(),
+                    m.edit.clone(),
                     m.meta_source.clone(),
                 )
             });
@@ -1234,19 +1314,58 @@ impl DrawLayer for TabBar {
             // Line 1 stops short of the hamburger (sticky-tab-title R3.1) — line 2 keeps
             // the full width, since the button only occupies the title line.
             let line1_right = (button.x - icon_gap).min(right_edge);
-            push_glyphs(
-                &mut text,
-                ctx,
-                title_text,
-                title_x,
-                inner_top,
-                cell,
-                1.0,
-                true,
-                linear(theme.title_fg, 1.0),
-                (line1_right - title_x).max(0.0),
-                ellipsis,
-            );
+            // Is THIS card being renamed (sticky-tab-title R2.1)? Joined by `tab_id`, not
+            // by index, so a roster shift cannot move the editor to another tab.
+            let editing = edit.as_ref().filter(|e| e.tab_id == rows[i].tab_id);
+            if let Some(e) = editing {
+                // A field treatment behind the title line, so the card reads as an input
+                // rather than as a label that mysteriously changed.
+                let field = [
+                    title_x - m.card_gap * 0.5,
+                    inner_top - m.card_gap * 0.25,
+                    (line1_right - title_x + m.card_gap).max(0.0),
+                    cell[1] + m.card_gap * 0.5,
+                ];
+                if let Some(bg) = SidebarShape::rounded_box(
+                    field,
+                    m.card_radius * 0.5,
+                    m.border_w,
+                    Fill::solid(linear(theme.panel_bg, 1.0)),
+                    linear(theme.card_border_active, 1.0),
+                ) {
+                    shapes.push(bg);
+                }
+                // Tail-anchored so the caret stays visible while typing a long name.
+                let line =
+                    edit_line_text(&e.text, cell[0], (line1_right - title_x).max(0.0), ellipsis);
+                push_glyphs(
+                    &mut text,
+                    ctx,
+                    &line,
+                    title_x,
+                    inner_top,
+                    cell,
+                    1.0,
+                    true,
+                    linear(theme.title_fg, 1.0),
+                    (line1_right - title_x).max(0.0),
+                    ellipsis,
+                );
+            } else {
+                push_glyphs(
+                    &mut text,
+                    ctx,
+                    title_text,
+                    title_x,
+                    inner_top,
+                    cell,
+                    1.0,
+                    true,
+                    linear(theme.title_fg, 1.0),
+                    (line1_right - title_x).max(0.0),
+                    ellipsis,
+                );
+            }
 
             // Line 2 (D6-reserved). When a task label took line 1, the repo/folder name
             // (the cwd title) moves here as the secondary identity, ahead of the git branch
@@ -1637,6 +1756,42 @@ mod tests {
             card_line1_text("refactor the auth module", "terminal"),
             "refactor the auth module"
         );
+    }
+
+    #[test]
+    fn edit_line_shows_the_caret_at_the_end() {
+        // sticky-tab-title R2.1 — the inline field is the card's own title line, so the
+        // caret has to be part of the drawn string.
+        assert_eq!(edit_line_text("Front", 10.0, 200.0, '…'), "Front▏");
+        // An empty name still shows a caret, so an opened field is visibly an input.
+        assert_eq!(edit_line_text("", 10.0, 200.0, '…'), "▏");
+    }
+
+    #[test]
+    fn edit_line_keeps_the_tail_visible_when_the_name_outgrows_the_card() {
+        // The whole reason this is not `truncate_to_width`: a sidebar card is barely
+        // wider than a word, so a name longer than the card is NORMAL while typing.
+        // Truncating from the end would hide the characters being typed and the caret.
+        let long = "Frontend-service-worker";
+        // 6 chars fit at advance 10 in 60px.
+        let out = edit_line_text(long, 10.0, 60.0, '…');
+        assert!(out.ends_with('▏'), "caret stays visible: {out}");
+        assert!(out.starts_with('…'), "elision marked at the FRONT: {out}");
+        assert!(
+            out.chars().count() as f32 * 10.0 <= 60.0,
+            "never wider than the field"
+        );
+        // It is the tail of the name that survives, not the head.
+        assert!(out.contains("rker"), "kept the end of the string: {out}");
+        assert!(!out.contains("Front"), "dropped the head: {out}");
+    }
+
+    #[test]
+    fn edit_line_degenerate_widths_do_not_panic() {
+        assert_eq!(edit_line_text("abc", 10.0, 0.0, '…'), "");
+        assert_eq!(edit_line_text("abc", 0.0, 100.0, '…'), "");
+        // Exactly one char of room: the caret alone wins, since it is the tail.
+        assert_eq!(edit_line_text("abc", 10.0, 10.0, '…'), "▏");
     }
 
     #[test]

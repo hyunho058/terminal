@@ -188,7 +188,20 @@ pub trait Overlay {
     fn visible(&self) -> bool;
     fn on_key(&mut self, input: &KeyInput, ctx: &mut AppCtx) -> Handled;
     /// The overlay's draw layer, registered with the renderer.
-    fn layer(&self) -> Box<dyn DrawLayer>;
+    ///
+    /// Default: a no-op layer, for an overlay that draws through **someone else's**
+    /// model rather than a layer of its own — the inline rename field paints onto the
+    /// sidebar card it is renaming, so it owns no surface to register.
+    fn layer(&self) -> Box<dyn DrawLayer> {
+        struct NoLayer;
+        impl DrawLayer for NoLayer {
+            fn z_order(&self) -> i32 {
+                0
+            }
+            fn record(&mut self, _: &mut renderer::FrameCtx<'_>) {}
+        }
+        Box::new(NoLayer)
+    }
     /// Drain any background work (e.g. a log-tail channel) into the overlay's
     /// draw model. Called when a `UserEvent` signals the overlay has pending data.
     /// Returns true if something changed (→ redraw). Default: nothing to do.

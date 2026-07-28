@@ -18,28 +18,12 @@ use wgpu::util::DeviceExt;
 use crate::tab_bar::{layout_line, truncate_cols};
 use crate::{DrawLayer, FrameCtx};
 
-/// Where an overlay's panel sits (sticky-tab-title R2.1). The ai-monitor wants a log
-/// pane along the bottom; a rename prompt wants a small box in the middle. Both are the
-/// same panel-plus-lines drawing, so this is a placement choice rather than a second
-/// layer with its own duplicated text pipeline.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Placement {
-    /// The lower 55% of the window — the ai-monitor's log pane (its original behaviour).
-    #[default]
-    BottomPanel,
-    /// A small centred box sized to its lines — the rename prompt.
-    CenteredPrompt,
-}
-
 /// Plain data the overlay renders (D6-style one-way flow).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OverlayModel {
     pub visible: bool,
     /// Lines to show, oldest first (newest drawn at the bottom).
     pub lines: Vec<String>,
-    /// Where to put the panel. Defaults to the ai-monitor's bottom pane, so existing
-    /// callers are unchanged.
-    pub placement: Placement,
 }
 
 /// A cloneable write handle the app keeps to push new models.
@@ -59,37 +43,12 @@ const PANEL_BG: [f32; 4] = [0.04, 0.05, 0.07, 0.88]; // translucent dark
 const TEXT_FG: u32 = 0xE6E1CF;
 const PAD: f32 = 10.0;
 
-/// The panel's rect for a placement (sticky-tab-title R2.1). Pure, so the centred
-/// prompt's sizing is unit-tested without a GPU.
-///
-/// `BottomPanel` is the original ai-monitor pane, unchanged. `CenteredPrompt` is sized to
-/// its lines and centred **within the terminal area** — right of the sidebar's
-/// `left_inset` and below `top_inset`, so it does not sit half-under the sidebar.
-fn panel_rect(
-    placement: Placement,
-    viewport: [f32; 2],
-    top_inset: f32,
-    left_inset: f32,
-    cell_h: f32,
-    lines: usize,
-) -> [f32; 4] {
+/// The log pane's rect: the lower 55% of the window, never above `top_inset`. Pure, so
+/// the sizing is unit-tested without a GPU.
+fn panel_rect(viewport: [f32; 2], top_inset: f32) -> [f32; 4] {
     let (vw, vh) = (viewport[0], viewport[1]);
-    match placement {
-        Placement::BottomPanel => {
-            let top = (vh * 0.45).max(top_inset);
-            [0.0, top, vw, vh - top]
-        }
-        Placement::CenteredPrompt => {
-            let avail_w = (vw - left_inset).max(0.0);
-            let w = (avail_w * 0.5).clamp(0.0, avail_w);
-            let h = lines as f32 * cell_h + 2.0 * PAD;
-            let x = left_inset + (avail_w - w) * 0.5;
-            // A third of the way down reads better than dead-centre for a prompt, and
-            // keeps it clear of the top inset.
-            let y = (top_inset + (vh - top_inset - h) * 0.33).max(top_inset);
-            [x, y, w, h]
-        }
-    }
+    let top = (vh * 0.45).max(top_inset);
+    [0.0, top, vw, vh - top]
 }
 
 /// z-order: above the tab bar (10), a genuine overlay.
@@ -344,14 +303,7 @@ impl DrawLayer for OverlayLayer {
         }
         self.ensure_gpu(ctx);
         let (vw, vh) = (ctx.viewport[0], ctx.viewport[1]);
-        let panel = panel_rect(
-            model.placement,
-            [vw, vh],
-            ctx.top_inset,
-            ctx.left_inset,
-            ctx.cell[1],
-            model.lines.len(),
-        );
+        let panel = panel_rect([vw, vh], ctx.top_inset);
 
         let rects = [RectInstance {
             rect: panel,
@@ -508,50 +460,17 @@ mod tests {
         h.set(OverlayModel {
             visible: true,
             lines: vec!["a".into(), "b".into()],
-            placement: Placement::default(),
         });
         assert!(h.snapshot().visible);
         assert_eq!(h.snapshot().lines.len(), 2);
     }
 
     #[test]
-    fn bottom_panel_placement_is_unchanged() {
-        // sticky-tab-title only ADDED a placement; the ai-monitor's pane must still be
-        // the full-width lower 55%, clamped below the top inset.
-        let r = panel_rect(Placement::BottomPanel, [800.0, 600.0], 0.0, 0.0, 16.0, 3);
-        assert_eq!(r, [0.0, 270.0, 800.0, 330.0]);
+    fn log_pane_is_the_lower_55_percent_below_the_top_inset() {
+        // The ai-monitor's pane: full width, lower 55% of the window.
+        assert_eq!(panel_rect([800.0, 600.0], 0.0), [0.0, 270.0, 800.0, 330.0]);
         // The top inset wins when it would otherwise overlap the tab bar.
-        let clamped = panel_rect(Placement::BottomPanel, [800.0, 600.0], 400.0, 0.0, 16.0, 3);
-        assert_eq!(clamped[1], 400.0);
-    }
-
-    #[test]
-    fn centered_prompt_sits_in_the_terminal_area_not_under_the_sidebar() {
-        // R2.1 — the rename prompt is centred within the area right of the sidebar, so a
-        // wide sidebar cannot leave it half-hidden.
-        let left = 300.0;
-        let r = panel_rect(
-            Placement::CenteredPrompt,
-            [1000.0, 600.0],
-            0.0,
-            left,
-            16.0,
-            2,
-        );
-        assert!(r[0] >= left, "starts right of the sidebar");
-        assert!(r[0] + r[2] <= 1000.0, "stays inside the window");
-        // Centred within the available width.
-        let avail = 1000.0 - left;
-        assert_eq!(r[0], left + (avail - r[2]) * 0.5);
-    }
-
-    #[test]
-    fn centered_prompt_height_follows_its_line_count() {
-        // The prompt is sized to its content (a title line + the edited text), not to a
-        // fixed box, so it never clips the line being typed.
-        let two = panel_rect(Placement::CenteredPrompt, [800.0, 600.0], 0.0, 0.0, 16.0, 2);
-        let three = panel_rect(Placement::CenteredPrompt, [800.0, 600.0], 0.0, 0.0, 16.0, 3);
-        assert_eq!(three[3] - two[3], 16.0);
+        assert_eq!(panel_rect([800.0, 600.0], 400.0)[1], 400.0);
     }
 
     #[test]
