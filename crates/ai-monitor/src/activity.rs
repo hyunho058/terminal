@@ -24,14 +24,18 @@ const PROMPT_TAIL: usize = 8;
 
 /// How the LAST *meaningful* message (a line whose `message.role` is `assistant` or
 /// `user`) classifies for the input-waiting rule (D16 of `left-sidebar-waiting-area`).
-/// The app maps `AssistantEndTurn` → `Waiting` and every other variant → `Busy`; a `None`
-/// on [`TailState::last`] (no meaningful line, or the newest record could not be robustly
-/// parsed — truncated by the tail cap / half-written) must NOT be read as Waiting
-/// (conservative bias: a false "waiting" is the worst failure).
+/// The app maps `AssistantEndTurn` and `AssistantAsksUser` → `Waiting` and every other
+/// variant → `Busy`; a `None` on [`TailState::last`] (no meaningful line, or the newest
+/// record could not be robustly parsed — truncated by the tail cap / half-written) must
+/// NOT be read as Waiting (conservative bias: a false "waiting" is the worst failure).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LastMessage {
     /// assistant turn whose `stop_reason == "end_turn"`: control handed back to the human.
     AssistantEndTurn,
+    /// assistant turn that called a tool from [`BLOCKING_TOOLS`] — a question put to the
+    /// human. Its `stop_reason` is `"tool_use"` like any other tool call, but the agent
+    /// cannot proceed until a person answers, so it is a *waiting* signal, not busy.
+    AssistantAsksUser,
     /// assistant turn mid-work (`stop_reason == "tool_use"`, or anything not `end_turn`).
     AssistantBusy,
     /// user line carrying a top-level `toolUseResult` (a tool result the agent is consuming).
@@ -229,8 +233,32 @@ fn last_meaningful(text: &str) -> Option<LastMessage> {
     None
 }
 
+/// The CLOSED list of tool names that block on a human *by definition*: the agent emits
+/// the call and then cannot make progress until a person answers it. Both are Claude Code
+/// tools whose only possible resolution is human input — `AskUserQuestion` puts a question
+/// to the user, `ExitPlanMode` asks them to approve a plan.
+///
+/// This list is deliberately closed and exact-matched. It must never grow to cover tools
+/// that merely *tend* to be slow or that a permission prompt *might* gate (`Bash`, `Edit`,
+/// …): those resolve on their own in the common case, and a wrong entry here manufactures a
+/// false "waiting" — the worst failure this module can produce. A new entry needs the same
+/// bar: blocking on a human is the tool's definition, not a mode it sometimes enters.
+///
+/// Evidence bar per entry: `AskUserQuestion` is **log-verified** — every record sampled
+/// (400+ across the author's `~/.claude/projects/**/*.jsonl`) carries `stop_reason:
+/// "tool_use"` with the name in a `tool_use` block, with no exceptions; in the sampled
+/// session the answering line landed 99 s later. That corpus is private and mutating, so
+/// the shape is the reproducible claim here, not any exact count.
+/// `ExitPlanMode` is **by construction** — no real `tool_use` record was available to
+/// sample, and under auto-accept-plan it can resolve without a person. Both directions of
+/// that uncertainty are safe: a wrong shape simply never matches and the turn reads `Busy`.
+const BLOCKING_TOOLS: &[&str] = &["AskUserQuestion", "ExitPlanMode"];
+
 /// An assistant message is `AssistantEndTurn` iff its stop reason is `end_turn`
-/// (`.message.stop_reason`, else top-level `.stopReason`); otherwise `AssistantBusy`.
+/// (`.message.stop_reason`, else top-level `.stopReason`). Otherwise, if it called a
+/// [`BLOCKING_TOOLS`] tool it is `AssistantAsksUser` (`stop_reason` is `tool_use` there
+/// too, which is why the tool name — not the stop reason — is the signal); else
+/// `AssistantBusy`. `end_turn` is checked FIRST so the existing signal keeps precedence.
 fn classify_assistant(v: &Value) -> LastMessage {
     let stop = v
         .pointer("/message/stop_reason")
@@ -238,9 +266,36 @@ fn classify_assistant(v: &Value) -> LastMessage {
         .or_else(|| v.get("stopReason").and_then(Value::as_str));
     if stop == Some("end_turn") {
         LastMessage::AssistantEndTurn
+    } else if calls_blocking_tool(v) {
+        LastMessage::AssistantAsksUser
     } else {
         LastMessage::AssistantBusy
     }
+}
+
+/// Whether `v`'s content carries a `tool_use` block whose `name` is in [`BLOCKING_TOOLS`].
+/// Array content only — the string form of `message.content` carries no tool calls. Exact
+/// name match; an absent/odd shape simply yields `false` (never panics, D14).
+///
+/// Unlike the `stop_reason` check, this needs the record's whole `content` array to be
+/// inside [`TAIL_CAP`], since the `tool_use` block can be the last thing in it. Measured
+/// over the sampled real `AskUserQuestion` records: median 2.2 KiB, p90 3.5 KiB, max
+/// 6.0 KiB — inside the 8 KiB window, but with only ~25% headroom. A record that outgrew
+/// the cap is cut, and either [`last_meaningful`] sees an unreadable newest line and
+/// returns `None` (caller falls back to the never-Waiting recency rule) or, if nothing
+/// parseable remains in the window at all, [`tail_state`] itself returns `None` (caller
+/// reads `Unknown`). Both paths miss the signal rather than fake it. If that headroom ever
+/// closes, raise [`TAIL_CAP`] — do not loosen the match.
+fn calls_blocking_tool(v: &Value) -> bool {
+    let Some(items) = v.pointer("/message/content").and_then(Value::as_array) else {
+        return false;
+    };
+    items.iter().any(|b| {
+        b.get("type").and_then(Value::as_str) == Some("tool_use")
+            && b.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| BLOCKING_TOOLS.contains(&n))
+    })
 }
 
 /// A user message is `UserToolResult` iff it carries a top-level `toolUseResult` (the agent
@@ -323,6 +378,132 @@ mod tests {
             tail_state(&log).expect("tail").last,
             Some(LastMessage::AssistantBusy)
         );
+    }
+
+    /// The real `AskUserQuestion` record shape, transcribed verbatim from a live session
+    /// log (`~/.claude/projects/**/*.jsonl`): `stop_reason: "tool_use"` — indistinguishable
+    /// from any other tool call by stop reason alone — with the tool name in a `tool_use`
+    /// content block. In that log the answering `user` line landed 99 s later, so this
+    /// record really is the newest one while the human decides.
+    const ASK_USER_QUESTION_LINE: &str = concat!(
+        r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","#,
+        r#""content":[{"type":"tool_use","id":"toolu_01","name":"AskUserQuestion","#,
+        r#""input":{"questions":[]}}]}}"#
+    );
+
+    #[test]
+    fn ask_user_question_is_a_waiting_signal_not_busy() {
+        // The bug: AskUserQuestion carries stop_reason "tool_use", so it used to read
+        // AssistantBusy and the sidebar never saw a rising edge into Waiting.
+        let log = tmpfile("askuser", ASK_USER_QUESTION_LINE.as_bytes());
+        assert_eq!(
+            tail_state(&log).expect("tail").last,
+            Some(LastMessage::AssistantAsksUser)
+        );
+    }
+
+    #[test]
+    fn exit_plan_mode_is_a_waiting_signal() {
+        // The other half of the closed list — plan approval also blocks on a human.
+        let body = concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","#,
+            r#""content":[{"type":"tool_use","id":"toolu_02","name":"ExitPlanMode","#,
+            r#""input":{"plan":"do the thing"}}]}}"#
+        );
+        let log = tmpfile("exitplan", body.as_bytes());
+        assert_eq!(
+            tail_state(&log).expect("tail").last,
+            Some(LastMessage::AssistantAsksUser)
+        );
+    }
+
+    #[test]
+    fn ordinary_tool_calls_stay_busy() {
+        // The closed list is exact-matched: a normal tool call — even a long-running one,
+        // and even one whose name merely resembles a blocking tool — is still Busy. This
+        // is the conservative bias: only a tool that blocks on a human by definition may
+        // yield Waiting.
+        for name in [
+            "Bash",
+            "Edit",
+            "Read",
+            "AskUserQuestionHelper",
+            "askuserquestion",
+        ] {
+            let body = format!(
+                concat!(
+                    r#"{{"type":"assistant","message":{{"role":"assistant","stop_reason":"tool_use","#,
+                    r#""content":[{{"type":"tool_use","id":"toolu_03","name":"{}","input":{{}}}}]}}}}"#
+                ),
+                name
+            );
+            let log = tmpfile(&format!("busy-{name}"), body.as_bytes());
+            assert_eq!(
+                tail_state(&log).expect("tail").last,
+                Some(LastMessage::AssistantBusy),
+                "{name} is not a blocking tool"
+            );
+        }
+    }
+
+    #[test]
+    fn blocking_tool_name_outside_a_tool_use_block_stays_busy() {
+        // Only a `type: "tool_use"` block counts. The tool NAME appearing in assistant
+        // prose (e.g. "I'll use AskUserQuestion next") must not fake a waiting signal.
+        let body = concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","#,
+            r#""content":[{"type":"text","text":"next I will call AskUserQuestion"},"#,
+            r#"{"type":"tool_use","id":"toolu_04","name":"Read","input":{}}]}}"#
+        );
+        let log = tmpfile("prose-mention", body.as_bytes());
+        assert_eq!(
+            tail_state(&log).expect("tail").last,
+            Some(LastMessage::AssistantBusy),
+            "a name in prose is not a tool call"
+        );
+    }
+
+    #[test]
+    fn end_turn_wins_over_the_blocking_tool_check() {
+        // Ordering: `end_turn` is checked FIRST, so the pre-existing signal keeps
+        // precedence and this change cannot reclassify anything that already worked.
+        let body = concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","#,
+            r#""content":[{"type":"tool_use","id":"toolu_05","name":"AskUserQuestion","input":{}}]}}"#
+        );
+        let log = tmpfile("endturn-and-ask", body.as_bytes());
+        assert_eq!(
+            tail_state(&log).expect("tail").last,
+            Some(LastMessage::AssistantEndTurn)
+        );
+    }
+
+    #[test]
+    fn an_answered_question_is_busy_again() {
+        // Once the human answers, the tool_result user line is the newest meaningful
+        // message — so the tab must leave Waiting and read Busy again (the falling edge
+        // `waiting.rs` needs to clear the band item).
+        let body = format!(
+            "{ASK_USER_QUESTION_LINE}\n{}\n",
+            r#"{"type":"user","message":{"role":"user"},"toolUseResult":{"answer":"ok"}}"#
+        );
+        let log = tmpfile("askuser-answered", body.as_bytes());
+        assert_eq!(
+            tail_state(&log).expect("tail").last,
+            Some(LastMessage::UserToolResult)
+        );
+    }
+
+    #[test]
+    fn truncated_record_after_a_question_suppresses_the_signal() {
+        // Conservative bias holds for the NEW signal too: a half-written newer line means
+        // the newest record is unreadable → `None`, never Waiting.
+        let body = format!(
+            "{ASK_USER_QUESTION_LINE}\n{}",
+            r#"{"type":"user","message":{"role":"user""#
+        );
+        let log = tmpfile("askuser-truncated", body.as_bytes());
+        assert_eq!(tail_state(&log).expect("tail").last, None);
     }
 
     #[test]

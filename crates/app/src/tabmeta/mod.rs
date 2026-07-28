@@ -67,11 +67,14 @@ pub enum AgentState {
     /// Mid-turn: the agent is actively working (a tool_use turn, a tool_result the agent is
     /// consuming, a fresh human prompt it is about to answer, or a recent append).
     Busy,
-    /// The agent finished its turn and handed control back to the human — waiting for MY
-    /// input (D4/D16 of `left-sidebar-waiting-area`). Produced only when the last meaningful
-    /// log message is an assistant `stop_reason == "end_turn"`. The waiting-band feature
-    /// (T4) renders the input-waiting affordance for this; earlier features treat it as an
-    /// attention state (see `sidebar_model::mark_for`).
+    /// The agent handed control back to the human — waiting for MY input (D4/D16 of
+    /// `left-sidebar-waiting-area`). Produced by exactly two precise log signals: the last
+    /// meaningful message is an assistant `stop_reason == "end_turn"` (the turn is over), or
+    /// it is an assistant turn calling a tool that blocks on a person, such as
+    /// `AskUserQuestion` (`ai_monitor::activity::LastMessage::AssistantAsksUser`). Never
+    /// produced by the recency fallback — a false "waiting" is the worst failure. The
+    /// waiting-band feature (T4) renders the input-waiting affordance for this; earlier
+    /// features treat it as an attention state (see `sidebar_model::mark_for`).
     Waiting,
     Idle,
     Unknown,
