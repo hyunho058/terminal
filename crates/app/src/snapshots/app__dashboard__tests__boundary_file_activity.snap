@@ -1,0 +1,9 @@
+---
+source: crates/app/src/dashboard.rs
+expression: "file_activity(&t).join(\"\\n\")"
+---
+── File Activity +1 more ───────────────────────────────────────────────────────────────────────────────
+  READ  ✓ …/renderer/atlas.rs 430ms
+  GREP  ✓ src/.*/mod\.rs 1.2s
+  WRITE ✗ …/src/dashboard.rs 1m02s
+  LIST  ✓ **/*.toml —

@@ -1,0 +1,9 @@
+---
+source: crates/app/src/dashboard.rs
+expression: "tasks(&t).join(\"\\n\")"
+---
+── Tasks +2 more ───────────────────────────────────────────────────────────────────────────────────────
+  Fold usage per message id · in_progress
+  Pin the worked examples · completed · 10m40s
+  Audit the dedupe keying · blocked
+  Measure the model census · in_progress

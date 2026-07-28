@@ -18,7 +18,7 @@
 //!   clock, no filesystem, no globals — which is what makes the `insta` snapshots
 //!   byte-stable.
 
-use ai_monitor::telemetry::TelemetrySnapshot;
+use ai_monitor::telemetry::{FileOp, TaskEntry, TelemetrySnapshot};
 
 /// Nominal rule length. At the default 900x540 logical window with `size_pt: 14.0`
 /// on a 2x display, `cw = round(14*2*0.6) = 17` and the full-width panel budgets
@@ -34,6 +34,46 @@ const LABEL_COLS: usize = 8;
 
 /// The placeholder for every unknown value (U+2014).
 pub const DASH: &str = "—";
+
+// ---- section policy (B1/B2) ---------------------------------------------------
+//
+// Row caps deliberately EXCEED the default window's ~14-line budget. Sizing to 14
+// would show one row per section on the large windows where this dashboard is
+// actually read, and the app cannot size adaptively — it is height-blind for the
+// same freshness reason it is width-blind. What makes the overflow safe is the
+// order: the renderer keeps the LAST `max_lines` (`overlay_layer.rs:268`), so the
+// least disposable content is composed last. Tasks clip first, the summary never.
+//
+// Populated: 5 rules + 19 rows + the 4-line summary = 28 lines. Empty: 5 inline
+// rules + 4 = 9 (B3 puts the empty state ON the rule rather than spending a row).
+const TASKS_ROWS: usize = 4;
+const SKILLS_ROWS: usize = 3;
+const TOOLS_ROWS: usize = 4;
+const FILES_ROWS: usize = 4;
+const AGENTS_ROWS: usize = 4;
+
+/// Outcome, for finished tool and file rows. Two-valued: the pending-tool map is
+/// excluded from the snapshot, so no in-flight tool reaches this layer (B4).
+const OK: &str = "✓";
+const FAIL: &str = "✗";
+
+/// Liveness, for agent rows — a *different axis* from outcome. The fold records no
+/// `is_error` for agents, so `✓`/`✗` would assert a result the data does not carry;
+/// an agent enters the ring the moment its call is folded and is completed later.
+///
+/// All four glyphs sit outside the procedurally-drawn `U+2500..=U+259F` range and so
+/// depend on font coverage — which is why each pair is one constant, replaceable
+/// with `+`/`-` in a line if the configured font disappoints.
+const LIVE: &str = "●";
+const DONE: &str = "◯";
+
+/// Column budget for a file row's path (B7), derived term by term against
+/// `RULE_COLS = 104`: `2 indent, 5 operation label, 1, 1 glyph, 1, 8 duration, 1
+/// separator` is 19 of chrome, leaving 85. Pinned by
+/// `the_path_budget_equals_its_own_derivation`, so the number cannot drift away from
+/// the row it describes — two revisions of the spec stated a budget that disagreed
+/// with its own subtraction.
+const PATH_COLS: usize = 85;
 
 /// Per-model context windows (SD4 — app-side, so a new model needs no `ai-monitor`
 /// change). Seeded from the model ids that actually appear in the logs, measured
@@ -73,11 +113,196 @@ pub fn context_window(model: &str) -> Option<u64> {
 /// with nothing folded into it yet (F3a's empty example). The two are the same
 /// statement to a reader ("nothing known"), and rendering nothing at all would flash
 /// the panel empty on every open.
+///
+/// Section order is Tasks → Skills → Other Tools → File Activity → Agents →
+/// summary, and it is a degradation order, not a reading order: the panel keeps the
+/// tail, so what is composed last is what survives a short window. File Activity
+/// sits below Other Tools deliberately — on the file-heavy session that motivates
+/// the "Other Tools" name, the reverse order would spend a guaranteed-visible slot
+/// on an empty section while decapitating the populated one above it.
 pub fn compose(snap: Option<&TelemetrySnapshot>, now_ms: u64) -> Vec<String> {
-    match snap {
-        Some(t) => summary(t, now_ms),
-        None => summary(&TelemetrySnapshot::default(), now_ms),
+    let empty = TelemetrySnapshot::default();
+    let t = snap.unwrap_or(&empty);
+    let mut lines = Vec::with_capacity(28);
+    lines.extend(tasks(t));
+    lines.extend(skills(t, now_ms));
+    lines.extend(other_tools(t));
+    lines.extend(file_activity(t));
+    lines.extend(agents(t, now_ms));
+    lines.extend(summary(t, now_ms));
+    lines
+}
+
+/// Tasks — newest-*updated* first (B6c).
+///
+/// The store is a keyed map, which has no order, so the sort is not a nicety: a
+/// `HashMap` iteration would make the pinned snapshots flaky run to run, Rust's
+/// hasher being randomly seeded per process. The key is `updated_ms` because it
+/// surfaces the task that just changed and because the crate already evicts by it —
+/// display order and eviction order agree instead of fighting. Ties fall through to
+/// `created_ms` then the id, so the order is total.
+fn tasks(t: &TelemetrySnapshot) -> Vec<String> {
+    let mut ordered: Vec<&(String, TaskEntry)> = t.tasks.iter().collect();
+    ordered.sort_by(|a, b| {
+        b.1.updated_ms
+            .cmp(&a.1.updated_ms)
+            .then_with(|| b.1.created_ms.cmp(&a.1.created_ms))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let rows = ordered
+        .iter()
+        .take(TASKS_ROWS)
+        .map(|(_, e)| fit_row("  ", &e.subject, &format!(" · {}{}", e.status, task_dur(e))))
+        .collect();
+    section("Tasks", "(no tasks)", t.tasks.len(), rows)
+}
+
+/// A task's duration, or nothing.
+///
+/// Only `completed` is treated as terminal — every other string, known or not. The
+/// measured vocabulary is exactly `completed` and `in_progress` (plus `active` at
+/// creation); `failed` does not occur. Closing the rule on one value rather than
+/// enumerating a set is what keeps an unknown status from being read as finished,
+/// and `updated_ms − created_ms` is only a duration when the last update *is* the
+/// completion — otherwise it measures time-since-last-change (B6a).
+fn task_dur(e: &TaskEntry) -> String {
+    if e.status != "completed" {
+        return String::new();
     }
+    match (e.created_ms, e.updated_ms) {
+        (Some(c), Some(u)) if u >= c => format!(" · {}", dur_short(u - c)),
+        _ => String::new(),
+    }
+}
+
+/// Skills — name and a relative age (B7a).
+///
+/// No duration: a `Skill` tool_use→result pair measures ~50ms of instruction-load
+/// latency, not the skill's execution, so a duration column here would be a
+/// precisely-formatted irrelevance. The age is relative rather than a wall clock
+/// because the injected `now_ms` is a bare epoch value and `std` alone cannot
+/// resolve a local timezone — a UTC clock on a local-session dashboard is worse
+/// than no clock.
+fn skills(t: &TelemetrySnapshot, now_ms: u64) -> Vec<String> {
+    let rows = t
+        .skills
+        .iter()
+        .take(SKILLS_ROWS)
+        .map(|s| {
+            let when = match s.start_ms {
+                Some(ms) => format!(" · {} ago", age(now_ms.saturating_sub(ms))),
+                None => String::new(),
+            };
+            fit_row("  ", &s.name, &when)
+        })
+        .collect();
+    section("Skills", "(no skills yet)", t.skills.len(), rows)
+}
+
+/// Other Tools — named for what the store actually holds (B7b).
+///
+/// The ring receives only tools that classify as *plain*: `Read|Write|Edit|Grep|Glob`
+/// go to file activity, `Agent`/`Skill`/`Task*` to their own stores. "Recent Tools"
+/// over a section that structurally excludes the five most common tools would read
+/// as a bug on a file-heavy session — empty here, full below.
+fn other_tools(t: &TelemetrySnapshot) -> Vec<String> {
+    let rows = t
+        .tools
+        .iter()
+        .take(TOOLS_ROWS)
+        .map(|c| {
+            fit_row(
+                &format!("  {} ", mark(c.ok)),
+                &c.name,
+                &format!(" {}", opt_dur(c.duration_ms)),
+            )
+        })
+        .collect();
+    section("Other Tools", "(no other tool calls)", t.tools.len(), rows)
+}
+
+/// File Activity — operation, outcome, target, duration.
+///
+/// Spacing here is single-column and deliberate: it is the layout B7's path budget
+/// is derived against, so widening a separator silently invalidates `PATH_COLS`.
+fn file_activity(t: &TelemetrySnapshot) -> Vec<String> {
+    let rows = t
+        .files
+        .iter()
+        .take(FILES_ROWS)
+        .map(|f| {
+            // Through `fit_row` like every other section, so the path yields when the
+            // duration is wider than the 8 columns B7 reserves for it. `dur` can
+            // legitimately emit 9 (`70000h00m`) from a hostile timestamp pair, and a
+            // row that overruns its own rule is the one thing this layout must not do.
+            fit_row(
+                &format!("  {:<5} {} ", op_label(f.op), mark(f.ok)),
+                &file_target(f.op, &f.path),
+                &format!(" {}", opt_dur(f.duration_ms)),
+            )
+        })
+        .collect();
+    section("File Activity", "(no file activity)", t.files.len(), rows)
+}
+
+/// Agents — a flat list, because there is no tree.
+///
+/// Real Claude Code JSONL carries no parent linkage (nested agents write to a
+/// `subagents/` sibling directory that is never read), so `├─`/`└─` connectors would
+/// draw a hierarchy that was never observed. The heading is "Agents" rather than
+/// "Active Agents" because completed entries persist: on an idle session nothing new
+/// pushes them out, and an "active" heading whose empty state becomes unreachable
+/// after the first agent ever runs is simply false (B5/B6).
+fn agents(t: &TelemetrySnapshot, now_ms: u64) -> Vec<String> {
+    let rows = t
+        .subagents
+        .iter()
+        .take(AGENTS_ROWS)
+        .map(|a| {
+            // Frozen on completion. A finished agent whose timer keeps climbing is
+            // the single most misleading thing a status dashboard can show.
+            let elapsed = match (a.start_ms, a.completed, a.end_ms) {
+                (Some(s), true, Some(e)) if e >= s => format!(" · {}", dur(e - s)),
+                (Some(s), false, _) => format!(" · {}", dur(now_ms.saturating_sub(s))),
+                _ => String::new(),
+            };
+            let head = format!(
+                "  {} {} · ",
+                if a.completed { DONE } else { LIVE },
+                a.subagent_type.as_deref().unwrap_or(DASH)
+            );
+            let tail = format!(
+                "{}{elapsed}",
+                a.model
+                    .as_deref()
+                    .map(|m| format!(" · {m}"))
+                    .unwrap_or_default()
+            );
+            fit_row(&head, a.description.as_deref().unwrap_or(DASH), &tail)
+        })
+        .collect();
+    section("Agents", "(no agents yet)", t.subagents.len(), rows)
+}
+
+/// A section: its rule, then its rows — or a single rule carrying the empty state.
+///
+/// An empty section is one line, not two: at a 14-line budget an all-empty dashboard
+/// must not spend ten of them saying nothing. A missing section and an empty one are
+/// different facts, so it is never simply omitted — the layout would jump as
+/// sections appeared, and a reader could not tell "no data" from "not built".
+fn section(label: &str, empty_state: &str, total: usize, rows: Vec<String>) -> Vec<String> {
+    if total == 0 || rows.is_empty() {
+        return vec![rule_empty(label, empty_state)];
+    }
+    let hidden = total.saturating_sub(rows.len());
+    let mut out = Vec::with_capacity(rows.len() + 1);
+    out.push(if hidden > 0 {
+        rule_with(label, Some(&format!("+{hidden} more")))
+    } else {
+        rule(label)
+    });
+    out.extend(rows);
+    out
 }
 
 /// The summary block: rule, session/model/context, spend, activity.
@@ -166,6 +391,20 @@ pub fn rule_with(label: &str, marker: Option<&str>) -> String {
     format!("{head}{}", "─".repeat(RULE_COLS.saturating_sub(used)))
 }
 
+/// A rule carrying its section's empty state: `── Skills ── (no skills yet) ───…`.
+///
+/// The state sits **next to the label**, not at the rule's tail, for the reason B2a
+/// gives for `+N more`: at a 700-logical-px window the budget is 81 columns, so
+/// anything past column 81 is clipped away — and a clipped empty state leaves a bare
+/// rule, which says nothing at all. Adjacent to the label it survives any width.
+fn rule_empty(label: &str, state: &str) -> String {
+    let head = format!("── {label} ── {state} ");
+    format!(
+        "{head}{}",
+        "─".repeat(RULE_COLS.saturating_sub(head.chars().count()))
+    )
+}
+
 /// A labelled row with an optional right-hand qualifier, one space after the value.
 /// Never padded to a column — aligning would be the fixed-width assumption the
 /// open-right design rejects, and it would break the moment a value changed length.
@@ -175,6 +414,146 @@ fn row(label: &str, value: &str, qualifier: Option<&str>) -> String {
         s.push_str(&format!(" ({q})"));
     }
     s
+}
+
+/// `prefix + variable + suffix`, truncating **only** the variable part so the row
+/// lands within `RULE_COLS`.
+///
+/// The budget is measured from the chrome actually composed, never from a stated
+/// per-row constant — a number written down beside a row is a number that drifts
+/// away from it. `PATH_COLS` is the one exception, and it is pinned by a test
+/// asserting it equals this same subtraction.
+/// The chrome itself is not always bounded — a task's `status` and an agent's
+/// `subagent_type`/`model` are raw strings the crate passes through verbatim — so the
+/// composed row is clipped once more at the end. Without that backstop a 150-column
+/// status would leave the variable part zero-width *and* still overrun the rule.
+fn fit_row(prefix: &str, variable: &str, suffix: &str) -> String {
+    let chrome = prefix.chars().count() + suffix.chars().count();
+    let budget = RULE_COLS.saturating_sub(chrome);
+    let row = format!("{prefix}{}{suffix}", truncate_right(variable, budget));
+    truncate_right(&row, RULE_COLS)
+}
+
+/// Keep the head, mark the loss with `…` (U+2026).
+fn truncate_right(s: &str, cols: usize) -> String {
+    if s.chars().count() <= cols {
+        return s.to_string();
+    }
+    match cols {
+        0 => String::new(),
+        n => s.chars().take(n - 1).chain(['…']).collect(),
+    }
+}
+
+/// Keep the tail. For a path that is the filename and its extension — the part
+/// worth reading — which is why paths truncate in the opposite direction to text.
+fn truncate_left(s: &str, cols: usize) -> String {
+    let len = s.chars().count();
+    if len <= cols {
+        return s.to_string();
+    }
+    match cols {
+        0 => String::new(),
+        n => std::iter::once('…')
+            .chain(s.chars().skip(len - (n - 1)))
+            .collect(),
+    }
+}
+
+/// Outcome glyph for a finished entry.
+fn mark(ok: bool) -> &'static str {
+    if ok {
+        OK
+    } else {
+        FAIL
+    }
+}
+
+/// The 5-column operation label the path budget is derived against.
+fn op_label(op: FileOp) -> &'static str {
+    match op {
+        FileOp::Read => "READ",
+        FileOp::Write => "WRITE",
+        FileOp::Grep => "GREP",
+        FileOp::List => "LIST",
+        FileOp::Other => "OTHER",
+    }
+}
+
+/// What a file row shows for its target.
+///
+/// `Grep`/`Glob` capture a **pattern**, not a path (the crate reads `pattern` as
+/// well as `file_path`/`path`). Path-shortening a regex is meaningless and actively
+/// mangles one containing `/`, so patterns keep their head and truncate right. The
+/// TS reference has this bug; it is deliberately not inherited.
+fn file_target(op: FileOp, s: &str) -> String {
+    match op {
+        FileOp::Grep | FileOp::List => truncate_right(s, PATH_COLS),
+        _ => short_path(s),
+    }
+}
+
+/// `parent/basename`, prefixed `…/` when ancestors were dropped (B7).
+///
+/// A full path spends the whole row on `/Users/…/IdeaProjects/…` and tells the
+/// reader nothing; a bare basename cannot distinguish two `mod.rs`. One parent is
+/// the cheapest thing that disambiguates.
+fn short_path(path: &str) -> String {
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let base = segs.last().copied().unwrap_or(path);
+    // The root counts as an ancestor: without this, `/etc/hosts` shortens to
+    // `etc/hosts`, which reads as a relative path — a different file.
+    let root = path.starts_with('/');
+    let candidate = match segs.len() {
+        0 | 1 if root => format!("…/{base}"),
+        0 | 1 => base.to_string(),
+        2 if !root => format!("{}/{}", segs[0], base),
+        n => format!("…/{}/{}", segs[n - 2], base),
+    };
+    if candidate.chars().count() <= PATH_COLS {
+        return candidate;
+    }
+    // Drop the parent before mangling the name; only then truncate the name itself,
+    // from the left, so the extension survives.
+    truncate_left(base, PATH_COLS)
+}
+
+/// A duration, or `—` when the crate could not derive one (a missing timestamp or a
+/// negative interval). Never `0ms`, which would read as a real sub-millisecond call.
+fn opt_dur(ms: Option<u64>) -> String {
+    match ms {
+        Some(ms) => dur_short(ms),
+        None => DASH.to_string(),
+    }
+}
+
+/// `450ms` / `1.2s` / `2m03s` — sub-second precision matters for a tool call, where
+/// the whole point of the column is telling a fast call from a slow one.
+fn dur_short(ms: u64) -> String {
+    // Round to a tenth FIRST, then pick the unit. Picking the unit first is how
+    // `59_990ms` comes out as `60.0s` — the same defect class as choosing `num()`'s
+    // magnitude before `{:.1}` rounds it.
+    let tenths = ms.saturating_add(50) / 100;
+    if tenths < 10 {
+        format!("{ms}ms")
+    } else if tenths < 600 {
+        format!("{}.{}s", tenths / 10, tenths % 10)
+    } else {
+        dur(tenths.saturating_mul(100))
+    }
+}
+
+/// `12s` / `4m` / `2h` — a coarse age, for "when did this happen" rather than
+/// "how long did it take".
+fn age(ms: u64) -> String {
+    let s = ms / 1000;
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3_600 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h", s / 3_600)
+    }
 }
 
 /// A billed counter, or `—` when it is zero.
@@ -223,6 +602,180 @@ pub fn dur(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_monitor::telemetry::{CompletedTool, FileActivity, SkillEntry, Subagent};
+
+    /// Every store filled **past** its cap, so each section shows both its rows and
+    /// its `+N more` marker, at a fixed `now_ms`. Hand-built: no live log, no clock.
+    fn full() -> (TelemetrySnapshot, u64) {
+        let (mut t, now) = populated();
+        // 6 tasks against a cap of 4, deliberately out of order and with a tie on
+        // `updated_ms` so the tie-break is exercised rather than assumed.
+        t.tasks = vec![
+            task(
+                "t-3",
+                "Wire the overlay seam",
+                "completed",
+                now - 900_000,
+                now - 600_000,
+            ),
+            task(
+                "t-1",
+                "Fold usage per message id",
+                "in_progress",
+                now - 300_000,
+                now - 60_000,
+            ),
+            task(
+                "t-5",
+                "Audit the dedupe keying",
+                "blocked",
+                now - 800_000,
+                now - 120_000,
+            ),
+            task(
+                "t-2",
+                "Pin the worked examples",
+                "completed",
+                now - 700_000,
+                now - 60_000,
+            ),
+            task(
+                "t-6",
+                "Measure the model census",
+                "in_progress",
+                now - 500_000,
+                now - 400_000,
+            ),
+            task(
+                "t-4",
+                "Draft the partition manifest",
+                "completed",
+                now - 950_000,
+                now - 930_000,
+            ),
+        ];
+        // 4 skills against a cap of 3.
+        t.skills = ["harness-ops:loop", "insta-review", "run-term", "specify"]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| SkillEntry {
+                name: (*n).to_string(),
+                start_ms: Some(now - (i as u64 + 1) * 240_000),
+            })
+            .collect();
+        // 11 plain tools against a cap of 4 — R2.2's exact "+7 more" case.
+        t.tools = (0..11)
+            .map(|i| CompletedTool {
+                name: ["Bash", "WebFetch", "TodoWrite", "Monitor"][i % 4].to_string(),
+                ok: i != 1,
+                duration_ms: match i {
+                    2 => None,
+                    _ => Some(120 + i as u64 * 640),
+                },
+                start_ms: Some(now - (i as u64 + 1) * 30_000),
+            })
+            .collect();
+        // 5 file activities against a cap of 4, covering a path, a pattern and a
+        // failed write.
+        t.files = vec![
+            file(
+                FileOp::Read,
+                "/Users/x/proj/crates/renderer/atlas.rs",
+                true,
+                Some(430),
+            ),
+            file(FileOp::Grep, r"src/.*/mod\.rs", true, Some(1_240)),
+            file(
+                FileOp::Write,
+                "/Users/x/proj/crates/app/src/dashboard.rs",
+                false,
+                Some(62_000),
+            ),
+            file(FileOp::List, "**/*.toml", true, None),
+            file(FileOp::Read, "Cargo.toml", true, Some(12)),
+        ];
+        // 5 subagents against a cap of 4: one live, the rest finished.
+        t.subagents = vec![
+            Subagent {
+                id: "a1".into(),
+                subagent_type: Some("general-purpose".into()),
+                description: Some("Gate 3 checker".into()),
+                model: Some("opus".into()),
+                start_ms: Some(now - 90_000),
+                end_ms: None,
+                completed: false,
+            },
+            agent_done(
+                "a2",
+                "Explore",
+                "map the overlay seam",
+                now - 400_000,
+                now - 370_000,
+            ),
+            agent_done(
+                "a3",
+                "general-purpose",
+                "census message.model",
+                now - 900_000,
+                now - 880_000,
+            ),
+            agent_done(
+                "a4",
+                "Plan",
+                "sequence the build order",
+                now - 1_200_000,
+                now - 1_150_000,
+            ),
+            agent_done(
+                "a5",
+                "Explore",
+                "find the panel budget",
+                now - 1_800_000,
+                now - 1_790_000,
+            ),
+        ];
+        (t, now)
+    }
+
+    fn task(
+        id: &str,
+        subject: &str,
+        status: &str,
+        created: u64,
+        updated: u64,
+    ) -> (String, TaskEntry) {
+        (
+            id.to_string(),
+            TaskEntry {
+                subject: subject.to_string(),
+                status: status.to_string(),
+                created_ms: Some(created),
+                updated_ms: Some(updated),
+            },
+        )
+    }
+
+    fn file(op: FileOp, path: &str, ok: bool, duration_ms: Option<u64>) -> FileActivity {
+        FileActivity {
+            op,
+            path: path.to_string(),
+            ok,
+            duration_ms,
+            start_ms: None,
+        }
+    }
+
+    fn agent_done(id: &str, kind: &str, desc: &str, start: u64, end: u64) -> Subagent {
+        Subagent {
+            id: id.to_string(),
+            subagent_type: Some(kind.to_string()),
+            description: Some(desc.to_string()),
+            model: Some("sonnet".into()),
+            start_ms: Some(start),
+            end_ms: Some(end),
+            completed: true,
+        }
+    }
 
     /// A populated snapshot: claude-opus-5, 117,066 of a 200k window, 45m12s uptime,
     /// 2m03s since the last event, at a fixed `now_ms`.
@@ -262,15 +815,28 @@ mod tests {
         let now = 1_785_226_000_000;
         assert_eq!(
             compose(None, now),
-            summary(&TelemetrySnapshot::default(), now)
+            compose(Some(&TelemetrySnapshot::default()), now)
         );
-        assert_eq!(compose(None, now).len(), 4, "the full frame, not a stub");
+        let lines = compose(None, now);
+        assert_eq!(
+            lines.len(),
+            9,
+            "five inline empty rules + the summary block"
+        );
+        assert_eq!(
+            &lines[5..],
+            &summary(&TelemetrySnapshot::default(), now)[..]
+        );
     }
 
     #[test]
     fn every_rule_is_exactly_rule_cols_wide() {
-        let (t, now) = populated();
-        for line in summary(&t, now).iter().filter(|l| l.starts_with("──")) {
+        let (t, now) = full();
+        for line in compose(Some(&t), now)
+            .iter()
+            .chain(compose(None, now).iter())
+            .filter(|l| l.starts_with("──"))
+        {
             assert_eq!(line.chars().count(), RULE_COLS, "{line}");
         }
         assert_eq!(
@@ -374,5 +940,383 @@ mod tests {
         assert_eq!(dur(12_000), "12s");
         assert_eq!(dur((2 * 60 + 3) * 1000), "2m03s");
         assert_eq!(dur((65 * 60) * 1000), "1h05m");
+        assert_eq!(dur_short(430), "430ms");
+        assert_eq!(dur_short(1_240), "1.2s");
+        // the same magnitude-boundary trap, one unit down — never "60.0s"
+        assert_eq!(dur_short(59_949), "59.9s");
+        assert_eq!(dur_short(59_950), "1m00s");
+        assert_eq!(dur_short(62_000), "1m02s");
+        assert_eq!(age(12_000), "12s");
+        assert_eq!(age(240_000), "4m");
+        assert_eq!(age(7_200_000), "2h");
+    }
+
+    // ---- sections ------------------------------------------------------------
+
+    #[test]
+    fn the_populated_dashboard_matches_its_pinned_form() {
+        let (t, now) = full();
+        insta::assert_snapshot!(compose(Some(&t), now).join("\n"));
+    }
+
+    #[test]
+    fn the_empty_dashboard_matches_its_pinned_form() {
+        insta::assert_snapshot!(compose(None, 1_785_226_000_000).join("\n"));
+    }
+
+    // R8.1 — one snapshot per section, each store holding more than its cap, so a
+    // change to a cap or to a row's shape shows up as a reviewable diff. One test per
+    // section rather than five assertions in one: `insta` stops a test at its first
+    // mismatch, so a single test would hide every section after the one that moved.
+
+    #[test]
+    fn tasks_at_their_truncation_boundary_are_pinned() {
+        let (t, _) = full();
+        insta::assert_snapshot!("boundary_tasks", tasks(&t).join("\n"));
+    }
+
+    #[test]
+    fn skills_at_their_truncation_boundary_are_pinned() {
+        let (t, now) = full();
+        insta::assert_snapshot!("boundary_skills", skills(&t, now).join("\n"));
+    }
+
+    #[test]
+    fn other_tools_at_their_truncation_boundary_are_pinned() {
+        let (t, _) = full();
+        insta::assert_snapshot!("boundary_other_tools", other_tools(&t).join("\n"));
+    }
+
+    #[test]
+    fn file_activity_at_its_truncation_boundary_is_pinned() {
+        let (t, _) = full();
+        insta::assert_snapshot!("boundary_file_activity", file_activity(&t).join("\n"));
+    }
+
+    #[test]
+    fn agents_at_their_truncation_boundary_are_pinned() {
+        let (t, now) = full();
+        insta::assert_snapshot!("boundary_agents", agents(&t, now).join("\n"));
+    }
+
+    #[test]
+    fn the_composed_height_is_28_populated_and_9_empty() {
+        // B1/B2 — the two numbers the caps were chosen against. If a cap moves, this
+        // is the assertion that says so.
+        let (t, now) = full();
+        assert_eq!(compose(Some(&t), now).len(), 28);
+        assert_eq!(compose(None, now).len(), 9);
+    }
+
+    #[test]
+    fn the_summary_block_is_last_and_survives_a_14_line_panel() {
+        // R1.2 — the renderer keeps the LAST max_lines, so "composed last" is what
+        // makes the summary the content that never gets clipped.
+        let (t, now) = full();
+        let lines = compose(Some(&t), now);
+        let tail: Vec<&String> = lines.iter().rev().take(14).collect();
+        for expected in ["ai-monitor", "session ", "spend ", "activity "] {
+            assert!(
+                tail.iter().any(|l| l.contains(expected)),
+                "{expected} clipped at 14 lines"
+            );
+        }
+        assert_eq!(&lines[lines.len() - 4..], &summary(&t, now)[..]);
+    }
+
+    #[test]
+    fn the_section_order_is_fixed() {
+        let (t, now) = full();
+        let rules: Vec<&String> = compose(Some(&t), now)
+            .iter()
+            .filter(|l| l.starts_with("──"))
+            .cloned()
+            .collect::<Vec<_>>()
+            .leak()
+            .iter()
+            .collect();
+        let labels: Vec<&str> = rules
+            .iter()
+            .map(|r| r.split(' ').nth(1).unwrap_or(""))
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["Tasks", "Skills", "Other", "File", "Agents", "ai-monitor"]
+        );
+    }
+
+    #[test]
+    fn each_section_renders_at_most_its_cap() {
+        // R2.1 — every store in `full()` holds more than its cap.
+        let (t, now) = full();
+        assert_eq!(tasks(&t).len(), TASKS_ROWS + 1, "rows + rule");
+        assert_eq!(skills(&t, now).len(), SKILLS_ROWS + 1);
+        assert_eq!(other_tools(&t).len(), TOOLS_ROWS + 1);
+        assert_eq!(file_activity(&t).len(), FILES_ROWS + 1);
+        assert_eq!(agents(&t, now).len(), AGENTS_ROWS + 1);
+    }
+
+    #[test]
+    fn truncation_is_stated_next_to_the_label_and_never_lengthens_the_rule() {
+        // R2.2 — 11 tools against a cap of 4.
+        let (t, _) = full();
+        let r = &other_tools(&t)[0];
+        assert!(r.starts_with("── Other Tools +7 more ─"), "{r}");
+        assert_eq!(r.chars().count(), RULE_COLS);
+        // At a 700-logical-px window the budget is 81 columns; a tail marker would
+        // be clipped away on exactly the narrow windows where truncation is likely.
+        assert!(r.chars().take(81).collect::<String>().contains("+7 more"));
+    }
+
+    #[test]
+    fn a_section_at_exactly_its_cap_carries_no_marker() {
+        // R2.3
+        let (mut t, _) = full();
+        t.tools.truncate(TOOLS_ROWS);
+        assert!(!other_tools(&t)[0].contains("more"));
+        assert_eq!(other_tools(&t)[0].chars().count(), RULE_COLS);
+    }
+
+    #[test]
+    fn an_empty_section_is_one_line_with_its_own_wording() {
+        // R3.1/R3.2 — all five reachable, inline on the rule, one line each.
+        let now = 1_785_226_000_000;
+        let e = TelemetrySnapshot::default();
+        for (lines, wording) in [
+            (tasks(&e), "(no tasks)"),
+            (skills(&e, now), "(no skills yet)"),
+            (other_tools(&e), "(no other tool calls)"),
+            (file_activity(&e), "(no file activity)"),
+            (agents(&e, now), "(no agents yet)"),
+        ] {
+            assert_eq!(lines.len(), 1, "inline on the rule, never a second row");
+            assert!(lines[0].contains(wording), "{}", lines[0]);
+            assert_eq!(lines[0].chars().count(), RULE_COLS);
+            // Adjacent to the label, so a narrow panel cannot clip away the only
+            // thing the section had to say.
+            assert!(lines[0]
+                .chars()
+                .take(81)
+                .collect::<String>()
+                .contains(wording));
+        }
+    }
+
+    #[test]
+    fn the_two_marker_pairs_are_never_conflated() {
+        // R4.1/R4.2 — outcome is ✓/✗; liveness is ●/◯. The fold records no agent
+        // outcome, so ✓ on an agent row would assert something the data lacks.
+        let (t, now) = full();
+        let tool_rows = other_tools(&t)[1..].join("\n");
+        assert!(tool_rows.contains(OK) && tool_rows.contains(FAIL));
+        assert!(!tool_rows.contains(LIVE) && !tool_rows.contains(DONE));
+
+        let agent_rows = agents(&t, now)[1..].join("\n");
+        assert!(agent_rows.contains(LIVE) && agent_rows.contains(DONE));
+        assert!(!agent_rows.contains(OK) && !agent_rows.contains(FAIL));
+    }
+
+    #[test]
+    fn agents_are_flat_with_no_tree_connectors() {
+        // R5.1 — there is no parent linkage in the data, so a connector would draw a
+        // hierarchy that was never observed.
+        let (t, now) = full();
+        for row in &agents(&t, now)[1..] {
+            assert!(!row.contains('├') && !row.contains('└'), "{row}");
+            assert!(row.starts_with("  ●") || row.starts_with("  ◯"), "{row}");
+        }
+    }
+
+    #[test]
+    fn a_live_agent_elapsed_grows_and_a_completed_one_is_frozen() {
+        // R5.2
+        let (t, now) = full();
+        let rows = agents(&t, now);
+        assert!(rows[1].contains("1m30s"), "live, from now_ms: {}", rows[1]);
+        assert!(
+            rows[2].contains("30s"),
+            "completed, from its end: {}",
+            rows[2]
+        );
+        let later = agents(&t, now + 600_000);
+        assert!(later[1].contains("11m30s"), "live grew: {}", later[1]);
+        assert!(later[2].contains("30s"), "completed did NOT: {}", later[2]);
+    }
+
+    #[test]
+    fn agent_rows_carry_type_description_and_model() {
+        // R5.4
+        let (t, now) = full();
+        let row = &agents(&t, now)[1];
+        assert!(row.contains("general-purpose") && row.contains("Gate 3 checker"));
+        assert!(row.contains("opus"), "{row}");
+    }
+
+    #[test]
+    fn tasks_sort_by_updated_desc_deterministically() {
+        // R6.1 — the store is an unordered map; without a total order the pinned
+        // snapshots would be flaky run to run (the hasher is seeded per process).
+        let (t, _) = full();
+        let rows = tasks(&t);
+        let subjects: Vec<&str> = rows[1..]
+            .iter()
+            .map(|r| r.trim_start().split(" · ").next().unwrap_or(""))
+            .collect();
+        // t-1 and t-2 tie on `updated_ms`; t-1 has the later `created_ms` and wins.
+        assert_eq!(
+            subjects,
+            vec![
+                "Fold usage per message id",
+                "Pin the worked examples",
+                "Audit the dedupe keying",
+                "Measure the model census"
+            ]
+        );
+        // Order does not depend on the input order of an unordered store.
+        let mut shuffled = t.clone();
+        shuffled.tasks.reverse();
+        assert_eq!(tasks(&shuffled), rows);
+    }
+
+    #[test]
+    fn task_status_is_the_raw_string_and_only_completed_shows_a_duration() {
+        // R6.2/R6.3 — `blocked` is unobserved in the corpus and must still pass
+        // through intact rather than being glyph-substituted or treated as terminal.
+        let (t, _) = full();
+        let rows = tasks(&t).join("\n");
+        assert!(rows.contains("· in_progress"), "{rows}");
+        assert!(rows.contains("· blocked"), "{rows}");
+        assert!(rows.contains("· completed · 10m40s"), "{rows}");
+        // the in_progress row carries no duration after its status
+        let ip = tasks(&t)[1].clone();
+        assert!(ip.ends_with("in_progress"), "{ip}");
+    }
+
+    #[test]
+    fn skills_show_a_relative_age_and_no_duration() {
+        // R7.1 — a Skill pair measures dispatch latency, not execution.
+        let (t, now) = full();
+        let row = &skills(&t, now)[1];
+        assert!(
+            row.contains("harness-ops:loop") && row.contains("4m ago"),
+            "{row}"
+        );
+        assert!(!row.contains("ms") && !row.contains(".0s"), "{row}");
+    }
+
+    #[test]
+    fn a_missing_duration_renders_the_placeholder() {
+        // R7.2
+        let (t, _) = full();
+        assert!(other_tools(&t)[1..].iter().any(|r| r.ends_with(DASH)));
+        assert!(file_activity(&t)[1..].iter().any(|r| r.ends_with(DASH)));
+    }
+
+    #[test]
+    fn paths_keep_the_filename_and_one_parent() {
+        // R7.3
+        assert_eq!(
+            short_path("/Users/x/proj/crates/renderer/atlas.rs"),
+            "…/renderer/atlas.rs"
+        );
+        assert_eq!(short_path("crates/app/dashboard.rs"), "…/app/dashboard.rs");
+        assert_eq!(short_path("Cargo.toml"), "Cargo.toml");
+        assert_eq!(short_path("src/main.rs"), "src/main.rs");
+        // The root is an ancestor: without the marker these read as relative paths,
+        // which name different files.
+        assert_eq!(short_path("/etc/hosts"), "…/etc/hosts");
+        assert_eq!(short_path("/Cargo.toml"), "…/Cargo.toml");
+    }
+
+    #[test]
+    fn no_row_overruns_the_rule_on_hostile_telemetry() {
+        // The chrome around the variable field is raw passthrough data — a task's
+        // status, an agent's type and model — so it is not bounded by construction.
+        let now = 1_785_226_000_000;
+        let mut t = TelemetrySnapshot {
+            tasks: vec![task("t", &"s".repeat(300), &"x".repeat(300), 0, 0)],
+            subagents: vec![Subagent {
+                id: "a".into(),
+                subagent_type: Some("y".repeat(300)),
+                description: Some("d".repeat(300)),
+                model: Some("m".repeat(300)),
+                start_ms: Some(0),
+                end_ms: None,
+                completed: false,
+            }],
+            ..TelemetrySnapshot::default()
+        };
+        // A timestamp pair spanning the whole epoch: `dur` emits 9 columns here,
+        // one more than the file row's derivation reserves.
+        t.files = vec![file(FileOp::Read, &"p".repeat(400), true, Some(u64::MAX))];
+        t.tools = vec![CompletedTool {
+            name: "n".repeat(300),
+            ok: true,
+            duration_ms: Some(u64::MAX),
+            start_ms: None,
+        }];
+        t.skills = vec![SkillEntry {
+            name: "k".repeat(300),
+            start_ms: Some(0),
+        }];
+        for line in compose(Some(&t), now) {
+            assert!(line.chars().count() <= RULE_COLS, "{line}");
+        }
+    }
+
+    #[test]
+    fn an_over_long_basename_truncates_from_the_left() {
+        // R7.4 — left, so the extension survives; right-truncation would clip the
+        // one part of a path worth reading.
+        let long = format!("/a/b/{}.rs", "x".repeat(120));
+        let out = short_path(&long);
+        assert_eq!(out.chars().count(), PATH_COLS);
+        assert!(out.starts_with('…') && out.ends_with(".rs"), "{out}");
+    }
+
+    #[test]
+    fn grep_and_glob_render_their_pattern_not_a_path() {
+        // R7.5 — path-shortening a regex mangles one containing `/`.
+        assert_eq!(
+            file_target(FileOp::Grep, r"src/.*/mod\.rs"),
+            r"src/.*/mod\.rs"
+        );
+        assert_eq!(file_target(FileOp::List, "**/*.toml"), "**/*.toml");
+        // ... and the head is what survives truncation, since that is a pattern's
+        // discriminating part.
+        let long = "a/".repeat(80);
+        let out = file_target(FileOp::Grep, &long);
+        assert_eq!(out.chars().count(), PATH_COLS);
+        assert!(out.starts_with("a/a/") && out.ends_with('…'), "{out}");
+    }
+
+    #[test]
+    fn the_path_budget_equals_its_own_derivation() {
+        // B7 term by term: 2 indent + 5 op + 1 + 1 glyph + 1 + 8 duration + 1 = 19.
+        // A stated number that disagrees with the row it describes is the defect this
+        // pins; two earlier revisions of the spec got it wrong in exactly that way.
+        const CHROME: usize = 2 + 5 + 1 + 1 + 1 + 8 + 1;
+        assert_eq!(PATH_COLS, RULE_COLS - CHROME);
+        // and the composed row honours it: op label is 5 wide, indent is 2
+        let (t, _) = full();
+        for row in &file_activity(&t)[1..] {
+            assert!(row.starts_with("  "), "{row}");
+            assert!(row.chars().count() <= RULE_COLS, "{row}");
+        }
+    }
+
+    #[test]
+    fn no_row_overruns_the_rule() {
+        let (t, now) = full();
+        for line in compose(Some(&t), now) {
+            assert!(line.chars().count() <= RULE_COLS, "{line}");
+        }
+    }
+
+    #[test]
+    fn the_whole_dashboard_is_pure() {
+        // R8.2 — same inputs, byte-identical output, twice.
+        let (t, now) = full();
+        assert_eq!(compose(Some(&t), now), compose(Some(&t), now));
     }
 }

@@ -1,0 +1,8 @@
+---
+source: crates/app/src/dashboard.rs
+expression: "skills(&t, now).join(\"\\n\")"
+---
+── Skills +1 more ──────────────────────────────────────────────────────────────────────────────────────
+  harness-ops:loop · 4m ago
+  insta-review · 8m ago
+  run-term · 12m ago
