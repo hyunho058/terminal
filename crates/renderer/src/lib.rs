@@ -16,6 +16,7 @@ pub mod cursor_layer;
 pub mod font_set;
 pub mod glyph;
 pub mod image_layer;
+pub mod link_layer;
 pub mod overlay_layer;
 pub mod preedit_layer;
 pub mod selection_layer;
@@ -940,7 +941,7 @@ const DIM_MIX: f32 = 0.45;
 
 /// The linear-light glyph color for a cell, applying REVERSE (fg/bg swap) and DIM
 /// (mix toward the background) — the color both its glyphs and its underline use.
-fn glyph_color(cell: &Cell) -> [f32; 3] {
+pub(crate) fn glyph_color(cell: &Cell) -> [f32; 3] {
     let (fg, bg) = if cell.attrs.contains(CellAttrs::REVERSE) {
         (cell.bg, cell.fg)
     } else {

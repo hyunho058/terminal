@@ -28,6 +28,7 @@ use common::config::{Config, SidebarConfig};
 use common::watch::ConfigWatcher;
 use objc2_app_kit::NSView;
 use renderer::cursor_layer::CursorLayer;
+use renderer::link_layer::{LinkHandle, LinkLayer};
 use renderer::preedit_layer::{PreeditHandle, PreeditLayer};
 use renderer::sidebar_header::{SidebarChromeHandle, SidebarChromeLayer};
 use renderer::sidebar_layout::{self, SidebarLayoutInput};
@@ -47,6 +48,9 @@ use winit::keyboard::ModifiersState;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
 
+use crate::hyperlink::{
+    frame_rescans, url_to_open, ClickInput, HoverInput, HoverState, LinkTrigger, Opener, Update,
+};
 use crate::input::{
     encode_key, is_double_click, pixel_to_cell, press_dismisses_modals, sidebar_hover,
     sidebar_press, suppress_key, tab_action, wheel_bytes, wheel_lines, wheel_scroll, SidebarAction,
@@ -172,6 +176,21 @@ struct Running {
     /// Latest cursor position in physical px (raw winit `f64`), updated on
     /// `CursorMoved` and read on a press to hit-test the sidebar and re-resolve hover.
     last_cursor: (f64, f64),
+    /// Whether the pointer is inside the window (hyperlinks R2.8). `last_cursor` is
+    /// written only by `CursorMoved` and never reset, so `cursor_cell()` keeps
+    /// reporting a stale cell after `CursorLeft`; this is the flag that actually
+    /// knows. Set true only by `CursorMoved`, where the position is fresh — not by
+    /// `CursorEntered`, which carries no coordinates.
+    pointer_inside: bool,
+    /// ⌘-hover link state + the handle its layer reads (hyperlinks D15/D24).
+    link_hover: HoverState,
+    link_handle: LinkHandle,
+    /// Was ⌘ held when the left button went down **over the grid** (hyperlinks D22)?
+    /// Sampled at press so a ⌘ tapped after an ordinary click cannot retroactively
+    /// turn it into an open. Reset by every press, including one the sidebar claims.
+    link_cmd_at_press: bool,
+    /// Hands a URL to macOS on an opening click (hyperlinks D14).
+    opener: Opener,
     /// Left-drag selection state (selection-input, the sanctioned event-loop
     /// exception). While `dragging`, `CursorMoved` updates the active grid's
     /// selection focus. `drag_anchor` is the press cell; `drag_moved` records
@@ -274,6 +293,13 @@ impl App {
         let (preedit_layer, preedit_handle) = PreeditLayer::new();
         preedit_handle.set_theme(self.cfg.theme.background, self.cfg.theme.foreground);
         renderer.add_layer(Box::new(preedit_layer));
+        // ⌘-hover link underline (hyperlinks D15). Registered here rather than
+        // through an `Overlay` presenter: the seam hands the renderer one *stateless*
+        // box at startup, and this layer's state is app-side by D11 — so the app must
+        // hold the write end of the handle. No theme to seed; the underline takes each
+        // cell's own glyph color.
+        let (link_layer, link_handle) = LinkLayer::new();
+        renderer.add_layer(Box::new(link_layer));
 
         // Drain the SD4 seam registrations into the live registries. Each
         // overlay also contributes a DrawLayer drawn above the grid (R4.1).
@@ -330,6 +356,11 @@ impl App {
             overlays,
             mods: ModifiersState::empty(),
             last_cursor: (0.0, 0.0),
+            pointer_inside: false,
+            link_hover: HoverState::default(),
+            link_handle,
+            link_cmd_at_press: false,
+            opener: Opener::new(),
             last_card_click: None,
             epoch: Instant::now(),
             open_menu: None,
@@ -1253,6 +1284,61 @@ impl Running {
         )
     }
 
+    /// Recompute the ⌘-hover link highlight for one edge (hyperlinks D24).
+    ///
+    /// The three triggers are distinct, not interchangeable:
+    /// - `Pointer` skips the scan when the pointer never left its cell (R2.4);
+    /// - `Modifier` always recomputes **and re-arms** — it is first-hand evidence of
+    ///   what ⌘ is doing;
+    /// - `Snapshot` always recomputes but must **not** re-arm, or a PTY burst would
+    ///   undo the focus-loss disarm (see [`HoverState::on_snapshot`]).
+    ///
+    /// The redraw is the **bare** `window.request_redraw()`, never [`redraw`](Self::redraw):
+    /// a highlight change is not a content change, and marking the snapshot stale
+    /// would re-clone the grid on every ⌘ tap — exactly the idle-CPU cache this
+    /// feature promised not to disturb (R3.6).
+    fn refresh_link_hover(&mut self, trigger: LinkTrigger) {
+        let cell = self.cursor_cell();
+        let input = HoverInput {
+            cmd_held: self.mods.super_key(),
+            pointer_inside: self.pointer_inside,
+            cell,
+            // The snapshot on *screen* — not `terminal.snapshot()`, which would clone
+            // the whole cell vector on every pointer move (D11).
+            snapshot: self.last_snapshot.as_ref(),
+        };
+        let update = match trigger {
+            LinkTrigger::Pointer => self.link_hover.on_pointer(input),
+            LinkTrigger::Modifier => self.link_hover.on_modifier(input),
+            LinkTrigger::Snapshot => self.link_hover.on_snapshot(input),
+        };
+        if let Update::Set(span) = update {
+            self.link_handle.set_span(span);
+            self.window.request_redraw();
+        }
+    }
+
+    /// Apply a hover update that came from something other than a recompute.
+    fn apply_link_update(&mut self, update: Update) {
+        if let Update::Set(span) = update {
+            self.link_handle.set_span(span);
+            self.window.request_redraw();
+        }
+    }
+
+    /// The pointer left the window: clear the highlight but keep the gesture armed
+    /// (D24.3 — the window still has focus, so ⌘ is not stale).
+    fn clear_link_hover(&mut self) {
+        let update = self.link_hover.on_pointer_left();
+        self.apply_link_update(update);
+    }
+
+    /// The window lost focus: clear the highlight **and** disarm (D24.5).
+    fn disarm_link_hover(&mut self) {
+        let update = self.link_hover.disarm();
+        self.apply_link_update(update);
+    }
+
     /// Scroll the **active** tab's scrollback viewport for one wheel event over the
     /// grid (terminal-scroll D2/D3/D7). Display-only — nothing is written to the PTY
     /// and the shell's cursor never moves (`scrollback` D4).
@@ -1671,14 +1757,20 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::ModifiersChanged(m) => {
                 inner.mods = m.state();
+                // Trigger 1/2 (hyperlinks D24): ⌘ down lights the link under the
+                // pointer, ⌘ up clears it. Also re-arms after a focus loss.
+                inner.refresh_link_hover(LinkTrigger::Modifier);
             }
 
             WindowEvent::CursorMoved { position, .. } => {
                 inner.last_cursor = (position.x, position.y);
+                inner.pointer_inside = true; // fresh coordinates (hyperlinks R2.8)
                 inner.refresh_hover(); // one hit_test feeds both hover fields (D8)
-                                       // Left-drag selection (selection-input): once the focus leaves the
-                                       // anchor cell, set the active grid's selection live. Keying `moved`
-                                       // on the *cell* (not raw px) makes an ordinary click jitter-safe.
+                inner.refresh_link_hover(LinkTrigger::Pointer); // trigger 3 (D24)
+
+                // Left-drag selection (selection-input): once the focus leaves the
+                // anchor cell, set the active grid's selection live. Keying `moved`
+                // on the *cell* (not raw px) makes an ordinary click jitter-safe.
                 if inner.dragging {
                     if let Some(focus) = inner.cursor_cell() {
                         if focus != inner.drag_anchor {
@@ -1696,7 +1788,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
-            WindowEvent::CursorLeft { .. } => inner.clear_hover(),
+            WindowEvent::CursorLeft { .. } => {
+                inner.clear_hover();
+                // Trigger 3, the leaving half (hyperlinks D24): nothing is under the
+                // pointer, and `last_cursor` keeps its stale value — so the flag is
+                // what stops a later ⌘ from lighting a link nobody is pointing at.
+                inner.pointer_inside = false;
+                inner.clear_link_hover();
+            }
 
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -1709,6 +1808,10 @@ impl ApplicationHandler<UserEvent> for App {
                 let inp = inner.sidebar_input();
                 let collapsed = inner.collapsed();
                 let action = sidebar_press(inner.last_cursor, &inp, inner.scroll, collapsed);
+                // Every press disarms the link gesture first (hyperlinks D22); only
+                // the grid fallthrough below re-arms it. A ⌘-click the sidebar claims
+                // therefore keeps its existing meaning and opens nothing (R4.12).
+                inner.link_cmd_at_press = false;
                 // Any press that is not ON the open menu dismisses it (sticky-tab-title
                 // R3.8) — including a press over the grid, which resolves to no sidebar
                 // action at all. The press still does its own job afterwards: dismissing
@@ -1775,6 +1878,9 @@ impl ApplicationHandler<UserEvent> for App {
                     inner.drag_anchor = cell;
                     inner.dragging = true;
                     inner.drag_moved = false;
+                    // Sample ⌘ at press (hyperlinks D22). The drag is armed exactly as
+                    // before either way — ⌘ adds a gesture here, it removes none.
+                    inner.link_cmd_at_press = inner.mods.super_key();
                     // Start a fresh latch (terminal-scroll D6). The drag freezes the
                     // viewport while `scrollback` D2's auto-increment keeps drifting it,
                     // so any snap raised in that window is recorded here and replayed on
@@ -1788,9 +1894,22 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } if inner.dragging => {
+                // Decide the open before anything is mutated (hyperlinks D19): what
+                // opens is whatever the handle is lit with *at this instant*, which
+                // D24 has kept current through pointer, modifier, and output edges.
+                // Nothing is re-resolved here — that is what makes "what is underlined
+                // is exactly what opens" true at the moment of the open, not merely by
+                // construction (D20).
+                let url = url_to_open(ClickInput {
+                    cmd_at_press: inner.link_cmd_at_press,
+                    cmd_at_release: inner.mods.super_key(),
+                    drag_moved: inner.drag_moved,
+                    lit: inner.link_handle.span(),
+                });
                 // End the drag (selection-input). A plain click — the focus never
                 // left the anchor cell — clears any selection; a real drag leaves the
-                // selection standing for Cmd+C.
+                // selection standing for Cmd+C. Unchanged by the open above: an
+                // opening click still clears the selection, exactly as it does today.
                 inner.dragging = false;
                 if !inner.drag_moved {
                     inner.tabs.active_mut().terminal.clear_selection();
@@ -1806,6 +1925,12 @@ impl ApplicationHandler<UserEvent> for App {
                 let latch = std::mem::take(&mut inner.drag_latch);
                 if let Some(id) = drag_release_snap(latch) {
                     inner.snap_tab_to_live(id);
+                }
+                // Last, so the browser handoff cannot reorder anything above it. The
+                // URL goes to macOS and nothing else happens: no PTY write, no grid
+                // change, and a failure is logged and silent (hyperlinks D10).
+                if let Some(url) = url {
+                    inner.opener.open(&url);
                 }
             }
 
@@ -1864,6 +1989,14 @@ impl ApplicationHandler<UserEvent> for App {
                 // …and clears the sidebar hover, since a Cmd-Tab away fires no
                 // `CursorLeft` while the pointer is still inside (D8).
                 inner.clear_hover();
+                // Trigger 5 (hyperlinks D24.5) — the same quirk, one layer deeper.
+                // winit 0.30.13 already queues a synthetic `ModifiersChanged(empty)`
+                // just before this event (window_delegate.rs:225-227), so `mods` is
+                // normally clear by now and the link is already unlit. This disarms
+                // anyway: it costs nothing, and it is what keeps "a plain click
+                // behaves exactly as today" true if that synthetic event ever stops
+                // arriving.
+                inner.disarm_link_hover();
             }
 
             WindowEvent::KeyboardInput {
@@ -1892,9 +2025,23 @@ impl ApplicationHandler<UserEvent> for App {
                 // snapshot — the renderer then sees an equal snapshot and skips the
                 // re-shape too (D5). A fresh snapshot is taken on the first frame and
                 // whenever `redraw()` marked the cache stale.
-                if inner.snapshot_dirty || inner.last_snapshot.is_none() {
+                let took_fresh_snapshot = inner.snapshot_dirty || inner.last_snapshot.is_none();
+                if took_fresh_snapshot {
                     inner.last_snapshot = Some(inner.tabs.active().terminal.snapshot());
                     inner.snapshot_dirty = false;
+                }
+                // Trigger 4 (hyperlinks D24.4): the content under a stationary pointer
+                // just moved, and that raises neither `CursorMoved` nor
+                // `ModifiersChanged`. Without this the highlight goes stale and the
+                // release — which opens only what is lit (D19) — would act on a link
+                // that is no longer there.
+                //
+                // The "not on an idle frame" half of R2.6 is the predicate's job, not
+                // this call's indentation: an idle continuous frame re-presents the
+                // cached snapshot and has nothing new to resolve against, and ⌘ up
+                // skips it outright so streaming output costs nothing.
+                if frame_rescans(took_fresh_snapshot, inner.mods.super_key()) {
+                    inner.refresh_link_hover(LinkTrigger::Snapshot);
                 }
                 if let Some(snapshot) = inner.last_snapshot.as_ref() {
                     if let Err(e) = inner.renderer.render(snapshot) {

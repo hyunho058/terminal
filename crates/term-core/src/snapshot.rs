@@ -171,7 +171,11 @@ impl GridSnapshot {
 
     /// D8 soft-wrap heuristic: a row is treated as soft-wrapped into the next iff
     /// its last column holds a non-blank, non-continuation cell.
-    fn row_soft_wraps(&self, row: u16) -> bool {
+    ///
+    /// `pub(crate)` so the sibling [`crate::links`] module can stitch a URL across
+    /// a wrap using the **same** rule copy uses (hyperlinks D5) — one heuristic, not
+    /// two that could drift.
+    pub(crate) fn row_soft_wraps(&self, row: u16) -> bool {
         if self.cols == 0 {
             return false;
         }
