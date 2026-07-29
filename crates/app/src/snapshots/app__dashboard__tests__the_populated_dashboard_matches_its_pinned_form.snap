@@ -1,0 +1,32 @@
+---
+source: crates/app/src/dashboard.rs
+expression: "compose(Some(&t), now).join(\"\\n\")"
+---
+── Tasks +2 more ───────────────────────────────────────────────────────────────────────────────────────
+  Fold usage per message id · in_progress
+  Pin the worked examples · completed · 10m40s
+  Audit the dedupe keying · blocked
+  Measure the model census · in_progress
+── Skills +1 more ──────────────────────────────────────────────────────────────────────────────────────
+  harness-ops:loop · 4m ago
+  insta-review · 8m ago
+  run-term · 12m ago
+── Other Tools +7 more ─────────────────────────────────────────────────────────────────────────────────
+  ✓ Bash 120ms
+  ✗ WebFetch 760ms
+  ✓ TodoWrite —
+  ✓ Monitor 2.0s
+── File Activity +1 more ───────────────────────────────────────────────────────────────────────────────
+  READ  ✓ …/renderer/atlas.rs 430ms
+  GREP  ✓ src/.*/mod\.rs 1.2s
+  WRITE ✗ …/src/dashboard.rs 1m02s
+  LIST  ✓ **/*.toml —
+── Agents +1 more ──────────────────────────────────────────────────────────────────────────────────────
+  ● general-purpose · Gate 3 checker · opus · 1m30s
+  ◯ Explore · map the overlay seam · sonnet · 30s
+  ◯ general-purpose · census message.model · sonnet · 20s
+  ◯ Plan · sequence the build order · sonnet · 50s
+── ai-monitor ──────────────────────────────────────────────────────────────────────────────────────────
+ session  5e59b629 · claude-opus-5 · context 59%
+ spend    in 45 · out 19.3K · cache 1.9M (billed)
+ activity up 45m12s · idle 2m03s (as of last update)

@@ -1,0 +1,9 @@
+---
+source: crates/app/src/dashboard.rs
+expression: "agents(&t, now).join(\"\\n\")"
+---
+── Agents +1 more ──────────────────────────────────────────────────────────────────────────────────────
+  ● general-purpose · Gate 3 checker · opus · 1m30s
+  ◯ Explore · map the overlay seam · sonnet · 30s
+  ◯ general-purpose · census message.model · sonnet · 20s
+  ◯ Plan · sequence the build order · sonnet · 50s

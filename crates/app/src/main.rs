@@ -10,6 +10,7 @@
 mod card_menu;
 mod clipboard;
 mod copy;
+mod dashboard;
 mod input;
 mod overlay;
 mod prompt;
@@ -20,6 +21,7 @@ mod settings;
 mod sidebar_model;
 mod tabmeta;
 mod tabs;
+mod tabsession;
 mod terminal_app;
 mod waiting;
 

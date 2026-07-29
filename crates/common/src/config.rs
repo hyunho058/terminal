@@ -21,6 +21,20 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub grid: GridConfig,
     pub sidebar: SidebarConfig,
+    pub ai_monitor: AiMonitorConfig,
+}
+
+/// ai-monitor overlay settings.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AiMonitorConfig {
+    /// Context window in tokens, overriding the overlay's per-model table.
+    ///
+    /// Exists because the window is **not derivable from the log**: a 1M-context
+    /// session records the same bare `message.model` as a 200k one, so an
+    /// occupancy percentage against the assumed 200k reads up to 5x high — the
+    /// measured case showed `context 128%`. `None` keeps the per-model table.
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -193,6 +207,25 @@ mod tests {
         let c = Config::default();
         assert!(c.grid.columns > 0 && c.grid.rows > 0);
         assert!(c.font.size_pt > 0.0);
+    }
+
+    #[test]
+    fn ai_monitor_context_window_is_optional_and_parses() {
+        // Absent by default: the overlay then falls back to its per-model table.
+        assert_eq!(Config::default().ai_monitor.context_window, None);
+
+        let c: Config = toml::from_str(
+            r#"
+            [ai_monitor]
+            context_window = 1000000
+        "#,
+        )
+        .unwrap();
+        assert_eq!(c.ai_monitor.context_window, Some(1_000_000));
+
+        // A config with no [ai_monitor] table at all still loads.
+        let c: Config = toml::from_str("[font]\nsize_pt = 13.0\n").unwrap();
+        assert_eq!(c.ai_monitor.context_window, None);
     }
 
     #[test]

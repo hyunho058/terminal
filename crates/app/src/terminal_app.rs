@@ -1233,7 +1233,8 @@ impl Running {
         self.refresh_hover();
         // Re-point cwd-derived overlays (ai-monitor) at the new active tab (R3.1).
         let cwd = self.tabs.active_cwd();
-        self.overlays.notify_active_changed(cwd);
+        self.overlays
+            .notify_active_changed(cwd, self.tabs.active_shell_pid());
         self.redraw();
     }
 
@@ -1430,9 +1431,11 @@ impl Running {
             } else {
                 None
             };
+            let shell_pid = self.tabs.active_shell_pid();
             let mut probe = WriteProbe::new(&mut self.tabs.active_mut().writer);
             let mut ctx = AppCtx::new(&mut probe, count, active, cwd)
                 .with_active_tab(active_tab, active_user_title)
+                .with_shell_pid(shell_pid)
                 .with_bracketed_paste(bracketed)
                 .with_selection_text(selection_text.clone());
             let consumed = self.overlays.dispatch(&input, &mut ctx) == Handled::Consumed;
@@ -1471,9 +1474,11 @@ impl Running {
             } else {
                 None
             };
+            let shell_pid = self.tabs.active_shell_pid();
             let mut probe = WriteProbe::new(&mut self.tabs.active_mut().writer);
             let mut ctx = AppCtx::new(&mut probe, count, active, cwd)
                 .with_active_tab(active_tab, active_user_title)
+                .with_shell_pid(shell_pid)
                 .with_bracketed_paste(bracketed)
                 .with_selection_text(selection_text);
             let consumed = self.router.dispatch(&input, &mut ctx) == Handled::Consumed;
