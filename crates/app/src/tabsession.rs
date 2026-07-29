@@ -17,7 +17,8 @@
 //! interface `session::cwd_of_pid` already uses. No signals, no writes.
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// What the tab's live `claude` process says about which session it is running.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -52,11 +53,116 @@ const MAX_VISITED: usize = 512;
 /// to identify the tab's session must never be worse than not having looked.
 pub fn hint_for(shell_pid: u32) -> Option<SessionHint> {
     let table = ProcTable::read()?;
-    let claude = table.find_claude(shell_pid)?;
+    let root = resolved_root(shell_pid);
+    let claude = choose_claude(root, shell_pid, |p| table.find_claude(p), cwd_of_pid)?;
     Some(SessionHint {
         session_id: table.resume_id(claude),
         started_ms: start_ms(claude),
     })
+}
+
+/// How long to wait for the tmux root before giving up and deriving from the tab's own shell.
+/// Generous for a local unix-socket query, imperceptible on a keypress.
+const RESOLVE_BUDGET: Duration = Duration::from_millis(250);
+
+/// The tmux-aware root, with a bounded wait.
+///
+/// `hint_for` runs on the **winit event-loop thread** — `Overlay::open` is reached from a
+/// keypress and from every tab switch while the panel is visible. `tmux list-clients` talks to a
+/// user-space server over a unix socket and can block indefinitely (a SIGSTOPped server, a wedged
+/// `$TMUX_TMPDIR`), which would freeze input and rendering, not merely the overlay. `/bin/ps`,
+/// the existing precedent here, is kernel-backed and always terminates; this is not.
+///
+/// So the resolve runs on a worker thread and this waits [`RESOLVE_BUDGET`] for it, falling back
+/// to the tab's own pid — the same "no re-root" answer every other failure yields. A hung server
+/// then costs the *feature*, never the UI. The honest price is one blocked thread leaked per
+/// hang, which is vastly cheaper than a frozen terminal.
+fn resolved_root(shell_pid: u32) -> u32 {
+    resolved_root_with(crate::tabmeta::tmux::effective_root_uncached, shell_pid)
+}
+
+/// [`resolved_root`]'s body, generic over the resolver so the budget is testable without
+/// actually hanging the suite.
+fn resolved_root_with(resolve: impl FnOnce(u32) -> u32 + Send + 'static, shell_pid: u32) -> u32 {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // The receiver may already have timed out and gone; that is the expected path, not an
+        // error, so the send result is deliberately discarded.
+        let _ = tx.send(resolve(shell_pid));
+    });
+    rx.recv_timeout(RESOLVE_BUDGET).unwrap_or(shell_pid)
+}
+
+/// Which `claude` this tab's session hint should describe: the tmux pane's when one is running
+/// **in the same directory**, else whatever the tab's own subtree holds.
+///
+/// Pure — every syscall arrives through an injected closure, so the fallback order, the
+/// single-walk guard and the cwd gate are all table-testable with no tmux, no live tty and no
+/// live pid. It returns the chosen **pid** rather than a built `SessionHint` for the same reason:
+/// building one would need `start_ms`, an uninjected syscall that would make these tests
+/// machine-dependent.
+///
+/// The cwd gate is the part that prevents a regression rather than adding a feature. Without it,
+/// a pane working in a *different* project yields a hint that `resolve_session` applies to the
+/// **tab shell's** projects directory: the session id names no file there, so control reaches the
+/// `since_ms` branch, whose filter is one-sided (`first + SLACK >= since`) and therefore admits
+/// any log started after the pane, returning the nearest with `owned: true` — which the overlay
+/// then latches. A ranked guess would have become a confidently wrong, sticky attachment. So a
+/// pane result is admitted **only** on a positive `Some(a) == Some(b)` cwd match; a divergent or
+/// unreadable cwd falls through to the tab's own subtree, which is exactly what today's code
+/// searches.
+fn choose_claude(
+    root: u32,
+    shell_pid: u32,
+    find: impl Fn(u32) -> Option<u32>,
+    cwd_of: impl Fn(u32) -> Option<PathBuf>,
+) -> Option<u32> {
+    // The pane branch: entered only when a pane was genuinely resolved, so a non-tmux tab does
+    // not pay a second identical walk.
+    if root != shell_pid {
+        if let Some(pid) = find(root) {
+            // Compare the found `claude`'s cwd, NOT the pane shell's: the pane's `-zsh` moves
+            // with every `cd`, while the projects directory that matters is the one `claude`
+            // itself writes into.
+            if let (Some(a), Some(b)) = (cwd_of(pid), cwd_of(shell_pid)) {
+                if a == b {
+                    return Some(pid);
+                }
+            }
+            // Divergent or unreadable: fall through. Never `None` — the tab's own subtree is
+            // what today's code searches, so this path cannot be worse than today.
+        }
+    }
+    find(shell_pid)
+}
+
+/// This tab's cwd, from its pid. A third in-repo copy of the same `proc_pidinfo` call
+/// (`session.rs` has a private one; `tabmeta::proc`'s is `pub(crate)` but sits inside a private
+/// `mod proc`), forced by the module boundary rather than by carelessness.
+fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if n < size {
+        return None;
+    }
+    let raw = &info.pvi_cdir.vip_path;
+    let bytes = unsafe {
+        std::slice::from_raw_parts(raw.as_ptr() as *const u8, std::mem::size_of_val(raw))
+    };
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(0);
+    if end == 0 {
+        return None;
+    }
+    std::str::from_utf8(&bytes[..end]).ok().map(PathBuf::from)
 }
 
 /// The process table: `pid -> (ppid, argv)`, read once per resolution.
@@ -343,6 +449,228 @@ mod tests {
             ..Default::default()
         }
         .is_empty());
+    }
+
+    // ---- the tmux re-root: choose_claude, against fakes (R1, R3, R4) ----
+
+    /// A tmux-shaped table: the tab's shell (34643) has a `tmux` client child, while the pane's
+    /// shell (74877) hangs off the tmux **server** (90662) with `claude` beneath it. This is the
+    /// measured shape, and it is why `find_claude(tab_shell)` finds nothing today.
+    const TMUX_SAMPLE: &str = "\
+34637     1 ./target/debug/app
+34643 34637 /bin/zsh
+75071 34643 tmux
+90662     1 tmux
+74877 90662 -zsh
+74922 74877 claude --resume 54e576c2-bd76-4acd-8eed-bda54f60a155
+";
+
+    #[test]
+    fn a_tmux_tab_finds_nothing_from_its_own_shell_but_does_from_the_pane() {
+        // R3.1 / R3.2 — the defect this feature fixes, and the premise the hop relies on. The
+        // pane is a child of the tmux SERVER, so it is not in the tab's subtree at any depth.
+        let t = ProcTable::parse(TMUX_SAMPLE);
+        assert_eq!(
+            t.find_claude(34643),
+            None,
+            "the defect: nothing from the tab"
+        );
+        assert_eq!(
+            t.find_claude(74877),
+            Some(74922),
+            "found from the pane root"
+        );
+    }
+
+    /// A tab with a `claude` in **both** subtrees — its own, and its tmux pane's. Without this
+    /// shape the interesting cases are unobservable: with only one candidate, "the pane wins"
+    /// and "the rejected pane falls through to the tab" both look identical to "found the only
+    /// one there was".
+    const BOTH_SAMPLE: &str = "\
+34637     1 ./target/debug/app
+34643 34637 /bin/zsh
+35303 34643 claude
+75071 34643 tmux
+90662     1 tmux
+74877 90662 -zsh
+74922 74877 claude
+";
+
+    #[test]
+    fn the_pane_wins_over_the_tabs_own_claude_when_both_exist() {
+        // R1.2 — "the pane is the more specific answer and must win when both exist and agree."
+        // Anchors the ORDER: a tab-first implementation would return 35303 here.
+        let t = ProcTable::parse(BOTH_SAMPLE);
+        let same = |_: u32| Some(PathBuf::from("/proj/a"));
+        assert_eq!(
+            choose_claude(74877, 34643, |p| t.find_claude(p), same),
+            Some(74922),
+            "the pane's claude, not the tab's own"
+        );
+    }
+
+    #[test]
+    fn a_rejected_pane_falls_through_to_the_tabs_own_claude() {
+        // D2(c) — the load-bearing "never worse than today" guarantee: every pid this function
+        // could find BEFORE the change, it still finds. A pane whose claude works elsewhere is
+        // not admitted, but that must not blind the tab to its own agent — which is exactly
+        // what a `return None` in the pane branch would do.
+        let t = ProcTable::parse(BOTH_SAMPLE);
+        let divergent = |pid: u32| {
+            Some(PathBuf::from(if pid == 74922 {
+                "/proj/other"
+            } else {
+                "/proj/a"
+            }))
+        };
+        assert_eq!(
+            choose_claude(74877, 34643, |p| t.find_claude(p), divergent),
+            Some(35303),
+            "falls through to the tab's own claude — never None"
+        );
+    }
+
+    #[test]
+    fn the_pane_wins_when_its_claude_shares_the_tabs_cwd() {
+        // R1.2 / R4.4 — the feature working: pane preferred, cwd agrees.
+        let t = ProcTable::parse(TMUX_SAMPLE);
+        let same = |_: u32| Some(PathBuf::from("/proj/a"));
+        assert_eq!(
+            choose_claude(74877, 34643, |p| t.find_claude(p), same),
+            Some(74922)
+        );
+    }
+
+    #[test]
+    fn a_pane_working_elsewhere_is_not_admitted() {
+        // R4.1 — the regression this gate exists to prevent. Without it the pane's started_ms
+        // reaches resolve_session against the TAB's projects dir, whose one-sided since_ms
+        // filter would return a wrong log with owned:true — a sticky, confident mistake.
+        let t = ProcTable::parse(TMUX_SAMPLE);
+        let divergent = |pid: u32| {
+            Some(PathBuf::from(if pid == 74922 {
+                "/proj/other"
+            } else {
+                "/proj/a"
+            }))
+        };
+        assert_eq!(
+            choose_claude(74877, 34643, |p| t.find_claude(p), divergent),
+            None,
+            "no claude under the tab's own shell, and the pane's is not admitted"
+        );
+    }
+
+    #[test]
+    fn the_gate_compares_the_found_claude_not_the_pane_shell() {
+        // R4.6 — the pane's `-zsh` moves with every `cd`; the directory that matters is the one
+        // `claude` writes into. Here the pane SHELL diverges but its `claude` agrees: admit.
+        let t = ProcTable::parse(TMUX_SAMPLE);
+        let shell_diverges = |pid: u32| {
+            Some(PathBuf::from(if pid == 74877 {
+                "/proj/elsewhere"
+            } else {
+                "/proj/a"
+            }))
+        };
+        assert_eq!(
+            choose_claude(74877, 34643, |p| t.find_claude(p), shell_diverges),
+            Some(74922),
+            "the pane shell's cwd is irrelevant; the claude's is what counts"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_cwd_never_counts_as_agreement() {
+        // R4.5 — a naive `!=` would conflate "different" with "could not read", and worse,
+        // `None == None` would ADMIT exactly the case the gate exists to block.
+        let t = ProcTable::parse(TMUX_SAMPLE);
+        for cwd_of in [
+            (|_: u32| None) as fn(u32) -> Option<PathBuf>,
+            |pid: u32| (pid != 74922).then(|| PathBuf::from("/proj/a")),
+            |pid: u32| (pid == 74922).then(|| PathBuf::from("/proj/a")),
+        ] {
+            assert_eq!(
+                choose_claude(74877, 34643, |p| t.find_claude(p), cwd_of),
+                None,
+                "only a positive Some(a) == Some(b) may admit the pane"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tab_subtree_is_retried_and_is_never_cwd_gated() {
+        // R1.3 — a tab-provenance hit is about the tab's own project by construction, so gating
+        // it on the PANE's cwd would suppress a hint today's code returns. The pane here has no
+        // agent; the tab's own subtree does.
+        let t = ProcTable::parse(
+            "34643 34637 /bin/zsh\n\
+             35303 34643 claude\n\
+             75071 34643 tmux\n\
+             90662     1 tmux\n\
+             74877 90662 -zsh\n",
+        );
+        // Even with a cwd reader that reports divergence for everything.
+        let divergent = |pid: u32| Some(PathBuf::from(format!("/proj/{pid}")));
+        assert_eq!(
+            choose_claude(74877, 34643, |p| t.find_claude(p), divergent),
+            Some(35303),
+            "the tab's own claude is returned, ungated"
+        );
+    }
+
+    #[test]
+    fn nothing_re_rooted_means_exactly_one_walk_and_no_cwd_read() {
+        // R1.4 / R4.3 — counting closures are the only way to assert a non-occurrence here.
+        let t = ProcTable::parse("1 0 /bin/zsh\n");
+        let walks = std::cell::RefCell::new(0usize);
+        let cwds = std::cell::RefCell::new(0usize);
+        let got = choose_claude(
+            7,
+            7, // root == shell_pid: the non-tmux case
+            |p| {
+                *walks.borrow_mut() += 1;
+                t.find_claude(p)
+            },
+            |p| {
+                *cwds.borrow_mut() += 1;
+                cwd_of_pid(p)
+            },
+        );
+        assert_eq!(got, None);
+        assert_eq!(
+            *walks.borrow(),
+            1,
+            "the guard suppressed a second identical walk"
+        );
+        assert_eq!(*cwds.borrow(), 0, "the cwd gate is inside the pane branch");
+    }
+
+    // ---- the resolve budget (R5) ----
+
+    #[test]
+    fn a_hung_resolver_degrades_to_the_tabs_own_pid_within_the_budget() {
+        // R5.1 — the property that keeps a wedged tmux server from freezing the terminal: it
+        // must RETURN, and return the fallback.
+        let start = std::time::Instant::now();
+        let got = resolved_root_with(
+            |_| {
+                std::thread::sleep(RESOLVE_BUDGET * 8);
+                99999 // never observed
+            },
+            4242,
+        );
+        assert_eq!(got, 4242, "budget expired -> the tab's own pid");
+        assert!(
+            start.elapsed() < RESOLVE_BUDGET * 4,
+            "must return near the budget, not wait out the resolver"
+        );
+    }
+
+    #[test]
+    fn a_prompt_resolver_value_is_used() {
+        // R5.2 — the bound costs nothing in the normal case.
+        assert_eq!(resolved_root_with(|_| 74877, 34643), 74877);
     }
 
     #[test]
