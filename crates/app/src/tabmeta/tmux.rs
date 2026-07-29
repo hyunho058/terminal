@@ -560,29 +560,37 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_costs_one_root_read_plus_one_per_direct_child() {
-        // R2.6 / D9 — the honest price of the presence gate on a NON-tmux tab, which every
-        // tab pays every refresh. `exe_path(root)` is the genuinely new syscall (the agent
-        // walk never classifies its root, so no fusion could recover it); `children_of` plus
-        // one `exe_path` per child duplicate reads the agent walk makes moments later.
-        let _g = super::super::probe::serial();
-        let me = std::process::id();
-        // Measure k INDEPENDENTLY, outside the counted window. Deriving it from PROC_EXE
-        // itself would make the assertion `PROC_EXE == 1 + (PROC_EXE - 1)` — a tautology that
-        // holds for any value and proves nothing.
-        let k = super::super::proc::children_of(me).len() as u64;
-
-        super::super::probe::reset_all();
-        assert!(tmux_client_of(me).is_none(), "the test binary is not tmux");
-        assert_eq!(
-            super::super::probe::PROC_CHILDREN.get(),
+    fn the_gate_reads_the_root_then_each_child() {
+        // R2.6 / D9 — the gate's exact syscall shape, proven against a fake tree so it is
+        // deterministic. (Against the real process table this would be racy: `k` is a live
+        // child count that a concurrently-running test spawning a process can change.)
+        // `exe_path(root)` is the genuinely NEW read — `agent::walk` never classifies its
+        // root, so no fusion with the agent walk could ever recover it.
+        let exes = HashMap::from([
+            (1u32, "/bin/zsh"),
+            (2u32, "/usr/bin/vim"),
+            (3u32, "/usr/bin/less"),
+        ]);
+        let kids = HashMap::from([(1u32, vec![2u32, 3u32])]);
+        let exe_calls = RefCell::new(0usize);
+        let child_calls = RefCell::new(0usize);
+        let got = tmux_client_of_with(
             1,
-            "exactly one child listing"
+            |pid| {
+                *exe_calls.borrow_mut() += 1;
+                exe_of(&exes)(pid)
+            },
+            |pid| {
+                *child_calls.borrow_mut() += 1;
+                kids_of(&kids)(pid)
+            },
         );
+        assert!(got.is_none(), "no tmux in this tree");
+        assert_eq!(*child_calls.borrow(), 1, "exactly one child listing");
         assert_eq!(
-            super::super::probe::PROC_EXE.get(),
-            1 + k,
-            "one exe read for the root (D5a's depth-0 check), plus one per direct child (k = {k})"
+            *exe_calls.borrow(),
+            3,
+            "1 for the root (depth 0) + k for its 2 direct children"
         );
     }
 
