@@ -77,7 +77,11 @@ const RESOLVE_BUDGET: Duration = Duration::from_millis(250);
 /// to the tab's own pid — the same "no re-root" answer every other failure yields. A hung server
 /// then costs the *feature*, never the UI. The honest price is one blocked thread leaked per
 /// hang, which is vastly cheaper than a frozen terminal.
-fn resolved_root(shell_pid: u32) -> u32 {
+/// `pub(crate)` so the ai-monitor overlay can reuse this exact guard when resolving the pane's
+/// *cwd* on open (tmux-pane-cwd D12). Sharing it is deliberate: a second copy of a 250 ms
+/// timeout around a call that can hang the UI is precisely the kind of safety logic that must
+/// not be duplicated.
+pub(crate) fn resolved_root(shell_pid: u32) -> u32 {
     resolved_root_with(crate::tabmeta::tmux::effective_root_uncached, shell_pid)
 }
 

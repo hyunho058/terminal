@@ -66,35 +66,30 @@ impl Deriver {
         }
     }
 
-    /// Derive one tab. cwd is resolved once and shared by the git and activity paths
-    /// (D10); each source is skipped entirely when its toggle is off (R1.8).
+    /// Derive one tab. cwd is resolved once and shared by the git and activity paths (D10)
+    /// **and published on `TabMeta`** (tmux-pane-cwd R1.1). The git and agent sources are each
+    /// skipped when their toggle is off (R1.8); the root and cwd never are (D13).
     fn tab(&mut self, tp: &TabPid, tick: u64, now: SystemTime) -> TabMeta {
-        let enabled = self.enabled_git || self.enabled_agent;
         // Re-root at the tmux pane when this tab runs a client. Absent tmux this is `tp.pid`,
-        // so every downstream read is byte-identical to today. Behind the same toggle as the
-        // cwd read: with both sources off the tab needs no root either, and running the
-        // presence gate would be pure waste.
-        let root = if enabled {
-            super::tmux::effective_root(&mut self.tmux_memo, tp.pid, tick)
-        } else {
-            tp.pid
-        };
-        // cwd feeds the git branch and Claude activity; skip it when neither is wanted.
-        // The read is gated *outside* the match: a `match (enabled, cwd_of_pid(root))` would
-        // evaluate the scrutinee tuple eagerly and fire the syscall even when `enabled` is
-        // false, breaking the "both toggles off touches nothing" contract.
-        let (root, cwd) = if !enabled {
-            (tp.pid, None)
-        } else {
-            match super::proc::cwd_of_pid(root) {
-                Some(c) => (root, Some(c)),
-                // The pane died between `effective_root`'s liveness check and here: retry from
-                // the tab's own shell so the card degrades to today's metadata rather than
-                // going blank. The rebound `root` also redirects `agent_of_pid` below, so
-                // branch and agent never describe different processes.
-                None if root != tp.pid => (tp.pid, super::proc::cwd_of_pid(tp.pid)),
-                None => (tp.pid, None),
-            }
+        // so every downstream read is byte-identical to today.
+        //
+        // **Deliberately not behind the display toggles** (tmux-pane-cwd D13). Both the root
+        // and the cwd used to be skipped when `show_git_branch` and `show_agent_status` were
+        // off, on the reasoning that nothing downstream wanted them. That stopped being true
+        // once `cwd` became a published field: `Session::cwd()` reads it for the ai-monitor's
+        // log directory and the tab title, so gating it would let two *sidebar display
+        // preferences* silently restore the wrong-directory bug this feature exists to fix —
+        // with nothing on screen connecting cause to effect. The toggles still skip the
+        // expensive work (`.git` I/O, the agent walk); they no longer skip a `proc_pidinfo`.
+        let root = super::tmux::effective_root(&mut self.tmux_memo, tp.pid, tick);
+        let (root, cwd) = match super::proc::cwd_of_pid(root) {
+            Some(c) => (root, Some(c)),
+            // The pane died between `effective_root`'s liveness check and here: retry from
+            // the tab's own shell so the card degrades to today's metadata rather than
+            // going blank. The rebound `root` also redirects `agent_of_pid` below, so
+            // branch and agent never describe different processes.
+            None if root != tp.pid => (tp.pid, super::proc::cwd_of_pid(tp.pid)),
+            None => (tp.pid, None),
         };
 
         let branch = if self.enabled_git {
@@ -130,6 +125,7 @@ impl Deriver {
             branch,
             agent,
             task,
+            cwd,
         }
     }
 
@@ -314,6 +310,7 @@ mod tests {
                 branch: Some("main".into()),
                 agent: None,
                 task: None,
+                cwd: None,
             },
         )];
         publish_if_changed(&s, &mut published, one.clone(), &wake);
@@ -336,6 +333,7 @@ mod tests {
                 branch: Some("dev".into()),
                 agent: None,
                 task: None,
+                cwd: None,
             },
         )];
         publish_if_changed(&s, &mut published, two, &wake);
@@ -448,11 +446,67 @@ mod tests {
     }
 
     #[test]
-    fn both_toggles_off_runs_no_gate_and_no_cwd_read() {
-        // R3.1 — the property the eager-scrutinee hazard would have broken. A
-        // `match (enabled, cwd_of_pid(root))` evaluates the tuple before matching, firing the
-        // syscall even with both sources off; gating the read outside the match is what keeps
-        // every one of these at zero.
+    fn a_cwd_only_change_publishes_and_wakes() {
+        // tmux-pane-cwd R1.5 — load-bearing for D6, and a deliberate change to the
+        // publication predicate. `cwd` joining `TabMeta`'s derived `PartialEq` means a bare
+        // `cd` (same branch, same agent, same task) now publishes where it previously did
+        // not. Without that wake the overlay would never learn the pane moved, because a tmux
+        // window switch changes no other field.
+        let s = TabMetaShared {
+            generation: Default::default(),
+            tabs: std::sync::Mutex::new(Vec::new()),
+        };
+        let woke = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w = woke.clone();
+        let wake = move || {
+            w.fetch_add(1, Ordering::Relaxed);
+        };
+        let mut published = Vec::new();
+
+        let at = |dir: &str| {
+            vec![(
+                TabId(1),
+                TabMeta {
+                    branch: Some("main".into()),
+                    agent: None,
+                    task: None,
+                    cwd: Some(PathBuf::from(dir)),
+                },
+            )]
+        };
+
+        publish_if_changed(&s, &mut published, at("/proj/a"), &wake);
+        assert_eq!(woke.load(Ordering::Relaxed), 1, "first publish");
+
+        // Only the cwd differs — everything else is byte-identical.
+        publish_if_changed(&s, &mut published, at("/proj/b"), &wake);
+        assert_eq!(
+            woke.load(Ordering::Relaxed),
+            2,
+            "a cwd-only change must publish (D6 depends on this wake)"
+        );
+        assert_eq!(s.generation.load(Ordering::Acquire), 2);
+
+        // ...and an unchanged cwd still must not, so the G1 idle-CPU property holds.
+        publish_if_changed(&s, &mut published, at("/proj/b"), &wake);
+        assert_eq!(
+            woke.load(Ordering::Relaxed),
+            2,
+            "an unchanged pass must stay silent"
+        );
+    }
+
+    #[test]
+    fn both_toggles_off_still_resolves_cwd_but_does_no_git_or_agent_work() {
+        // tmux-pane-cwd R1.4 — **deliberately inverts** this test's previous contract
+        // (`both_toggles_off_runs_no_gate_and_no_cwd_read`), which asserted that both toggles
+        // off meant zero cwd reads and no presence gate.
+        //
+        // Why it had to change: `cwd` is now a *published* field that `Session::cwd()` reads
+        // for the ai-monitor's log directory and the tab title. Leaving it gated on
+        // `show_git_branch` / `show_agent_status` meant two sidebar **display preferences**
+        // could silently restore the wrong-directory bug this feature exists to fix (D13).
+        // So the root + cwd are now unconditional; only the expensive sources stay gated.
         let _g = super::super::probe::serial();
         let mut d = Deriver::new();
         d.enabled_git = false;
@@ -463,18 +517,23 @@ mod tests {
         };
         super::super::probe::reset_all();
         let meta = d.tab(&tp, 0, SystemTime::now());
-        assert_eq!(meta, TabMeta::default(), "both off -> nothing published");
-        assert_eq!(super::super::probe::PROC_CWD.get(), 0, "no cwd read");
-        assert_eq!(
-            super::super::probe::PROC_EXE.get(),
-            0,
-            "the gate did not run"
+
+        // The cwd is published even with every display source off.
+        assert!(
+            meta.cwd.is_some(),
+            "both off must still publish a cwd (R1.4)"
         );
-        assert_eq!(
-            super::super::probe::PROC_CHILDREN.get(),
-            0,
-            "the gate did not run"
+        assert!(
+            super::super::probe::PROC_CWD.get() >= 1,
+            "the cwd read is unconditional now"
         );
+        // ...and nothing else is. The toggles still buy back all the *expensive* work.
+        assert_eq!(meta.branch, None, "git off -> no branch");
+        assert_eq!(meta.agent, None, "agent off -> no agent");
+        assert_eq!(meta.task, None, "agent off -> no task");
+        assert_eq!(super::super::probe::GIT_STAT.get(), 0, "git off -> no stat");
+        assert_eq!(super::super::probe::GIT_READ.get(), 0, "git off -> no read");
+        // Still no subprocess: the presence gate runs, but this tab has no tmux under it.
         assert_eq!(super::super::probe::TMUX_LIST.get(), 0, "no spawn");
     }
 
@@ -581,11 +640,14 @@ mod tests {
             0,
             "disabled → no git read"
         );
-        assert_eq!(
-            super::super::probe::PROC_CWD.get(),
-            0,
-            "both off → no cwd resolve"
+        // tmux-pane-cwd R1.4 — was `PROC_CWD == 0`. The cwd read is no longer behind the
+        // display toggles (D13), because `Session::cwd()` publishes it to the overlay and the
+        // tab title. What the toggles still buy back is the git I/O asserted just above.
+        assert!(
+            super::super::probe::PROC_CWD.get() >= 1,
+            "cwd resolve is unconditional now"
         );
+        assert!(without.cwd.is_some(), "cwd survives both toggles being off");
     }
 
     // ---- R6.5 transition guard ----
@@ -603,6 +665,7 @@ mod tests {
                 state: AgentState::Unknown,
             }),
             task: None,
+            cwd: None,
         };
         d.note_activity_gap(id, &unknown);
         assert_eq!(d.debug_seen.get(&id), Some(&AgentKind::Aider));
@@ -619,6 +682,7 @@ mod tests {
                 state: AgentState::Busy,
             }),
             task: None,
+            cwd: None,
         };
         d.note_activity_gap(id, &busy);
         assert!(!d.debug_seen.contains_key(&id));

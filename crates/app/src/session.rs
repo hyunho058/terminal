@@ -10,6 +10,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 
 use term_core::{Color, CommandEnd, Pty, Terminal};
+
+use crate::tabmeta::TabMeta;
 use winit::event_loop::EventLoopProxy;
 
 use crate::terminal_app::UserEvent;
@@ -163,12 +165,23 @@ impl Session {
         Ok(())
     }
 
-    /// The shell's live working directory, via the child pid + `proc_pidinfo`
-    /// (macOS). Follows `cd`, so it drives per-tab log resolution (ai-monitor R1.1/
-    /// R3.1) and cwd-basename tab titles (R6.1). `None` if the pid/cwd is
-    /// unavailable.
-    pub fn cwd(&self) -> Option<PathBuf> {
-        cwd_of_pid(self.pty.child_pid()?)
+    /// This tab's working directory — the **active tmux pane's** when the tab runs a tmux
+    /// client, else the shell's own. Drives cwd-basename tab titles (R6.1) and the rename
+    /// prefill; the ai-monitor resolves its own on open (tmux-pane-cwd D12).
+    ///
+    /// Reads `meta.cwd`, which the tabmeta worker publishes (tmux-pane-cwd D1/D2). That is
+    /// what makes this **free on the hot paths**: it is called twice per keystroke
+    /// (`terminal_app.rs`) and once per tab per sidebar resync, and a published read costs no
+    /// syscall where the old direct `proc_pidinfo` cost one every time.
+    ///
+    /// Falls back to that direct lookup when nothing is published — a tab the worker has not
+    /// polled yet, or one where no cwd resolved — so this is **never emptier than the old
+    /// implementation** (R2.3), and still returns `None` for a dead shell once the worker has
+    /// observed it (R8.2). The fallback returns the *tab's own* cwd, which under tmux is the
+    /// client's rather than the pane's; that window is why the overlay does not rely on this
+    /// (D12) and why a briefly-wrong title is an accepted residue.
+    pub fn cwd(&self, meta: Option<&TabMeta>) -> Option<PathBuf> {
+        published_or(meta, || cwd_of_pid(self.pty.child_pid()?))
     }
 
     /// The pid of this tab's shell. The root of the process tree the ai-monitor
@@ -226,10 +239,31 @@ fn err<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
     e.into()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of real `proc_pidinfo` calls made through [`cwd_of_pid`]. Exists so
+    /// R6.1's "the hot path costs zero syscalls" is a *measured delta* rather than an argument
+    /// about whether a closure ran. Not compiled into the shipping binary.
+    ///
+    /// **Thread-local, not a global.** libtest runs tests concurrently and
+    /// `cwd_of_pid_resolves_current_process` calls `cwd_of_pid` directly in this same binary; a
+    /// process-wide counter would let it land inside another test's measurement window and fail
+    /// it spuriously. Both the calls and the reads happen on the measuring test's own thread,
+    /// so a thread-local is exactly the scope wanted — and needs no serialization.
+    pub(crate) static CWD_SYSCALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The current working directory of process `pid` via macOS `proc_pidinfo`
 /// (`PROC_PIDVNODEPATHINFO`). Read-only. `None` on any failure (dead pid,
 /// permission, empty path) — callers degrade gracefully.
-fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
+///
+/// `pub(crate)` since tmux-pane-cwd: `overlay.rs` calls it to turn the resolved tmux pane pid
+/// into a path (D12). In-surface, so it needs no deviation record — but it is a real new
+/// cross-module coupling and is named here so it is not a silent one.
+pub(crate) fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
+    #[cfg(test)]
+    CWD_SYSCALLS.with(|c| c.set(c.get() + 1));
+
     let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
     let n = unsafe {
@@ -256,6 +290,24 @@ fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
     std::str::from_utf8(&bytes[..end]).ok().map(PathBuf::from)
 }
 
+/// The cwd-resolution rule, split from [`Session::cwd`] so it is testable without a PTY
+/// (tmux-pane-cwd R2.1-R2.3) — the same pure-logic/thin-wrapper split `proc.rs`'s parsers and
+/// `tabsession::resolved_root_with` already use.
+///
+/// `fallback` is a closure, not a value, so it is **not evaluated** when a cwd is published.
+/// That laziness is the whole performance claim: on the hot paths (twice per keystroke, once
+/// per tab per sidebar resync) a published read must cost zero syscalls, and eagerly computing
+/// a fallback that is then discarded would reinstate exactly the `proc_pidinfo` this removes.
+fn published_or(
+    meta: Option<&TabMeta>,
+    fallback: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    match meta.and_then(|m| m.cwd.clone()) {
+        Some(cwd) => Some(cwd),
+        None => fallback(),
+    }
+}
+
 /// Normalize a user title on its way in (sticky-tab-title R2.3): a blank or whitespace-only
 /// name is not a name — it is the user clearing the tab back to its auto label. Applied at
 /// the single setter so every entry point (the rename chord, the card menu, anything later)
@@ -274,6 +326,124 @@ fn program_title_is_visible(user_title: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `TabMeta` carrying just a cwd — the only field these tests care about.
+    fn meta_with(cwd: Option<&str>) -> TabMeta {
+        TabMeta {
+            cwd: cwd.map(PathBuf::from),
+            ..TabMeta::default()
+        }
+    }
+
+    #[test]
+    fn a_published_cwd_wins_and_costs_no_fallback() {
+        // R2.1 — the published value is returned.
+        let got = published_or(Some(&meta_with(Some("/a/b"))), || {
+            Some(PathBuf::from("/fallback"))
+        });
+        assert_eq!(got, Some(PathBuf::from("/a/b")));
+    }
+
+    /// A real `Session` with no winit event loop.
+    ///
+    /// `EventLoopProxy` is a parameter of [`Session::spawn`], **not a field of `Session`** — so
+    /// the struct is constructible directly here, and `Session::cwd` (the actual subject of
+    /// R6.1) is measurable rather than merely arguable. Spawns a real `/bin/zsh` via
+    /// `Pty::spawn`, which is consistent with existing practice in this crate (`tabsession`
+    /// shells out to `/bin/ps`) and with the macOS-only rule.
+    ///
+    /// `Tabs` genuinely is out of reach — it holds an `EventLoopProxy` as a field — but its
+    /// `active_cwd`/`titles` are thin wrappers whose only cwd cost is the `Session::cwd` call
+    /// measured here.
+    fn live_session() -> Session {
+        let (_tx, rx) = mpsc::channel::<Vec<u8>>();
+        let pty = Pty::spawn(80, 24).expect("pty");
+        let writer = pty.writer().expect("writer");
+        Session {
+            id: TabId(1),
+            terminal: Terminal::new(80, 24, Color::rgb(200, 200, 200), Color::rgb(0, 0, 0)),
+            pty,
+            writer,
+            rx,
+            user_title: None,
+            program_title: String::new(),
+            title_dirty: false,
+            command_end: None,
+            _reader: std::thread::spawn(|| {}),
+        }
+    }
+
+    #[test]
+    fn session_cwd_performs_zero_syscalls_when_published_and_one_when_not() {
+        // R6.1 — the cost claim as a MEASURED delta on the real `Session::cwd`, not an argument
+        // about whether a closure ran. This is the path evaluated twice per key press
+        // (`terminal_app.rs`) and once per tab per sidebar resync (`tabs.rs`), where it used to
+        // cost a `proc_pidinfo` every single time.
+        let s = live_session();
+        let meta = meta_with(Some("/published"));
+
+        // Published: zero syscalls, however many times it is called.
+        let before = CWD_SYSCALLS.with(|c| c.get());
+        for _ in 0..100 {
+            assert_eq!(s.cwd(Some(&meta)), Some(PathBuf::from("/published")));
+        }
+        assert_eq!(
+            CWD_SYSCALLS.with(|c| c.get()) - before,
+            0,
+            "100 reads on the keystroke path must cost 0 syscalls (R6.1)"
+        );
+
+        // Unpublished: the fallback fires — proving the counter is live, so the zero above is
+        // a real measurement and not a counter that never moves.
+        let before = CWD_SYSCALLS.with(|c| c.get());
+        let _ = s.cwd(None);
+        assert!(
+            CWD_SYSCALLS.with(|c| c.get()) - before >= 1,
+            "the fallback must actually reach the syscall — otherwise the zero proves nothing"
+        );
+    }
+
+    #[test]
+    fn published_or_short_circuits_before_the_fallback() {
+        // The pure half of R6.1: `published_or` never evaluates its fallback when a cwd is
+        // published. `session_cwd_performs_zero_syscalls_when_published_and_one_when_not` is
+        // the real measurement on `Session::cwd`; this one pins the rule itself, with a
+        // panicking fallback so a regression is loud rather than a silent extra syscall.
+        let got = published_or(Some(&meta_with(Some("/proj"))), || {
+            panic!("R6.1 violated: the keystroke path performed a cwd syscall")
+        });
+        assert_eq!(got, Some(PathBuf::from("/proj")));
+    }
+
+    #[test]
+    fn absence_falls_back_to_the_direct_lookup() {
+        // R2.2 — both flavours of absence fall through: no entry for this tab at all (the
+        // not-yet-polled window), and an entry that resolved no cwd.
+        let fb = || Some(PathBuf::from("/fallback"));
+        assert_eq!(published_or(None, fb), Some(PathBuf::from("/fallback")));
+        assert_eq!(
+            published_or(Some(&meta_with(None)), fb),
+            Some(PathBuf::from("/fallback"))
+        );
+    }
+
+    #[test]
+    fn cwd_is_never_emptier_than_the_direct_lookup() {
+        // R2.3 / C7 — whenever the old implementation would have produced a path, so does
+        // this; and when even the fallback has nothing (a dead shell, once the worker has
+        // observed it) the answer is still `None`, not a stale directory.
+        assert_eq!(
+            published_or(None, || Some(PathBuf::from("/live"))),
+            Some(PathBuf::from("/live")),
+            "no publication yet must not be emptier than today"
+        );
+        assert_eq!(published_or(None, || None), None, "dead shell stays None");
+        assert_eq!(
+            published_or(Some(&meta_with(None)), || None),
+            None,
+            "polled-with-no-cwd plus dead shell stays None"
+        );
+    }
 
     #[test]
     fn blank_user_title_normalizes_to_a_clear() {

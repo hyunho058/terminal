@@ -32,9 +32,11 @@ pub struct AiMonitorOverlay {
     /// before spawning, it is `Some` immediately after a successful open — never
     /// "opened but nothing folded yet".
     latest: Option<Arc<TelemetrySnapshot>>,
-    cwd: Option<PathBuf>,
-    /// The tab's shell pid, root of the process tree that identifies its session.
-    shell_pid: Option<u32>,
+    /// The re-point bookkeeping: which notification this panel was last opened for, and the
+    /// rule for deciding whether a new one is a real change (D6/R4.3). Owning it as a unit
+    /// rather than as loose fields is what puts the *choice of key* under test — the storm
+    /// bug was in which value the call site stored, not in the comparison.
+    repoint: Repoint,
     watcher: Option<LogWatcher>,
     proxy: EventLoopProxy<UserEvent>,
     /// This window's start time. A log whose last event precedes it stopped being
@@ -65,8 +67,7 @@ impl AiMonitorOverlay {
             visible: false,
             handle: OverlayHandle::default(),
             latest: None,
-            cwd: None,
-            shell_pid: None,
+            repoint: Repoint::default(),
             watcher: None,
             proxy,
             started_ms: now_ms(),
@@ -84,6 +85,31 @@ impl AiMonitorOverlay {
         matches!(&input.key, Key::Character(s) if s.eq_ignore_ascii_case("m"))
     }
 
+    /// The **active tmux pane's** cwd for the tab rooted at `shell_pid`, or `None` when this
+    /// tab is not running tmux (tmux-pane-cwd D12/R3.1).
+    ///
+    /// Why this exists at all: under tmux the pane's shell is a child of the tmux *server*,
+    /// not of the tab, so the tab's own cwd is the **client's** — measured as `~` while the
+    /// pane sat in a worktree, which makes `project_dir` resolve a directory that does not
+    /// exist and blanks every dashboard row.
+    ///
+    /// Resolved here rather than read from the tabmeta snapshot because the snapshot has no
+    /// entry until a roster round-trip completes, and its absence falls back to exactly the
+    /// wrong answer — so `tmux attach` followed quickly by the toggle would open on the
+    /// client's project. A toggle is user-initiated and on no cadence, which is the cost
+    /// licence `effective_root_uncached` is written for.
+    ///
+    /// Uses [`tabsession::resolved_root`]'s bounded wait, not the raw resolver: this runs on
+    /// the winit event-loop thread, and `tmux list-clients` can block indefinitely against a
+    /// wedged server. A hang must cost the feature, never the UI.
+    fn pane_cwd(shell_pid: Option<u32>) -> Option<PathBuf> {
+        pane_cwd_with(
+            tabsession::resolved_root,
+            crate::session::cwd_of_pid,
+            shell_pid,
+        )
+    }
+
     /// Open on `cwd`: resolve the log, backfill, and start tailing (D1/D6).
     fn open(&mut self, cwd: Option<PathBuf>, shell_pid: Option<u32>) {
         // Re-read on open rather than holding a live handle: `settings::apply` does
@@ -92,8 +118,11 @@ impl AiMonitorOverlay {
         self.context_window = common::config::Config::load()
             .ok()
             .and_then(|c| c.ai_monitor.context_window);
-        self.cwd = cwd.clone();
-        self.shell_pid = shell_pid;
+        // One call does both halves of the bookkeeping: it records the *notified* value as the
+        // re-point key and returns the *resolved* value to open on, preferring the tmux pane's
+        // cwd and falling back to the tab's own (R3.3). Keeping the two straight is the whole
+        // storm fix, so it lives in a unit a test can drive (see `Repoint`).
+        let cwd = self.repoint.opened(cwd, shell_pid, Self::pane_cwd);
         // Ask the tab's own process tree which session it is running. This is the
         // only signal that distinguishes it from a session another application is
         // running in the same project directory.
@@ -192,6 +221,94 @@ impl AiMonitorOverlay {
             lines,
         });
     }
+}
+
+/// The re-point bookkeeping for the ai-monitor panel: what it was last opened *for*, and
+/// whether a new notification is a real change (D6/R4.3).
+///
+/// **Why this is a struct and not two fields plus a predicate.** The storm bug was never in
+/// the comparison — it was in *which value the call site stored*. `open` has two cwds in hand:
+/// the one it was **notified** with (`Tabs::active_cwd`, which falls back to the tab's own
+/// shell — under tmux, the client's) and the one it **resolved** (`pane_cwd`, the tmux pane's).
+/// Storing the resolved one and comparing it against incoming notifications meant the two
+/// disagreed by construction for the whole window before the worker's first publish, so the
+/// guard fired on every wake and never converged — watcher dropped and respawned, full backfill
+/// re-run, and two 250 ms UI-thread `tmux list-clients` calls each time. The overlay's own
+/// watcher emits `OverlayPending`, so the storm fed itself.
+///
+/// A free predicate could not catch that: a test would hand it literals and pass either way
+/// (verified — the earlier test passed against the buggy call site). Making [`opened`] own the
+/// choice puts it under test, because a test drives the *transition* and never types the key.
+///
+/// [`opened`]: Repoint::opened
+#[derive(Default)]
+struct Repoint {
+    /// The cwd this panel was last **notified** with — never the resolved one.
+    key_cwd: Option<PathBuf>,
+    key_pid: Option<u32>,
+}
+
+impl Repoint {
+    /// Record one `open` and return the directory it should actually open on.
+    ///
+    /// `notified` becomes the key; `resolve()` (the tmux pane's cwd, when one is found) is
+    /// preferred for the directory, falling back to `notified` (R3.3). Returning the choice
+    /// rather than storing it keeps this the single place the two are told apart.
+    ///
+    /// **There is exactly one `Option<PathBuf>` parameter, so there is nothing to swap it
+    /// with.** That is deliberate and was arrived at the hard way. With `notified` and
+    /// `resolved` both plain options, transposing them at the call site compiled and left all
+    /// tests green while reintroducing *both* original bugs at once — the key became the
+    /// resolved cwd (the re-open storm) and the panel opened on the client's directory (the
+    /// originally reported symptom). An intermediate form took the resolver as
+    /// `impl FnOnce() -> Option<PathBuf>`; that was **not** sufficient either, because a swap
+    /// wrapped in `||` still type-checks. Passing the pid *into* the resolver removes the
+    /// second candidate entirely, so reintroducing the bug now requires writing a visibly wrong
+    /// `|_| cwd` rather than transposing two arguments.
+    fn opened(
+        &mut self,
+        notified: Option<PathBuf>,
+        shell_pid: Option<u32>,
+        resolve: impl FnOnce(Option<u32>) -> Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        self.key_cwd = notified.clone();
+        self.key_pid = shell_pid;
+        resolve(shell_pid).or(notified)
+    }
+
+    /// Whether an incoming notification is a real change worth re-opening for.
+    ///
+    /// Re-point only while open, and only if the tab actually changed. Keyed on the shell pid
+    /// as well as the cwd: two tabs in the SAME directory are different sessions, which is what
+    /// tab binding exists for. Returning `true` is **not** cheap — it runs `open`, which drops
+    /// and respawns the watcher, re-runs the full backfill, and performs two 250 ms-budgeted
+    /// `tmux list-clients` calls on the event-loop thread. Since D6 fires this after *every*
+    /// metadata sync, the common case must be inert.
+    fn changed(
+        &self,
+        visible: bool,
+        cwd: Option<&std::path::Path>,
+        shell_pid: Option<u32>,
+    ) -> bool {
+        visible && (self.key_cwd.as_deref(), self.key_pid) != (cwd, shell_pid)
+    }
+}
+
+/// [`AiMonitorOverlay::pane_cwd`]'s body, generic over the two syscall-backed steps so the
+/// re-root decision is testable on a machine with no tmux (tmux-pane-cwd R10.3) — the same
+/// split `tabsession::resolved_root_with` uses.
+fn pane_cwd_with(
+    resolve: impl FnOnce(u32) -> u32,
+    cwd_of: impl FnOnce(u32) -> Option<PathBuf>,
+    shell_pid: Option<u32>,
+) -> Option<PathBuf> {
+    let shell_pid = shell_pid?;
+    let root = resolve(shell_pid);
+    // `resolved_root` returns the input pid for "no tmux here" *and* for every failure (its
+    // `-> u32` is deliberately not an `Option`, so the two are indistinguishable). Either way
+    // there is nothing to re-root to, so yield `None` and let the caller keep the cwd it was
+    // passed — which for a non-tmux tab is already the right answer.
+    (root != shell_pid).then(|| cwd_of(root))?
 }
 
 /// Wall-clock millis since the epoch, saturating.
@@ -341,10 +458,10 @@ impl Overlay for AiMonitorOverlay {
     }
 
     fn on_active_changed(&mut self, cwd: Option<PathBuf>, shell_pid: Option<u32>) {
-        // Re-point only while open, and only if the tab actually changed (R3.1).
-        // Keyed on the shell pid as well as the cwd: two tabs in the SAME directory
-        // are different sessions, and that is exactly the case tab binding exists for.
-        if self.visible && (cwd != self.cwd || shell_pid != self.shell_pid) {
+        if self
+            .repoint
+            .changed(self.visible, cwd.as_deref(), shell_pid)
+        {
             self.open(cwd, shell_pid);
         }
     }
@@ -352,9 +469,147 @@ impl Overlay for AiMonitorOverlay {
 
 #[cfg(test)]
 mod tests {
-    use super::{drain_to_newest, proves_ownership, Attachment};
+    use super::{drain_to_newest, pane_cwd_with, proves_ownership, Attachment, Repoint};
     use ai_monitor::telemetry::TelemetrySnapshot;
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc;
+
+    // ---- tmux-pane-cwd: the overlay's own cwd resolution (R3.1, R3.3) ----
+
+    // ---- tmux-pane-cwd D6: the re-point trigger (R4.2, R4.3) ----
+    //
+    // These drive `Repoint` through the SAME transition `open` performs — `opened(notified,
+    // resolved, pid)` then `changed(...)` — so the key selection is under test. An earlier
+    // version of these tests called a free predicate with hand-typed arguments and passed
+    // against the buggy call site; that is exactly the hole this shape closes.
+
+    const CLIENT: &str = "/Users/u"; // what the app notifies with (tab shell = tmux client)
+    const PANE: &str = "/Users/u/proj"; // what `pane_cwd` resolves to under tmux
+
+    #[test]
+    fn repeated_identical_notifications_never_restart_the_watcher() {
+        // REGRESSION for the re-open storm. Cold start under tmux: the app notifies with the
+        // CLIENT cwd (the worker has not published yet), while `open` resolves the PANE cwd.
+        // If `opened` keys on the resolved value, every subsequent identical notification looks
+        // like a change and re-opens forever — and the overlay's own watcher supplies the wakes.
+        let mut r = Repoint::default();
+        let opened_on = r.opened(Some(PathBuf::from(CLIENT)), Some(8060), |_| {
+            Some(PathBuf::from(PANE))
+        });
+        // D12: the panel opens on the pane, not the client — that part must not regress either.
+        assert_eq!(
+            opened_on,
+            Some(PathBuf::from(PANE)),
+            "must open on the resolved pane cwd"
+        );
+        // ...and the key must nonetheless be the CLIENT cwd, so repeats are inert.
+        for i in 0..5 {
+            assert!(
+                !r.changed(true, Some(Path::new(CLIENT)), Some(8060)),
+                "wake {i}: an unchanged notification must not re-open (the storm)"
+            );
+        }
+    }
+
+    #[test]
+    fn a_changed_cwd_repoints_an_open_overlay() {
+        // R4.2 — the case the trigger exists for: a tmux window switch moves the pane while the
+        // tab is unchanged, so the published cwd changes under a stable shell pid.
+        let mut r = Repoint::default();
+        r.opened(Some(PathBuf::from("/proj/a")), Some(99), |_| None);
+        assert!(r.changed(true, Some(Path::new("/proj/b")), Some(99)));
+        // A genuine tab switch (both change) still re-points.
+        assert!(r.changed(true, Some(Path::new("/proj/b")), Some(100)));
+        // Two tabs in the SAME directory are still different sessions.
+        assert!(
+            r.changed(true, Some(Path::new("/proj/a")), Some(100)),
+            "same cwd, different tab must re-point — this is what tab binding is for"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_cwd_is_a_no_op() {
+        // R4.3 — load-bearing for cost: D6 fires this after EVERY metadata sync.
+        let mut r = Repoint::default();
+        r.opened(Some(PathBuf::from("/proj/a")), Some(99), |_| None);
+        assert!(!r.changed(true, Some(Path::new("/proj/a")), Some(99)));
+
+        let mut empty = Repoint::default();
+        empty.opened(None, None, |_| None);
+        assert!(!empty.changed(true, None, None));
+    }
+
+    #[test]
+    fn a_hidden_overlay_never_repoints() {
+        // R4.3 — a closed panel holds no watcher and must not spin one up.
+        let mut r = Repoint::default();
+        r.opened(Some(PathBuf::from("/proj/a")), Some(99), |_| None);
+        assert!(!r.changed(false, Some(Path::new("/proj/b")), Some(1)));
+        assert!(!r.changed(false, None, None));
+    }
+
+    #[test]
+    fn with_no_tmux_the_key_and_the_opened_directory_agree() {
+        // A non-tmux tab resolves nothing, so both the key and the directory are the notified
+        // value — and the first published cwd equal to it is correctly inert.
+        let mut r = Repoint::default();
+        let opened_on = r.opened(Some(PathBuf::from(CLIENT)), Some(4242), |_| None);
+        assert_eq!(opened_on, Some(PathBuf::from(CLIENT)));
+        assert!(!r.changed(true, Some(Path::new(CLIENT)), Some(4242)));
+    }
+
+    #[test]
+    fn a_tmux_tab_opens_on_the_pane_not_the_client() {
+        // R3.1 — the reported bug, in miniature. The tab's shell sits in `~` while its tmux
+        // pane is in a worktree; without the re-root `project_dir` resolves
+        // `~/.claude/projects/-Users-<u>/`, which does not exist, and every dashboard row
+        // renders empty.
+        let got = pane_cwd_with(
+            |shell| {
+                assert_eq!(shell, 8060);
+                7503 // the pane's shell, a child of the tmux *server*
+            },
+            |root| {
+                assert_eq!(root, 7503, "the cwd must come from the pane, not the tab");
+                Some(PathBuf::from("/Users/u/IdeaProjects/worktree"))
+            },
+            Some(8060),
+        );
+        assert_eq!(got, Some(PathBuf::from("/Users/u/IdeaProjects/worktree")));
+    }
+
+    #[test]
+    fn no_tmux_yields_none_so_the_caller_keeps_its_own_cwd() {
+        // R3.3 — `resolved_root` returns the input pid both when there is no tmux and on every
+        // failure (timeout, non-zero exit, unparseable output), so the two are one code path:
+        // yield `None` and let `open` fall back to the cwd it was passed. The cwd resolver
+        // must not even be called — there is nothing to resolve.
+        let got = pane_cwd_with(
+            |shell| shell, // no re-root: no tmux, or the lookup failed
+            |_| panic!("must not resolve a cwd when there is no re-root"),
+            Some(4242),
+        );
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn a_pane_that_died_between_resolve_and_read_yields_none() {
+        // R3.3 / R5.4 — the pane re-rooted fine but its cwd read failed (it exited in the
+        // window between). Degrade to the passed cwd rather than panicking.
+        let got = pane_cwd_with(|_| 7503, |_| None, Some(8060));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn a_tab_with_no_shell_pid_resolves_nothing() {
+        // R5.4 — a tab whose pid is unavailable must not reach either syscall.
+        let got = pane_cwd_with(
+            |_| panic!("must not resolve without a pid"),
+            |_| panic!("must not read a cwd without a pid"),
+            None,
+        );
+        assert_eq!(got, None);
+    }
 
     fn snap_at(last_event_ms: Option<u64>) -> TelemetrySnapshot {
         TelemetrySnapshot {
