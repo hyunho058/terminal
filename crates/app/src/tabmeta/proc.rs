@@ -7,9 +7,9 @@
 //! split out so the `MAX_CHILDREN` cap and the KERN_PROCARGS2 layout are table-tested
 //! without spawning processes (D6, R5.5, R11.4).
 
-use std::ffi::OsString;
-use std::os::unix::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::ffi::{CString, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 use std::ptr;
 
 use libc::{
@@ -87,6 +87,73 @@ pub(crate) fn exe_path(pid: u32) -> Option<PathBuf> {
     // proc_pidpath returns the path length (NUL not included).
     let bytes = &buf[..n as usize];
     std::str::from_utf8(bytes).ok().map(PathBuf::from)
+}
+
+/// "No controlling tty". The kernel reports `NODEV` (`-1`) in `e_tdev` for a process with
+/// no controlling terminal, and libc's Apple bindings do **not** export the constant (only
+/// `ENODEV` / `MNT_NODEV` exist), so it is named here rather than left as a magic `-1 as u32`
+/// at the comparison site — where it would read as a bug later.
+// Consumed via `tmux::effective_root`, whose own consumers (worker.rs, tabsession.rs) land
+// after this feature — so the whole chain reads as dead until then. Same disposition as
+// `mod.rs`'s `global()`.
+#[allow(dead_code)]
+const NODEV: u32 = u32::MAX;
+
+/// The controlling-tty **device number** of `pid`, via `proc_pidinfo(PROC_PIDTBSDINFO)`.
+/// `None` on any failure, and for the two values that mean "no tty" ([`NODEV`] and `0`) —
+/// both are *valid-looking* device numbers that could only ever fail to match, so rejecting
+/// them here turns a pointless `stat` of every client tty into a cheap early return.
+///
+/// Returns `u32`, not `libc::dev_t`: the two sides of the tmux tty join are different Rust
+/// types over the same 32-bit device number — `proc_bsdinfo.e_tdev` is `u32` while
+/// `dev_t` (and so `stat.st_rdev`) is `i32` on Apple. Normalising on `u32` puts the single
+/// conversion on the `stat` side ([`rdev_of_path`]) instead of scattering `as` casts through
+/// the comparison.
+#[allow(dead_code)] // consumed by tmux::effective_root once its consumers land
+pub(crate) fn tty_dev_of_pid(pid: u32) -> Option<u32> {
+    #[cfg(test)]
+    super::probe::PROC_TTY.bump(1);
+
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut c_void,
+            size,
+        )
+    };
+    if n != size {
+        return None; // error or short read
+    }
+    let dev = info.e_tdev;
+    (dev != NODEV && dev != 0).then_some(dev)
+}
+
+/// The device number a path refers to (`stat`'s `st_rdev`), as `u32`. `None` on any failure.
+/// The tmux side of the tty join: `tmux list-clients` reports `#{client_tty}` as a path, and
+/// this resolves it to the number [`tty_dev_of_pid`] returns for the tab's shell.
+///
+/// The join runs in this direction — path → device — deliberately. `libc::devname` *is*
+/// available on macOS (`bsd/mod.rs`, not the `apple` submodule), so a name-direction join is
+/// possible, but `devname` returns a pointer into a process-global **static buffer** (not
+/// thread-safe, and this module is reached from the metadata worker thread *and* the UI
+/// thread) and on a cache miss it synthesises a `"#major/minor"` string that would silently
+/// never match a real tty name.
+#[allow(dead_code)] // consumed by tmux::resolve_rdevs once its consumers land
+pub(crate) fn rdev_of_path(path: &Path) -> Option<u32> {
+    #[cfg(test)]
+    super::probe::TTY_STAT.bump(1);
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::stat(c_path.as_ptr(), &mut st) };
+    if rc != 0 {
+        return None;
+    }
+    Some(st.st_rdev as u32)
 }
 
 /// The argv of `pid`, via `sysctl(KERN_PROCARGS2)`. Empty on failure. Called only
@@ -245,6 +312,88 @@ mod tests {
         // argv[0] is the test binary's path.
         let argv0 = args[0].to_string_lossy();
         assert!(!argv0.is_empty());
+    }
+
+    // ---- the tty join's two wrappers (tmux-root-resolution R1, R4.7) ----
+
+    #[test]
+    fn tty_dev_of_self_matches_its_own_tty_device() {
+        let _g = super::super::probe::serial();
+        // R1.1 — when the test process has a controlling tty, the number it reports must be
+        // the same one `stat` gives for that tty path. Under a CI runner with no tty there is
+        // nothing to compare, and `None` is the correct answer — so this asserts the
+        // *agreement* of the two sides rather than requiring a tty to exist.
+        match tty_dev_of_pid(std::process::id()) {
+            Some(dev) => {
+                assert_ne!(dev, 0, "0 must be rejected as absent");
+                assert_ne!(dev, NODEV, "NODEV must be rejected as absent");
+            }
+            None => { /* no controlling tty (CI) — absent is correct */ }
+        }
+    }
+
+    #[test]
+    fn tty_dev_of_dead_pid_is_none() {
+        let _g = super::super::probe::serial();
+        // R1.2 — a pid that cannot exist yields None, no panic.
+        assert!(tty_dev_of_pid(0).is_none());
+        assert!(tty_dev_of_pid(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn tty_dev_bumps_its_counter_once_per_call_either_way() {
+        let _g = super::super::probe::serial();
+        // R1.5 — the counter counts calls, not successes, so a budget assertion over it is
+        // meaningful on the failure path too.
+        super::super::probe::reset_all();
+        let _ = tty_dev_of_pid(std::process::id());
+        assert_eq!(super::super::probe::PROC_TTY.get(), 1);
+        let _ = tty_dev_of_pid(0); // fails
+        assert_eq!(
+            super::super::probe::PROC_TTY.get(),
+            2,
+            "a failed read still counts"
+        );
+    }
+
+    #[test]
+    fn rdev_of_path_reads_a_real_device_and_counts_itself() {
+        let _g = super::super::probe::serial();
+        // R4.7 — /dev/null is a character device present on every macOS box.
+        super::super::probe::reset_all();
+        assert!(rdev_of_path(Path::new("/dev/null")).is_some());
+        assert_eq!(super::super::probe::TTY_STAT.get(), 1);
+        // A path that cannot be stat-ed is absent, not a panic — and still counts.
+        assert!(rdev_of_path(Path::new("/dev/definitely-not-a-device")).is_none());
+        assert_eq!(super::super::probe::TTY_STAT.get(), 2);
+        // An embedded NUL cannot become a CString — absent, no panic.
+        assert!(rdev_of_path(Path::new("/dev/nu\0ll")).is_none());
+    }
+
+    #[test]
+    fn the_two_sides_of_the_join_agree_on_one_device() {
+        let _g = super::super::probe::serial();
+        // The load-bearing property of the whole feature: `e_tdev` (u32, from proc_pidinfo)
+        // and `st_rdev` (i32 dev_t, from stat) are different Rust types over the SAME 32-bit
+        // device number. If that were false, the tmux join could never match.
+        if let Some(dev) = tty_dev_of_pid(std::process::id()) {
+            // Resolve our own tty by NAME rather than guessing device paths: macOS allocates
+            // /dev/ttysNNN on demand, so a bounded numeric scan silently goes flaky on a busy
+            // machine that has allocated past the scan's ceiling.
+            // `ttyname` shares `devname`'s process-global static buffer — the very property
+            // D1 rejects it for in production. Safe here: test-only, under `probe::serial()`,
+            // and the path is copied out immediately.
+            let name = unsafe { libc::ttyname(0) };
+            if !name.is_null() {
+                let path = unsafe { std::ffi::CStr::from_ptr(name) };
+                let path = Path::new(std::str::from_utf8(path.to_bytes()).expect("tty path"));
+                assert_eq!(
+                    rdev_of_path(path),
+                    Some(dev),
+                    "e_tdev {dev:#x} != st_rdev of {path:?} — the tmux join's premise is broken"
+                );
+            }
+        }
     }
 
     // ---- pure parsers, tested with no syscall (R5.5, R11.4) ----

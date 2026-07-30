@@ -18,6 +18,10 @@ mod activity;
 mod agent;
 mod git;
 mod proc;
+// `pub(crate)` unlike its private siblings: the crate-root `tabsession` module consumes
+// `effective_root_uncached` from here, and `super::` from there is the crate root
+// (tmux-root-resolution R8.3).
+pub(crate) mod tmux;
 mod worker;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -351,6 +355,13 @@ pub(crate) mod probe {
     pub(crate) static GIT_STAT: Counter = Counter::new();
     pub(crate) static GIT_READ: Counter = Counter::new();
     pub(crate) static GIT_READ_BYTES: Counter = Counter::new();
+    // proc.rs / tmux.rs (tmux-root-resolution) — the tty join + the client-map spawn.
+    // `TTY_STAT` is the third counter that feature's D15 adds beyond SD6's sketched two:
+    // it covers the *tmux* side of the join (one `stat` per client tty), which `PROC_TTY`
+    // (the tab's side) does not, and which would otherwise be uncounted cost.
+    pub(crate) static PROC_TTY: Counter = Counter::new();
+    pub(crate) static TTY_STAT: Counter = Counter::new();
+    pub(crate) static TMUX_LIST: Counter = Counter::new();
     // activity.rs (T5) — the log-resolution + tail-read entry points (D13(6)).
     pub(crate) static LOG_RESOLVE: Counter = Counter::new();
     pub(crate) static LOG_STAT: Counter = Counter::new();
@@ -364,6 +375,9 @@ pub(crate) mod probe {
             &PROC_CHILDREN,
             &PROC_EXE,
             &PROC_ARGS,
+            &PROC_TTY,
+            &TTY_STAT,
+            &TMUX_LIST,
             &GIT_STAT,
             &GIT_READ,
             &GIT_READ_BYTES,

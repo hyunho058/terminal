@@ -20,6 +20,7 @@ use crate::session::TabId;
 
 use super::activity::ActivityMemo;
 use super::git::Memo as GitMemo;
+use super::tmux::Memo as TmuxMemo;
 use super::{Agent, AgentKind, AgentState, Cmd, TabMeta, TabMetaShared, TabPid};
 
 /// The base cadence. Active tabs refresh every tick (500 ms); background tabs every
@@ -43,6 +44,9 @@ fn should_refresh(is_active: bool, tick_index: u64, tab_slot: usize) -> bool {
 struct Deriver {
     git_memo: GitMemo,
     act_memo: ActivityMemo,
+    /// The per-tick tmux client→pane map. The third memo of the same kind, so its lifetime is
+    /// the worker's and it needs no plumbing through `pass()` or `run()`.
+    tmux_memo: TmuxMemo,
     projects_root: Option<PathBuf>,
     debug_seen: HashMap<TabId, AgentKind>,
     enabled_git: bool,
@@ -54,6 +58,7 @@ impl Deriver {
         Deriver {
             git_memo: GitMemo::new(),
             act_memo: ActivityMemo::new(),
+            tmux_memo: TmuxMemo::new(),
             projects_root: ai_monitor::claude_projects_dir(),
             debug_seen: HashMap::new(),
             enabled_git: true,
@@ -64,11 +69,32 @@ impl Deriver {
     /// Derive one tab. cwd is resolved once and shared by the git and activity paths
     /// (D10); each source is skipped entirely when its toggle is off (R1.8).
     fn tab(&mut self, tp: &TabPid, tick: u64, now: SystemTime) -> TabMeta {
-        // cwd feeds the git branch and Claude activity; skip it when neither is wanted.
-        let cwd = if self.enabled_git || self.enabled_agent {
-            super::proc::cwd_of_pid(tp.pid)
+        let enabled = self.enabled_git || self.enabled_agent;
+        // Re-root at the tmux pane when this tab runs a client. Absent tmux this is `tp.pid`,
+        // so every downstream read is byte-identical to today. Behind the same toggle as the
+        // cwd read: with both sources off the tab needs no root either, and running the
+        // presence gate would be pure waste.
+        let root = if enabled {
+            super::tmux::effective_root(&mut self.tmux_memo, tp.pid, tick)
         } else {
-            None
+            tp.pid
+        };
+        // cwd feeds the git branch and Claude activity; skip it when neither is wanted.
+        // The read is gated *outside* the match: a `match (enabled, cwd_of_pid(root))` would
+        // evaluate the scrutinee tuple eagerly and fire the syscall even when `enabled` is
+        // false, breaking the "both toggles off touches nothing" contract.
+        let (root, cwd) = if !enabled {
+            (tp.pid, None)
+        } else {
+            match super::proc::cwd_of_pid(root) {
+                Some(c) => (root, Some(c)),
+                // The pane died between `effective_root`'s liveness check and here: retry from
+                // the tab's own shell so the card degrades to today's metadata rather than
+                // going blank. The rebound `root` also redirects `agent_of_pid` below, so
+                // branch and agent never describe different processes.
+                None if root != tp.pid => (tp.pid, super::proc::cwd_of_pid(tp.pid)),
+                None => (tp.pid, None),
+            }
         };
 
         let branch = if self.enabled_git {
@@ -79,7 +105,7 @@ impl Deriver {
         };
 
         let (agent, task) = if self.enabled_agent {
-            match super::agent::agent_of_pid(tp.pid) {
+            match super::agent::agent_of_pid(root) {
                 Some(kind) => {
                     let state = self.activity(kind, cwd.as_deref(), tick, now);
                     // The "current task" label (tab-identity): only Claude has a log source
@@ -396,6 +422,133 @@ mod tests {
         assert!(
             super::super::probe::GIT_STAT.get() <= 1,
             "warm repo: at most one revalidation stat"
+        );
+    }
+
+    // ---- the tmux hop's cost + toggle discipline (R3, R5, R6) ----
+
+    #[test]
+    fn constructing_a_deriver_touches_no_source() {
+        // R6.1 — `empty_roster_does_no_work` calls reset_all() BEFORE Deriver::new(), so its
+        // "no source touched" assertion silently depends on every memo constructor being
+        // side-effect free. Pinned explicitly so a future memo cannot break it invisibly.
+        let _g = super::super::probe::serial();
+        super::super::probe::reset_all();
+        let _d = Deriver::new();
+        for c in [
+            &super::super::probe::PROC_CWD,
+            &super::super::probe::PROC_CHILDREN,
+            &super::super::probe::PROC_EXE,
+            &super::super::probe::PROC_TTY,
+            &super::super::probe::TTY_STAT,
+            &super::super::probe::TMUX_LIST,
+        ] {
+            assert_eq!(c.get(), 0, "Deriver::new() must perform no I/O");
+        }
+    }
+
+    #[test]
+    fn both_toggles_off_runs_no_gate_and_no_cwd_read() {
+        // R3.1 — the property the eager-scrutinee hazard would have broken. A
+        // `match (enabled, cwd_of_pid(root))` evaluates the tuple before matching, firing the
+        // syscall even with both sources off; gating the read outside the match is what keeps
+        // every one of these at zero.
+        let _g = super::super::probe::serial();
+        let mut d = Deriver::new();
+        d.enabled_git = false;
+        d.enabled_agent = false;
+        let tp = TabPid {
+            id: TabId(0),
+            pid: std::process::id(),
+        };
+        super::super::probe::reset_all();
+        let meta = d.tab(&tp, 0, SystemTime::now());
+        assert_eq!(meta, TabMeta::default(), "both off -> nothing published");
+        assert_eq!(super::super::probe::PROC_CWD.get(), 0, "no cwd read");
+        assert_eq!(
+            super::super::probe::PROC_EXE.get(),
+            0,
+            "the gate did not run"
+        );
+        assert_eq!(
+            super::super::probe::PROC_CHILDREN.get(),
+            0,
+            "the gate did not run"
+        );
+        assert_eq!(super::super::probe::TMUX_LIST.get(), 0, "no spawn");
+    }
+
+    #[test]
+    fn a_non_tmux_tab_costs_exactly_the_gate_and_spawns_nothing() {
+        // R0.6 / R5.2 — the honest delta every tab pays. `k` is measured independently, before
+        // the counted window: deriving it from PROC_EXE itself would make the assertion a
+        // tautology.
+        let _g = super::super::probe::serial();
+        let me = std::process::id();
+
+        let mut d = Deriver::new();
+        d.enabled_agent = false; // isolate the gate from agent_of_pid's own walk
+        let tp = TabPid {
+            id: TabId(0),
+            pid: me,
+        };
+        super::super::probe::reset_all();
+        let _ = d.tab(&tp, 0, SystemTime::now());
+
+        assert_eq!(
+            super::super::probe::TMUX_LIST.get(),
+            0,
+            "no tmux -> no spawn"
+        );
+        assert_eq!(super::super::probe::PROC_CWD.get(), 1, "cwd resolved once");
+        assert_eq!(
+            super::super::probe::PROC_CHILDREN.get(),
+            1,
+            "one child listing"
+        );
+        // NOT `== 1 + k`: k is this process's LIVE child count, and other tests in this binary
+        // spawn processes without holding `probe::serial()` (tabsession's `ProcTable` shells
+        // out to /bin/ps), so k can change between any sample and this call. Assert the
+        // k-independent floor here — the exact `1 + k` shape is proven deterministically
+        // against a fake tree by `tmux::tests::the_gate_reads_the_root_then_each_child`.
+        assert!(
+            super::super::probe::PROC_EXE.get() >= 1,
+            "the depth-0 root read always happens"
+        );
+    }
+
+    #[test]
+    fn the_single_toggle_states_both_still_resolve_a_root() {
+        // R3.2 / R3.3 — the guard is a disjunction, so three of its four states run the gate.
+        // git-only is not hypothetical: it is what both pre-existing cost tests set.
+        let _g = super::super::probe::serial();
+        let tp = TabPid {
+            id: TabId(0),
+            pid: std::process::id(),
+        };
+
+        // git-only: the gate runs, and agent_of_pid does not.
+        let mut d = Deriver::new();
+        d.enabled_agent = false;
+        super::super::probe::reset_all();
+        let _ = d.tab(&tp, 0, SystemTime::now());
+        assert_eq!(
+            super::super::probe::PROC_CHILDREN.get(),
+            1,
+            "git-only: the gate's listing only"
+        );
+
+        // agent-only: the gate runs AND agent_of_pid walks, so the listing happens twice.
+        let mut d = Deriver::new();
+        d.enabled_git = false;
+        super::super::probe::reset_all();
+        let _ = d.tab(&tp, 0, SystemTime::now());
+        assert!(
+            super::super::probe::PROC_CHILDREN.get() >= 2,
+            "agent-only: the gate's listing PLUS agent_of_pid's own walk — at least two. \
+             Not an equality: `walk` also lists each visited child, and a concurrently-running \
+             test that spawns a process (tabsession's /bin/ps) transiently changes this \
+             process's child count."
         );
     }
 
