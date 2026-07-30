@@ -170,7 +170,7 @@ impl Tabs {
     /// per-tab `proc_pidinfo` is not on the render path (SD4). The field/method keep the
     /// name `titles` although they now carry rows — a documented cost of the frozen
     /// `terminal_app` struct literal (D2).
-    pub fn titles(&self) -> Vec<SidebarRow> {
+    pub fn titles(&self, meta: &crate::tabmeta::TabMetaSnapshot) -> Vec<SidebarRow> {
         // Push the live roster + active tab to the metadata worker (the tab-metadata
         // seam's natural site — called on tab actions, not per frame), so it derives each
         // tab's git branch + agent state off the UI thread. Idempotent; a no-op when the
@@ -193,7 +193,7 @@ impl Tabs {
             .enumerate()
             .map(|(i, s)| {
                 let title = s
-                    .cwd()
+                    .cwd(meta.get(s.id))
                     .as_deref()
                     .and_then(|p| p.file_name())
                     .map(|n| n.to_string_lossy().into_owned())
@@ -217,8 +217,9 @@ impl Tabs {
     }
 
     /// The active tab's live working directory (ai-monitor log resolution).
-    pub fn active_cwd(&self) -> Option<PathBuf> {
-        self.active().cwd()
+    pub fn active_cwd(&self, meta: &crate::tabmeta::TabMetaSnapshot) -> Option<PathBuf> {
+        let a = self.active();
+        a.cwd(meta.get(a.id))
     }
 
     /// The active tab's shell pid (ai-monitor tab binding).

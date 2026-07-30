@@ -768,8 +768,10 @@ impl Running {
             handle.sync(&mut self.tabmeta_snapshot);
         }
         let session = self.tabs.by_id(id)?;
+        // The sync just above makes this the freshest published cwd (tmux-pane-cwd D2), so the
+        // prefill names the same directory the card shows.
         let cwd = session
-            .cwd()
+            .cwd(self.tabmeta_snapshot.get(id))
             .as_deref()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
@@ -859,7 +861,7 @@ impl Running {
     /// Push the current tab rows + active index into the sidebar layer. `Tabs::titles()`
     /// also pushes the metadata roster to the worker (tab-metadata seam).
     fn sync_tab_model(&mut self) {
-        let titles = self.tabs.titles();
+        let titles = self.tabs.titles(&self.tabmeta_snapshot);
         let waiting = self.build_waiting_rows(&titles);
         self.tab_model.set(TabBarModel {
             titles,
@@ -937,6 +939,18 @@ impl Running {
             return false;
         };
         handle.sync(&mut self.tabmeta_snapshot);
+        // The sync may have brought a new cwd for the active tab — a tmux window switch moves
+        // the pane without touching the tab, so `on_active_tab_changed` (the only other caller
+        // of this seam) never fires for it (tmux-pane-cwd D6/R4.1). Without this the panel
+        // stays attached to the directory it opened on.
+        //
+        // Called **unconditionally**, level-triggered: `on_active_changed` already no-ops when
+        // nothing moved (`overlay.rs`'s `Repoint::changed` guard), which is cheaper and more
+        // robust than tracking an edge here. An edge would be lost outright when
+        // `displayed_label` consumes the same generation from its own `sync` first.
+        let cwd = self.tabs.active_cwd(&self.tabmeta_snapshot);
+        let shell_pid = self.tabs.active_shell_pid();
+        self.overlays.notify_active_changed(cwd, shell_pid);
         self.push_agent_states()
     }
 
@@ -1263,7 +1277,7 @@ impl Running {
         self.publish_scroll();
         self.refresh_hover();
         // Re-point cwd-derived overlays (ai-monitor) at the new active tab (R3.1).
-        let cwd = self.tabs.active_cwd();
+        let cwd = self.tabs.active_cwd(&self.tabmeta_snapshot);
         self.overlays
             .notify_active_changed(cwd, self.tabs.active_shell_pid());
         self.redraw();
@@ -1502,7 +1516,7 @@ impl Running {
         {
             let active = self.tabs.active_index();
             let count = self.tabs.len();
-            let cwd = self.tabs.active_cwd();
+            let cwd = self.tabs.active_cwd(&self.tabmeta_snapshot);
             // The active tab's identity + the label it is CURRENTLY SHOWING, for the
             // rename chord (R2.1) — read before the mutable writer borrow, like
             // `bracketed`/`selection_text`. The displayed label, not `user_title`: a tab
@@ -1545,7 +1559,7 @@ impl Running {
         {
             let active = self.tabs.active_index();
             let count = self.tabs.len();
-            let cwd = self.tabs.active_cwd();
+            let cwd = self.tabs.active_cwd(&self.tabmeta_snapshot);
             // The active tab's identity + the label it is CURRENTLY SHOWING, for the
             // rename chord (R2.1) — read before the mutable writer borrow, like
             // `bracketed`/`selection_text`. The displayed label, not `user_title`: a tab

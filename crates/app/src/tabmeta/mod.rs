@@ -24,6 +24,7 @@ mod proc;
 pub(crate) mod tmux;
 mod worker;
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -37,13 +38,26 @@ use crate::session::TabId;
 // Public types (D8, D11) — illegal states unrepresentable.
 // ---------------------------------------------------------------------------
 
-/// A tab's derived metadata. `default()` = a plain zsh tab in a non-repo, which is
-/// also the correct value for a not-yet-polled tab (so there is no third "unpolled"
-/// state). Only `branch` and `task` allocate.
+/// A tab's derived metadata. `default()` = a plain zsh tab in a non-repo.
+///
+/// **`cwd` is the one field where `default()` is not simply "the correct value for a
+/// not-yet-polled tab"** (tmux-pane-cwd D8). `cwd: None` means two distinguishable things —
+/// this tab has not been polled yet, or it was polled and no cwd could be resolved — and the
+/// two are not equivalent to a consumer: the first is a gap to fall back through, the second
+/// is an answer. `Session::cwd()` treats both as "fall back to my own shell", which is right
+/// for the title but would silently open the ai-monitor on the wrong project during the
+/// unpolled window; that is why the overlay resolves its own cwd on open rather than reading
+/// this field (D12). Only `branch`, `task` and `cwd` allocate.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct TabMeta {
     pub branch: Option<String>,
     pub agent: Option<Agent>,
+    /// The tab's working directory — the **active tmux pane's** when the tab runs a client,
+    /// else the tab's own shell's (tmux-pane-cwd D1/R1.2). Resolved here, on the worker
+    /// thread, so `Session::cwd()`'s hot callers (every keystroke, every sidebar resync) read
+    /// a published value instead of paying a syscall each. Deliberately **not** gated on the
+    /// sidebar display toggles (D13) — see `Deriver::tab`.
+    pub cwd: Option<PathBuf>,
     /// The live "current task" label for the tab (tab-identity): the session's latest
     /// substantive Claude user prompt, one-line normalised. `None` when there is no
     /// agent, no resolvable log, or no substantive prompt ever seen — the renderer then
@@ -443,6 +457,7 @@ mod tests {
                         branch: Some("main".into()),
                         agent: None,
                         task: None,
+                        cwd: None,
                     },
                 ),
                 (
@@ -454,6 +469,7 @@ mod tests {
                             state: AgentState::Busy,
                         }),
                         task: None,
+                        cwd: None,
                     },
                 ),
             ],
@@ -496,7 +512,8 @@ mod tests {
             TabMeta {
                 branch: None,
                 agent: None,
-                task: None
+                task: None,
+                cwd: None
             }
         );
     }
