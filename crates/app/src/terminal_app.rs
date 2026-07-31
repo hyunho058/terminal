@@ -20,6 +20,7 @@
 //! `NSTextInputContext::discardMarkedText` — `set_ime_allowed(false)` does **not**
 //! do that (it only clears winit's own `marked_text` ivar).
 
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::Instant;
@@ -46,15 +47,16 @@ use winit::keyboard::ModifiersState;
 // winit 0.30 re-exports raw-window-handle 0.6 (`rwh_06`, a default feature), so
 // reaching the `NSView` needs no new dependency on `app` (D11).
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::hyperlink::{
     frame_rescans, url_to_open, ClickInput, HoverInput, HoverState, LinkTrigger, Opener, Update,
 };
 use crate::input::{
-    encode_key, is_double_click, pixel_to_cell, press_dismisses_modals, sidebar_hover,
-    sidebar_press, suppress_key, tab_action, wheel_bytes, wheel_lines, wheel_scroll, SidebarAction,
-    TabAction, WheelDelta,
+    self, encode_key, hover_card, hover_cursor, is_double_click, is_sidebar_toggle_chord,
+    pixel_to_cell, press_dismisses_modals, sidebar_press, sidebar_region, suppress_key, tab_action,
+    wheel_bytes, wheel_lines, wheel_scroll, ReleaseTarget, ResizeDrag, SidebarAction, TabAction,
+    WheelDelta,
 };
 use crate::seam::{
     AppCtx, AppRequest, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayCommand,
@@ -202,6 +204,44 @@ struct Running {
     /// What the in-flight drag swallowed, replayed on release (terminal-scroll D6).
     /// Meaningless while `dragging` is false; reset at each press.
     drag_latch: DragLatch,
+    /// The mouse cursor shape currently set on the window (tab-resize D11). Mirrored here
+    /// so `set_cursor_icon` can skip a platform call when the shape has not changed —
+    /// `refresh_hover` runs on every `CursorMoved`.
+    cursor_icon: CursorIcon,
+    /// An in-flight sidebar edge resize (tab-resize D17). **Deliberately disjoint from
+    /// `dragging`**: the two gestures have different release semantics — a selection
+    /// release keeps a selection, a resize release commits a config write — and one
+    /// overloaded flag is how they would come to corrupt each other. Invariant:
+    /// `resize_drag.is_some()` ⇒ `!dragging`.
+    ///
+    /// While this is `Some`, the resize owns the pointer: `CursorMoved` drives the width
+    /// and skips hover resolution, and `CursorLeft` does not end the gesture.
+    resize_drag: Option<ResizeDrag>,
+    /// Where the sidebar size is persisted (tab-resize D2). `None` when the platform gave
+    /// us no config directory — the session then works normally but does not remember.
+    config_path: Option<PathBuf>,
+    /// The `(width_px, collapsed)` pair of our last **successful** write (tab-resize D15).
+    ///
+    /// The latch behind echo suppression: the atomic rename IS a change event, so the
+    /// watcher hands our own write straight back, and `settings::apply` would rebuild the
+    /// whole glyph atlas for a change we already applied. **Latched, not one-shot** — every
+    /// delivery equal to this is suppressed, because FSEvents can report one rename more
+    /// than once and a "consume the first match" rule would pay the rebuild on the second.
+    written_sidebar: Vec<(f32, bool)>,
+    /// The last `Config` actually applied to the running app (tab-resize D15, as amended).
+    ///
+    /// Echo suppression compares the **whole** delivered config against this, not just the
+    /// sidebar pair. Comparing only the pair looked right and was catastrophic: the latch
+    /// is armed on every successful persist and the file then matches it indefinitely, so
+    /// *every* later reload — of any field — classified as an echo and was dropped. One
+    /// click of Hide killed live settings for the rest of the session. Suppress only when
+    /// nothing at all changed; the sidebar pair still decides override precedence (D15a).
+    last_applied_cfg: Config,
+    /// Set when a write FAILED, so the file and the override are knowingly out of step
+    /// (tab-resize D14 × D15a). While true, a non-echo delivery must not clear the sidebar
+    /// override — otherwise an unrelated reload (a `font.size_pt` edit) would snap the
+    /// sidebar back and break D14's promise that the session keeps the dragged width.
+    sidebar_override_authoritative: bool,
     /// Fresh configs delivered by the background watcher (settings feature).
     config_rx: Receiver<Config>,
     /// Kept alive so the watch thread keeps running; dropping it stops watching.
@@ -324,8 +364,13 @@ impl App {
         // Live-config watcher (settings feature): on a valid change it sends the
         // fresh Config and wakes the loop with UserEvent::ConfigReloaded.
         let (config_tx, config_rx) = mpsc::channel::<Config>();
-        let config_watcher = match Config::path() {
-            Ok(path) => {
+        // Resolved once and kept: the same path the watcher observes is the one
+        // tab-resize writes back to (D2), so they can never drift apart.
+        let config_path = Config::path()
+            .map_err(|e| tracing::warn!("config path unavailable: {e}"))
+            .ok();
+        let config_watcher = match config_path.clone() {
+            Some(path) => {
                 let proxy = self.proxy.clone();
                 ConfigWatcher::spawn(path, move |cfg| {
                     if config_tx.send(cfg).is_ok() {
@@ -335,8 +380,8 @@ impl App {
                 .map_err(|e| tracing::warn!("config watcher disabled: {e}"))
                 .ok()
             }
-            Err(e) => {
-                tracing::warn!("config path unavailable, live settings off: {e}");
+            None => {
+                tracing::warn!("live settings off: no config path");
                 None
             }
         };
@@ -368,6 +413,12 @@ impl App {
             drag_anchor: (0, 0),
             drag_moved: false,
             drag_latch: DragLatch::default(),
+            cursor_icon: CursorIcon::Default,
+            resize_drag: None,
+            config_path,
+            written_sidebar: Vec::new(),
+            last_applied_cfg: self.cfg.clone(),
+            sidebar_override_authoritative: false,
             config_rx,
             _config_watcher: config_watcher,
             occluded: false,
@@ -1157,6 +1208,152 @@ impl Running {
         self.publish_scroll();
         self.refresh_hover();
         self.redraw();
+        // Remember it (tab-resize D16). Every way of collapsing — this button, the drag,
+        // and the chord — lands here, so two controls doing the same thing can never
+        // remember differently. `SidebarConfig::collapsed` was documented as "persisted"
+        // long before anything wrote it; this is what makes that true.
+        self.persist_sidebar();
+    }
+
+    /// Write the sidebar's size to `config.toml` (tab-resize D2/D16) — the ONE persistence
+    /// site, shared by the drag release, focus loss, the Hide/Restore button, and the
+    /// toggle chord, so no two entry points can remember differently.
+    ///
+    /// A failure warns and is otherwise silent (D14): the session keeps the size on screen,
+    /// it simply will not survive a restart. Never reverts — punishing the user for a
+    /// read-only filesystem by undoing a gesture that visibly succeeded is worse than not
+    /// remembering it.
+    fn persist_sidebar(&mut self) {
+        let Some(path) = self.config_path.clone() else {
+            tracing::warn!("no config path; sidebar size not persisted");
+            return;
+        };
+        // Logical px, and readable even while collapsed — collapsing must not erase the
+        // width a restore brings back (D7).
+        let pair = (
+            self.renderer.sidebar_width_logical(),
+            self.renderer.sidebar_collapsed(),
+        );
+        // Nothing changed since the config we last applied — don't touch the file. A bare
+        // click on the grab band (press + release, no motion) would otherwise rewrite
+        // `config.toml` for a value already on disk: on a fresh install that CREATES the
+        // file out of nothing, and on an existing one it rewrites `340` as `340.0`.
+        //
+        // Compared against `last_applied_cfg` rather than the write history, so the guard
+        // also covers the FIRST gesture of a session, when nothing has been written yet.
+        let on_disk = (
+            self.last_applied_cfg.sidebar.width_px,
+            self.last_applied_cfg.sidebar.collapsed,
+        );
+        if on_disk == pair && !self.sidebar_override_authoritative {
+            return;
+        }
+        match common::config::save_sidebar(&path, pair.0, pair.1) {
+            Ok(()) => {
+                // Arm the echo latch ONLY on success (D15/D14×D15a): a failed write leaves
+                // the file disagreeing with the override on purpose.
+                input::remember_write(&mut self.written_sidebar, pair);
+                self.sidebar_override_authoritative = false;
+                // Fold the written values into the applied-config baseline, so the echo
+                // this write is about to provoke compares equal and is suppressed — while
+                // a delivery that ALSO changes any other field still differs, and applies.
+                self.last_applied_cfg.sidebar.width_px = pair.0;
+                self.last_applied_cfg.sidebar.collapsed = pair.1;
+            }
+            Err(e) => {
+                tracing::warn!("sidebar size not saved: {e}");
+                self.written_sidebar.clear();
+                self.sidebar_override_authoritative = true;
+            }
+        }
+    }
+
+    /// End an in-flight resize: commit the width and persist it (tab-resize D2/R7.3/R7.6).
+    /// Idempotent — clearing `resize_drag` first means a later `Released` after a
+    /// focus-loss commit finds nothing armed and does not write a second time.
+    fn finish_resize(&mut self) {
+        if self.resize_drag.take().is_some() {
+            self.persist_sidebar();
+        }
+    }
+
+    /// Which gesture a left-release belongs to (tab-resize D17/R7.3) — the guard both
+    /// `Released` arms read, so their precedence is a tested rule rather than source order.
+    fn release_target(&self) -> ReleaseTarget {
+        input::release_target(self.resize_drag.is_some(), self.dragging)
+    }
+
+    /// Arm a sidebar edge resize at the current pointer (tab-resize D9/D17/R7.1).
+    ///
+    /// Captures the grab offset against the edge's *live* position, once — `drive_resize`
+    /// never recomputes it (R3.4). Clears `dragging` to uphold the D17 invariant: nothing
+    /// clears it on `Focused(false)`, so a lost `Released` can leave it stale, and a stale
+    /// selection drag racing a resize is the one way both could be armed at once.
+    fn begin_resize(&mut self) {
+        let edge_x = self.renderer.left_inset();
+        self.dragging = false;
+        self.resize_drag = Some(ResizeDrag {
+            grab_offset: input::resize_grab_offset(self.last_cursor.0, edge_x),
+        });
+        debug_assert!(
+            self.resize_drag.is_some() && !self.dragging,
+            "D17 invariant: a resize drag and a selection drag are never both armed"
+        );
+    }
+
+    /// Advance an in-flight resize to the current pointer (tab-resize D1/D9).
+    ///
+    /// Order is load-bearing and copied from `toggle_sidebar` (D6): set the width FIRST so
+    /// the inset is live, then re-fit the grid, then rebuild the layout from the new width
+    /// and re-clamp the scroll. Hover is deliberately NOT re-resolved — the drag owns the
+    /// pointer (R7.4).
+    fn drive_resize(&mut self, drag: ResizeDrag) {
+        let scale = self.renderer.scale_factor();
+        let raw = input::resize_raw_width(self.last_cursor.0, drag, scale);
+        // The grid size the tabs are currently fitted to. `settings::refit` is the only
+        // site that resizes them (D6), so this is always their true dimension.
+        let before = self.renderer.grid_size();
+
+        // Collapse / re-expand mid-gesture on the RAW width (D12/R4.4), before applying
+        // the clamped one — the mode change is what makes the width meaningful.
+        let collapsed = self.collapsed();
+        let next = input::next_collapsed(raw, collapsed);
+        if next != collapsed {
+            self.renderer.set_sidebar_collapsed(next);
+        }
+        // Only write the width while the sidebar is OPEN — once collapsed there is no
+        // meaningful width to track, and writing one would floor the remembered value.
+        //
+        // **What this does NOT do**, stated plainly because the first version of this
+        // comment claimed otherwise: it does not preserve a pre-drag width across a
+        // drag-collapse. `clamp` floors every `raw < 260` at 260 while `next_collapsed`
+        // only fires below 220, so a continuous drag from 400 writes 260 all the way
+        // through the [220, 260) hysteresis band before the collapse happens. Restoring
+        // after a drag-collapse therefore yields **260**, not 400.
+        //
+        // That is the honest consequence of the pointer having genuinely been dragged to
+        // the minimum on its way down — the Hide button behaves identically if you drag to
+        // 260 first — but it is a real behavioural choice, recorded in the spec's Known
+        // Gaps rather than papered over here.
+        if !next {
+            self.renderer
+                .set_sidebar_width(input::clamp_sidebar_width(raw));
+        }
+
+        // Refit ONLY when the column/row count actually changed (D13/R5.1). This is a
+        // correctness guard, not an optimisation: `Grid::resize` reallocates every tab's
+        // cells AND clears the selection, so an unguarded per-pixel refit would wipe the
+        // user's selection on every pointer move and fire a SIGWINCH at zsh on every tab.
+        // The band still follows the pointer every frame — only the grid steps by columns.
+        let after = self.renderer.grid_size();
+        if input::needs_refit(before, after) {
+            crate::settings::refit(&self.renderer, &mut self.tabs);
+        }
+
+        let inp = self.sidebar_input();
+        self.scroll = sidebar_layout::clamp_scroll(self.scroll, &inp);
+        self.publish_scroll();
+        self.redraw();
     }
 
     /// Re-resolve hover at `last_cursor` after the layout moved under a stationary pointer
@@ -1167,12 +1364,27 @@ impl Running {
         let collapsed = self.collapsed();
         self.chrome_handle
             .set_cursor(Some([self.last_cursor.0 as f32, self.last_cursor.1 as f32]));
-        let hit = sidebar_hover(self.last_cursor, &inp, self.scroll, collapsed);
+        // ONE hit_test feeds every hover output (D8, extended by tab-resize D11/R2.3):
+        // the card highlight AND the mouse cursor shape. Resolving them separately would
+        // let the highlight and the cursor disagree about the same pointer.
+        let region = sidebar_region(self.last_cursor, &inp, self.scroll, collapsed);
+        let hit = hover_card(region);
         if hit != self.last_hit {
             self.last_hit = hit;
             self.tab_model.set_hovered(hit);
         }
+        self.set_cursor_icon(hover_cursor(region));
         self.window.request_redraw();
+    }
+
+    /// Set the window's mouse cursor, skipping the call when it is already that shape
+    /// (tab-resize D11/R2.1). Every `CursorMoved` passes through here, so the guard keeps
+    /// an unchanged hover from issuing a platform call per motion event.
+    fn set_cursor_icon(&mut self, icon: CursorIcon) {
+        if self.cursor_icon != icon {
+            self.cursor_icon = icon;
+            self.window.set_cursor(icon);
+        }
     }
 
     /// Clear all hover state — the pointer left the window or focus was lost with it still
@@ -1183,6 +1395,9 @@ impl Running {
             self.last_hit = None;
             self.tab_model.set_hovered(None);
         }
+        // The pointer is gone, so the resize affordance is too (R2.4). A drag in flight
+        // overrides this — see the `CursorLeft` arm, which does not call us (D17/R7.5).
+        self.set_cursor_icon(CursorIcon::Default);
         self.window.request_redraw();
     }
 
@@ -1596,6 +1811,17 @@ impl Running {
                 return true;
             }
         }
+        // 3a) The sidebar toggle chord (tab-resize D17a), intercepted before the shell for
+        // the same reason tab chords are: `encode_key` swallows Cmd only for its `key_seq`
+        // table, so a `Key::Character` chord would otherwise reach zsh through the text
+        // fallback. This is the recovery path D16 owes — persisting `collapsed` removes
+        // restart-as-escape-hatch, and D12 makes an accidental collapse a one-flick
+        // gesture, so a hidden sidebar must be reachable without hunting for a 28px button.
+        if is_sidebar_toggle_chord(&input.key, &input.mods) {
+            let collapsed = self.collapsed();
+            self.toggle_sidebar(!collapsed); // persists, like every other entry point
+            return true;
+        }
         // 3) Tab chords, intercepted before the shell (D5/R3.2).
         if let Some(action) = tab_action(&input.key, &input.mods) {
             return self.do_tab_action(action);
@@ -1727,6 +1953,32 @@ impl ApplicationHandler<UserEvent> for App {
                     latest = Some(cfg);
                 }
                 if let Some(cfg) = latest {
+                    // Is this our own write coming back (tab-resize D15, as amended)? The
+                    // atomic rename IS a change event, so the round-trip is guaranteed —
+                    // and `settings::apply` → `apply_config` rebuilds the entire glyph
+                    // atlas. Paying that for values we already applied is absurd.
+                    //
+                    // The comparison is against the WHOLE applied config, not the sidebar
+                    // pair alone. Pair-only suppression shipped once and killed live
+                    // settings outright: the latch stays armed, the file keeps matching
+                    // it, and every subsequent reload of every unrelated field was
+                    // silently dropped for the rest of the session.
+                    if input::suppress_delivery(&cfg, &inner.last_applied_cfg) {
+                        return;
+                    }
+                    // Something really changed. The sidebar pair still decides precedence:
+                    // if it differs from what we last wrote, a human edited it and the
+                    // file wins (D15a); if it matches, this delivery is about some other
+                    // field and our override must stand.
+                    let delivered = (cfg.sidebar.width_px, cfg.sidebar.collapsed);
+                    let delivery = input::classify_delivery(delivered, &inner.written_sidebar);
+                    // A real human edit wins: drop the sticky override so the file is
+                    // authoritative again (D15a) — otherwise these two fields would be the
+                    // only ones in config.toml that stop live-reloading after a drag.
+                    if input::should_clear_override(delivery, inner.sidebar_override_authoritative)
+                    {
+                        inner.renderer.clear_sidebar_override();
+                    }
                     crate::settings::apply(
                         &cfg,
                         &mut inner.renderer,
@@ -1737,6 +1989,9 @@ impl ApplicationHandler<UserEvent> for App {
                     // both of which move max_scroll; refresh the cached section, re-clamp,
                     // and re-resolve hover under the stationary pointer (D10/D8).
                     inner.sidebar_cfg = cfg.sidebar.clone();
+                    // The new baseline for echo suppression — set AFTER apply, so a
+                    // delivery that fails to apply cannot be mistaken for one that did.
+                    inner.last_applied_cfg = cfg.clone();
                     let inp = inner.sidebar_input();
                     inner.scroll = sidebar_layout::clamp_scroll(inner.scroll, &inp);
                     inner.publish_scroll();
@@ -1779,6 +2034,19 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 inner.last_cursor = (position.x, position.y);
                 inner.pointer_inside = true; // fresh coordinates (hyperlinks R2.8)
+                                             // A resize drag OWNS the pointer (tab-resize D17/R7.4): drive the width and
+                                             // return. Hover must not be re-resolved mid-gesture — once D12 collapses the
+                                             // sidebar, `hit_test` short-circuits to Restore-only and would strip the
+                                             // very state the drag is standing on. Link hover is skipped for the same
+                                             // reason: while you are dragging the sidebar edge you are not pointing at
+                                             // text, so nothing should light up under ⌘.
+                                             //
+                                             // `pointer_inside` is set FIRST, above — the coordinates really are fresh,
+                                             // and that flag is the hyperlink feature's, not this gesture's to withhold.
+                if let Some(drag) = inner.resize_drag {
+                    inner.drive_resize(drag);
+                    return;
+                }
                 inner.refresh_hover(); // one hit_test feeds both hover fields (D8)
                 inner.refresh_link_hover(LinkTrigger::Pointer); // trigger 3 (D24)
 
@@ -1802,6 +2070,19 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
+            // A resize drag survives the pointer leaving the window (tab-resize D17/R7.5):
+            // macOS keeps delivering held-button moves outside the frame, so tracking
+            // continues and the clamp handles the excursion. `clear_hover` is what this arm
+            // withholds — it would reset the ColResize cursor mid-gesture, overriding D11
+            // for the duration.
+            //
+            // The hyperlink half still runs: the pointer really has left, so a later ⌘ must
+            // not light a link nobody is pointing at (hyperlinks D24). Neither call touches
+            // the cursor icon, so the resize is unaffected.
+            WindowEvent::CursorLeft { .. } if inner.resize_drag.is_some() => {
+                inner.pointer_inside = false;
+                inner.clear_link_hover();
+            }
             WindowEvent::CursorLeft { .. } => {
                 inner.clear_hover();
                 // Trigger 3, the leaving half (hyperlinks D24): nothing is under the
@@ -1882,6 +2163,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 event_loop.exit();
                             }
                         }
+                        SidebarAction::BeginResize => inner.begin_resize(),
                         SidebarAction::Inert => {}
                     }
                 } else if let Some(cell) = inner.cursor_cell() {
@@ -1903,11 +2185,34 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
+            // End a resize (tab-resize D17/R7.3). A SEPARATE arm placed BEFORE the
+            // selection one — not a `||`-widened guard on it: Rust runs exactly one match
+            // arm, so a widened guard would swallow the selection release too if both were
+            // somehow armed, leaving `dragging` stuck true forever. Two arms, two guards,
+            // each clearing only its own state.
+            //
+            // Fires wherever the pointer is, including outside the window and over the
+            // grid, because the drag captured it at press. T7 commits + persists here.
             WindowEvent::MouseInput {
                 state: ElementState::Released,
                 button: MouseButton::Left,
                 ..
-            } if inner.dragging => {
+            } if inner.release_target() == ReleaseTarget::Resize => {
+                inner.finish_resize();
+                // The pointer may have ended up somewhere new while the drag owned it, and
+                // the sidebar edge has moved — re-resolve hover and the cursor icon now
+                // that the gesture no longer suppresses them.
+                inner.refresh_hover();
+                // Deliberately NOT an link-open path: dragging the sidebar edge is not a
+                // click on text, so `url_to_open` is never consulted here (hyperlinks D19
+                // keys on the selection drag's own state, which a resize never arms).
+            }
+
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } if inner.release_target() == ReleaseTarget::Selection => {
                 // Decide the open before anything is mutated (hyperlinks D19): what
                 // opens is whatever the handle is lit with *at this instant*, which
                 // D24 has kept current through pointer, modifier, and output edges.
@@ -1996,6 +2301,13 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Ime(ime) => inner.on_ime(ime),
 
             WindowEvent::Focused(false) => {
+                // A resize in flight COMMITS and ends here (tab-resize D17/R7.6). Cmd-Tab
+                // fires no `CursorLeft` (see `clear_hover`), so focus loss is the only
+                // signal that the gesture was abandoned; committing what is on screen
+                // beats both silently reverting and leaving a drag armed across an app
+                // switch. `finish_resize` disarms, so the eventual `Released` — which may
+                // never arrive — cannot write a second time.
+                inner.finish_resize();
                 // Losing the window abandons the composition too (R8.1/R8.2): the
                 // preedit is drawn by *our* layer, so leaving it on screen would
                 // show text the shell never received.

@@ -88,6 +88,14 @@ pub enum SidebarRegion {
     /// to whatever card the popup happens to cover.
     MenuItem(usize),
     Card(usize),
+    /// The drag-to-resize grab band: a narrow strip ending at the sidebar's right edge
+    /// (tab-resize D10). Resolved *after* the collapsed short-circuit, the open card
+    /// menu, and the viewport bail, but *before* the header/band/list — its top rows
+    /// overlap the header, and a press there must start a resize, not press a button.
+    ///
+    /// The band lies wholly **inside** `[0, sidebar_w)`, so [`hit_test`]'s
+    /// outside-the-band test is untouched and the grid loses no pixel to it.
+    GrabEdge,
     Panel,
 }
 
@@ -525,6 +533,32 @@ pub fn restore_button_rect(scale: f64) -> Rect {
     }
 }
 
+/// Width of the drag-to-resize grab band, **logical** px (tab-resize D10). Multiplied by
+/// `scale` at the single point of use, like every other token here.
+///
+/// The band lies *inside* the sidebar — `[sidebar_w − GRAB_BAND_PX·scale, sidebar_w)` —
+/// deliberately, rather than straddling the edge: [`hit_test`]'s
+/// `p[0] >= inp.sidebar_w → None` bound then needs no change, so the grid loses no pixel
+/// to the sidebar's hit-test and no sibling feature's routing shifts.
+pub const GRAB_BAND_PX: f32 = 6.0;
+
+/// The drag-to-resize grab band's rect (tab-resize D10/R1.1). Empty (`w == 0`) when the
+/// sidebar has no width, so a collapsed or zero-width sidebar can never produce a hit.
+///
+/// Spans the full viewport height: the band's whole point is that the *edge* is grabbable
+/// anywhere along it, including beside the header and the waiting band.
+pub fn grab_band_rect(inp: &SidebarLayoutInput) -> Rect {
+    let w = (GRAB_BAND_PX * inp.scale as f32)
+        .min(inp.sidebar_w)
+        .max(0.0);
+    Rect {
+        x: inp.sidebar_w - w,
+        y: 0.0,
+        w,
+        h: inp.viewport[1],
+    }
+}
+
 /// Chrome-only, scroll-free hit-test — what the layer calls to resolve hover, and what
 /// `sidebar-interaction` calls on a press (D10). The filter has no region (D2).
 pub fn chrome_hit(p: [f32; 2], inp: &SidebarLayoutInput, collapsed: bool) -> Option<ChromeRegion> {
@@ -574,6 +608,18 @@ pub fn hit_test(
     // 2. Outside the sidebar band.
     if p[0] < 0.0 || p[0] >= inp.sidebar_w || p[1] < 0.0 || p[1] >= inp.viewport[1] {
         return None;
+    }
+    // 2.5. The drag-to-resize grab band (tab-resize D10/R1.1). Position is load-bearing in
+    // BOTH directions:
+    //   - after step 2, so a point in the band's column but outside the viewport is
+    //     rejected as outside the window rather than resolving to a resize (R1.5);
+    //   - after step 1.5, because the card-menu popup extends past `sidebar_w` and
+    //     therefore overlaps this band — the right 6px of an open menu must activate the
+    //     menu, not start a resize (R1.4);
+    //   - before steps 3/3.5/4, or the band's top rows would press a header button and
+    //     its lower rows would switch tabs instead of grabbing the edge.
+    if grab_band_rect(inp).contains(p) {
+        return Some(SidebarRegion::GrabEdge);
     }
     // 3. Inside the header: a button, else Panel — never a card (D9's whole point).
     if header_rect(inp).contains(p) {
@@ -1092,5 +1138,167 @@ mod tests {
         let a = menu_rect(0.0, &inp).expect("menu open");
         let b = menu_rect(40.0, &inp).expect("menu open");
         assert_eq!(b.y, a.y - 40.0);
+    }
+
+    // ---------------------------------------------------------------------
+    // tab-resize: the drag-to-resize grab band (D10)
+    // ---------------------------------------------------------------------
+
+    /// Like `input`, but with a viewport WIDER than the sidebar — the realistic case, and
+    /// the only way to test that a point at `x >= sidebar_w` is rejected by the sidebar
+    /// bound rather than incidentally by the viewport bound.
+    fn input_wide(sidebar_w: f32, scale: f64, row_count: usize) -> SidebarLayoutInput {
+        SidebarLayoutInput {
+            viewport: [sidebar_w + 800.0, 900.0],
+            ..input(sidebar_w, 900.0, scale, row_count)
+        }
+    }
+
+    #[test]
+    fn grab_band_hugs_the_right_edge_and_scales() {
+        // R1.1 — the band is the last GRAB_BAND_PX logical px, inside the sidebar.
+        for scale in [1.0_f64, 2.0] {
+            let inp = input_wide(340.0 * scale as f32, scale, 5);
+            let band = grab_band_rect(&inp);
+            assert_eq!(band.w, GRAB_BAND_PX * scale as f32);
+            assert_eq!(
+                band.x + band.w,
+                inp.sidebar_w,
+                "band's right edge IS the sidebar's edge"
+            );
+            assert_eq!(band.y, 0.0);
+            assert_eq!(band.h, inp.viewport[1], "grabbable along the full height");
+        }
+    }
+
+    #[test]
+    fn a_point_in_the_band_resolves_to_grab_edge() {
+        // R1.1 — at every y, including beside the header and deep in the list.
+        let inp = input_wide(340.0, 1.0, 5);
+        for y in [1.0_f32, 30.0, 200.0, 800.0] {
+            assert_eq!(
+                hit_test([336.0, y], 0.0, &inp, false),
+                Some(SidebarRegion::GrabEdge),
+                "y={y}"
+            );
+        }
+        // The inclusive left edge of the band (sidebar_w - 6) is inside it.
+        assert_eq!(
+            hit_test([334.0, 400.0], 0.0, &inp, false),
+            Some(SidebarRegion::GrabEdge)
+        );
+    }
+
+    #[test]
+    fn the_band_steals_no_pixel_from_the_card_beside_it() {
+        // R1.2 — one px left of the band still resolves to whatever is under it.
+        let inp = input_wide(340.0, 1.0, 5);
+        let list_y = header_h(1.0) + 10.0;
+        assert_eq!(
+            hit_test([333.0, list_y], 0.0, &inp, false),
+            Some(SidebarRegion::Card(0)),
+            "the band starts at 334, so 333 is still the card"
+        );
+    }
+
+    #[test]
+    fn the_band_never_reaches_into_the_grid() {
+        // R1.3 — the first grid pixel is still None, exactly as before this feature.
+        let inp = input_wide(340.0, 1.0, 5);
+        assert_eq!(hit_test([340.0, 400.0], 0.0, &inp, false), None);
+        assert_eq!(hit_test([341.0, 400.0], 0.0, &inp, false), None);
+    }
+
+    #[test]
+    fn the_menu_does_not_reach_the_band_at_production_widths() {
+        // Documents the real geometry, against which R1.4's ordering is *defensive*:
+        // the popup is right-aligned ~21 logical px inside the edge (card margin + pad +
+        // BUTTON_INSET), so at any width the 260 clamp permits it stops well short of the
+        // 6px band. The `hit_test` comment claiming the popup "may extend past sidebar_w"
+        // is true only below ~171px — see the next test.
+        for logical_w in [260.0_f32, 340.0, 440.0] {
+            let inp = SidebarLayoutInput {
+                viewport: [1140.0, 900.0],
+                open_menu: Some(OpenMenu { row: 0, items: 3 }),
+                ..input(logical_w, 900.0, 1.0, 5)
+            };
+            let popup = menu_rect(0.0, &inp).expect("menu open");
+            let band = grab_band_rect(&inp);
+            assert!(
+                popup.x + popup.w <= band.x,
+                "at w={logical_w} popup ends {} , band starts {}",
+                popup.x + popup.w,
+                band.x
+            );
+        }
+    }
+
+    #[test]
+    fn an_open_card_menu_outranks_the_grab_band() {
+        // R1.4 — where the two DO overlap (a sidebar narrower than the popup, so the
+        // left-edge clamp pushes the popup out past `sidebar_w`), the menu must win:
+        // pressing the right 6px of an open popup activates the menu, never a resize.
+        // Unreachable through the config clamp, which is exactly why it is a test and not
+        // a comment — the arm ordering is the only thing keeping it true.
+        let inp = SidebarLayoutInput {
+            viewport: [1140.0, 900.0],
+            open_menu: Some(OpenMenu { row: 0, items: 3 }),
+            ..input(90.0, 900.0, 1.0, 5)
+        };
+        let popup = menu_rect(0.0, &inp).expect("menu open");
+        let band = grab_band_rect(&inp);
+        // Prove the premise before asserting the consequence: they really do overlap.
+        let overlap_x0 = popup.x.max(band.x);
+        let overlap_x1 = (popup.x + popup.w).min(band.x + band.w);
+        assert!(
+            overlap_x1 > overlap_x0,
+            "premise: popup [{}, {}) must overlap band [{}, {})",
+            popup.x,
+            popup.x + popup.w,
+            band.x,
+            band.x + band.w
+        );
+        let p = [(overlap_x0 + overlap_x1) / 2.0, popup.y + popup.h / 2.0];
+        assert!(matches!(
+            hit_test(p, 0.0, &inp, false),
+            Some(SidebarRegion::MenuItem(_)) | Some(SidebarRegion::Panel)
+        ));
+        assert_ne!(hit_test(p, 0.0, &inp, false), Some(SidebarRegion::GrabEdge));
+    }
+
+    #[test]
+    fn the_band_is_bounded_by_the_viewport_test() {
+        // R1.5 — this is why the arm sits AFTER step 2, not before it. A point in the
+        // band's column but outside the window is None, not a resize.
+        let inp = input_wide(340.0, 1.0, 5);
+        let h = inp.viewport[1];
+        assert_eq!(hit_test([336.0, h + 10.0], 0.0, &inp, false), None);
+        assert_eq!(hit_test([336.0, -1.0], 0.0, &inp, false), None);
+    }
+
+    #[test]
+    fn no_grab_band_while_collapsed() {
+        // R1.6 — collapsed short-circuits to the restore button alone; a zero-width
+        // sidebar has no edge to grab.
+        let inp = SidebarLayoutInput {
+            viewport: [1140.0, 900.0],
+            ..input(0.0, 900.0, 1.0, 5)
+        };
+        assert_eq!(hit_test([336.0, 400.0], 0.0, &inp, true), None);
+        assert_eq!(hit_test([0.0, 400.0], 0.0, &inp, true), None);
+        // And the rect itself is empty, so no caller can conjure a hit from it.
+        assert_eq!(grab_band_rect(&inp).w, 0.0);
+    }
+
+    #[test]
+    fn grab_band_never_exceeds_a_narrow_sidebar() {
+        // Defensive: a sidebar narrower than the band must not produce a negative x.
+        let inp = SidebarLayoutInput {
+            viewport: [1140.0, 900.0],
+            ..input(4.0, 900.0, 1.0, 5)
+        };
+        let band = grab_band_rect(&inp);
+        assert_eq!(band.x, 0.0);
+        assert_eq!(band.w, 4.0);
     }
 }

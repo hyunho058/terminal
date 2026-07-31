@@ -26,6 +26,13 @@ pub enum CommonError {
         source: toml::de::Error,
     },
 
+    #[error("failed to write config at {path}: {source}")]
+    ConfigWrite {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("config watcher: {0}")]
     Watch(String),
 }

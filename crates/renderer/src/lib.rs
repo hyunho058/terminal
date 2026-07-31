@@ -592,6 +592,31 @@ impl Renderer {
         self.sync_left_inset();
     }
 
+    /// The effective sidebar width in **logical** px — config with the runtime override
+    /// applied (D4). Unlike [`left_inset`](Renderer::left_inset) this is non-zero while
+    /// collapsed: it is the width a restore brings back, and the value tab-resize persists
+    /// (D7), so collapsing must not erase it.
+    pub fn sidebar_width_logical(&self) -> f32 {
+        self.effective_sidebar().width_px
+    }
+
+    /// The effective collapsed state — config with the runtime override applied (D4).
+    pub fn sidebar_collapsed(&self) -> bool {
+        self.effective_sidebar().collapsed
+    }
+
+    /// Drop the runtime sidebar override so the config file is authoritative again
+    /// (tab-resize D15a).
+    ///
+    /// The override is otherwise sticky for the session, which would make `width_px` and
+    /// `collapsed` the only fields in `config.toml` that stop live-reloading once the user
+    /// has dragged. Called when a delivered config carries a value that is *not* our own
+    /// echo — i.e. a real human edit, which should win.
+    pub fn clear_sidebar_override(&mut self) {
+        self.sidebar_override = SidebarOverride::default();
+        self.sync_left_inset();
+    }
+
     /// Current left inset in physical px.
     pub fn left_inset(&self) -> f32 {
         self.left_inset
@@ -1526,6 +1551,37 @@ mod tests {
         r.set_sidebar_width(100_000.0);
         assert_eq!(r.left_inset(), 440.0, "clamped to SIDEBAR_WIDTH_MAX");
         assert_eq!(r.grid_size().1, rows_open, "left inset never changes rows");
+
+        // tab-resize R9.3/D15a — a real human edit clears BOTH override fields, so the
+        // file is authoritative again. Without this the two persisted fields would be the
+        // only ones in config.toml that stop live-reloading once the user has dragged.
+        r.set_sidebar_collapsed(true);
+        r.set_sidebar_width(400.0);
+        assert_eq!(r.left_inset(), 0.0, "override says collapsed");
+        r.clear_sidebar_override();
+        assert_eq!(
+            r.left_inset(),
+            340.0,
+            "both override fields dropped — back to the config's width and open state"
+        );
+        assert_eq!(r.sidebar_width_logical(), 340.0);
+        assert!(!r.sidebar_collapsed());
+
+        // …and `set_sidebar_collapsed` does not zero `width_px`, so a restore brings back
+        // whatever width the override last held. NOTE this proves a property of `Renderer`
+        // alone: it does NOT mean a drag-collapse restores the pre-drag width. The drag
+        // writes the clamped width on every frame down to the collapse threshold, so it
+        // restores at 260 — see `drive_resize` and the spec's Known Gaps.
+        r.set_sidebar_width(400.0);
+        r.set_sidebar_collapsed(true);
+        assert_eq!(r.left_inset(), 0.0);
+        assert_eq!(
+            r.sidebar_width_logical(),
+            400.0,
+            "collapsing must not erase the remembered width"
+        );
+        r.set_sidebar_collapsed(false);
+        assert_eq!(r.left_inset(), 400.0, "restored at the chosen width");
     }
 
     #[test]
