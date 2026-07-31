@@ -1327,8 +1327,8 @@ impl Running {
         // **What this does NOT do**, stated plainly because the first version of this
         // comment claimed otherwise: it does not preserve a pre-drag width across a
         // drag-collapse. `clamp` floors every `raw < 260` at 260 while `next_collapsed`
-        // only fires below 220, so a continuous drag from 400 writes 260 all the way
-        // through the [220, 260) hysteresis band before the collapse happens. Restoring
+        // only fires below 240, so a continuous drag from 400 writes 260 all the way
+        // through the [240, 260) hysteresis band before the collapse happens. Restoring
         // after a drag-collapse therefore yields **260**, not 400.
         //
         // That is the honest consequence of the pointer having genuinely been dragged to

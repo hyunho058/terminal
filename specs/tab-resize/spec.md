@@ -260,10 +260,10 @@ was right that pointer capture (D17) had never been asked about.
 ### D9a: The clamp is applied at the setter; the collapse/expand thresholds read the RAW value
 - **Status**: resolved
 - **Rationale**: Correcting an outright contradiction between D9 and D12 caught by the L2
-  reviewer: `clamp(raw, 260, 440)` can never be below 260, so a threshold test at 220 on
+  reviewer: `clamp(raw, 260, 440)` can never be below 260, so a threshold test at 240 on
   the clamped width would be **dead code that never fires**. The two quantities are
   distinct and must stay distinct — `raw` drives the D12 threshold comparisons (collapse
-  when `raw < 220`, re-expand when `raw ≥ 260`), while `clamp(raw, …)` is what reaches
+  when `raw < 240`, re-expand when `raw ≥ 260`), while `clamp(raw, …)` is what reaches
   `set_sidebar_width` and therefore what is ever drawn or persisted. The 260 in "clamp at
   260" and the 260 in "re-expand past 260" are the same number naming two different
   things; this decision exists so nobody collapses them back together.
@@ -306,7 +306,7 @@ was right that pointer capture (D17) had never been asked about.
   helpers — the existing card-index mapping and a new cursor-icon mapping. `sidebar_hover`
   keeps its signature and its existing test assertions (`input.rs:960-975`) intact.
 
-### D12: Crossing ~220px collapses mid-drag; dragging back past 260px re-expands, with hysteresis
+### D12: Crossing ~240px collapses mid-drag; dragging back past 260px re-expands, with hysteresis
 - **Status**: resolved
 - **Rationale**: The gesture stays live across the mode change — a mis-drag costs nothing.
   The two thresholds are deliberately different (collapse at `MIN − 40`, re-expand at
@@ -641,7 +641,7 @@ was right that pointer capture (D17) had never been asked about.
 
 #### R4.1: Crossing the collapse threshold collapses mid-drag
 - **Given**: A drag in flight with the sidebar open
-- **When**: `raw` falls below 220
+- **When**: `raw` falls below 240
 - **Then**: `set_sidebar_collapsed(true)` is called, `left_inset` becomes `0.0`, and the
   grid re-fits to the full window width
 
@@ -651,8 +651,8 @@ was right that pointer capture (D17) had never been asked about.
 - **Then**: `set_sidebar_collapsed(false)` is called and the width resumes tracking `raw`
 
 #### R4.3: The two thresholds differ, so jitter cannot flicker the mode
-- **Given**: A drag hovering at `raw = 240` (between the thresholds)
-- **When**: `raw` oscillates by ±15 across several events without leaving 220..260
+- **Given**: A drag hovering at `raw = 250` (between the thresholds)
+- **When**: `raw` oscillates by ±8 across several events without leaving 240..260
 - **Then**: No collapse or expand call is made at all
 
 #### R4.4: The thresholds read the raw value, not the clamped width
@@ -992,8 +992,9 @@ least one task.
 - **Eyeball it** — `/run-term`, then drag: check the cursor changes on the band, the grid
   reflows column-by-column, collapse/re-expand does not flicker, and the width survives a
   relaunch. None of R0.1, R2.1, or R4.3 is convincing from a unit test alone.
-- **Tune the judgement constants** (Known Gaps): the 220/260 hysteresis gap and the 6px
-  band width are unmeasured; adjust by feel after the first real session.
+- ~~**Tune the judgement constants**~~ — done: the gap was tuned 220→240 from instrumented
+  drag logs (see Known Gaps). The 6px band measured well in the same session (three clean
+  entries, correct rejection 2px outside) and is left as-is.
 - **Consider documenting** the new `sidebar.width_px` / `collapsed` write-back behavior
   wherever the config is described for users, since these become the first fields the app
   writes rather than only reads.
@@ -1005,8 +1006,8 @@ least one task.
   every reload path. Deliberately deferred as another feature's surface; worth a
   follow-up spec if the atlas rebuild shows up in another reload path.
 - **A drag-collapse remembers 260, not the pre-drag width.** `clamp` floors every raw
-  value below 260 at 260, while D12's collapse only fires below 220 — so a continuous drag
-  from 400 writes 260 throughout the [220, 260) hysteresis band before collapsing, and a
+  value below 260 at 260, while D12's collapse only fires below 240 — so a continuous drag
+  from 400 writes 260 throughout the [240, 260) hysteresis band before collapsing, and a
   later Restore brings the sidebar back at 260. This is the honest consequence of the
   pointer having really been dragged to the minimum on the way down (the Hide button does
   the same if you drag to 260 first), but it is a behavioural choice, not an accident:
@@ -1015,9 +1016,12 @@ least one task.
 - **`save_sidebar` is an unsynchronised read-modify-write.** A hand-edit saved between our
   `read_to_string` and our `rename` is silently clobbered. Inherent to D8's surgical
   rewrite; the window is milliseconds and the loser is one edit, not the file.
-- **Hysteresis thresholds (220 / 260) are a judgement, not a measurement.** They were
-  chosen to be jitter-proof under D1's per-frame reflow; no trackpad jitter data was
-  collected. Expect to tune the 40px gap by feel.
+- **Hysteresis thresholds (240 / 260) were tuned from instrumented drag logs.** The first
+  cut used a 40px gap (collapse at 220); hand-verification with per-frame logging showed
+  the sidebar sitting pinned at its 260 minimum through ~55 logical px of pointer travel
+  with no visual feedback before collapsing abruptly, while the same logs showed 20+
+  stable frames inside the gap — margin to spare. Halved to 20px (collapse at 240), which
+  buys back half the dead travel. Still a judgement: one session, one hand, one trackpad.
 - **Grab-band width (6 logical px) is unvalidated against a trackpad.** It is inside the
   sidebar only (D10), so it is strictly less forgiving than a straddling band; if it
   proves hard to hit, widening it inward is a one-constant change, but widening it

@@ -277,7 +277,11 @@ pub fn resize_raw_width(pointer_x: f64, drag: ResizeDrag, scale: f64) -> f32 {
 /// the sidebar (tab-resize D12), and therefore the width of the hysteresis gap.
 ///
 /// [`SIDEBAR_WIDTH_MIN`]: common::config::SIDEBAR_WIDTH_MIN
-pub const COLLAPSE_HYSTERESIS_PX: f32 = 40.0;
+/// Tuned 40 → 20 from instrumented drag logs: at 40 the sidebar sat at its 260 minimum
+/// through ~55 logical px of pointer travel with no visual feedback, then collapsed
+/// abruptly. The same logs showed 20+ stable frames inside the gap, i.e. margin to spare,
+/// so halving it buys back half the dead travel without inviting flicker.
+pub const COLLAPSE_HYSTERESIS_PX: f32 = 20.0;
 
 /// The raw width at or below which a drag collapses the sidebar (tab-resize D12).
 pub fn collapse_threshold() -> f32 {
@@ -293,7 +297,7 @@ pub fn collapse_threshold() -> f32 {
 /// right re-expands without releasing (R4.2).
 ///
 /// Reads `raw`, never the clamped width: `clamp(raw, 260, 440)` can never be below 260, so
-/// a threshold at 220 tested against it would be unreachable dead code (D9a/R4.4).
+/// a threshold at 240 tested against it would be unreachable dead code (D9a/R4.4).
 pub fn next_collapsed(raw: f32, collapsed: bool) -> bool {
     if collapsed {
         // Re-expand only once the pointer is back at the honest minimum.
@@ -1525,13 +1529,14 @@ mod tests {
 
     #[test]
     fn dragging_past_the_threshold_collapses() {
-        // R4.1 — crossing ~220 collapses mid-drag.
-        assert_eq!(collapse_threshold(), 220.0);
+        // R4.1 — crossing ~240 collapses mid-drag (tuned from 220, see
+        // COLLAPSE_HYSTERESIS_PX).
+        assert_eq!(collapse_threshold(), 240.0);
         assert!(
-            next_collapsed(219.0, false),
+            next_collapsed(239.0, false),
             "below the threshold → collapse"
         );
-        assert!(!next_collapsed(221.0, false), "above it → stay open");
+        assert!(!next_collapsed(241.0, false), "above it → stay open");
     }
 
     #[test]
@@ -1547,10 +1552,15 @@ mod tests {
 
     #[test]
     fn the_two_thresholds_differ_so_jitter_cannot_flicker_the_mode() {
-        // R4.3 — the whole point of the hysteresis gap. Inside [220, 260) the state is
+        // R4.3 — the whole point of the hysteresis gap. Inside [240, 260) the state is
         // *sticky*: whatever it was, it stays. Under D1 each flip is a full-window reflow,
         // so a single shared threshold would reflow the grid on ordinary hand tremor.
-        for raw in [220.0_f32, 230.0, 240.0, 250.0, 259.9] {
+        //
+        // The gap is deliberately narrower than the first cut (20 rather than 40 logical
+        // px) — instrumented drag logs showed 20+ stable frames inside the old gap, i.e.
+        // margin to spare, while the user paid ~55px of dead travel before the collapse.
+        // The property under test is unchanged; only its width moved.
+        for raw in [240.0_f32, 245.0, 250.0, 255.0, 259.9] {
             assert!(!next_collapsed(raw, false), "open stays open at {raw}");
             assert!(
                 next_collapsed(raw, true),
@@ -1559,17 +1569,19 @@ mod tests {
         }
         // And a full oscillation inside the gap changes nothing.
         let mut state = false;
-        for raw in [240.0_f32, 255.0, 225.0, 250.0, 230.0] {
+        for raw in [250.0_f32, 259.0, 241.0, 255.0, 245.0] {
             state = next_collapsed(raw, state);
             assert!(!state, "no flip anywhere inside the gap");
         }
+        // The gap is still a real gap: a single shared threshold at MIN would flip here.
+        assert!(collapse_threshold() < common::config::SIDEBAR_WIDTH_MIN);
     }
 
     #[test]
     fn the_thresholds_read_the_raw_width_not_the_clamped_one() {
         // R4.4 — the regression test for the contradiction the L2 review caught. Feeding
         // the CLAMPED width in would make collapse unreachable, because clamping floors
-        // the value at 260 — well above the 220 threshold.
+        // the value at 260 — well above the 240 threshold.
         let drag = ResizeDrag { grab_offset: 0.0 };
         let raw = resize_raw_width(200.0, drag, 1.0);
         assert!(next_collapsed(raw, false), "raw 200 collapses");
@@ -1956,7 +1968,7 @@ mod tests {
     fn the_raw_value_is_not_clamped_so_collapse_thresholds_can_see_it() {
         // R4.4 / D9a — the regression test for an outright contradiction the L2 review
         // caught: if `resize_raw_width` clamped, `raw` could never be below 260 and D12's
-        // 220 collapse threshold would be unreachable dead code.
+        // 240 collapse threshold would be unreachable dead code.
         let drag = ResizeDrag { grab_offset: 0.0 };
         let raw = resize_raw_width(200.0, drag, 1.0);
         assert_eq!(raw, 200.0, "raw must stay BELOW the 260 minimum");
