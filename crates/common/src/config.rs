@@ -1,6 +1,8 @@
 //! User configuration: font, color theme, ligatures, and grid defaults.
 //!
-//! Loaded from `~/.config/mac-terminal/config.toml` (TOML + serde). Every field
+//! Loaded from the platform config dir via [`directories::ProjectDirs`] — on macOS that
+//! is `~/Library/Application Support/mac-terminal/config.toml`, **not** `~/.config`
+//! (verified empirically; several docs still say otherwise). TOML + serde. Every field
 //! has a default, so a missing or partial file still yields a usable `Config`.
 //! This type is deliberately UI/GPU-free so both `renderer` and `app` can read it.
 
@@ -141,7 +143,9 @@ impl Default for SidebarConfig {
 }
 
 impl Config {
-    /// Absolute path to the config file (`~/.config/mac-terminal/config.toml`).
+    /// Absolute path to the config file. `ProjectDirs` follows the platform convention, so
+    /// on macOS this is `~/Library/Application Support/mac-terminal/config.toml` — the
+    /// XDG-style `~/.config/...` that older comments cite is not what this returns.
     pub fn path() -> Result<PathBuf> {
         let dirs =
             directories::ProjectDirs::from("", "", APP_ID).ok_or(CommonError::NoConfigDir)?;
@@ -196,6 +200,320 @@ impl Config {
             self.sidebar.width_px = effective;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sidebar write-back (tab-resize D8) — the FIRST thing in this workspace that
+// writes `config.toml` rather than only reading it.
+// ---------------------------------------------------------------------------
+
+/// The temp file a [`save_sidebar`] writes before renaming it over the target (D8).
+///
+/// It must live in the config directory (`rename` is only atomic within one filesystem)
+/// and it must **not** be named [`CONFIG_FILE`]: [`crate::watch::ConfigWatcher`] matches
+/// change events by file *name* over that very directory, so a same-named temp would trip
+/// our own watcher twice per save.
+const TMP_FILE: &str = "config.toml.tmp";
+
+/// Render an `f32` the way [`save_sidebar`] writes it — shortest representation that
+/// round-trips exactly (tab-resize D15/R8.7).
+///
+/// `{}` is deliberate: a fixed precision like `{:.1}` loses bits, and the echo-suppression
+/// predicate compares the *re-parsed* value against what we wrote. A lossy format would
+/// therefore turn every one of our own writes into a spurious "human edit", clearing the
+/// runtime override on every drag. Also forces a decimal point so the value re-parses as a
+/// TOML float, not an integer (`400` would be an integer and fail `f32` deserialization).
+fn fmt_f32(v: f32) -> String {
+    let s = format!("{v}");
+    if s.contains(['.', 'e', 'E', 'n', 'i']) {
+        // already fractional, exponential, NaN or inf
+        s
+    } else {
+        format!("{s}.0")
+    }
+}
+
+/// Persist ONLY the sidebar's `width_px` and `collapsed` to `path`, preserving everything
+/// else in the file byte-for-byte (tab-resize D2/D8/D16).
+///
+/// **Surgical, not a serde round-trip.** `toml::to_string(&Config)` would be three lines
+/// and would silently delete every comment and reorder every key — turning a file the user
+/// hand-edits into one only the machine can maintain. So this rewrites the two target
+/// lines in place, inserts a `[sidebar]` table when absent, and leaves comments, blank
+/// lines, key order, and keys we do not model exactly where they were.
+///
+/// **Atomic.** Writes [`TMP_FILE`] beside the target and renames over it, so the watcher
+/// (and any concurrent reader) can never observe a half-written file.
+///
+/// Creates the parent directory and the file itself when missing — a fresh install has no
+/// `config.toml` at all, because [`Config::load`] returns defaults without creating one.
+pub fn save_sidebar(path: &Path, width_px: f32, collapsed: bool) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|source| CommonError::ConfigWrite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    // A missing file is not an error — it is a fresh install. Treat it as empty and let
+    // the editor below synthesize the `[sidebar]` table.
+    let original = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(CommonError::ConfigWrite {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+
+    // Refuse to touch a file whose `sidebar` is an inline table or a dotted key
+    // (`sidebar = { .. }` / `sidebar.width_px = ..`). Both are valid TOML that
+    // `load_from` accepts today, but the line-oriented editor below cannot see them as a
+    // table and would append a second `[sidebar]` — defining the key twice, which makes
+    // the file unparseable and silently drops the user back to full defaults at next
+    // launch. Warning and keeping the session value is exactly what D14 prescribes.
+    if has_non_table_sidebar(&original) {
+        return Err(CommonError::ConfigWrite {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "[sidebar] is written as an inline table or dotted key; refusing to rewrite it",
+            ),
+        });
+    }
+    let updated = edit_sidebar_toml(&original, width_px, collapsed);
+
+    let tmp = path.with_file_name(TMP_FILE);
+    std::fs::write(&tmp, updated).map_err(|source| CommonError::ConfigWrite {
+        path: tmp.clone(),
+        source,
+    })?;
+    std::fs::rename(&tmp, path).map_err(|source| CommonError::ConfigWrite {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// The pure text transform behind [`save_sidebar`] — separated so every fidelity rule is
+/// unit-testable without touching a filesystem.
+///
+/// Rules, in the order they matter:
+/// 1. Inside the `[sidebar]` table, replace the *value* of an existing `width_px` /
+///    `collapsed` line, preserving its indentation and re-attaching any trailing comment.
+/// 2. Keys absent from an existing `[sidebar]` table are appended to the end of that
+///    table (before the next `[header]`), never to the file's end — which would place them
+///    under a different table and change their meaning.
+/// 3. No `[sidebar]` table at all → append a fresh one.
+fn edit_sidebar_toml(original: &str, width_px: f32, collapsed: bool) -> String {
+    let width_line = format!("width_px = {}", fmt_f32(width_px));
+    let collapsed_line = format!("collapsed = {collapsed}");
+    // `str::lines()` strips the `\r` of a `\r\n`, so rejoining with `\n` alone would
+    // silently rewrite every line ending in a CRLF file — a change to every byte of every
+    // line, which R8.2's "byte-identical" promise forbids.
+    // Keyed on the file's FIRST line ending, not "contains a CRLF anywhere": a mostly-LF
+    // file with one stray CRLF would otherwise be rewritten wholly to CRLF — the same
+    // every-line-changed damage, in the other direction.
+    let newline = match original.find('\n') {
+        Some(i) if i > 0 && original.as_bytes()[i - 1] == b'\r' => "\r\n",
+        _ => "\n",
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    let mut in_sidebar = false;
+    let mut seen_sidebar = false;
+    let mut wrote_width = false;
+    let mut wrote_collapsed = false;
+    // Where the `[sidebar]` table ended, so missing keys land inside it (rule 2).
+    let mut sidebar_end: Option<usize> = None;
+
+    for line in original.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            // Leaving the sidebar table: remember where to append any missing key.
+            if in_sidebar {
+                sidebar_end = Some(out.len());
+                in_sidebar = false;
+            }
+            if is_table_header(trimmed, "sidebar") {
+                in_sidebar = true;
+                seen_sidebar = true;
+            }
+            out.push(line.to_string());
+            continue;
+        }
+        if in_sidebar {
+            // Keep any trailing comment the user wrote beside the value — replacing the
+            // whole line would delete `# I like it narrow`, which R8.2 promises not to do.
+            if let Some(indent) = key_indent(line, "width_px") {
+                let (before, comment) = split_trailing_comment(line);
+                out.push(join_comment(indent, &width_line, before, comment));
+                wrote_width = true;
+                continue;
+            }
+            if let Some(indent) = key_indent(line, "collapsed") {
+                let (before, comment) = split_trailing_comment(line);
+                out.push(join_comment(indent, &collapsed_line, before, comment));
+                wrote_collapsed = true;
+                continue;
+            }
+        }
+        out.push(line.to_string());
+    }
+    if in_sidebar {
+        sidebar_end = Some(out.len());
+    }
+
+    let missing: Vec<String> = [
+        (!wrote_width).then(|| width_line.clone()),
+        (!wrote_collapsed).then(|| collapsed_line.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    if !missing.is_empty() {
+        if seen_sidebar {
+            // Rule 2: append inside the existing table, at its end.
+            let at = sidebar_end.unwrap_or(out.len());
+            // Skip back over trailing blank lines so the keys hug the table's content.
+            let at = trim_back_blanks(&out, at);
+            for (i, line) in missing.iter().enumerate() {
+                out.insert(at + i, line.clone());
+            }
+        } else {
+            // Rule 3: no table — append a fresh one.
+            if !out.is_empty() && !out.last().is_some_and(|l| l.trim().is_empty()) {
+                out.push(String::new());
+            }
+            out.push("[sidebar]".to_string());
+            out.extend(missing);
+        }
+    }
+
+    let mut text = out.join(newline);
+    // Preserve the original's trailing-newline convention; default to having one.
+    if original.is_empty() || original.ends_with('\n') {
+        text.push_str(newline);
+    }
+    text
+}
+
+/// Re-attach a preserved trailing comment to a rewritten key line, reusing the **original**
+/// gap between the value and the `#` so the line's spacing is untouched (R8.2). `before` is
+/// the original text left of the comment; only its trailing whitespace is read.
+fn join_comment(indent: &str, key_line: &str, before: &str, comment: &str) -> String {
+    if comment.is_empty() {
+        return format!("{indent}{key_line}");
+    }
+    let gap = &before[before.trim_end().len()..];
+    let gap = if gap.is_empty() { " " } else { gap };
+    format!("{indent}{key_line}{gap}{comment}")
+}
+
+/// Whether the file declares `sidebar` as a **top-level inline table or dotted key**
+/// rather than a `[sidebar]` section — a shape [`edit_sidebar_toml`] cannot edit safely.
+///
+/// Only top-level assignments count: a `sidebar = ...` line *inside* some other table is
+/// a different key entirely and is none of our business.
+fn has_non_table_sidebar(original: &str) -> bool {
+    let mut at_top_level = true;
+    for line in original.lines() {
+        let t = line.trim_start();
+        if t.starts_with('[') {
+            at_top_level = false;
+            // `[[sidebar]]` is an array-of-tables — a third door into the same duplicate-key
+            // corruption, since `is_table_header` does not match it and the editor would
+            // append a plain `[sidebar]` alongside it. Refuse rather than corrupt.
+            if t.starts_with("[[") {
+                let name = t.trim_start_matches('[');
+                if unquote(name.split(']').next().unwrap_or("").trim()) == "sidebar" {
+                    return true;
+                }
+            }
+            continue;
+        }
+        if !at_top_level {
+            continue;
+        }
+        // Accept a quoted key too (`"sidebar" = { .. }`) — TOML treats it as the same key,
+        // and missing it produces the same duplicate-table corruption this guard exists
+        // to prevent.
+        let key = t
+            .strip_prefix("sidebar")
+            .or_else(|| t.strip_prefix("\"sidebar\""))
+            .or_else(|| t.strip_prefix("'sidebar'"));
+        if let Some(rest) = key {
+            let rest = rest.trim_start();
+            // `sidebar = {..}` (inline table) or `sidebar.width_px = ..` (dotted key).
+            if rest.starts_with('=') || rest.starts_with('.') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Split a line into `(before_comment, comment_including_hash)` so a rewrite can keep a
+/// trailing comment the user wrote beside the value.
+///
+/// The `#` must be outside a quoted string — `width_px = "a#b"` has no comment. Only
+/// basic double/single quotes are tracked, which is all a scalar value can contain here.
+fn split_trailing_comment(line: &str) -> (&str, &str) {
+    let (mut in_d, mut in_s) = (false, false);
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' if !in_s => in_d = !in_d,
+            '\'' if !in_d => in_s = !in_s,
+            '#' if !in_d && !in_s => return (&line[..i], &line[i..]),
+            _ => {}
+        }
+    }
+    (line, "")
+}
+
+/// Whether `line` is the table header `[name]` — tolerating inner spaces (`[ sidebar ]`)
+/// and a quoted key (`["sidebar"]`), both of which TOML treats as identical to `[sidebar]`.
+///
+/// The quoting case is not pedantry: missing it made the editor believe there was no
+/// `[sidebar]` table, append a second one, and produce a file with a duplicate key — which
+/// fails to parse, so the next launch silently falls back to *all* defaults and the user's
+/// whole config stops taking effect.
+fn is_table_header(line: &str, name: &str) -> bool {
+    line.strip_prefix('[')
+        .and_then(|s| s.split(']').next())
+        .is_some_and(|s| unquote(s.trim()) == name)
+}
+
+/// Strip one layer of matching `"` or `'` quotes, if present.
+fn unquote(s: &str) -> &str {
+    for q in ['"', '\''] {
+        if s.len() >= 2 && s.starts_with(q) && s.ends_with(q) {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
+}
+
+/// If `line` assigns `key`, return the line's leading whitespace so the rewrite keeps the
+/// file's indentation style. `None` when the line assigns something else.
+fn key_indent<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix(key)?;
+    // `width_px_extra = 1` must not match `width_px`.
+    if !rest.trim_start().starts_with('=') {
+        return None;
+    }
+    Some(&line[..line.len() - trimmed.len()])
+}
+
+/// The index at or before `at` that skips back over trailing blank lines.
+fn trim_back_blanks(lines: &[String], at: usize) -> usize {
+    let mut i = at;
+    while i > 0 && lines[i - 1].trim().is_empty() {
+        i -= 1;
+    }
+    i
 }
 
 #[cfg(test)]
@@ -349,5 +667,318 @@ mod tests {
             explicit.font.ligatures,
             "explicit `ligatures = true` still enables"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // tab-resize: sidebar write-back (D8)
+    // -----------------------------------------------------------------
+
+    /// A temp dir with NO config file written — for the fresh-install path.
+    fn empty_tmp_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mac-term-save-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn save_preserves_comments_key_order_and_unknown_keys() {
+        // R8.2 — the whole reason this is surgical instead of a serde round-trip.
+        let original = "\
+# my terminal config
+# (hand-written, do not clobber)
+
+[font]
+size_pt = 14.0   # a bit bigger
+
+[sidebar]
+# how wide the tab list is
+width_px = 340.0
+show_git_branch = true
+accent = 0x86B0A1
+collapsed = false
+
+[grid]
+columns = 120
+";
+        let updated = edit_sidebar_toml(original, 400.0, false);
+        assert!(updated.contains("# my terminal config"));
+        assert!(updated.contains("# (hand-written, do not clobber)"));
+        assert!(updated.contains("# how wide the tab list is"));
+        assert!(updated.contains("size_pt = 14.0   # a bit bigger"));
+        assert!(updated.contains("accent = 0x86B0A1"));
+        assert!(updated.contains("columns = 120"));
+        assert!(updated.contains("width_px = 400.0"));
+        // Key ORDER is untouched: sidebar still precedes grid, width_px still first.
+        let i_font = updated.find("[font]").unwrap();
+        let i_side = updated.find("[sidebar]").unwrap();
+        let i_grid = updated.find("[grid]").unwrap();
+        assert!(i_font < i_side && i_side < i_grid);
+        assert!(updated.find("width_px").unwrap() < updated.find("show_git_branch").unwrap());
+        // And it still parses back to the value we wrote.
+        let c: Config = toml::from_str(&updated).expect("still valid TOML");
+        assert_eq!(c.sidebar.width_px, 400.0);
+        assert_eq!(c.grid.columns, 120);
+    }
+
+    #[test]
+    fn save_rewrites_only_the_target_lines() {
+        // R8.2 — byte-level: exactly the two lines differ.
+        let original = "[sidebar]\nwidth_px = 340.0\ncollapsed = false\naccent = 0x86B0A1\n";
+        let updated = edit_sidebar_toml(original, 400.0, true);
+        assert_eq!(
+            updated, "[sidebar]\nwidth_px = 400.0\ncollapsed = true\naccent = 0x86B0A1\n",
+            "only the two managed values change"
+        );
+    }
+
+    #[test]
+    fn save_inserts_a_missing_sidebar_table() {
+        // R8.3 — a config with no [sidebar] table at all.
+        let original = "[grid]\ncolumns = 80\n";
+        let updated = edit_sidebar_toml(original, 400.0, false);
+        let c: Config = toml::from_str(&updated).expect("valid after insert");
+        assert_eq!(c.sidebar.width_px, 400.0);
+        assert!(!c.sidebar.collapsed);
+        assert_eq!(c.grid.columns, 80, "the existing table is untouched");
+    }
+
+    #[test]
+    fn save_appends_missing_keys_inside_the_existing_table() {
+        // A [sidebar] table that has only SOME of the keys: the missing one must land
+        // inside that table, not at the file's end (where it would fall under [grid] and
+        // mean something entirely different).
+        let original = "[sidebar]\nwidth_px = 340.0\n\n[grid]\ncolumns = 80\n";
+        let updated = edit_sidebar_toml(original, 400.0, true);
+        let c: Config = toml::from_str(&updated).expect("valid");
+        assert_eq!(c.sidebar.width_px, 400.0);
+        assert!(c.sidebar.collapsed);
+        assert_eq!(c.grid.columns, 80);
+        assert!(
+            updated.find("collapsed").unwrap() < updated.find("[grid]").unwrap(),
+            "collapsed must sit inside [sidebar], not after [grid]:\n{updated}"
+        );
+    }
+
+    #[test]
+    fn save_preserves_indentation_style() {
+        let original = "[sidebar]\n    width_px = 340.0\n    collapsed = false\n";
+        let updated = edit_sidebar_toml(original, 300.0, true);
+        assert!(updated.contains("    width_px = 300.0"));
+        assert!(updated.contains("    collapsed = true"));
+    }
+
+    #[test]
+    fn save_does_not_match_a_key_that_merely_starts_the_same() {
+        // `width_px_extra` must not be mistaken for `width_px`. (deny_unknown_fields
+        // would reject it on load, but the text transform must still be honest.)
+        let original = "[sidebar]\nwidth_px_extra = 1\nwidth_px = 340.0\n";
+        let updated = edit_sidebar_toml(original, 400.0, false);
+        assert!(updated.contains("width_px_extra = 1"));
+        assert!(updated.contains("width_px = 400.0"));
+    }
+
+    #[test]
+    fn save_only_touches_keys_inside_the_sidebar_table() {
+        // A `width_px` under a DIFFERENT table must be left alone.
+        let original = "[other]\nwidth_px = 1.0\n\n[sidebar]\nwidth_px = 340.0\n";
+        let updated = edit_sidebar_toml(original, 400.0, false);
+        assert!(updated.contains("[other]\nwidth_px = 1.0"));
+        assert!(updated.contains("width_px = 400.0"));
+    }
+
+    #[test]
+    fn saved_float_round_trips_exactly() {
+        // R8.7 / D15 — the echo predicate compares the RE-PARSED value against what we
+        // wrote. A lossy format would make every one of our own writes look like a human
+        // edit and clear the runtime override on every drag.
+        for w in [260.0_f32, 300.5, 333.33333, 400.0, 439.99997, 440.0] {
+            let updated = edit_sidebar_toml("[sidebar]\nwidth_px = 1.0\n", w, false);
+            let c: Config = toml::from_str(&updated).expect("valid");
+            assert_eq!(c.sidebar.width_px, w, "round-trip of {w} via {updated:?}");
+        }
+    }
+
+    #[test]
+    fn whole_numbers_are_written_as_floats() {
+        // `width_px = 400` is a TOML *integer* and fails f32 deserialization — the value
+        // must carry a decimal point.
+        let updated = edit_sidebar_toml("[sidebar]\nwidth_px = 1.0\n", 400.0, false);
+        assert!(updated.contains("width_px = 400.0"), "got {updated:?}");
+    }
+
+    #[test]
+    fn save_sidebar_creates_dirs_and_file_on_a_fresh_install() {
+        // R8.4 — Config::load returns defaults WITHOUT creating a file, so the first
+        // save may be the first time the directory exists at all.
+        let dir = empty_tmp_dir("fresh");
+        let path = dir.join("config.toml");
+        assert!(!dir.exists());
+        save_sidebar(&path, 400.0, true).expect("save on a fresh install");
+        let c = Config::load_from(&path).expect("loads back");
+        assert_eq!(c.sidebar.width_px, 400.0);
+        assert!(c.sidebar.collapsed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_sidebar_leaves_no_temp_file_and_uses_a_distinct_name() {
+        // R8.5 — the temp must not be named config.toml (the watcher matches by NAME
+        // over the parent dir, so a same-named temp would trip it twice), and the rename
+        // must leave nothing behind.
+        assert_ne!(TMP_FILE, CONFIG_FILE);
+        let path = write_tmp_config("atomic", "[sidebar]\nwidth_px = 340.0\n");
+        let dir = path.parent().unwrap().to_path_buf();
+        save_sidebar(&path, 400.0, false).expect("save");
+        assert!(
+            !dir.join(TMP_FILE).exists(),
+            "temp file cleaned up by rename"
+        );
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+            .collect();
+        assert_eq!(names, vec![CONFIG_FILE.to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_sidebar_round_trips_through_a_real_file() {
+        let path = write_tmp_config(
+            "roundtrip",
+            "# keep me\n[sidebar]\nwidth_px = 340.0\ncollapsed = false\n",
+        );
+        save_sidebar(&path, 420.0, true).expect("save");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# keep me"), "comment survived: {text:?}");
+        let c = Config::load_from(&path).expect("loads");
+        assert_eq!(c.sidebar.width_px, 420.0);
+        assert!(c.sidebar.collapsed);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_trailing_comment_on_the_managed_line_survives() {
+        // R8.2 — found by the Gate-3 checker: the first cut replaced the whole line and
+        // deleted the user's note, while the doc comment claimed it was preserved.
+        let original =
+            "[sidebar]\nwidth_px = 340.0  # I like it narrow\ncollapsed = false # nope\n";
+        let updated = edit_sidebar_toml(original, 400.0, true);
+        assert!(
+            updated.contains("width_px = 400.0  # I like it narrow"),
+            "got {updated:?}"
+        );
+        // The ORIGINAL gap before each `#` is reused, not normalised: two spaces on the
+        // first line, one on the second — exactly as the user wrote them.
+        assert!(
+            updated.contains("collapsed = true # nope"),
+            "got {updated:?}"
+        );
+        let c: Config = toml::from_str(&updated).expect("valid");
+        assert_eq!(c.sidebar.width_px, 400.0);
+        assert!(c.sidebar.collapsed);
+    }
+
+    #[test]
+    fn a_quoted_table_header_is_recognised_not_duplicated() {
+        // The residual corruption escape the Gate-3 re-check found: `["sidebar"]` is
+        // identical TOML to `[sidebar]`, but the first cut did not match it, appended a
+        // SECOND table, and produced a duplicate key — an unparseable file, which silently
+        // resets the user to full defaults at next launch.
+        let original = "[\"sidebar\"]\nwidth_px = 340.0\n";
+        let updated = edit_sidebar_toml(original, 400.0, false);
+        assert_eq!(
+            updated.matches("sidebar").count(),
+            1,
+            "no second table appended: {updated:?}"
+        );
+        let c: Config = toml::from_str(&updated).expect("still parses");
+        assert_eq!(c.sidebar.width_px, 400.0);
+        // A quoted top-level inline table is likewise refused rather than corrupted.
+        assert!(has_non_table_sidebar(
+            "\"sidebar\" = { width_px = 340.0 }\n"
+        ));
+        // …and so is an array-of-tables — the third door into the same duplicate-key bug.
+        assert!(has_non_table_sidebar("[[sidebar]]\nwidth_px = 340.0\n"));
+        assert!(has_non_table_sidebar("[[ \"sidebar\" ]]\n"));
+        // A DIFFERENT array-of-tables is none of our business.
+        assert!(!has_non_table_sidebar("[[other]]\nx = 1\n"));
+    }
+
+    #[test]
+    fn a_hash_inside_a_string_is_not_a_comment() {
+        // The comment splitter must not truncate a value that legitimately contains `#`.
+        assert_eq!(split_trailing_comment("a = \"x#y\"").1, "");
+        assert_eq!(split_trailing_comment("a = 1 # real").1, "# real");
+        assert_eq!(split_trailing_comment("a = 'x#y' # real").1, "# real");
+    }
+
+    #[test]
+    fn a_stray_crlf_does_not_convert_the_whole_file() {
+        // Pins the first-line-ending rule. The pure-CRLF test below passed under BOTH the
+        // buggy `contains("\r\n")` implementation and the fixed one, so the fix was
+        // unpinned — a "simplification" back to `contains` would have gone unnoticed.
+        let original = "# note\n[sidebar]\r\nwidth_px = 340.0\n";
+        let updated = edit_sidebar_toml(original, 400.0, false);
+        assert!(
+            !updated.starts_with("# note\r\n"),
+            "a mostly-LF file must stay LF: {updated:?}"
+        );
+        assert!(updated.contains("width_px = 400.0"));
+    }
+
+    #[test]
+    fn a_crlf_file_keeps_its_line_endings() {
+        // R8.2 — `str::lines()` strips `\r`, so rejoining with `\n` would rewrite every
+        // line ending in the file. Found by the Gate-3 checker.
+        let original = "# note\r\n[sidebar]\r\nwidth_px = 340.0\r\n";
+        let updated = edit_sidebar_toml(original, 400.0, false);
+        assert!(updated.contains("\r\n"), "CRLF preserved: {updated:?}");
+        assert!(
+            !updated.replace("\r\n", "").contains('\n'),
+            "no bare LF introduced: {updated:?}"
+        );
+        let c: Config = toml::from_str(&updated).expect("valid");
+        assert_eq!(c.sidebar.width_px, 400.0);
+    }
+
+    #[test]
+    fn an_inline_table_sidebar_is_refused_not_corrupted() {
+        // The worst outcome this writer could produce: appending a second [sidebar] to a
+        // file that already defines `sidebar` as an inline table makes the file
+        // UNPARSEABLE, and a config that fails to parse silently drops the user back to
+        // full defaults. Refusing (D14: warn and keep the session value) is the safe path.
+        assert!(has_non_table_sidebar(
+            "sidebar = { width_px = 340.0, collapsed = false }\n"
+        ));
+        assert!(has_non_table_sidebar("sidebar.width_px = 340.0\n"));
+        // A `[sidebar]` section is fine, and so is a `sidebar = ...` key inside ANOTHER
+        // table — that is a different key entirely.
+        assert!(!has_non_table_sidebar("[sidebar]\nwidth_px = 340.0\n"));
+        assert!(!has_non_table_sidebar("[other]\nsidebar = 1\n"));
+
+        let path = write_tmp_config("inline", "sidebar = { width_px = 340.0 }\n");
+        assert!(
+            save_sidebar(&path, 400.0, false).is_err(),
+            "must refuse rather than corrupt"
+        );
+        // The file is untouched, so it still parses exactly as before.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "sidebar = { width_px = 340.0 }\n");
+        assert!(toml::from_str::<Config>(&text).is_ok());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_sidebar_reports_a_write_failure_rather_than_panicking() {
+        // R8.6's precondition: the failure must arrive as an Err the caller can warn on.
+        // A path whose parent cannot be created (a file where a directory must go).
+        let dir = empty_tmp_dir("readonly");
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("config.toml");
+        assert!(save_sidebar(&path, 400.0, false).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

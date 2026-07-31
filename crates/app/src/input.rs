@@ -6,6 +6,7 @@
 use renderer::sidebar_layout::{self, ChromeRegion, SidebarLayoutInput, SidebarRegion};
 use term_core::MouseEncoding;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::window::CursorIcon;
 
 /// A tab-management action triggered by a Cmd chord (D5). Intercepted before
 /// `encode_key`, so these keys never reach the shell (R3.2).
@@ -64,6 +65,9 @@ pub enum SidebarAction {
     /// renderer knows only the item's position; which action that position means is the
     /// app's to decide, since the app chose the item set.
     MenuItem(usize),
+    /// Begin a drag-to-resize on the sidebar's right edge (tab-resize D3/R1.7). The press
+    /// landed in the grab band; the app arms the drag and owns the pointer from here.
+    BeginResize,
     Inert,
 }
 
@@ -95,21 +99,243 @@ pub fn sidebar_press(
         SidebarRegion::Chrome(ChromeRegion::NewTab) => SidebarAction::NewTab,
         SidebarRegion::Chrome(ChromeRegion::HideSidebar) => SidebarAction::Collapse,
         SidebarRegion::Chrome(ChromeRegion::Restore) => SidebarAction::Expand,
+        SidebarRegion::GrabEdge => SidebarAction::BeginResize,
         SidebarRegion::Panel => SidebarAction::Inert,
     })
 }
 
-/// Resolve the card index under the cursor for the row layer's `hovered` highlight (D8).
-/// Chrome hover is driven separately by the chrome layer's own raw-cursor handle
-/// (chrome-collapse D10 as shipped), so this returns only the card index.
-pub fn sidebar_hover(
+/// An in-flight drag-to-resize of the sidebar's right edge (tab-resize D9/D17).
+///
+/// The `grab_offset` is captured at press and **never re-derived** — that is what lets the
+/// gesture survive D12's mid-drag collapse, where there is no edge left to measure against.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ResizeDrag {
+    /// `pointer_x − edge_x` at the moment of the press, **physical** px. Fixed for the
+    /// whole gesture, so the edge stays welded to the point the user grabbed.
+    pub grab_offset: f32,
+}
+
+/// Is this the **Cmd+Shift+S** sidebar toggle chord (tab-resize D17a)?
+///
+/// Chosen against the live inventory: `tab_action`'s Cmd+T/W/[/]/1-9, Cmd+C (copy),
+/// Cmd+V (paste), Cmd+Shift+M (ai-monitor), Cmd+Shift+R (rename) — and it joins the
+/// `Cmd+Shift+<letter>` family both existing chrome toggles already use.
+///
+/// Must be tested BEFORE `encode_key`: that function swallows `super` only for its
+/// `key_seq` table, so a `Key::Character` chord otherwise reaches zsh via the text
+/// fallback. Case-insensitive because Shift alters the produced character.
+pub fn is_sidebar_toggle_chord(key: &Key, mods: &ModifiersState) -> bool {
+    if !(mods.super_key() && mods.shift_key()) {
+        return false;
+    }
+    matches!(key, Key::Character(s) if s.eq_ignore_ascii_case("s"))
+}
+
+/// What a delivered config means for the sidebar (tab-resize D15/D15a).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConfigDelivery {
+    /// Our own write coming back through the watcher — drop it entirely.
+    Echo,
+    /// A real change from outside this app. Apply it; the file wins.
+    HumanEdit,
+}
+
+/// Whether a delivered config should be dropped without applying it (tab-resize D15, as
+/// amended) — **the predicate the event loop actually uses**.
+///
+/// Suppress only when *nothing* changed. The first cut compared only the
+/// `(width_px, collapsed)` pair and was catastrophic: the pair latch is armed on every
+/// successful persist and the file then matches it indefinitely, so every later reload of
+/// every unrelated field was silently dropped — one click of Hide killed live settings for
+/// the rest of the session.
+///
+/// Extracted as a free function purely so that behaviour is testable; the event loop is
+/// otherwise unreachable without a window.
+pub fn suppress_delivery(
+    delivered: &common::config::Config,
+    applied: &common::config::Config,
+) -> bool {
+    delivered == applied
+}
+
+/// How many recent writes are remembered for echo classification.
+///
+/// More than one is load-bearing: FSEvents delivers asynchronously, so two persists inside
+/// one round-trip window (a drag released, then a second drag) leave the FIRST write's echo
+/// still in flight while the latch already holds the second. Matching only the newest write
+/// classified that stale echo as a human edit — which cleared the override and snapped the
+/// sidebar back to the older width before the second echo corrected it, a visible flicker
+/// plus two of the glyph-atlas rebuilds D15 exists to prevent.
+/// **Known trade-off** (recorded rather than discovered later): this widens D15's "the last
+/// value written" to "any of the last four". A hand edit that happens to set the width to a
+/// value dragged through earlier in the same session is therefore misread as an echo, so the
+/// override is not cleared and the edit has no visible effect until the ring rolls over.
+/// Narrow, and strictly better than the flicker it replaces — but real.
+pub const RECENT_WRITES: usize = 4;
+
+/// Classify a delivered config's sidebar pair against the values we recently wrote
+/// (tab-resize D15) — this decides **override precedence** (D15a), not suppression;
+/// [`suppress_delivery`] owns that.
+///
+/// **Exact match, latched.** Not "differs only in those fields": under that reading a
+/// deliberate hand edit to `sidebar.width_px` alone would be dropped forever, killing live
+/// reload for the one field this feature owns. And latched rather than one-shot, because
+/// FSEvents can deliver a single rename more than once — a "consume the first match" rule
+/// would treat the duplicate as a human edit and clear the override after every drag.
+///
+/// The float comparison is on the **re-parsed** value, which is exact only because the
+/// writer emits a round-trip representation (`config::save_sidebar`, R8.7).
+pub fn classify_delivery(delivered: (f32, bool), recent: &[(f32, bool)]) -> ConfigDelivery {
+    if recent.contains(&delivered) {
+        ConfigDelivery::Echo
+    } else {
+        ConfigDelivery::HumanEdit
+    }
+}
+
+/// Push a successful write onto the recent-writes ring, capped at [`RECENT_WRITES`].
+pub fn remember_write(recent: &mut Vec<(f32, bool)>, pair: (f32, bool)) {
+    recent.retain(|p| *p != pair);
+    recent.push(pair);
+    while recent.len() > RECENT_WRITES {
+        recent.remove(0);
+    }
+}
+
+/// Whether a human edit should clear the runtime sidebar override (tab-resize D15a/D14).
+///
+/// Normally yes — that is what keeps `config.toml` genuinely hand-editable after the first
+/// drag. The exception is a **failed** write: the file and the override are then knowingly
+/// out of step, and clearing would snap the sidebar back mid-session on the next unrelated
+/// reload, breaking D14's promise that the session keeps the dragged size.
+pub fn should_clear_override(delivery: ConfigDelivery, override_authoritative: bool) -> bool {
+    delivery == ConfigDelivery::HumanEdit && !override_authoritative
+}
+
+/// Whether a width change actually changed the terminal's grid, and therefore whether the
+/// drag must call `settings::refit` (tab-resize D13/R5.1).
+///
+/// Deliberately evaluated at the **drag call site**, never inside `refit` itself: `refit`
+/// is shared with startup, `Resized`, and config reload (D6), and moving the guard in
+/// there would silently change their behaviour too — including stopping a no-op window
+/// resize from clearing the selection, which is a sibling feature's business, not ours.
+pub fn needs_refit(before: (u16, u16), after: (u16, u16)) -> bool {
+    before != after
+}
+
+/// Which in-flight gesture a left-release belongs to (tab-resize D17/R7.3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReleaseTarget {
+    /// End a sidebar resize: commit the width and persist it.
+    Resize,
+    /// End a text selection (selection-input's pre-existing behavior).
+    Selection,
+    /// Nothing armed — the release is not ours.
+    Neither,
+}
+
+/// Resolve a left-release to exactly one gesture (tab-resize D17/R7.3).
+///
+/// The event loop's two `Released` arms guard on this rather than relying on their
+/// **position** in the `match`. That is deliberate: Rust runs exactly one arm, so if the
+/// precedence lived only in the source order, a future reorder would silently change which
+/// gesture gets its cleanup — and a `||`-widened single guard would swallow the selection
+/// release entirely whenever both were armed, leaving `dragging` stuck `true` forever.
+///
+/// Resize wins when both are somehow armed. D17's invariant says that cannot happen, but
+/// nothing clears `dragging` on `Focused(false)`, so a lost `Released` can leave it stale —
+/// and the resize is the gesture holding an uncommitted config write.
+pub fn release_target(resize_armed: bool, selection_armed: bool) -> ReleaseTarget {
+    if resize_armed {
+        ReleaseTarget::Resize
+    } else if selection_armed {
+        ReleaseTarget::Selection
+    } else {
+        ReleaseTarget::Neither
+    }
+}
+
+/// The grab offset to capture on a press (tab-resize D9). Both arguments are physical px.
+pub fn resize_grab_offset(pointer_x: f64, edge_x: f32) -> f32 {
+    pointer_x as f32 - edge_x
+}
+
+/// The drag's **raw**, unclamped width in *logical* px (tab-resize D9/D9a).
+///
+/// This is the value D12's collapse/re-expand thresholds compare against — NOT the clamped
+/// width. Clamping first would pin the value at `SIDEBAR_WIDTH_MIN`, making a threshold
+/// below that minimum unreachable and the collapse gesture dead code (D9a).
+pub fn resize_raw_width(pointer_x: f64, drag: ResizeDrag, scale: f64) -> f32 {
+    let physical = pointer_x as f32 - drag.grab_offset;
+    // Logical px, because `SIDEBAR_WIDTH_MIN`/`MAX` and `SidebarConfig::width_px` are
+    // logical (D7) — persisting physical px would make the file display-dependent.
+    let scale = if scale > 0.0 { scale as f32 } else { 1.0 };
+    physical / scale
+}
+
+/// How far **below** [`SIDEBAR_WIDTH_MIN`] the raw width must fall before a drag collapses
+/// the sidebar (tab-resize D12), and therefore the width of the hysteresis gap.
+///
+/// [`SIDEBAR_WIDTH_MIN`]: common::config::SIDEBAR_WIDTH_MIN
+/// Tuned 40 → 20 from instrumented drag logs: at 40 the sidebar sat at its 260 minimum
+/// through ~55 logical px of pointer travel with no visual feedback, then collapsed
+/// abruptly. The same logs showed 20+ stable frames inside the gap, i.e. margin to spare,
+/// so halving it buys back half the dead travel without inviting flicker.
+pub const COLLAPSE_HYSTERESIS_PX: f32 = 20.0;
+
+/// The raw width at or below which a drag collapses the sidebar (tab-resize D12).
+pub fn collapse_threshold() -> f32 {
+    common::config::SIDEBAR_WIDTH_MIN - COLLAPSE_HYSTERESIS_PX
+}
+
+/// The collapsed state a drag should be in, given its **raw** (unclamped) width and where
+/// it is now (tab-resize D12).
+///
+/// Two different thresholds, deliberately: collapse at `MIN − 40`, re-expand at `MIN`. A
+/// single threshold would flip the mode on ordinary hand jitter, and under D1 each flip is
+/// a full-window grid reflow. The gesture stays live across the change — dragging back
+/// right re-expands without releasing (R4.2).
+///
+/// Reads `raw`, never the clamped width: `clamp(raw, 260, 440)` can never be below 260, so
+/// a threshold at 240 tested against it would be unreachable dead code (D9a/R4.4).
+pub fn next_collapsed(raw: f32, collapsed: bool) -> bool {
+    if collapsed {
+        // Re-expand only once the pointer is back at the honest minimum.
+        raw < common::config::SIDEBAR_WIDTH_MIN
+    } else {
+        raw < collapse_threshold()
+    }
+}
+
+/// The width actually applied and persisted: the raw value clamped to the supported band
+/// (tab-resize D9a). Non-finite input falls back to the low end rather than propagating a
+/// `NaN` into the renderer's uniforms.
+pub fn clamp_sidebar_width(raw: f32) -> f32 {
+    if !raw.is_finite() {
+        return common::config::SIDEBAR_WIDTH_MIN;
+    }
+    raw.clamp(
+        common::config::SIDEBAR_WIDTH_MIN,
+        common::config::SIDEBAR_WIDTH_MAX,
+    )
+}
+
+/// The ONE `hit_test` call the hover path makes (tab-resize D11). `refresh_hover` calls
+/// this once per `CursorMoved` and feeds the result to both [`hover_card`] and
+/// [`hover_cursor`] — never calling `hit_test` twice, which is the drift SD2 forbids.
+pub fn sidebar_region(
     cursor: (f64, f64),
     inp: &SidebarLayoutInput,
     scroll: f32,
     collapsed: bool,
-) -> Option<usize> {
+) -> Option<SidebarRegion> {
     let p = [cursor.0 as f32, cursor.1 as f32];
-    match sidebar_layout::hit_test(p, scroll, inp, collapsed) {
+    sidebar_layout::hit_test(p, scroll, inp, collapsed)
+}
+
+/// The card index a resolved region highlights (D8) — the pure hover mapping.
+pub fn hover_card(region: Option<SidebarRegion>) -> Option<usize> {
+    match region {
         Some(SidebarRegion::Card(i)) => Some(i),
         // The hamburger sits ON a card and resolves ahead of it (sticky-tab-title R3.1),
         // so without this arm the card would lose its hover highlight the moment the
@@ -117,6 +343,33 @@ pub fn sidebar_hover(
         Some(SidebarRegion::MenuButton(i)) => Some(i),
         _ => None,
     }
+}
+
+/// The mouse cursor a resolved region asks for (tab-resize D11/R2.1).
+///
+/// The grab band is the terminal's only resize affordance — D10 draws no grip — so this
+/// mapping is the whole of its discoverability.
+pub fn hover_cursor(region: Option<SidebarRegion>) -> CursorIcon {
+    match region {
+        Some(SidebarRegion::GrabEdge) => CursorIcon::ColResize,
+        _ => CursorIcon::Default,
+    }
+}
+
+/// Resolve the card index under the cursor for the row layer's `hovered` highlight (D8) —
+/// `hover_card ∘ sidebar_region`, kept for tests that assert hover *semantics* in one call.
+///
+/// Production no longer calls this: `refresh_hover` resolves the region ONCE and feeds
+/// both [`hover_card`] and [`hover_cursor`] from it (tab-resize D11/R2.3), so routing
+/// through here would issue a second `hit_test` per pointer move.
+#[cfg(test)]
+fn sidebar_hover(
+    cursor: (f64, f64),
+    inp: &SidebarLayoutInput,
+    scroll: f32,
+    collapsed: bool,
+) -> Option<usize> {
+    hover_card(sidebar_region(cursor, inp, scroll, collapsed))
 }
 
 /// Whether a left-press dismisses the open modal surfaces — the card menu **and** the
@@ -1160,6 +1413,601 @@ mod tests {
         assert!(n > 0, "a huge scroll goes up, got {n}");
         let n = wheel_lines(WheelDelta::Pixels(-1e30), 16.0, &mut acc);
         assert!(n < 0, "and a huge reverse scroll goes down, got {n}");
+    }
+    // -----------------------------------------------------------------
+    // tab-resize: routing the grab band (D3/D11/D13a)
+    // -----------------------------------------------------------------
+
+    /// An x inside the grab band of a `sidebar_w`-wide sidebar at scale 1.
+    fn in_band(sidebar_w: f32) -> f64 {
+        (sidebar_w - 2.0) as f64
+    }
+
+    #[test]
+    fn a_press_on_the_edge_begins_a_resize() {
+        // R1.7 — the region resolves to an ACTION; the app does no geometry of its own.
+        let inp = layout_input(340.0, 5);
+        for y in [10.0_f64, 200.0, 700.0] {
+            assert_eq!(
+                sidebar_press((in_band(340.0), y), &inp, 0.0, false),
+                Some(SidebarAction::BeginResize),
+                "y={y}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_edge_press_does_not_switch_tabs() {
+        // The regression this arm exists to prevent: without the band resolving first,
+        // a press 2px inside the edge would land on the card behind it.
+        let inp = layout_input(340.0, 5);
+        let card_y = (sidebar_layout::header_h(1.0) + 100.0) as f64;
+        assert_eq!(
+            sidebar_press((in_band(340.0), card_y), &inp, 0.0, false),
+            Some(SidebarAction::BeginResize)
+        );
+        // …while a press further left still switches, unchanged.
+        assert!(matches!(
+            sidebar_press((170.0, card_y), &inp, 0.0, false),
+            Some(SidebarAction::Switch(_))
+        ));
+    }
+
+    #[test]
+    fn an_edge_press_dismisses_the_open_modals() {
+        // Starting a resize is not "operating the menu", so it dismisses like any other
+        // non-menu press (sticky-tab-title D8/D8a.1).
+        assert!(press_dismisses_modals(Some(SidebarAction::BeginResize)));
+    }
+
+    #[test]
+    fn the_band_shows_a_column_resize_cursor() {
+        // R2.1 — the band's only discoverability affordance.
+        let inp = layout_input(340.0, 5);
+        let region = sidebar_region((in_band(340.0), 300.0), &inp, 0.0, false);
+        assert_eq!(region, Some(SidebarRegion::GrabEdge));
+        assert_eq!(hover_cursor(region), CursorIcon::ColResize);
+    }
+
+    #[test]
+    fn every_other_region_keeps_the_default_cursor() {
+        // R2.2 — leaving the band restores the default, including over the grid (None).
+        let inp = layout_input(340.0, 5);
+        let card_y = (sidebar_layout::header_h(1.0) + 100.0) as f64;
+        for p in [(170.0, card_y), (170.0, 10.0), (600.0, 300.0)] {
+            let region = sidebar_region(p, &inp, 0.0, false);
+            assert_ne!(region, Some(SidebarRegion::GrabEdge));
+            assert_eq!(hover_cursor(region), CursorIcon::Default, "at {p:?}");
+        }
+    }
+
+    #[test]
+    fn a_collapsed_sidebar_offers_no_resize_cursor() {
+        // R1.6 / R2.2 — nothing to grab when there is no edge.
+        let inp = layout_input(0.0, 5);
+        let region = sidebar_region((in_band(340.0), 300.0), &inp, 0.0, true);
+        assert_eq!(hover_cursor(region), CursorIcon::Default);
+        assert_eq!(
+            sidebar_press((in_band(340.0), 300.0), &inp, 0.0, true),
+            None
+        );
+    }
+
+    #[test]
+    fn the_band_highlights_no_card() {
+        // R6.2 — the band sits over the list, but hovering it must not light a card.
+        let inp = layout_input(340.0, 5);
+        let card_y = (sidebar_layout::header_h(1.0) + 100.0) as f64;
+        let region = sidebar_region((in_band(340.0), card_y), &inp, 0.0, false);
+        assert_eq!(hover_card(region), None);
+        assert_eq!(
+            sidebar_hover((in_band(340.0), card_y), &inp, 0.0, false),
+            None
+        );
+    }
+
+    #[test]
+    fn hover_still_resolves_cards_and_the_hamburger() {
+        // The refactor to hover_card ∘ sidebar_region must not change what hover means.
+        let inp = layout_input(340.0, 5);
+        let card_y = (sidebar_layout::header_h(1.0) + 100.0) as f64;
+        assert_eq!(
+            sidebar_hover((170.0, card_y), &inp, 0.0, false),
+            hover_card(sidebar_region((170.0, card_y), &inp, 0.0, false)),
+            "the wrapper and the pure mapping agree"
+        );
+        assert!(sidebar_hover((170.0, card_y), &inp, 0.0, false).is_some());
+    }
+
+    // -----------------------------------------------------------------
+    // tab-resize: pointer → width mapping (D9/D9a)
+    // -----------------------------------------------------------------
+
+    // -----------------------------------------------------------------
+    // tab-resize: collapse hysteresis (D12) + refit guard (D13)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn dragging_past_the_threshold_collapses() {
+        // R4.1 — crossing ~240 collapses mid-drag (tuned from 220, see
+        // COLLAPSE_HYSTERESIS_PX).
+        assert_eq!(collapse_threshold(), 240.0);
+        assert!(
+            next_collapsed(239.0, false),
+            "below the threshold → collapse"
+        );
+        assert!(!next_collapsed(241.0, false), "above it → stay open");
+    }
+
+    #[test]
+    fn dragging_back_re_expands_within_the_same_gesture() {
+        // R4.2 — the gesture stays live across the mode change.
+        assert!(!next_collapsed(260.0, true), "back at MIN → re-expand");
+        assert!(!next_collapsed(300.0, true));
+        assert!(
+            next_collapsed(259.0, true),
+            "just under MIN → still collapsed"
+        );
+    }
+
+    #[test]
+    fn the_two_thresholds_differ_so_jitter_cannot_flicker_the_mode() {
+        // R4.3 — the whole point of the hysteresis gap. Inside [240, 260) the state is
+        // *sticky*: whatever it was, it stays. Under D1 each flip is a full-window reflow,
+        // so a single shared threshold would reflow the grid on ordinary hand tremor.
+        //
+        // The gap is deliberately narrower than the first cut (20 rather than 40 logical
+        // px) — instrumented drag logs showed 20+ stable frames inside the old gap, i.e.
+        // margin to spare, while the user paid ~55px of dead travel before the collapse.
+        // The property under test is unchanged; only its width moved.
+        for raw in [240.0_f32, 245.0, 250.0, 255.0, 259.9] {
+            assert!(!next_collapsed(raw, false), "open stays open at {raw}");
+            assert!(
+                next_collapsed(raw, true),
+                "collapsed stays collapsed at {raw}"
+            );
+        }
+        // And a full oscillation inside the gap changes nothing.
+        let mut state = false;
+        for raw in [250.0_f32, 259.0, 241.0, 255.0, 245.0] {
+            state = next_collapsed(raw, state);
+            assert!(!state, "no flip anywhere inside the gap");
+        }
+        // The gap is still a real gap: a single shared threshold at MIN would flip here.
+        assert!(collapse_threshold() < common::config::SIDEBAR_WIDTH_MIN);
+    }
+
+    #[test]
+    fn the_thresholds_read_the_raw_width_not_the_clamped_one() {
+        // R4.4 — the regression test for the contradiction the L2 review caught. Feeding
+        // the CLAMPED width in would make collapse unreachable, because clamping floors
+        // the value at 260 — well above the 240 threshold.
+        let drag = ResizeDrag { grab_offset: 0.0 };
+        let raw = resize_raw_width(200.0, drag, 1.0);
+        assert!(next_collapsed(raw, false), "raw 200 collapses");
+        assert!(
+            !next_collapsed(clamp_sidebar_width(raw), false),
+            "the clamped 260 would NOT — this is why D9a keeps them separate"
+        );
+    }
+
+    #[test]
+    fn a_collapse_survives_the_pointer_running_far_past_it() {
+        // The width-0 case D9's fixed grab offset exists for: `raw` keeps advancing while
+        // the sidebar is shut, so the return trip is still measured from the same origin.
+        let drag = ResizeDrag { grab_offset: 0.0 };
+        assert!(next_collapsed(resize_raw_width(50.0, drag, 1.0), false));
+        assert!(next_collapsed(resize_raw_width(-200.0, drag, 1.0), true));
+        assert!(!next_collapsed(resize_raw_width(300.0, drag, 1.0), true));
+    }
+
+    // -----------------------------------------------------------------
+    // tab-resize: echo suppression (D15/D15a) + the toggle chord (D17a)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn our_own_write_is_recognised_as_an_echo() {
+        // R9.1 — the exact pair we wrote comes back through the watcher.
+        assert_eq!(
+            classify_delivery((400.0, false), &[(400.0, false)]),
+            ConfigDelivery::Echo
+        );
+    }
+
+    #[test]
+    fn the_echo_latch_is_not_consumed_by_the_first_match() {
+        // R9.2 — FSEvents can report one rename several times. A one-shot rule would call
+        // the duplicate a human edit and clear the override after EVERY drag; latched, the
+        // classification is stable however many times it arrives.
+        let latch: &[(f32, bool)] = &[(400.0, false)];
+        for _ in 0..3 {
+            assert_eq!(
+                classify_delivery((400.0, false), latch),
+                ConfigDelivery::Echo
+            );
+        }
+    }
+
+    #[test]
+    fn a_different_value_is_a_human_edit() {
+        // R9.3 — this is what keeps config.toml hand-editable after the first drag.
+        assert_eq!(
+            classify_delivery((300.0, false), &[(400.0, false)]),
+            ConfigDelivery::HumanEdit
+        );
+        assert!(should_clear_override(ConfigDelivery::HumanEdit, false));
+    }
+
+    #[test]
+    fn a_partial_match_is_a_human_edit_not_an_echo() {
+        // R9.4 — the pair is compared whole: same width, different collapsed state is a
+        // real edit. (Under a "differs only in that field" reading it would be dropped.)
+        assert_eq!(
+            classify_delivery((400.0, true), &[(400.0, false)]),
+            ConfigDelivery::HumanEdit
+        );
+    }
+
+    #[test]
+    fn nothing_written_yet_means_every_delivery_is_a_human_edit() {
+        // Before the first drag the override is None anyway, so the file rightly wins.
+        assert_eq!(
+            classify_delivery((340.0, false), &[]),
+            ConfigDelivery::HumanEdit
+        );
+    }
+
+    #[test]
+    fn an_echo_never_clears_the_override() {
+        // R9.6 — suppression and precedence are the same distinction, decided once.
+        assert!(!should_clear_override(ConfigDelivery::Echo, false));
+        assert!(!should_clear_override(ConfigDelivery::Echo, true));
+    }
+
+    #[test]
+    fn a_failed_write_stops_an_unrelated_reload_snapping_the_sidebar_back() {
+        // R9.5 / D14 × D15a — the contradiction the L2 review caught. After a failed write
+        // the file still holds the OLD pair, so the next reload for any unrelated reason
+        // (a font.size_pt edit) delivers a non-echo. Clearing the override there would undo
+        // the gesture D14 just promised to keep.
+        assert!(!should_clear_override(ConfigDelivery::HumanEdit, true));
+        // …and once a write succeeds again, normal precedence resumes.
+        assert!(should_clear_override(ConfigDelivery::HumanEdit, false));
+    }
+
+    #[test]
+    fn suppression_keys_on_the_whole_config_not_the_sidebar_pair() {
+        // **The BUG-1 regression.** Pair-only suppression shipped and killed live settings:
+        // the latch is armed on every successful persist, the file then matches it
+        // forever, so every later reload of ANY field classified as an echo and was
+        // dropped. One click of Hide and your font/theme/grid edits stopped applying.
+        //
+        // This pins the distinction the fix rests on: the sidebar pair alone CANNOT tell a
+        // real change from an echo, so the suppression decision must compare whole configs.
+        let mut applied = common::config::Config::default();
+        applied.sidebar.width_px = 400.0;
+        applied.sidebar.collapsed = false;
+        let latch: &[(f32, bool)] = &[(400.0, false)];
+
+        // A font edit arriving after our own sidebar write: the PAIR is unchanged…
+        let mut font_edit = applied.clone();
+        font_edit.font.size_pt = 18.0;
+        assert_eq!(
+            classify_delivery(
+                (font_edit.sidebar.width_px, font_edit.sidebar.collapsed),
+                latch
+            ),
+            ConfigDelivery::Echo,
+            "the pair predicate alone calls this an echo — which is exactly the trap"
+        );
+        // …but the config as a whole differs, which is what the event loop now tests, so
+        // the font change is applied instead of being silently swallowed.
+        assert_ne!(
+            font_edit, applied,
+            "whole-config comparison sees the change"
+        );
+
+        // A true echo — nothing changed at all — still compares equal and is suppressed.
+        assert_eq!(applied.clone(), applied);
+
+        // And the pair predicate still does its own job: deciding override precedence.
+        let mut sidebar_edit = applied.clone();
+        sidebar_edit.sidebar.width_px = 300.0;
+        assert_eq!(
+            classify_delivery(
+                (
+                    sidebar_edit.sidebar.width_px,
+                    sidebar_edit.sidebar.collapsed
+                ),
+                latch
+            ),
+            ConfigDelivery::HumanEdit,
+            "a hand-edited width still clears the override (D15a)"
+        );
+    }
+
+    #[test]
+    fn the_production_suppression_predicate_drops_only_true_no_ops() {
+        // R9.1 against the predicate the event loop ACTUALLY calls. The earlier tests
+        // exercised `classify_delivery`, which after D15's amendment decides override
+        // precedence, not suppression — so the behaviour that broke live settings had no
+        // test covering it at all.
+        let mut applied = common::config::Config::default();
+        applied.sidebar.width_px = 400.0;
+
+        // A true echo: byte-for-byte the config we already applied.
+        assert!(suppress_delivery(&applied.clone(), &applied));
+
+        // Our own sidebar write coming back while ANOTHER field also changed must NOT be
+        // suppressed — this is precisely the case that died before.
+        let mut font_edit = applied.clone();
+        font_edit.font.size_pt = 18.0;
+        assert!(
+            !suppress_delivery(&font_edit, &applied),
+            "a font edit must survive even when the sidebar pair is unchanged"
+        );
+
+        // Every other field, too — the bug swallowed all of them.
+        let mut theme_edit = applied.clone();
+        theme_edit.theme.background = 0x11_22_33;
+        assert!(!suppress_delivery(&theme_edit, &applied));
+        let mut grid_edit = applied.clone();
+        grid_edit.grid.columns = 200;
+        assert!(!suppress_delivery(&grid_edit, &applied));
+
+        // And a genuine sidebar edit is applied as well.
+        let mut sidebar_edit = applied.clone();
+        sidebar_edit.sidebar.width_px = 300.0;
+        assert!(!suppress_delivery(&sidebar_edit, &applied));
+    }
+
+    #[test]
+    fn a_stale_echo_from_an_earlier_write_is_still_an_echo() {
+        // Found by the Gate-3 re-check. FSEvents delivers asynchronously, so two persists
+        // inside one round-trip window leave the FIRST write's echo in flight while the
+        // latch already holds the SECOND. Remembering only the newest write classified
+        // that stale echo as a human edit → cleared the override → snapped the sidebar
+        // back to the older width before the second echo corrected it: a visible flicker
+        // and two of the atlas rebuilds D15 exists to prevent.
+        let mut recent = Vec::new();
+        remember_write(&mut recent, (400.0, false)); // drag 1 released
+        remember_write(&mut recent, (420.0, false)); // drag 2 released, echo 1 still queued
+        assert_eq!(
+            classify_delivery((400.0, false), &recent),
+            ConfigDelivery::Echo,
+            "the in-flight echo of the FIRST write is ours, not a human edit"
+        );
+        assert_eq!(
+            classify_delivery((420.0, false), &recent),
+            ConfigDelivery::Echo
+        );
+        // A value we never wrote is still a human edit.
+        assert_eq!(
+            classify_delivery((300.0, false), &recent),
+            ConfigDelivery::HumanEdit
+        );
+    }
+
+    #[test]
+    fn the_write_history_is_bounded_and_deduplicated() {
+        let mut recent = Vec::new();
+        for w in [300.0, 310.0, 320.0, 330.0, 340.0, 350.0] {
+            remember_write(&mut recent, (w, false));
+        }
+        assert_eq!(recent.len(), RECENT_WRITES, "bounded — cannot grow forever");
+        assert!(
+            !recent.contains(&(300.0, false)),
+            "the oldest write is evicted"
+        );
+        assert!(recent.contains(&(350.0, false)), "the newest is kept");
+        // Re-writing a value already present moves it to newest without growing the ring.
+        let before = recent.len();
+        remember_write(&mut recent, (340.0, false));
+        assert_eq!(recent.len(), before);
+        assert_eq!(recent.last(), Some(&(340.0, false)));
+    }
+
+    #[test]
+    fn cmd_shift_s_toggles_the_sidebar() {
+        // R10.4
+        let cmd_shift = ModifiersState::SUPER | ModifiersState::SHIFT;
+        assert!(is_sidebar_toggle_chord(
+            &Key::Character("s".into()),
+            &cmd_shift
+        ));
+        assert!(is_sidebar_toggle_chord(
+            &Key::Character("S".into()),
+            &cmd_shift
+        ));
+    }
+
+    #[test]
+    fn the_toggle_chord_does_not_collide_or_reach_the_shell() {
+        // R10.5 — verified against the live inventory, not by assertion in prose.
+        let cmd = ModifiersState::SUPER;
+        let cmd_shift = ModifiersState::SUPER | ModifiersState::SHIFT;
+        let plain = ModifiersState::empty();
+
+        // Not a tab chord, in either modifier combination.
+        assert!(tab_action(&Key::Character("s".into()), &cmd_shift).is_none());
+        assert!(tab_action(&Key::Character("s".into()), &cmd).is_none());
+        // Every shipped tab chord still resolves — the new chord shadows none of them.
+        for (c, want) in [
+            ("t", TabAction::New),
+            ("w", TabAction::CloseActive),
+            ("[", TabAction::Prev),
+            ("]", TabAction::Next),
+        ] {
+            assert_eq!(tab_action(&Key::Character(c.into()), &cmd), Some(want));
+        }
+        // Plain `s` and Cmd+S are NOT the chord, so ordinary typing is untouched.
+        assert!(!is_sidebar_toggle_chord(
+            &Key::Character("s".into()),
+            &plain
+        ));
+        assert!(!is_sidebar_toggle_chord(&Key::Character("s".into()), &cmd));
+        // And it is distinct from the two existing Cmd+Shift chrome toggles (M, R).
+        assert!(!is_sidebar_toggle_chord(
+            &Key::Character("m".into()),
+            &cmd_shift
+        ));
+        assert!(!is_sidebar_toggle_chord(
+            &Key::Character("r".into()),
+            &cmd_shift
+        ));
+    }
+
+    #[test]
+    fn a_sub_cell_width_change_does_not_refit() {
+        // R5.1 — the guard that keeps a per-pixel drag from wiping the selection and
+        // storming zsh with SIGWINCH.
+        assert!(!needs_refit((120, 40), (120, 40)));
+    }
+
+    #[test]
+    fn crossing_a_column_boundary_refits() {
+        // R5.2
+        assert!(needs_refit((120, 40), (119, 40)));
+        assert!(needs_refit((120, 40), (120, 39)));
+    }
+
+    #[test]
+    fn a_release_routes_to_exactly_one_gesture() {
+        // R7.3 — the precedence the two `Released` arms guard on.
+        assert_eq!(release_target(false, false), ReleaseTarget::Neither);
+        assert_eq!(release_target(true, false), ReleaseTarget::Resize);
+        assert_eq!(release_target(false, true), ReleaseTarget::Selection);
+    }
+
+    #[test]
+    fn a_resize_release_wins_over_a_stale_selection_drag() {
+        // R7.2/R7.3 — the L2 reviewer's b4 case. Nothing clears `dragging` on
+        // Focused(false), so it can be stale; the resize is the gesture holding an
+        // uncommitted config write, so it must be the one that gets its cleanup.
+        assert_eq!(release_target(true, true), ReleaseTarget::Resize);
+    }
+
+    #[test]
+    fn a_plain_selection_release_is_untouched_by_the_new_arm() {
+        // R7.7 — the regression guard: adding the resize arm must not shadow selection.
+        assert_eq!(release_target(false, true), ReleaseTarget::Selection);
+        assert_ne!(release_target(false, true), ReleaseTarget::Resize);
+    }
+
+    #[test]
+    fn the_width_tracks_the_pointer_through_a_fixed_grab_offset() {
+        // R3.1 — the spec's worked example: armed at pointer 345 against edge 340, so the
+        // offset is 5; at pointer 405 the width is 400.
+        let drag = ResizeDrag {
+            grab_offset: resize_grab_offset(345.0, 340.0),
+        };
+        assert_eq!(drag.grab_offset, 5.0);
+        assert_eq!(resize_raw_width(405.0, drag, 1.0), 400.0);
+        assert_eq!(
+            clamp_sidebar_width(resize_raw_width(405.0, drag, 1.0)),
+            400.0
+        );
+    }
+
+    #[test]
+    fn the_edge_stays_welded_to_the_grabbed_point() {
+        // R3.1 — grabbing anywhere in the band tracks without a jump: the width equals the
+        // pointer minus the SAME offset throughout.
+        for grab_x in [334.0_f64, 337.0, 339.9] {
+            let drag = ResizeDrag {
+                grab_offset: resize_grab_offset(grab_x, 340.0),
+            };
+            // Moving the pointer by +50 moves the width by exactly +50, whatever the grab.
+            let before = resize_raw_width(grab_x, drag, 1.0);
+            let after = resize_raw_width(grab_x + 50.0, drag, 1.0);
+            assert_eq!(before, 340.0, "starts at the edge, no jump");
+            assert_eq!(after - before, 50.0);
+        }
+    }
+
+    #[test]
+    fn the_applied_width_is_clamped_at_both_ends() {
+        // R3.2
+        let drag = ResizeDrag { grab_offset: 0.0 };
+        assert_eq!(
+            clamp_sidebar_width(resize_raw_width(700.0, drag, 1.0)),
+            440.0
+        );
+        assert_eq!(
+            clamp_sidebar_width(resize_raw_width(100.0, drag, 1.0)),
+            260.0
+        );
+        // Exactly on the bounds passes through.
+        assert_eq!(clamp_sidebar_width(260.0), 260.0);
+        assert_eq!(clamp_sidebar_width(440.0), 440.0);
+    }
+
+    #[test]
+    fn overshoot_is_not_accumulated() {
+        // R3.3 — pushing 260px past the maximum then coming back 200px must NOT move the
+        // edge: the pointer has to return to where the edge actually is. This is the
+        // absolute-mapping property; a delta-accumulating model would have moved it.
+        let drag = ResizeDrag { grab_offset: 0.0 };
+        assert_eq!(
+            clamp_sidebar_width(resize_raw_width(700.0, drag, 1.0)),
+            440.0
+        );
+        assert_eq!(
+            clamp_sidebar_width(resize_raw_width(500.0, drag, 1.0)),
+            440.0,
+            "still pinned — 500 is still past the 440 edge"
+        );
+        // It resumes only once the pointer is back inside the band.
+        assert_eq!(
+            clamp_sidebar_width(resize_raw_width(430.0, drag, 1.0)),
+            430.0
+        );
+    }
+
+    #[test]
+    fn the_raw_value_is_not_clamped_so_collapse_thresholds_can_see_it() {
+        // R4.4 / D9a — the regression test for an outright contradiction the L2 review
+        // caught: if `resize_raw_width` clamped, `raw` could never be below 260 and D12's
+        // 240 collapse threshold would be unreachable dead code.
+        let drag = ResizeDrag { grab_offset: 0.0 };
+        let raw = resize_raw_width(200.0, drag, 1.0);
+        assert_eq!(raw, 200.0, "raw must stay BELOW the 260 minimum");
+        assert!(raw < common::config::SIDEBAR_WIDTH_MIN);
+        assert_eq!(
+            clamp_sidebar_width(raw),
+            260.0,
+            "only the applied value clamps"
+        );
+    }
+
+    #[test]
+    fn the_mapping_is_in_logical_px_across_scales() {
+        // D7 — the band and the persisted value are logical, so a 2x display must not
+        // halve the usable range. At scale 2, physical 800 is logical 400.
+        let drag = ResizeDrag { grab_offset: 0.0 };
+        assert_eq!(resize_raw_width(800.0, drag, 2.0), 400.0);
+        assert_eq!(resize_raw_width(400.0, drag, 1.0), 400.0);
+    }
+
+    #[test]
+    fn a_degenerate_scale_does_not_poison_the_width() {
+        // Defensive: a zero/negative scale must not divide by zero into the uniforms.
+        let drag = ResizeDrag { grab_offset: 0.0 };
+        assert_eq!(resize_raw_width(400.0, drag, 0.0), 400.0);
+        assert!(clamp_sidebar_width(f32::NAN).is_finite());
+        assert!(clamp_sidebar_width(f32::INFINITY).is_finite());
+    }
+
+    #[test]
+    fn a_wheel_over_the_band_scrolls_the_list() {
+        // R6.1/D13a — the band lies OVER the card list; a dead stripe there would stop
+        // the list scrolling under a pointer the user cannot see is "on" anything.
+        let inp = layout_input(340.0, 40); // overflows → scrollable
+        let over_band = (in_band(340.0), 400.0);
+        // The routing predicate the event loop uses: Some(region) → scroll the sidebar.
+        assert!(sidebar_region(over_band, &inp, 0.0, false).is_some());
+        let scrolled = wheel_scroll(WheelDelta::Lines(-1.0), over_band, 0.0, &inp, false);
+        assert!(scrolled > 0.0, "wheel over the band scrolls the list");
     }
 }
 
