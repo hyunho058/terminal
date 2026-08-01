@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ai_monitor::telemetry::{SessionTelemetry, TelemetrySnapshot};
-use ai_monitor::{backfill_telemetry, project_dir, resolve_session, LogWatcher, Wanted, Watch};
+use ai_monitor::{
+    backfill_telemetry, project_dir, resolve_owned_session, LogWatcher, Wanted, Watch,
+};
 use renderer::overlay_layer::{OverlayHandle, OverlayLayer, OverlayModel};
 use renderer::DrawLayer;
 use winit::event_loop::EventLoopProxy;
@@ -59,6 +61,13 @@ pub struct AiMonitorOverlay {
     attached_flag: Arc<AtomicBool>,
     /// `[ai_monitor] context_window`, re-read on each open.
     context_window: Option<u64>,
+    /// Whether this tab's process tree holds a `claude` process at all — the
+    /// `is_some()` of the hint, captured before `unwrap_or_default()` flattens it
+    /// away. It is the *only* thing that separates the two empty states the dashboard
+    /// can show: "no Claude session in this tab" from "this tab's session has not
+    /// written a log yet". Same lifecycle as `context_window`: re-decided on every
+    /// `open()`, read by `refresh_model`, never recomputed per frame.
+    tab_has_claude: bool,
 }
 
 impl AiMonitorOverlay {
@@ -74,6 +83,7 @@ impl AiMonitorOverlay {
             attach: Attachment::default(),
             attached_flag: Arc::new(AtomicBool::new(false)),
             context_window: None,
+            tab_has_claude: false,
         }
     }
 
@@ -126,7 +136,16 @@ impl AiMonitorOverlay {
         // Ask the tab's own process tree which session it is running. This is the
         // only signal that distinguishes it from a session another application is
         // running in the same project directory.
-        let hint = shell_pid.and_then(tabsession::hint_for).unwrap_or_default();
+        let h = shell_pid.and_then(tabsession::hint_for);
+        // Recorded from the `Option`'s *shape*, before `unwrap_or_default()` destroys
+        // it: `None` means no `claude` under this tab, while an empty-but-present hint
+        // means one is running that named neither an id nor a start time. Assigned
+        // here — above the `project_dir` branch below — so a tab running `claude` on a
+        // cwd with no project directory still gets the "has not written a log yet"
+        // wording rather than being told there is no session at all. Unconditional, so
+        // re-pointing to a tab with no `claude` clears it.
+        self.tab_has_claude = h.is_some();
+        let hint = h.unwrap_or_default();
         self.latest = None;
         self.attach = Attachment::default();
         // A fresh flag rather than a store: the previous watcher may still be
@@ -139,15 +158,25 @@ impl AiMonitorOverlay {
             // it may not be this tab's session, and the tab's own session may not have
             // written a file yet. The watcher re-resolves with the same hint.
             let want = match hint.is_empty() {
-                // No claude process under this tab: nothing to confirm with, so
-                // resolution degrades to ranking the directory.
+                // No claude process under this tab: nothing to confirm with. An empty
+                // `Wanted` confirms nothing on either tier, so strict resolution
+                // answers `None` — the panel shows an explained empty state rather
+                // than the directory's most recently active log, which is very often
+                // some other application's.
                 true => Wanted::default(),
                 false => Wanted {
                     session_id: hint.session_id.clone(),
                     since_ms: hint.started_ms,
                 },
             };
-            let resolved = resolve_session(&dir, &want);
+            // STRICT: confirmation-only (R4.1). A session this tab cannot prove is its
+            // own resolves to `None`, and `None` means no file is opened, read, or
+            // backfilled — the strictness lives where the file is *chosen*, not where
+            // it is displayed, so a foreign log is never folded into a
+            // `SessionTelemetry` in the first place. `resolve_session`'s ranked
+            // fallback remains public and under test; it has no production caller.
+            let rivals = hint.rival_starts.clone();
+            let resolved = resolve_owned_session(&dir, &want, &rivals);
             let owned = resolved.as_ref().is_some_and(|r| r.owned);
             let log = resolved.map(|r| r.path);
             // Seed on THIS thread, exactly where `backfill` ran before: publish the
@@ -158,19 +187,26 @@ impl AiMonitorOverlay {
             };
             self.note(Arc::new(telemetry.snapshot()), owned);
             let proxy = self.proxy.clone();
-            // The watcher re-resolves only until this flag says we are attached — it
-            // holds no copy of the rule. Seeded from the backfill decision just made
-            // above, which is the case that used to disagree: work for a while, then
-            // open the panel, and the app was attached while the watcher was not.
+            // UNCONDITIONAL — the watch is armed even when the hint knows nothing and
+            // strict resolution will therefore answer `None` on every re-resolution
+            // (R6.1). Skipping the spawn here would restate the strictness rule in a
+            // second place that has to agree with the resolver, and the last time this
+            // rule was written twice the two copies disagreed and pinned the watcher to
+            // a log the display would never show. One fs watch on one directory is the
+            // cheaper of the two costs.
+            //
+            // The watcher re-resolves only until the shared flag below says we are
+            // attached — it holds no copy of the rule. That flag is seeded from the
+            // backfill decision just made above, which is the case that used to
+            // disagree: work for a while, then open the panel, and the app was attached
+            // while the watcher was not.
             self.watcher = LogWatcher::spawn(
                 Watch {
                     dir,
                     log,
                     want,
                     owned,
-                    // The watcher re-resolves only until this flag says we are
-                    // attached — it holds no copy of the rule. Seeded from the
-                    // backfill decision just made above.
+                    rivals,
                     attached: self.attached_flag.clone(),
                 },
                 telemetry,
@@ -214,6 +250,7 @@ impl AiMonitorOverlay {
             now_ms: now_ms(),
             attached: self.attach.attached,
             context_window: self.context_window,
+            tab_has_claude: self.tab_has_claude,
         };
         let lines = dashboard::compose(self.latest.as_deref(), &env);
         self.handle.set(OverlayModel {
@@ -348,7 +385,42 @@ impl Attachment {
     /// Does this snapshot replace what is on screen? Updates the attachment.
     fn admit(&mut self, snap: &TelemetrySnapshot, started_ms: u64, owned: bool) -> bool {
         if !self.attached {
-            if proves_ownership(snap, started_ms) {
+            // A CONFIRMED resolution attaches on CONTENT, not on freshness.
+            // `proves_ownership` exists to keep a *foreign* session off the panel;
+            // once resolution is confirmation-only a foreign session can no longer be
+            // resolved at all, so applying a freshness gate to a confirmed one only
+            // hides the user's own data — a tab running `claude --resume <id>` that
+            // went idle before the panel opened would be told `(no active session —
+            // newest log idle 12m)` about its own session.
+            //
+            // **The emptiness condition is not incidental — it is what preserves
+            // self-correction.** `proves_ownership` was quietly doing a second job:
+            // it is the gate that fails OPEN. `note()` runs in `open()` *before*
+            // `LogWatcher::spawn`, and it publishes this decision to the flag the
+            // watch thread reads to decide whether to keep re-resolving. A bare
+            // `owned` short-circuit would attach on an owned-but-EMPTY backfill
+            // snapshot, so the watcher would be born frozen and any near-miss by the
+            // resolver's dating tier would be permanent from its first callback.
+            // Attaching empty also latches `session_id = None`, after which the
+            // identity guard below hits its `_ => true` arm until a snapshot names one
+            // (see the adoption arm) — satisfying "a different session never replaces
+            // an owned attachment" *vacuously* for that whole window, which is a
+            // weakening of that contract dressed up as compliance. Requiring content
+            // leaves a confirmed-but-empty log unattached, the shared flag unset and
+            // the watcher free; the first appended line re-emits and attaches then.
+            //
+            // The `proves_ownership` fallback below is entered whenever the
+            // confirmed-and-non-empty test fails — including with `owned: true` and an
+            // empty snapshot, where it answers `false` because a default snapshot has
+            // no `last_event_ms`. What production can no longer produce is an ATTACH
+            // through it: `open()` resolves via `resolve_owned_session`, every result
+            // of which is `owned: true`, so the only case reaching here is that empty
+            // one. It is retained deliberately — it is the attach contract for a caller
+            // using the ranked `resolve_session` fallback, and it is what the
+            // `owned: false` tests in this module exercise.
+            if (owned && *snap != TelemetrySnapshot::default())
+                || proves_ownership(snap, started_ms)
+            {
                 self.attached = true;
                 self.session_id = snap.session_id.clone();
                 self.owned = owned;
@@ -359,6 +431,13 @@ impl Attachment {
         // could lock onto another application's session — one running in the same
         // project directory, legitimately active — and never let go, which is how a
         // brand-new tab came to show `up 116h40m` from a session in Warp.
+        //
+        // PRODUCTION-UNREACHABLE, honestly: strict resolution leaves no unconfirmed
+        // attachment to displace, so `owned && !self.owned` can never fire from the
+        // overlay's own call sites. Retained as the contract for a caller using
+        // `resolve_session` — deleting it would take the `owned: false` half of the
+        // rule out of the suite in the same move that makes the code depend on
+        // nothing else.
         if owned && !self.owned {
             self.session_id = snap.session_id.clone();
             self.owned = true;
@@ -377,8 +456,23 @@ impl Attachment {
         // attach. That is a check-then-act window no memory ordering closes — the
         // reader has to be able to reject the result, not merely to decline the
         // switch.
+        //
+        // ADOPTION closes what non-emptiness alone cannot: `session_id` is filled only
+        // from a `sessionId`/`session_id` field on a folded line, while non-emptiness
+        // can come from any field at all (`total_output`, a tool count). A confirmed
+        // log whose backfilled content names no session therefore attaches holding
+        // `None`, and every comparison below would fall through `_ => true` forever.
+        // So when the attachment holds no identity and a snapshot offers one, record
+        // it: from that point the check compares two `Some`s and means something. It
+        // adopts an identity it did not have and NEVER changes one it holds — a
+        // snapshot whose id differs from an already-recorded `Some` is still refused
+        // by the arm above.
         match (&self.session_id, &snap.session_id) {
             (Some(mine), Some(theirs)) => mine == theirs,
+            (None, Some(theirs)) => {
+                self.session_id = Some(theirs.clone());
+                true
+            }
             _ => true,
         }
     }
@@ -397,6 +491,16 @@ impl Attachment {
 /// A log with no parseable event time answers **no**: absence of a clock is not
 /// evidence of freshness. It costs nothing — the watcher keeps re-resolving until
 /// some log does answer yes.
+///
+/// **Production can no longer *attach through* this** — note the wording: the call is
+/// still made. `Attachment::admit` reaches it whenever its confirmed-and-non-empty test
+/// fails, and since `open()` resolves via `resolve_owned_session` (every result
+/// `owned: true`), the only production case that gets here is an empty snapshot from a
+/// resolution that returned `None` — which answers `false`, because a default snapshot
+/// carries no `last_event_ms`. So the *outcome* is unreachable, not the code: do not
+/// delete the call believing it dead. It is retained as the attach contract for a
+/// caller using the ranked `resolve_session` fallback, and it is still directly
+/// unit-tested below.
 fn proves_ownership(snap: &TelemetrySnapshot, started_ms: u64) -> bool {
     snap.last_event_ms.is_some_and(|last| last >= started_ms)
 }
@@ -695,10 +799,14 @@ mod tests {
 
     #[test]
     fn a_confirmed_session_displaces_an_unconfirmed_one() {
-        // The reported case: the panel attached to a live session belonging to
-        // ANOTHER application (Warp) in the same project directory, and the freeze
-        // that protects data made it permanent. A session confirmed by the tab's own
-        // process tree must be able to take it back.
+        // The `owned: false` half of the attach rule, kept under test. This once
+        // described the reported case — a panel attaching to another application's
+        // live session in the same project directory, then freezing on it — but
+        // strict resolution makes that path unreachable: an unconfirmed session is
+        // never resolved, so production never builds an unconfirmed attachment to
+        // displace. What this now pins is the contract for a caller using the ranked
+        // `resolve_session` fallback: an unconfirmed attachment yields to a confirmed
+        // one. The assertions are unchanged.
         let launched = 1_785_226_000_000;
         let mut a = Attachment::default();
         assert!(a.admit(&snap_of("warp", Some(launched + 1)), launched, false));
@@ -754,6 +862,96 @@ mod tests {
         assert!(!a.attached);
         assert!(a.admit(&snap_of("new", Some(launched)), launched, false));
         assert!(a.attached);
+    }
+
+    #[test]
+    fn a_confirmed_session_attaches_however_stale_it_is() {
+        // R5.1 / D4 — a tab running `claude --resume <id>` on a session that went
+        // idle before the panel opened. Freshness answers "no" about the user's OWN
+        // session, and the panel would report `(no active session — newest log idle
+        // 12m)` about data it has positively identified. Confirmation decides.
+        let launched = 1_785_226_000_000;
+        let stale = snap_of("mine", Some(launched - 720_000)); // idle 12 minutes
+        assert!(
+            !proves_ownership(&stale, launched),
+            "premise: the freshness gate says no about this very log"
+        );
+
+        let mut a = Attachment::default();
+        assert!(a.admit(&stale, launched, true));
+        assert!(a.attached, "a confirmed, non-empty log attaches on content");
+        assert!(a.owned);
+        assert_eq!(a.session_id.as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn a_confirmed_but_empty_session_does_not_attach() {
+        // R5.2 / D4 — the emptiness condition, which is the whole of what keeps the
+        // watcher self-correcting. `note()` runs in `open()` BEFORE `LogWatcher::spawn`
+        // and publishes this decision to the flag the watch thread reads, so attaching
+        // on an owned-but-empty backfill would freeze the watcher at birth *and* latch
+        // `session_id = None`, making "a different session never replaces an owned
+        // attachment" true only vacuously.
+        let launched = 1_785_226_000_000;
+        let mut a = Attachment::default();
+        assert!(a.admit(&TelemetrySnapshot::default(), launched, true));
+        assert!(
+            !a.attached,
+            "confirmed but with nothing in it: the flag stays unset and the watcher \
+             stays free to re-resolve"
+        );
+
+        // The first appended line re-emits, and attaches — stale though it is.
+        assert!(a.admit(&snap_of("mine", Some(launched - 1)), launched, true));
+        assert!(a.attached);
+        assert_eq!(a.session_id.as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn an_attachment_holding_no_identity_adopts_the_first_one_offered() {
+        // R5.3 / D4b — non-emptiness alone does not restore the identity guard.
+        // `session_id` is filled only from a `sessionId` field on a folded line, while
+        // non-emptiness can come from any field at all, so a confirmed log can attach
+        // holding `None` — after which every comparison falls through `_ => true`.
+        let launched = 1_785_226_000_000;
+        let anonymous = TelemetrySnapshot {
+            session_id: None,
+            ..snap_of("names-nothing", Some(launched - 1))
+        };
+        let mut a = Attachment::default();
+        assert!(a.admit(&anonymous, launched, true));
+        assert!(
+            a.attached && a.session_id.is_none(),
+            "premise: attached, with no identity to compare against"
+        );
+
+        assert!(a.admit(&snap_of("abc", Some(launched + 1)), launched, true));
+        assert_eq!(
+            a.session_id.as_deref(),
+            Some("abc"),
+            "the gap is filled the first time a snapshot names a session"
+        );
+        // And from here the guard means something rather than admitting everything.
+        assert!(
+            !a.admit(&snap_of("rival", Some(launched + 2)), launched, true),
+            "once an identity is held, a differently-named session is refused"
+        );
+    }
+
+    #[test]
+    fn an_identity_already_held_is_never_replaced() {
+        // R5.4 / D4b — adoption fills a gap; it never overwrites. Without this the
+        // adopt arm would quietly become a rename of the rule it exists to shore up.
+        let launched = 1_785_226_000_000;
+        let mut a = Attachment::default();
+        assert!(a.admit(&snap_of("mine", Some(launched - 1)), launched, true));
+        assert_eq!(a.session_id.as_deref(), Some("mine"));
+
+        assert!(
+            !a.admit(&snap_of("other", Some(launched + 9_000)), launched, true),
+            "confirmed or not, a different session cannot take a held identity"
+        );
+        assert_eq!(a.session_id.as_deref(), Some("mine"));
     }
 
     #[test]
