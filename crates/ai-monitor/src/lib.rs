@@ -41,6 +41,48 @@ pub fn encode_cwd(cwd: &Path) -> String {
         .collect()
 }
 
+/// What Claude Code itself records about a running session, keyed by pid.
+///
+/// `~/.claude/sessions/<pid>.json` is written by the `claude` process for its own pid and
+/// names its session **exactly** — no inference, no timing. It is the answer four rounds
+/// of this feature tried to derive from clock arithmetic and could not: two processes
+/// alive before a log is written are indistinguishable by start time, because start time
+/// simply does not record who wrote what.
+///
+/// Verified against every live `claude` on the machine (2026-08-01): 5/5 had a file, every
+/// `session_id` named an existing log, every `cwd` matched, and `started_at_ms` sat
+/// 1.3–2.0s after the true process start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Registered {
+    pub session_id: String,
+    pub cwd: PathBuf,
+    /// When the process recorded itself, epoch millis — slightly after its real start.
+    /// The caller compares this against the live process to reject a **stale file whose
+    /// pid has been reused**, which is not hypothetical: the same sample held 5 files for
+    /// 4 live processes.
+    pub started_at_ms: u64,
+}
+
+/// Read `<root>/<pid>.json`. Split from [`registered_session`] so it is testable without
+/// a real `$HOME`. Any missing field, bad JSON, or unreadable file yields `None` — this
+/// is an undocumented on-disk detail of another program, so it must never be load-bearing
+/// beyond "use it when it is there".
+pub fn registered_session_in(sessions_root: &Path, pid: u32) -> Option<Registered> {
+    let text = std::fs::read_to_string(sessions_root.join(format!("{pid}.json"))).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    Some(Registered {
+        session_id: v.get("sessionId").and_then(Value::as_str)?.to_string(),
+        cwd: PathBuf::from(v.get("cwd").and_then(Value::as_str)?),
+        started_at_ms: v.get("startedAt").and_then(Value::as_u64)?,
+    })
+}
+
+/// `~/.claude/sessions/<pid>.json`, if `$HOME` is set and the file parses.
+pub fn registered_session(pid: u32) -> Option<Registered> {
+    let home = std::env::var_os("HOME")?;
+    registered_session_in(&PathBuf::from(home).join(".claude").join("sessions"), pid)
+}
+
 /// `~/.claude/projects` (or `None` if `$HOME` is unset).
 pub fn claude_projects_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
@@ -114,44 +156,154 @@ pub struct Resolved {
     pub owned: bool,
 }
 
-/// How long after a `claude` process starts its session's first event may appear.
-/// Generous on purpose: the cost of being too tight is failing to recognise the
-/// tab's own session, which is the whole point; the cost of being loose is admitting
-/// a session that started in the same minute in the same directory from another app,
-/// which the id path already covers whenever it is available.
+/// How long AFTER the `claude` process starts its session's first event may appear.
+/// The window is deliberately **asymmetric** — see [`FIRST_EVENT_LEAD_MS`] for the other
+/// side, which is nearly zero because it encodes a physical impossibility rather than a
+/// tolerance.
+///
+/// A session this tab started writes its first event seconds after the process —
+/// **measured, not assumed**: across every live `claude` on this machine that owned a
+/// log, `first_event − process_start` was +1s, +2s, +1s, +2s, +1s (n=5, 2026-08-01), and
+/// never negative. 120s is generous against that: a cold start's first write is not
+/// guaranteed inside 30s, and failing to recognise our own session is the more expensive
+/// error.
+///
+/// Bounding this side matters because a one-sided `first >= since − SLACK` rule admits
+/// *any* log whose first event is later, including one that began five hours after; under
+/// strict resolution that log would be the sole thing reaching the panel, and it would
+/// stick. Sessions genuinely older than the process are named by tier 1
+/// (`claude --resume <id>`), which never reaches this bound.
+///
+/// **This bound does not apply to a sole, unrivalled candidate.** A tab where `claude`
+/// runs but the user does not type for a long time writes its first event well past 120s;
+/// that log is still adopted, because uniqueness plus the rival test (see
+/// `resolve_owned_session`) account for it without needing distance.
+/// `the_upper_bound_stops_at_120s_after_the_process` covers both halves: the bound
+/// separates *rivals*, and a lone candidate passes it by.
+///
+/// Two earlier drafts of this paragraph are worth naming, since decisions were taken on
+/// each. The first said such a tab "fills in on the first write" — false: `since_ms` is
+/// the process start and never moves, so no re-resolution rescues a first event past the
+/// bound. The second said the tab was therefore empty *permanently* — true at the time,
+/// and the reason uniqueness was added.
+///
+/// **What this bound cannot save.** A session resumed *without* an id in argv —
+/// `claude --continue` / `-c`, a fork, a compacted transcript — inherits the original
+/// conversation's first event, so it misses this window by days, and tier 1 has no id to
+/// match. Neither tier confirms it and the panel shows its empty state for the life of
+/// the tab. Accepted deliberately; see `specs/ai-monitor-session-isolation/spec.md`
+/// § Known Gaps for the two fixes that were tested and rejected, and the shape of the
+/// follow-up.
 const FIRST_EVENT_SLACK_MS: u64 = 120_000;
 
-/// Resolve the log for `dir`, preferring one the caller can prove is theirs.
+/// How far a session's first event may precede its own process start — a clock-skew
+/// allowance, **not** a matching window.
 ///
-/// The directory records no application, window or tab — Warp, iTerm and every other
-/// mac-terminal window writing in the same project all append here — so `want` is
-/// the only thing that can separate them. Without it this degrades exactly to
-/// [`most_recent_session`].
-pub fn resolve_session(dir: &Path, want: &Wanted) -> Option<Resolved> {
-    // Named outright: nothing to rank.
+/// The rule this encodes is physical: *a session cannot write an event before the process
+/// that creates it exists.* Anything earlier belongs to a different session, however
+/// close in time. Only measurement error should ever produce a negative delta, so this is
+/// sized for that and nothing more: process start comes from `PROC_PIDTBSDINFO` and log
+/// timestamps from the same wall clock on the same machine, and the 5 genuine matches
+/// measured on 2026-08-01 were all *positive* (+1s, +2s, +1s, +2s, +1s).
+///
+/// It was 120_000 — a symmetric window — and that shipped the defect this constant
+/// exists to close. Two tabs in one project, `claude` started 16s apart: tab 1's log had
+/// a first event **15s before tab 2's process existed**, the symmetric rule called that a
+/// match, and both tabs rendered one dashboard. Under D4 the wrong attachment was
+/// immediate and permanent. Widening this is not a tuning knob — it re-admits impossible
+/// matches, so any increase needs the same evidence this decrease has.
+const FIRST_EVENT_LEAD_MS: u64 = 5_000;
+
+/// Resolve a log in `dir` that the caller can *prove* is theirs — or nothing.
+///
+/// Two tiers, in order: the id `want` names outright, then the log whose first event
+/// dates it to the caller's own process start (within [`FIRST_EVENT_SLACK_MS`]).
+/// When neither confirms, the answer is `None` rather than a guess: the directory
+/// records no application, window or tab — Warp, iTerm and every other mac-terminal
+/// window writing in the same project all append here — so an unconfirmed pick is a
+/// foreign session as often as not.
+///
+/// Every [`Resolved`] this returns has `owned: true` by construction; there is no
+/// code path here that builds `owned: false`. This is what production calls.
+/// `rivals` are the start times of the OTHER live `claude` processes working in the same
+/// project — sibling tabs of this app, and other applications' sessions alike. They are
+/// what makes tier 2 an *assignment* rather than a guess: a log belongs to the latest
+/// process that started at or before its first event, so a rival that started after us
+/// but still before the log was written owns it, not us. Pass `&[]` when unknown; the
+/// rule then degrades to the distance test alone, which is where this started.
+pub fn resolve_owned_session(dir: &Path, want: &Wanted, rivals: &[u64]) -> Option<Resolved> {
+    // Named outright: nothing to rank, and nothing to fall back to.
+    //
+    // A session id here is *authoritative* — it comes from `claude` naming its own session
+    // (`~/.claude/sessions/<pid>.json`) or from `--resume <id>` in its argv — so if its log
+    // does not exist yet, the honest answer is "not written yet", NOT a timing guess. The
+    // fall-through this used to do is what let a tab with a perfectly known session id
+    // adopt a sibling's log during the window before its own first write.
     if let Some(id) = want.session_id.as_deref() {
         let path = dir.join(format!("{id}.jsonl"));
-        if path.is_file() {
-            return Some(Resolved {
-                last_event_ms: last_event_in_tail(&path),
-                path,
-                owned: true,
-            });
-        }
+        return path.is_file().then(|| Resolved {
+            last_event_ms: last_event_in_tail(&path),
+            path,
+            owned: true,
+        });
     }
     // Dated: the caller's process started at `since`, so its session's FIRST event
-    // follows shortly after. Another app's long-running session fails this by days.
+    // follows shortly AFTER — never before. The two sides of this window mean different
+    // things and are sized differently on purpose: below is a clock-skew allowance on an
+    // impossibility, above is a real tolerance for how long a session may take to write.
+    // A symmetric window here is what let one tab's log be confirmed as another's,
+    // 15 seconds before that tab's process had even started.
     if let Some(since) = want.since_ms {
-        let owned = candidates(dir)
+        // Everything that could be ours: a log that began at or after our process did
+        // (the hard invariant — see FIRST_EVENT_LEAD_MS), and that no OTHER live claude
+        // has a better claim to.
+        //
+        // The rival test is what turns this from a distance heuristic into an assignment.
+        // A log is written by exactly one process, and that process must have existed
+        // when it was written; among the processes that qualify, the latest one to start
+        // is the writer. So a rival that started after us but at or before this log's
+        // first event outranks us for it — no matter how close the log sits to our own
+        // start. Without this, two tabs opened seconds apart in one project each see the
+        // other's session as plausibly their own, which is the defect this feature has
+        // now been through twice: once with the tabs one way round, once the other.
+        let after: Vec<(u64, PathBuf)> = candidates(dir)
             .into_iter()
             .filter_map(|p| {
                 let first = first_event(&p)?;
-                (first + FIRST_EVENT_SLACK_MS >= since).then_some((first, p))
+                if first + FIRST_EVENT_LEAD_MS < since {
+                    return None; // predates us: impossible
+                }
+                // `<= first`, with NO skew allowance — deliberately asymmetric with the
+                // test above, because the two comparisons mean different things.
+                //
+                // Above, `+ FIRST_EVENT_LEAD_MS` tolerates measurement error in *our own*
+                // claim, and erring wide there costs nothing: it only keeps a candidate we
+                // then have to justify. Here, widening REFUSES a log, and a rival that
+                // started after the log was already written provably did not write it. An
+                // earlier revision used `<= first + LEAD` here too, out of a false sense of
+                // symmetry, and it blanked the panel of the tab that actually wrote the
+                // log whenever a second tab opened within LEAD of it — the ordinary
+                // workflow, and a worse failure than the one it was fixing.
+                let outranked = rivals.iter().any(|&r| r > since && r <= first);
+                (!outranked).then_some((first, p))
             })
-            // Nearest to the process start, not merely the earliest qualifying one:
-            // with two tabs open on the same project every one of their sessions
-            // qualifies, and the earliest would hand them all the same log.
-            .min_by_key(|(first, _)| first.abs_diff(since));
+            .collect();
+        // Uniqueness discriminates where distance cannot, and the rival test above is
+        // what makes it safe: if exactly one session began after us and no better-placed
+        // process exists, it is ours however long the user sat at the splash before
+        // typing. The alternative is a panel empty for the life of the tab, since `since`
+        // is the process start and never moves — no re-resolution can rescue a first
+        // event past the slack.
+        //
+        // With two or more, uniqueness proves nothing and proximity takes over: the
+        // nearest inside the slack, or nothing.
+        let owned = match after.len() {
+            1 => after.into_iter().next(),
+            _ => after
+                .into_iter()
+                .filter(|(first, _)| *first <= since.saturating_add(FIRST_EVENT_SLACK_MS))
+                .min_by_key(|(first, _)| first.abs_diff(since)),
+        };
         if let Some((_, path)) = owned {
             return Some(Resolved {
                 last_event_ms: last_event_in_tail(&path),
@@ -160,10 +312,25 @@ pub fn resolve_session(dir: &Path, want: &Wanted) -> Option<Resolved> {
             });
         }
     }
-    most_recent_session(dir).map(|(path, last_event_ms)| Resolved {
-        path,
-        last_event_ms,
-        owned: false,
+    None
+}
+
+/// Resolve the log for `dir`, preferring one the caller can prove is theirs and
+/// falling back to ranking the directory when nothing confirms.
+///
+/// **Production calls [`resolve_owned_session`], not this.** This is the
+/// ranked-fallback contract, retained under test with no production caller: it is
+/// the only thing keeping [`most_recent_session`]'s ranking, the `owned: false` half
+/// of [`Resolved`], and the app's displacement/re-attach rules exercised. Its
+/// fallback answers "the session that most recently wrote here", which may belong to
+/// any application — never "this tab's session".
+pub fn resolve_session(dir: &Path, want: &Wanted) -> Option<Resolved> {
+    resolve_owned_session(dir, want, &[]).or_else(|| {
+        most_recent_session(dir).map(|(path, last_event_ms)| Resolved {
+            path,
+            last_event_ms,
+            owned: false,
+        })
     })
 }
 
@@ -391,6 +558,9 @@ pub struct Watch {
     pub want: Wanted,
     /// Whether `log` was confirmed to be the caller's.
     pub owned: bool,
+    /// Start times of the other live `claude` processes in this project — see
+    /// [`resolve_owned_session`]. Captured at spawn alongside `want`.
+    pub rivals: Vec<u64>,
     /// Set by the caller once it has attached; the watcher then stops re-resolving.
     pub attached: Arc<AtomicBool>,
 }
@@ -423,6 +593,7 @@ impl LogWatcher {
             log,
             want,
             mut owned,
+            rivals,
             attached,
         } = watch;
         let watch_dir = dir.clone();
@@ -430,20 +601,35 @@ impl LogWatcher {
         let mut offset = start_offset;
         let mut partial = String::new();
         let mut target = log;
-        // Whether to keep re-resolving is the CALLER's decision, shared by handle.
+        // *Whether* to keep re-resolving is the CALLER's decision, shared by handle.
         //
-        // It is the same question as "is this log this window's session", and that
-        // question is answered in exactly one place — `app::overlay::proves_ownership`
-        // — because the last time it was implemented twice the two copies disagreed
-        // and pinned the watcher to a log the display would never show. This crate
-        // does not re-derive it; it reads the answer.
+        // That question — "has this window attached to a session yet" — has exactly
+        // one author, `app::overlay`, because the last time it was implemented twice
+        // the two copies disagreed and pinned the watcher to a log the display would
+        // never show. This crate does not re-derive it; it reads the flag. (The app's
+        // rule for *when* to attach has since changed — a confirmed, non-empty log
+        // attaches on sight rather than having to prove it wrote since the window
+        // opened — which is precisely why it is stated there and not here.)
+        //
+        // *What* re-resolution may adopt is this crate's, and it is strict:
+        // `resolve_owned_session` only, so the target can move only to a log the
+        // caller can prove is its own — named by `--resume`, or dated to the caller's
+        // own process start. A hint that confirms nothing answers `None` on every
+        // callback and the target never moves. That is the point rather than a
+        // shortfall: the project directory records no application, window or tab, so
+        // a tab with no identifiable session must show nothing rather than adopt
+        // whatever else happens to be writing there. Consequently the only value
+        // re-resolution can assign to `owned` is `true`; the field remains because
+        // the caller's initial value still flows through untouched when no switch
+        // happens, and because `Update.owned` is what the app reads to decide
+        // attachment.
         //
         // Until the caller attaches, a different file appearing may well be the tab's
-        // own session writing for the first time, so we re-resolve to it. Once the
-        // caller has attached, we stay: two concurrently active sessions in one
-        // project would otherwise trade the attachment on every line, resetting the
-        // accumulator and re-reading the whole file each time — and, worse, replacing
-        // data already on screen.
+        // own session writing for the first time, so a *confirmed* one takes over.
+        // Once the caller has attached, we stay: two concurrently active sessions in
+        // one project would otherwise trade the attachment on every line, resetting
+        // the accumulator and re-reading the whole file each time — and, worse,
+        // replacing data already on screen.
 
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(ev) = res else { return };
@@ -456,7 +642,7 @@ impl LogWatcher {
                     path: newest,
                     owned: newly_owned,
                     ..
-                }) = resolve_session(&dir, &want)
+                }) = resolve_owned_session(&dir, &want, &rivals)
                 {
                     if Some(&newest) != target.as_ref() {
                         owned = newly_owned;
@@ -654,6 +840,7 @@ mod tests {
                 log: Some(log.clone()),
                 want: Wanted::default(),
                 owned: false,
+                rivals: Vec::new(),
                 attached: unattached(),
             },
             t,
@@ -688,6 +875,76 @@ mod tests {
             w.rx.recv_timeout(Duration::from_millis(400)).is_err(),
             "no duplicate snapshots"
         );
+    }
+
+    #[test]
+    fn the_registry_names_a_session_and_shrugs_at_anything_odd() {
+        // The shape `claude` actually writes, taken verbatim from a live file.
+        let root = temp_dir("registry");
+        std::fs::write(
+            root.join("45326.json"),
+            r#"{"pid":45326,"sessionId":"2b1ca0f2-8a99-4aff-90f1-115839f17f01","cwd":"/Users/x/IdeaProjects/terminal","startedAt":1785449383738,"procStart":"Thu Jul 30 22:09:42 2026","version":"2.1.220","kind":"interactive","status":"busy"}"#,
+        )
+        .unwrap();
+        let r = registered_session_in(&root, 45326).expect("reads the record");
+        assert_eq!(r.session_id, "2b1ca0f2-8a99-4aff-90f1-115839f17f01");
+        assert_eq!(r.cwd, PathBuf::from("/Users/x/IdeaProjects/terminal"));
+        assert_eq!(r.started_at_ms, 1_785_449_383_738);
+
+        // This is an undocumented on-disk detail of another program, so every way it can
+        // disappoint us must be a `None` rather than a panic or a wrong answer.
+        assert_eq!(registered_session_in(&root, 99999), None, "no file");
+        std::fs::write(root.join("1.json"), "not json").unwrap();
+        assert_eq!(registered_session_in(&root, 1), None, "unparseable");
+        std::fs::write(root.join("2.json"), r#"{"pid":2,"cwd":"/x"}"#).unwrap();
+        assert_eq!(registered_session_in(&root, 2), None, "no sessionId");
+        std::fs::write(
+            root.join("3.json"),
+            r#"{"sessionId":"s","cwd":"/x","startedAt":"yesterday"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            registered_session_in(&root, 3),
+            None,
+            "startedAt not a number"
+        );
+    }
+
+    #[test]
+    fn an_authoritative_id_whose_log_is_missing_resolves_to_nothing_not_a_guess() {
+        // The reason tier 1 no longer falls through. When `claude` has named its own
+        // session, a missing log means "not written yet" — a fact — and guessing by time
+        // from there is how a tab with a perfectly known session id came to adopt a
+        // sibling's log in the window before its first write.
+        let dir = temp_dir("authoritative");
+        // A sibling's log sits here, freshly written and temptingly close in time.
+        std::fs::write(
+            dir.join("sibling.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-08-01T12:00:01.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        let want = Wanted {
+            session_id: Some("11111111-1111-1111-1111-111111111111".into()),
+            since_ms: Some(1_785_585_600_000), // 12:00:00Z — tier 2 would take the sibling
+        };
+        assert_eq!(
+            resolve_owned_session(&dir, &want, &[]),
+            None,
+            "we know which session is ours; it just has not written yet"
+        );
+
+        // The moment our own log appears, it is named exactly — no timing involved.
+        std::fs::write(
+            dir.join("11111111-1111-1111-1111-111111111111.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-08-01T12:05:00.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        let r = resolve_owned_session(&dir, &want, &[]).expect("named outright");
+        assert_eq!(
+            r.path.file_name().unwrap(),
+            "11111111-1111-1111-1111-111111111111.jsonl"
+        );
+        assert!(r.owned);
     }
 
     #[test]
@@ -816,6 +1073,466 @@ mod tests {
     }
 
     #[test]
+    fn nothing_confirmable_resolves_to_none_rather_than_a_foreign_log() {
+        // The defect under repair. The directory holds one log and it is another
+        // application's; the hint names a session that does not exist here and dates
+        // the tab's process to a time nothing in the directory matches. The ranked
+        // fallback would hand back `foreign.jsonl` with `owned: false`, and every
+        // caller that ignored the flag would show it. Strict resolution answers
+        // `None` — the assertion is against `None`, not against a different path.
+        let dir = temp_dir("nothingconfirmable");
+        std::fs::write(
+            dir.join("foreign.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-23T17:06:00.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+
+        let want = Wanted {
+            session_id: Some("00000000-0000-0000-0000-000000000000".into()),
+            since_ms: Some(1_785_271_140_000), // 2026-07-28T20:39:00Z — five days later
+        };
+        assert_eq!(resolve_owned_session(&dir, &want, &[]), None);
+
+        // ...while the retained fallback still degrades to ranking, unchanged. The
+        // two functions differ in exactly this: what happens when nothing confirms.
+        let ranked = resolve_session(&dir, &want).expect("the fallback still answers");
+        assert_eq!(ranked.path.file_name().unwrap(), "foreign.jsonl");
+        assert!(!ranked.owned);
+    }
+
+    #[test]
+    fn an_empty_hint_confirms_nothing_whatever_the_directory_holds() {
+        // No claude process, no permission to read one, a sandbox: with neither an id
+        // nor a process start there is nothing to separate these logs from any other
+        // application's, so directory contents cannot change the answer.
+        let dir = temp_dir("emptyhintstrict");
+        std::fs::write(
+            dir.join("a.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T19:00:00.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T19:30:00.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+
+        assert_eq!(resolve_owned_session(&dir, &Wanted::default(), &[]), None);
+        // An empty directory is the same answer for a different reason — stated so a
+        // future change cannot pass this test by resolving the contents case only.
+        let empty = temp_dir("emptyhintemptydir");
+        assert_eq!(resolve_owned_session(&empty, &Wanted::default(), &[]), None);
+    }
+
+    #[test]
+    fn the_process_that_wrote_a_log_keeps_it_when_a_later_tab_opens() {
+        // The other half of the rival rule, and the one it is easy to get backwards.
+        //
+        //   we start at T and write at T+1s; a second tab starts at T+3s
+        //
+        // That rival did not exist when the log was written, so it cannot be the writer
+        // and must not outrank us. An earlier revision compared rivals with the same
+        // `+ FIRST_EVENT_LEAD_MS` slack used for our own claim; at LEAD = 5s that made a
+        // rival starting 2s AFTER the write outrank the process that made it, and the
+        // writing tab's panel went blank whenever a second tab opened within ~6s.
+        const T: u64 = 1_785_585_600_000; // 2026-08-01T12:00:00Z
+        let dir = temp_dir("writerkeeps");
+        std::fs::write(
+            dir.join("mine.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-08-01T12:00:01.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        let want = Wanted {
+            session_id: None,
+            since_ms: Some(T),
+        };
+
+        for rival_at in [T + 3_000, T + 1_001, T + 60_000] {
+            let r = resolve_owned_session(&dir, &want, &[rival_at])
+                .unwrap_or_else(|| panic!("rival at +{}ms must not take our log", rival_at - T));
+            assert_eq!(r.path.file_name().unwrap(), "mine.jsonl");
+        }
+
+        // A rival that started at or before the write DOES outrank us — the boundary,
+        // straddled so neither side can drift.
+        assert!(
+            resolve_owned_session(&dir, &want, &[T + 1_000]).is_none(),
+            "a rival that existed exactly at the write is a plausible writer"
+        );
+        assert!(
+            resolve_owned_session(&dir, &want, &[T + 999]).is_none(),
+            "and so is one that started just before it"
+        );
+    }
+
+    #[test]
+    fn a_sibling_tab_that_started_later_owns_the_log_it_wrote() {
+        // The MIRROR of the field report, and the case that sent this feature round a
+        // third time. The reported defect was tab 2 (fresh) showing tab 1's session; the
+        // mirror is tab 1 — idle, having written nothing — showing tab 2's.
+        //
+        //   tab A: claude starts 11:38:25, user never types, no log
+        //   tab B: claude starts 11:38:41, writes at 11:38:42
+        //
+        // B's log is at or after A's start, so distance alone makes it a candidate for A;
+        // being the only one, uniqueness would hand it over. What refuses it is the rival
+        // test: B's process started after A's and before that log was written, so B is
+        // the writer. A owns nothing and must be told so.
+        const A_START: u64 = 1_785_584_305_000; // 11:38:25Z
+        const B_START: u64 = 1_785_584_321_000; // 11:38:41Z
+        let dir = temp_dir("mirrorsibling");
+        std::fs::write(
+            dir.join("tabB.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-08-01T11:38:42.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+
+        // Tab A, told about tab B: nothing is its own.
+        assert_eq!(
+            resolve_owned_session(
+                &dir,
+                &Wanted {
+                    session_id: None,
+                    since_ms: Some(A_START),
+                },
+                &[B_START],
+            ),
+            None,
+            "the later process wrote that log; tab A owns nothing"
+        );
+
+        // Tab B, told about tab A: the log is B's — a rival that started EARLIER never
+        // outranks, or no session could ever be claimed.
+        let r = resolve_owned_session(
+            &dir,
+            &Wanted {
+                session_id: None,
+                since_ms: Some(B_START),
+            },
+            &[A_START],
+        )
+        .expect("tab B wrote it");
+        assert_eq!(r.path.file_name().unwrap(), "tabB.jsonl");
+        assert!(r.owned);
+
+        // Without the rival list — the degraded case — A wrongly adopts B's log. Pinned
+        // so the value of passing rivals is visible rather than assumed.
+        assert!(
+            resolve_owned_session(
+                &dir,
+                &Wanted {
+                    session_id: None,
+                    since_ms: Some(A_START),
+                },
+                &[],
+            )
+            .is_some(),
+            "documents what knowing nothing about rivals costs"
+        );
+    }
+
+    #[test]
+    fn a_log_that_began_hours_after_the_process_is_not_this_tab_s() {
+        // The reported scenario. The tab's own `claude` started at 10:04 and never
+        // wrote a transcript; the only log in the project began at 15:30, five and a
+        // half hours later, from another application. The old one-sided bound
+        // (`first + SLACK >= since`) admitted it — anything at or after
+        // `since - 120s` qualified — and `min_by_key` then reported it as confirmed.
+        let dir = temp_dir("hourslater");
+        std::fs::write(
+            dir.join("foreign.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T15:30:00.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+
+        // Alone and unrivalled it IS adopted — the deliberate trade for a tab left idle
+        // at the splash, whose own first event can be arbitrarily late.
+        const SINCE: u64 = 1_785_233_040_000; // 2026-07-28T10:04:00Z
+        let want = Wanted {
+            session_id: None,
+            since_ms: Some(SINCE),
+        };
+        assert!(
+            resolve_owned_session(&dir, &want, &[]).is_some(),
+            "sole unrivalled candidate since we started"
+        );
+
+        // The moment anything else can account for it, it is refused: a rival process
+        // that started in between...
+        assert_eq!(
+            resolve_owned_session(&dir, &want, &[SINCE + 60_000]),
+            None,
+            "a later process wrote it"
+        );
+
+        // ...or a second, promptly-written session, which uniqueness no longer covers and
+        // which beats it on distance.
+        let rival = temp_dir("hourslaterrival");
+        std::fs::write(
+            rival.join("late.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T15:30:00.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            rival.join("prompt.jsonl"), // SINCE + 30s
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T10:04:30.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        let r = resolve_owned_session(&rival, &want, &[]).expect("the prompt one confirms");
+        assert_eq!(r.path.file_name().unwrap(), "prompt.jsonl");
+    }
+
+    #[test]
+    fn the_originally_reported_foreign_session_is_still_refused() {
+        // Regression guard on the defect that started this feature (`HANDOFF.md`),
+        // re-checked against uniqueness — "sole candidate wins at any distance" is
+        // exactly the shape that could let it back in.
+        //
+        // It cannot: the reported foreign session was `up 18h55m`, so its FIRST event
+        // long predates the tab's `claude`. It never enters the candidate set, and
+        // uniqueness only ever selects from that set.
+        let dir = temp_dir("handoffregression");
+        std::fs::write(
+            dir.join("foreign.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-27T15:09:00.000Z\",\"message\":{}}\n\
+             {\"type\":\"assistant\",\"timestamp\":\"2026-07-28T10:05:00.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_owned_session(
+                &dir,
+                &Wanted {
+                    session_id: None,
+                    since_ms: Some(1_785_233_088_000), // 2026-07-28T10:04:48Z
+                },
+                &[],
+            ),
+            None,
+            "a session older than this process is not a candidate, sole or otherwise"
+        );
+    }
+
+    #[test]
+    fn the_upper_bound_stops_at_120s_after_the_process() {
+        // The window is ASYMMETRIC — this pins the generous side, where the number is a
+        // real tolerance for how long a session may take to write its first event. The
+        // tight side is `a_log_that_predates_the_process_is_not_that_process_s_session`,
+        // where the number is a clock-skew allowance on an impossibility. Sizing them
+        // the same is what shipped the two-tabs-one-dashboard defect.
+        const S: u64 = 1_785_240_000_000; // 2026-07-28T12:00:00Z
+        let since = Wanted {
+            session_id: None,
+            since_ms: Some(S),
+        };
+
+        // Both present: the one inside the window wins, and the outsider does not
+        // merely lose the nearest-match comparison — see the sole-candidate dir below.
+        let dir = temp_dir("upperbound");
+        std::fs::write(
+            dir.join("inside.jsonl"), // S + 119_000
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T12:01:59.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("outside.jsonl"), // S + 121_000
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T12:02:01.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        let r = resolve_owned_session(&dir, &since, &[]).expect("the inside candidate confirms");
+        assert_eq!(r.path.file_name().unwrap(), "inside.jsonl");
+        assert!(r.owned);
+
+        // Alone in its own directory, and with no rival process to outrank us, the
+        // outsider is ACCEPTED — by uniqueness, not by this bound. The slack separates
+        // rivals; it is not a gate a sole candidate must pass. Pinned here so the two
+        // rules are not confused: an earlier revision asserted `None` on exactly this
+        // input, and that is what left a tab idle at the splash showing an empty panel
+        // for the life of its process.
+        let dir2 = temp_dir("upperboundalone");
+        std::fs::write(
+            dir2.join("outside.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T12:02:01.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        let sole =
+            resolve_owned_session(&dir2, &since, &[]).expect("sole candidate, no rival claims it");
+        assert_eq!(sole.path.file_name().unwrap(), "outside.jsonl");
+
+        // ...but a rival process that started between us and that log owns it instead.
+        assert_eq!(
+            resolve_owned_session(&dir2, &since, &[S + 60_000]),
+            None,
+            "a process that started closer to the write has the better claim"
+        );
+    }
+
+    #[test]
+    fn a_log_that_predates_the_process_is_not_that_process_s_session() {
+        // The invariant, stated as a test: a session cannot write an event before the
+        // process that creates it exists.
+        //
+        // This REPLACES `a_session_that_began_just_before_the_process_start_still_qualifies`,
+        // which asserted the opposite and justified itself with "the process start is
+        // observed after the fact, so a first event legitimately predates it". That
+        // reasoning was wrong: `hint_for` reads the true start from `PROC_PIDTBSDINFO`,
+        // not the time of the walk. The false premise is what licensed the symmetric
+        // window that shipped the two-tabs-one-dashboard defect.
+        let since = Wanted {
+            session_id: None,
+            since_ms: Some(1_785_240_000_000), // 2026-07-28T12:00:00Z
+        };
+
+        // 60s before the process: impossible, and no longer admitted.
+        let dir = temp_dir("predates");
+        std::fs::write(
+            dir.join("earlier.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T11:59:00.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_owned_session(&dir, &since, &[]),
+            None,
+            "a log whose first event predates the process is a different session"
+        );
+
+        // Inside the skew allowance it still confirms: only measurement error should
+        // ever produce a negative delta, and the rule must not punish it.
+        let dir2 = temp_dir("predatesskew");
+        std::fs::write(
+            dir2.join("skewed.jsonl"), // S - 2_000, inside FIRST_EVENT_LEAD_MS
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T11:59:58.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        let r = resolve_owned_session(&dir2, &since, &[]).expect("clock skew is tolerated");
+        assert_eq!(r.path.file_name().unwrap(), "skewed.jsonl");
+        assert!(r.owned);
+    }
+
+    #[test]
+    fn the_skew_allowance_is_pinned_at_its_stated_value() {
+        // Without this the MAGNITUDE of `FIRST_EVENT_LEAD_MS` is untested — the sign is
+        // an invariant, but 5s versus 10s versus 60s is a judgement, and a judgement no
+        // test pins is one a later edit can move silently. Straddle it exactly.
+        let since = Wanted {
+            session_id: None,
+            since_ms: Some(1_785_240_000_000), // 2026-07-28T12:00:00Z
+        };
+
+        // S − 5_000: the last accepted value.
+        let inside = temp_dir("skewinside");
+        std::fs::write(
+            inside.join("edge.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T11:59:55.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        assert!(
+            resolve_owned_session(&inside, &since, &[]).is_some(),
+            "exactly FIRST_EVENT_LEAD_MS early still confirms"
+        );
+
+        // S − 5_001: the first rejected value.
+        let outside = temp_dir("skewoutside");
+        std::fs::write(
+            outside.join("edge.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T11:59:54.999Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_owned_session(&outside, &since, &[]),
+            None,
+            "one millisecond past the allowance is a different session"
+        );
+    }
+
+    #[test]
+    fn among_qualifying_logs_the_nearest_to_the_process_start_wins() {
+        // R2.4's nearest-match rule, pinned directly.
+        //
+        // It used to be covered incidentally by tests that straddled the old symmetric
+        // window, but tightening the lower bound turned those into filter tests: their
+        // rivals are now rejected outright rather than out-ranked, so inverting
+        // `min_by_key` to `max_by_key` left the entire workspace green. Both candidates
+        // here sit AFTER the process start and inside the upper bound, so only the
+        // ranking can separate them.
+        let dir = temp_dir("nearestwins");
+        std::fs::write(
+            dir.join("near.jsonl"), // S + 10s
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T12:00:10.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("far.jsonl"), // S + 90s — still qualifying, merely further
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T12:01:30.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+
+        let r = resolve_owned_session(
+            &dir,
+            &Wanted {
+                session_id: None,
+                since_ms: Some(1_785_240_000_000), // 2026-07-28T12:00:00Z
+            },
+            &[],
+        )
+        .expect("both qualify; one must win");
+        assert_eq!(
+            r.path.file_name().unwrap(),
+            "near.jsonl",
+            "nearest to the process start, not merely the first qualifier"
+        );
+    }
+
+    #[test]
+    fn two_tabs_started_sixteen_seconds_apart_do_not_share_a_dashboard() {
+        // The reported defect, reproduced from the measured timeline (2026-08-01).
+        //
+        //   tab 1: claude pid 5550 starts 11:38:25, writes c2abd08b at 11:38:26 (+1s)
+        //   tab 2: claude pid 5771 starts 11:38:41, writes NOTHING
+        //
+        // The symmetric window scored |11:38:26 − 11:38:41| = 15s <= 120s and handed tab
+        // 1's live session to tab 2 with `owned: true`; being non-empty, D4 attached it
+        // immediately and permanently. Both tabs rendered one dashboard — the exact
+        // failure this whole feature exists to prevent, through a door left open by the
+        // window's shape. Two tabs opened sixteen seconds apart is the ordinary workflow,
+        // not an edge case.
+        let dir = temp_dir("twotabs16s");
+        // 2026-08-01T11:38:26Z
+        std::fs::write(
+            dir.join("c2abd08b.jsonl"),
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-08-01T11:38:26.000Z\",\"message\":{}}\n",
+        )
+        .unwrap();
+        const TAB1_START: u64 = 1_785_584_305_000; // 11:38:25Z
+        const TAB2_START: u64 = 1_785_584_321_000; // 11:38:41Z, 16s later
+
+        // Tab 1 owns it: its process precedes the first event by a second.
+        let r = resolve_owned_session(
+            &dir,
+            &Wanted {
+                session_id: None,
+                since_ms: Some(TAB1_START),
+            },
+            &[],
+        )
+        .expect("tab 1's own session");
+        assert_eq!(r.path.file_name().unwrap(), "c2abd08b.jsonl");
+
+        // Tab 2 owns nothing. It must be told so, not handed tab 1's session.
+        assert_eq!(
+            resolve_owned_session(
+                &dir,
+                &Wanted {
+                    session_id: None,
+                    since_ms: Some(TAB2_START),
+                },
+                &[],
+            ),
+            None,
+            "tab 2's claude did not exist when this log was written"
+        );
+    }
+
+    #[test]
     fn resolution_ranks_by_last_event_not_by_mtime() {
         // The measured case. In a real project directory `539f86bf` had the newest
         // mtime (12:48) but a 15-minute-stale newest event (12:33), while the session
@@ -925,8 +1642,18 @@ mod tests {
             Watch {
                 dir: dir.clone(),
                 log: Some(old.clone()),
-                want: Wanted::default(),
+                // `claude --resume fresh` — the tab can name its session outright, so
+                // tier 1 confirms `fresh.jsonl` the instant it exists. The hint is not
+                // decoration: re-resolution is strict, and these fixture lines carry no
+                // `timestamp`, so tier 2 could never date them to a process start. Note
+                // the id names a file that does NOT exist yet, which is the case under
+                // test — tier 1 answers `None` until the tab's session writes.
+                want: Wanted {
+                    session_id: Some("fresh".into()),
+                    since_ms: None,
+                },
                 owned: false,
+                rivals: Vec::new(),
                 attached: unattached(),
             },
             t,
@@ -971,8 +1698,16 @@ mod tests {
             Watch {
                 dir: missing.clone(),
                 log: None,
-                want: Wanted::default(),
+                // The tab names its session, so tier 1 confirms `first.jsonl` once the
+                // directory and the file both exist. Required, not incidental: the
+                // fixture line below carries no `timestamp`, so `first_event` returns
+                // `None` and tier 2 can never confirm it.
+                want: Wanted {
+                    session_id: Some("first".into()),
+                    since_ms: None,
+                },
                 owned: false,
+                rivals: Vec::new(),
                 attached: unattached(),
             },
             SessionTelemetry::new(),
@@ -997,6 +1732,69 @@ mod tests {
     }
 
     #[test]
+    fn an_unowned_log_appended_before_attach_sends_no_update() {
+        // The watcher half of the defect (the overlay half is `open()`'s resolution).
+        // A tab whose hint confirms nothing sits in a project directory another
+        // application is actively writing in. Before this, re-resolution ranked the
+        // directory, adopted the foreign log on its first append and handed it up as
+        // an `Update` — the same defect one frame later, differing only in which side
+        // of the channel it arrived on.
+        //
+        // The assertion is that NOTHING is sent, not that what is sent gets refused:
+        // an `Update` the overlay declines has still had the foreign file opened,
+        // read and folded into a snapshot, and one caller that forgets to consult
+        // `owned` puts it on screen. Strictness belongs where the file is chosen.
+        //
+        // Mechanically: `want` confirms nothing, so re-resolution answers `None` on
+        // every callback; the watch began with no target at all, so it never acquires
+        // one and the callback returns before it reads a byte.
+        use std::io::Write;
+        use std::time::Duration;
+
+        let dir = temp_dir("unownedpreattach");
+        let foreign = dir.join("foreign.jsonl");
+        std::fs::write(
+            &foreign,
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-07-23T17:06:00.000Z\",\"requestId\":\"f\",\"message\":{\"id\":\"f\",\"usage\":{\"output_tokens\":900}}}\n",
+        )
+        .unwrap();
+
+        let w = LogWatcher::spawn(
+            Watch {
+                dir: dir.clone(),
+                log: None,
+                want: Wanted::default(),
+                owned: false,
+                rivals: Vec::new(),
+                attached: unattached(),
+            },
+            SessionTelemetry::new(),
+            0,
+            || {},
+        )
+        .expect("spawn");
+
+        // The foreign session keeps working while our panel is open and unattached —
+        // precisely the moment the ranked fallback used to adopt it.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&foreign)
+                .unwrap();
+            writeln!(
+                f,
+                r#"{{"type":"assistant","timestamp":"2026-07-28T20:44:00.000Z","requestId":"g","message":{{"id":"g","usage":{{"output_tokens":11}}}}}}"#
+            )
+            .unwrap();
+        }
+
+        assert!(
+            w.rx.recv_timeout(Duration::from_secs(1)).is_err(),
+            "no Update at all — the overlay is never offered the foreign log's telemetry"
+        );
+    }
+
+    #[test]
     fn no_projects_root_means_no_watch_rather_than_a_home_wide_one() {
         // The fallback climbs exactly one level. If ~/.claude/projects itself is
         // absent, no session has ever run anywhere, and arming a recursive watch on
@@ -1011,6 +1809,7 @@ mod tests {
                     log: None,
                     want: Wanted::default(),
                     owned: false,
+                    rivals: Vec::new(),
                     attached: unattached()
                 },
                 SessionTelemetry::new(),
@@ -1023,11 +1822,95 @@ mod tests {
     }
 
     #[test]
+    fn a_frozen_watcher_refuses_a_log_its_hint_would_otherwise_confirm() {
+        // The freeze, pinned INDEPENDENTLY of strict resolution.
+        //
+        // Every other freeze test spawns with a `want` that confirms nothing, so once
+        // resolution went strict they all passed for the wrong reason: the rival was
+        // refused by `resolve_owned_session`, not by the flag. Measured, not guessed —
+        // replacing the guard with `if true || !attached.load(..)` left the whole suite
+        // green, which means the flag could have been deleted outright and CI would not
+        // have noticed. It is this crate's only coordination primitive with `app`, so
+        // that is not an acceptable state to leave it in.
+        //
+        // The separation here is the hint: it names `other`, which tier 1 WOULD confirm.
+        // So resolution positively wants to switch, and the only thing stopping it is
+        // the flag. Remove the guard and this test fails — the accumulator resets to the
+        // rival's totals.
+        use std::io::Write;
+        use std::time::Duration;
+
+        let dir = temp_dir("frozenagainstconfirmable");
+        let mine = dir.join("mine.jsonl");
+        std::fs::write(&mine, "").unwrap();
+        let (t, off) = backfill_telemetry(&mine);
+        let w = LogWatcher::spawn(
+            Watch {
+                dir: dir.clone(),
+                log: Some(mine.clone()),
+                // Names the RIVAL, not ours — the whole point.
+                want: Wanted {
+                    session_id: Some("other".into()),
+                    since_ms: None,
+                },
+                owned: true,
+                rivals: Vec::new(),
+                attached: Arc::new(AtomicBool::new(true)), // the caller already attached
+            },
+            t,
+            off,
+            || {},
+        )
+        .expect("spawn");
+
+        let append = |path: &std::path::Path, id: &str, out: u64| {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            writeln!(
+                f,
+                r#"{{"type":"assistant","requestId":"{id}","message":{{"id":"{id}","usage":{{"output_tokens":{out}}}}}}}"#
+            )
+            .unwrap();
+        };
+
+        append(&mine, "a", 10);
+        assert_eq!(
+            w.rx.recv_timeout(Duration::from_secs(10))
+                .expect("our own append")
+                .snap
+                .total_output,
+            10
+        );
+
+        // The log the hint NAMES appears. An unfrozen watcher confirms it by id,
+        // switches, and resets the accumulator to 999.
+        append(&dir.join("other.jsonl"), "z", 999);
+        append(&mine, "b", 5);
+        let mut last = None;
+        while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(3)) {
+            last = Some(s);
+        }
+        assert_eq!(
+            last.expect("still ours").snap.total_output,
+            15,
+            "cumulative on OUR log — the flag held against a log resolution would have confirmed"
+        );
+    }
+
+    #[test]
     fn an_attached_caller_freezes_the_target() {
         // Once the caller says it has attached, another session writing in the same
         // project must not steal the watch — that would reset the accumulator and
         // replace data already on screen, which is exactly what the panel must never
         // do. The watcher holds no copy of the ownership rule; it reads this flag.
+        //
+        // NOTE: with strict resolution this one also passes degenerately (its empty
+        // `want` confirms nothing, so the rival is refused twice over). The freeze is
+        // pinned independently by
+        // `a_frozen_watcher_refuses_a_log_its_hint_would_otherwise_confirm` above.
         use std::io::Write;
         use std::time::Duration;
 
@@ -1042,6 +1925,7 @@ mod tests {
                 log: Some(mine.clone()),
                 want: Wanted::default(),
                 owned: false,
+                rivals: Vec::new(),
                 attached,
             },
             t,
@@ -1112,8 +1996,26 @@ mod tests {
             Watch {
                 dir: dir.clone(),
                 log: Some(a.clone()),
-                want: Wanted::default(),
+                // The hint names `b`, so tier 1 confirms it for the first phase —
+                // without it strict re-resolution answers `None` and the take-over
+                // below could never happen.
+                //
+                // READ THIS BEFORE TRUSTING THE SECOND PHASE: `c` is then refused for
+                // TWO independent reasons — the frozen flag, which is what this test
+                // was written for, and the fact that the hint does not confirm `c`
+                // either. Removing the `attached` guard alone would not make this
+                // test fail. Stated rather than hidden: one `want` can name only one
+                // id, so a fixture that keeps the first phase working cannot also make
+                // `c` confirmable, and the freeze is no longer separable here. What the
+                // test still pins on its own is the first phase and the sequencing:
+                // a confirmed newcomer is adopted while the caller is free, and the
+                // totals never regress afterwards.
+                want: Wanted {
+                    session_id: Some("b".into()),
+                    since_ms: None,
+                },
                 owned: false,
+                rivals: Vec::new(),
                 attached: attached.clone(),
             },
             t,
@@ -1196,6 +2098,7 @@ mod tests {
                 log: Some(log.clone()),
                 want: Wanted::default(),
                 owned: false,
+                rivals: Vec::new(),
                 attached: unattached(),
             },
             t,
@@ -1259,6 +2162,7 @@ mod tests {
                 log: Some(log.clone()),
                 want: Wanted::default(),
                 owned: false,
+                rivals: Vec::new(),
                 attached: unattached(),
             },
             t,

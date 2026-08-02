@@ -29,6 +29,16 @@ pub struct SessionHint {
     /// its first event just after this — the fallback when the id is not on the
     /// command line, and *only* a fallback: it dates a session rather than naming it.
     pub started_ms: Option<u64>,
+    /// Start times of the OTHER live `claude` processes working in the same directory —
+    /// sibling tabs of this app, and other applications' sessions alike.
+    ///
+    /// `started_ms` alone dates a session but cannot *assign* one: two tabs opened
+    /// seconds apart in one project each look like a plausible owner of the other's log.
+    /// These turn the question into an assignment — a log belongs to the latest process
+    /// that started at or before its first event — which is the only thing that separates
+    /// two tabs whose own timings are indistinguishable. Empty when the process table is
+    /// unreadable, which degrades to the timing rule alone.
+    pub rival_starts: Vec<u64>,
 }
 
 impl SessionHint {
@@ -55,10 +65,50 @@ pub fn hint_for(shell_pid: u32) -> Option<SessionHint> {
     let table = ProcTable::read()?;
     let root = resolved_root(shell_pid);
     let claude = choose_claude(root, shell_pid, |p| table.find_claude(p), cwd_of_pid)?;
+    let mine = cwd_of_pid(claude);
+    let started = start_ms(claude);
     Some(SessionHint {
-        session_id: table.resume_id(claude),
-        started_ms: start_ms(claude),
+        // Ask the process what session it is running, before trying to infer it.
+        // `--resume` is only the argv spelling of the same question and stays as the
+        // fallback for a `claude` old enough not to write the registry file.
+        session_id: registered_id(claude, started).or_else(|| table.resume_id(claude)),
+        started_ms: started,
+        rival_starts: table.rival_starts(claude, mine.as_deref(), cwd_of_pid, start_ms),
     })
+}
+
+/// How far after the true process start `claude` may record itself before we stop
+/// believing the record belongs to this process. Measured at 1.3–2.0s across five live
+/// sessions (2026-08-01); a minute is far beyond that and still far below the gap that a
+/// recycled pid would show.
+const REGISTRY_DRIFT_MS: u64 = 60_000;
+
+/// The session id `claude` recorded for its own pid, validated against this process.
+///
+/// The validation is not ceremony. `~/.claude/sessions/` holds a file per pid and they
+/// outlive the process — the sample that motivated this had **5 files for 4 live
+/// processes** — so on a recycled pid an unvalidated read names a stranger's session with
+/// total confidence, which is precisely the failure this feature exists to remove. A
+/// record may only be believed when it was written just *after* the process we are asking
+/// about started.
+fn registered_id(pid: u32, started_ms: Option<u64>) -> Option<String> {
+    registered_id_with(ai_monitor::registered_session, pid, started_ms)
+}
+
+/// The rule, with the file read injected so the guard is testable without a real
+/// `~/.claude/sessions` or a live process.
+fn registered_id_with(
+    read: impl FnOnce(u32) -> Option<ai_monitor::Registered>,
+    pid: u32,
+    started_ms: Option<u64>,
+) -> Option<String> {
+    let started = started_ms?;
+    let reg = read(pid)?;
+    // `checked_sub` is the stale-file test, not arithmetic hygiene: a record written
+    // BEFORE the process we are asking about started cannot describe it, so `None` here
+    // is the answer rather than an error to paper over with `saturating_sub`.
+    let drift = reg.started_at_ms.checked_sub(started)?;
+    (drift <= REGISTRY_DRIFT_MS).then_some(reg.session_id)
 }
 
 /// How long to wait for the tmux root before giving up and deriving from the tab's own shell.
@@ -107,14 +157,18 @@ fn resolved_root_with(resolve: impl FnOnce(u32) -> u32 + Send + 'static, shell_p
 /// machine-dependent.
 ///
 /// The cwd gate is the part that prevents a regression rather than adding a feature. Without it,
-/// a pane working in a *different* project yields a hint that `resolve_session` applies to the
-/// **tab shell's** projects directory: the session id names no file there, so control reaches the
-/// `since_ms` branch, whose filter is one-sided (`first + SLACK >= since`) and therefore admits
-/// any log started after the pane, returning the nearest with `owned: true` — which the overlay
-/// then latches. A ranked guess would have become a confidently wrong, sticky attachment. So a
-/// pane result is admitted **only** on a positive `Some(a) == Some(b)` cwd match; a divergent or
-/// unreadable cwd falls through to the tab's own subtree, which is exactly what today's code
-/// searches.
+/// a pane working in a *different* project yields a hint that resolution applies to the **tab
+/// shell's** projects directory: the session id names no file there, so control reaches the
+/// `since_ms` branch, whose filter is asymmetric (`since - LEAD <= first <= since + SLACK`,
+/// `specs/ai-monitor-session-isolation/spec.md` D3). Two-sided is narrower, not sufficient: a pane
+/// working elsewhere can still have started within ±120s of a log in the *tab's* project
+/// directory — two processes a minute apart is an ordinary morning — and that log comes back
+/// `owned: true`, which the overlay then latches. Strict resolution makes such a false
+/// confirmation **worse** than it was, not better: it is now the only thing that can reach the
+/// panel, there is no ranked fallback below it to soften the error, and a confirmed non-empty
+/// result is attached to permanently. So a pane result is admitted **only** on a positive
+/// `Some(a) == Some(b)` cwd match; a divergent or unreadable cwd falls through to the tab's own
+/// subtree, which is exactly what today's code searches.
 fn choose_claude(
     root: u32,
     shell_pid: u32,
@@ -257,6 +311,35 @@ impl ProcTable {
     }
 
     /// The id in `--resume <id>`, when the process was started that way.
+    /// Start times of every OTHER live `claude` working in `mine`.
+    ///
+    /// Deliberately not limited to this app's tabs: the question tier 2 has to answer is
+    /// "did some other process write this log", and Warp's `claude` answers it exactly as
+    /// well as a sibling tab's. The whole process table is already in hand
+    /// (`ps -axo`), so this costs one `cwd_of_pid` + `start_ms` per `claude` on the
+    /// machine — single digits in practice, and it runs at panel-open, never per frame.
+    ///
+    /// A rival whose cwd cannot be read is skipped rather than assumed to match: claiming
+    /// a rival that is not there would refuse a log that really is ours, and failing to
+    /// identify our own session must never be worse than not having looked.
+    fn rival_starts(
+        &self,
+        mine_pid: u32,
+        mine_cwd: Option<&std::path::Path>,
+        cwd_of: impl Fn(u32) -> Option<PathBuf>,
+        start_of: impl Fn(u32) -> Option<u64>,
+    ) -> Vec<u64> {
+        let Some(mine_cwd) = mine_cwd else {
+            return Vec::new(); // cannot compare projects; claim nothing
+        };
+        self.rows
+            .iter()
+            .filter(|(pid, _)| **pid != mine_pid && self.is_claude(**pid))
+            .filter(|(pid, _)| cwd_of(**pid).as_deref() == Some(mine_cwd))
+            .filter_map(|(pid, _)| start_of(*pid))
+            .collect()
+    }
+
     fn resume_id(&self, pid: u32) -> Option<String> {
         let (_, args) = self.rows.get(&pid)?;
         let mut toks = args.split_whitespace();
@@ -363,6 +446,91 @@ mod tests {
             None,
             "claude itself has no claude under it"
         );
+    }
+
+    #[test]
+    fn a_recycled_pid_never_inherits_the_dead_process_s_session() {
+        // The guard that makes reading `~/.claude/sessions/<pid>.json` safe at all.
+        //
+        // Those files outlive the process that wrote them — the sample this was built
+        // from held 5 files for 4 live `claude` processes — so a pid handed out again
+        // later finds a record describing a stranger's session and, being an exact
+        // session id, it would be believed completely. That is this feature's original
+        // defect with more confidence behind it, so the record is only trusted when it was
+        // written just *after* the process now holding the pid started.
+        const START: u64 = 1_785_449_383_000;
+        let reg = |at: u64| {
+            move |_pid: u32| {
+                Some(ai_monitor::Registered {
+                    session_id: "2b1ca0f2-8a99-4aff-90f1-115839f17f01".into(),
+                    cwd: PathBuf::from("/proj/a"),
+                    started_at_ms: at,
+                })
+            }
+        };
+
+        // Written 1.7s after this process started — the measured norm. Believed.
+        assert_eq!(
+            registered_id_with(reg(START + 1_700), 45326, Some(START)).as_deref(),
+            Some("2b1ca0f2-8a99-4aff-90f1-115839f17f01")
+        );
+        // Exactly at the drift limit, and one millisecond past it.
+        assert!(registered_id_with(reg(START + REGISTRY_DRIFT_MS), 45326, Some(START)).is_some());
+        assert_eq!(
+            registered_id_with(reg(START + REGISTRY_DRIFT_MS + 1), 45326, Some(START)),
+            None
+        );
+        // Written BEFORE this process existed: a leftover from the pid's last owner.
+        assert_eq!(registered_id_with(reg(START - 1), 45326, Some(START)), None);
+        assert_eq!(
+            registered_id_with(reg(START - 86_400_000), 45326, Some(START)),
+            None,
+            "a day-old record for a recycled pid claims nothing"
+        );
+        // No record, or no readable process start: infer nothing.
+        assert_eq!(registered_id_with(|_| None, 45326, Some(START)), None);
+        assert_eq!(registered_id_with(reg(START + 1_700), 45326, None), None);
+    }
+
+    #[test]
+    fn rival_starts_names_every_other_claude_in_the_same_project() {
+        // The signal that turns "date this session" into "assign this session". SAMPLE
+        // holds four `claude` processes: 35303 and 35404 under this app's two tabs, 10502
+        // under Warp, and the caller. Pure here — both syscalls are injected — so this is
+        // table-testable with no live process.
+        let t = ProcTable::parse(SAMPLE);
+        let proj = PathBuf::from("/proj/a");
+        let cwd = |pid: u32| {
+            Some(PathBuf::from(match pid {
+                10502 => "/proj/elsewhere", // Warp, but working somewhere else
+                _ => "/proj/a",
+            }))
+        };
+        let start = |pid: u32| Some(1_000_000 + u64::from(pid));
+
+        // From 35303's point of view: its sibling tab counts, Warp-in-another-project
+        // does not, and it never lists itself.
+        let mut got = t.rival_starts(35303, Some(&proj), cwd, start);
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![1_035_404],
+            "the sibling tab's claude, and only it"
+        );
+
+        // Warp working in the SAME project is a rival like any other — the rule is about
+        // which process wrote the log, not which application it belongs to.
+        let same = |_: u32| Some(PathBuf::from("/proj/a"));
+        let mut got = t.rival_starts(35303, Some(&proj), same, start);
+        got.sort_unstable();
+        assert_eq!(got, vec![1_010_502, 1_035_404]);
+
+        // An unreadable cwd claims nothing rather than guessing: a rival invented here
+        // would refuse a log that really is ours.
+        assert!(t.rival_starts(35303, None, same, start).is_empty());
+        assert!(t
+            .rival_starts(35303, Some(&proj), |_| None, start)
+            .is_empty());
     }
 
     #[test]
@@ -548,8 +716,10 @@ mod tests {
     #[test]
     fn a_pane_working_elsewhere_is_not_admitted() {
         // R4.1 — the regression this gate exists to prevent. Without it the pane's started_ms
-        // reaches resolve_session against the TAB's projects dir, whose one-sided since_ms
-        // filter would return a wrong log with owned:true — a sticky, confident mistake.
+        // reaches resolution against the TAB's projects dir, whose asymmetric since_ms filter
+        // (`since - LEAD <= first <= since + SLACK`) still admits a wrong log that merely began within
+        // ±120s of the pane's claude, returning it with owned:true. Under strict resolution that
+        // mistake is worse than it was: nothing ranks below it, and the panel attaches for good.
         let t = ProcTable::parse(TMUX_SAMPLE);
         let divergent = |pid: u32| {
             Some(PathBuf::from(if pid == 74922 {

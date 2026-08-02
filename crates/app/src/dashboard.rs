@@ -104,6 +104,12 @@ pub struct Env {
     pub attached: bool,
     /// `[ai_monitor] context_window` from the TOML config, overriding the table.
     pub context_window: Option<u64>,
+    /// Whether the tab this panel belongs to is running a `claude` process at all —
+    /// answered by walking the tab's process tree in `overlay.rs`, which is why it is
+    /// injected rather than derived: [`compose`] reads no process table, and a
+    /// snapshot that does not exist carries nothing to derive it from. It selects
+    /// which of the two [`Detached::NoLog`] wordings the session row shows.
+    pub tab_has_claude: bool,
 }
 
 /// The window for `model`, or `None` when no prefix matches.
@@ -165,6 +171,14 @@ pub fn compose(snap: Option<&TelemetrySnapshot>, env: &Env) -> Vec<String> {
 }
 
 /// Why a resolved log is not being shown as this window's session.
+///
+/// `StaleSince` and `Undated` describe a log that *was* resolved and then declined —
+/// which production no longer produces: strict resolution means a log this tab cannot
+/// prove is its own is never resolved in the first place, so "not attached" collapses
+/// to `NoLog`. Both variants are reachable only through the `resolve_session` ranked
+/// fallback, which is retained under test and has no production caller. They are kept
+/// (and worded, and tested) for that contract rather than deleted on the strength of
+/// one release's call graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Detached {
     /// Its last event predates the window. Carries that time, so the row can say
@@ -389,7 +403,18 @@ pub fn summary(t: &TelemetrySnapshot, env: &Env, detached: Option<Detached>) -> 
             dur(env.now_ms.saturating_sub(last))
         ),
         Some(Detached::Undated) => "(no active session — newest log is undated)".to_string(),
-        Some(Detached::NoLog) => "(no active session)".to_string(),
+        // Nothing resolved — which under strict resolution is the ordinary empty
+        // state, so it has to say *which* nothing this is. The key is whether the tab
+        // runs a `claude` process, deliberately NOT whether its hint was usable: a
+        // live `claude` started without `--resume`, or whose start time could not be
+        // read, yields an empty hint, and telling the user there is no session in a
+        // tab where they can watch `claude` running reads as a bug. Being slightly
+        // optimistic when the real cause was an unreadable process is the cheaper
+        // error of the two.
+        Some(Detached::NoLog) if env.tab_has_claude => {
+            "(this tab's session has not written a log yet)".to_string()
+        }
+        Some(Detached::NoLog) => "(no Claude session in this tab)".to_string(),
         None => {
             let mut ident = vec![
                 t.session_id
@@ -704,11 +729,14 @@ pub fn dur(ms: u64) -> String {
 mod tests {
     /// A default environment at `now`: attached (so nothing is detached) and no
     /// configured window, so every pre-existing expectation keeps its meaning.
+    /// `tab_has_claude` is irrelevant while attached — it only selects between the two
+    /// `NoLog` wordings — so it takes the same `false` the derived `Default` would.
     fn env(now: u64) -> Env {
         Env {
             now_ms: now,
             attached: true,
             context_window: None,
+            tab_has_claude: false,
         }
     }
 
@@ -1441,6 +1469,7 @@ mod tests {
                 now_ms: now,
                 attached: false,
                 context_window: None,
+                tab_has_claude: false,
             },
         )
         .join("\n");
@@ -1467,6 +1496,7 @@ mod tests {
                     now_ms: now,
                     attached: true,
                     context_window: None,
+                    tab_has_claude: false,
                 },
             )
             .join("\n");
@@ -1488,6 +1518,7 @@ mod tests {
                     now_ms: now,
                     attached: false,
                     context_window: None,
+                    tab_has_claude: false,
                 },
             )
             .join("\n")
@@ -1502,9 +1533,10 @@ mod tests {
         // A log with content but no clock: say that instead of inventing an age.
         t.last_event_ms = None;
         assert!(unattached(&t).contains("newest log is undated"));
-        // No log at all: claim nothing about a log.
+        // No log at all: claim nothing about a log. `tab_has_claude: false` above, so
+        // this is the no-process wording.
         let none = unattached(&TelemetrySnapshot::default());
-        assert!(none.contains("(no active session)"), "{none}");
+        assert!(none.contains("(no Claude session in this tab)"), "{none}");
         assert!(
             !none.contains("undated") && !none.contains("idle"),
             "{none}"
@@ -1521,10 +1553,85 @@ mod tests {
                 now_ms: 1_785_226_000_000,
                 attached: false,
                 context_window: None,
+                tab_has_claude: false,
             },
         );
         assert_eq!(out.len(), 9, "five empty sections + the summary block");
-        assert!(out.join("\n").contains("(no active session)"));
+        assert!(out.join("\n").contains("(no Claude session in this tab)"));
+    }
+
+    /// The unattached, nothing-resolved environment the two wordings are keyed in.
+    fn no_session(now: u64, tab_has_claude: bool) -> Env {
+        Env {
+            now_ms: now,
+            attached: false,
+            context_window: None,
+            tab_has_claude,
+        }
+    }
+
+    #[test]
+    fn a_tab_with_no_claude_process_is_told_exactly_that() {
+        // R7.5 — the everyday case: a tab that simply is not running Claude Code.
+        let out = compose(None, &no_session(1_785_226_000_000, false)).join("\n");
+        assert!(out.contains("(no Claude session in this tab)"), "{out}");
+        assert!(!out.contains("has not written a log"), "{out}");
+    }
+
+    #[test]
+    fn a_tab_running_claude_with_nothing_confirmed_is_told_the_other_thing() {
+        // R7.6 — the reported case: `claude` is running in this tab and the user can
+        // watch it, but no log in the project directory can be confirmed as its own.
+        // "(no Claude session in this tab)" here would read as a bug, which is why the
+        // wording is keyed on process presence rather than on the hint's usability.
+        let out = compose(None, &no_session(1_785_226_000_000, true)).join("\n");
+        assert!(
+            out.contains("(this tab's session has not written a log yet)"),
+            "{out}"
+        );
+        assert!(!out.contains("(no Claude session in this tab)"), "{out}");
+    }
+
+    #[test]
+    fn nothing_resolved_leaks_nothing_from_the_session_that_was_declined() {
+        // R0.1 — the goal-level assertion, and the whole reason this feature exists.
+        // The foreign values are taken from a REAL snapshot rather than written out as
+        // literals, so the test cannot pass by asserting the absence of strings this
+        // dashboard never emits: every one of these does appear when that snapshot is
+        // composed attached (asserted below), and none may appear when strict
+        // resolution answered `None`.
+        let (foreign, now) = populated();
+        let leaked = compose(Some(&foreign), &env(now)).join("\n");
+        let markers = [
+            "5e59b629",      // session id, as the row truncates it
+            "claude-opus-5", // model
+            "19.3K",         // spend (output)
+            "1.9M",          // spend (cache)
+            "context 59%",   // occupancy
+            "up 45m12s",     // uptime
+        ];
+        for m in markers {
+            assert!(leaked.contains(m), "fixture no longer emits {m}:\n{leaked}");
+        }
+
+        for tab_has_claude in [false, true] {
+            let out = compose(None, &no_session(now, tab_has_claude)).join("\n");
+            for m in markers {
+                assert!(
+                    !out.contains(m),
+                    "{m} leaked from a foreign session:\n{out}"
+                );
+            }
+            // ... and it is not merely blank: the row says which nothing this is.
+            assert!(
+                out.contains(if tab_has_claude {
+                    "(this tab's session has not written a log yet)"
+                } else {
+                    "(no Claude session in this tab)"
+                }),
+                "{out}"
+            );
+        }
     }
 
     #[test]
@@ -1537,6 +1644,7 @@ mod tests {
                 now_ms: now,
                 attached: false,
                 context_window: None,
+                tab_has_claude: false,
             },
         ) {
             assert!(line.chars().count() <= RULE_COLS, "{line}");
@@ -1569,6 +1677,7 @@ mod tests {
                 now_ms: now,
                 attached: true,
                 context_window: Some(1_000_000),
+                tab_has_claude: false,
             },
         )
         .join("\n");
@@ -1587,7 +1696,8 @@ mod tests {
                 &Env {
                     now_ms: now,
                     attached: true,
-                    context_window: Some(200_000)
+                    context_window: Some(200_000),
+                    tab_has_claude: false,
                 }
             ),
             Some(59)
