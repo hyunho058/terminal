@@ -9,7 +9,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use notify::{RecursiveMode, Watcher};
 use serde_json::Value;
@@ -63,6 +63,23 @@ pub struct Registered {
     pub started_at_ms: u64,
 }
 
+/// Another live `claude` working in the same project — a sibling tab of this app, or any
+/// other application's session.
+///
+/// Carries **process facts only**: the pid, and when that process started. It deliberately
+/// does NOT carry the rival's session id, even though the caller could read it once at
+/// panel-open. The watch thread re-reads each rival's record while unattached (a rival in
+/// its first ~2s has no record yet, and that is exactly the state in which it would
+/// otherwise keep vetoing), so a resolved id would be stale by the time it mattered. The
+/// pid is a filename key into `~/.claude/sessions/`; this crate never queries the kernel
+/// with it — that stays in `app`, which owns `libc`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rival {
+    pub pid: u32,
+    /// The rival process's start time, epoch millis, measured by the caller.
+    pub started_ms: u64,
+}
+
 /// Read `<root>/<pid>.json`. Split from [`registered_session`] so it is testable without
 /// a real `$HOME`. Any missing field, bad JSON, or unreadable file yields `None` — this
 /// is an undocumented on-disk detail of another program, so it must never be load-bearing
@@ -81,6 +98,31 @@ pub fn registered_session_in(sessions_root: &Path, pid: u32) -> Option<Registere
 pub fn registered_session(pid: u32) -> Option<Registered> {
     let home = std::env::var_os("HOME")?;
     registered_session_in(&PathBuf::from(home).join(".claude").join("sessions"), pid)
+}
+
+/// How far after a process's true start `claude` may record itself before we stop believing
+/// the record describes *that* process.
+///
+/// Measured at 1.3–2.0s across five live sessions (2026-08-01) and again at +2.2s on
+/// 2026-08-02; a minute is far beyond that. The bound exists for **pid reuse**:
+/// `~/.claude/sessions/` files outlive their processes (5 files for 4 live processes, when
+/// measured), so a recycled pid can present a stranger's record.
+pub const REGISTRY_DRIFT_MS: u64 = 60_000;
+
+/// The session id in `reg`, believed only if the record post-dates the process now holding
+/// that pid — `None` when it cannot be trusted.
+///
+/// **One rule, one function** (R3.3). This is applied to our *own* tab's record by
+/// `app::tabsession` and to every *rival's* record by [`resolve_owned_session`]. It lived
+/// only in `app` before, and duplicating it here for rivals is exactly the shape that has
+/// already produced two defects in this feature: two copies of a rule that must agree.
+///
+/// `checked_sub` is the stale-file test, not arithmetic hygiene — a record written BEFORE
+/// the process started cannot describe it, so `None` is the answer rather than something to
+/// paper over with `saturating_sub`.
+pub fn validated_session_id(reg: &Registered, process_start_ms: u64) -> Option<&str> {
+    let drift = reg.started_at_ms.checked_sub(process_start_ms)?;
+    (drift <= REGISTRY_DRIFT_MS).then_some(reg.session_id.as_str())
 }
 
 /// `~/.claude/projects` (or `None` if `$HOME` is unset).
@@ -174,12 +216,26 @@ pub struct Resolved {
 /// stick. Sessions genuinely older than the process are named by tier 1
 /// (`claude --resume <id>`), which never reaches this bound.
 ///
-/// **This bound does not apply to a sole, unrivalled candidate.** A tab where `claude`
-/// runs but the user does not type for a long time writes its first event well past 120s;
-/// that log is still adopted, because uniqueness plus the rival test (see
-/// `resolve_owned_session`) account for it without needing distance.
-/// `the_upper_bound_stops_at_120s_after_the_process` covers both halves: the bound
-/// separates *rivals*, and a lone candidate passes it by.
+/// **This bound does not apply to a sole candidate with no EFFECTIVE, KNOWN rivals.** A tab
+/// where `claude` runs but the user does not type for a long time writes its first event
+/// well past 120s; that log is still adopted, because uniqueness accounts for it without
+/// needing distance. `the_upper_bound_stops_at_120s_after_the_process` covers both halves:
+/// the bound separates *rivals*, and a lone candidate passes it by.
+///
+/// Both qualifiers are load-bearing, and "unrivalled" now names a condition the code
+/// branches on rather than a figure of speech. The sentence previously read:
+///
+/// > **This bound does not apply to a sole, unrivalled candidate.**
+///
+/// which left two readings open, and the wrong one is reachable in each direction:
+/// - *effective* — a rival whose own record names a different session did not write this
+///   log and does not count. Counting the raw list instead makes the rival fix inert: for a
+///   rival to have vetoed us it must satisfy `since < r <= first`, which forces
+///   `first − since >= r − since`, so any rival far enough out to veto also pushes the log
+///   past this bound. Lifting the veto then changes nothing.
+/// - *known* — an empty rival list is also what a FAILED enumeration looks like (an
+///   unreadable cwd, ours or a rival's). Since this exemption adopts at unbounded distance
+///   with `owned: true`, granting it on a failed read confirms a foreign log and latches it.
 ///
 /// Two earlier drafts of this paragraph are worth naming, since decisions were taken on
 /// each. The first said such a tab "fills in on the first write" — false: `since_ms` is
@@ -231,7 +287,29 @@ const FIRST_EVENT_LEAD_MS: u64 = 5_000;
 /// process that started at or before its first event, so a rival that started after us
 /// but still before the log was written owns it, not us. Pass `&[]` when unknown; the
 /// rule then degrades to the distance test alone, which is where this started.
-pub fn resolve_owned_session(dir: &Path, want: &Wanted, rivals: &[u64]) -> Option<Resolved> {
+/// `rivals_known` says whether the caller could actually enumerate the rivals, as opposed
+/// to handing back an empty list because a read failed. It gates the uniqueness rescue:
+/// an empty rival set is a *privilege* under that rule, and a privilege must never be
+/// granted by a failed read.
+pub fn resolve_owned_session(
+    dir: &Path,
+    want: &Wanted,
+    rivals: &[Rival],
+    rivals_known: bool,
+) -> Option<Resolved> {
+    resolve_owned_session_with(dir, want, rivals, rivals_known, registered_session)
+}
+
+/// [`resolve_owned_session`]'s body, generic over the registry read so the rival rules are
+/// testable without a real `~/.claude/sessions` — the same split `app`'s
+/// `registered_id_with` and `resolved_root_with` already use.
+fn resolve_owned_session_with(
+    dir: &Path,
+    want: &Wanted,
+    rivals: &[Rival],
+    rivals_known: bool,
+    read: impl Fn(u32) -> Option<Registered>,
+) -> Option<Resolved> {
     // Named outright: nothing to rank, and nothing to fall back to.
     //
     // A session id here is *authoritative* — it comes from `claude` naming its own session
@@ -247,7 +325,22 @@ pub fn resolve_owned_session(dir: &Path, want: &Wanted, rivals: &[u64]) -> Optio
             owned: true,
         });
     }
-    // Dated: the caller's process started at `since`, so its session's FIRST event
+    // Dated — the FALLBACK tier, and it is worth being explicit about its standing.
+    //
+    // Tier 1 above answers by NAME, from a record `claude` writes about itself. Measured
+    // 2026-08-02 on 2.1.220: that record appears 1.1-2.2s after process start, with no
+    // activity required, through a plain pty, through zsh, through a generated ZDOTDIR and
+    // through this app's own PTY. So in the ordinary case tier 2 is never reached.
+    //
+    // It is NOT vestigial, and must not be documented as covering a closed list of cases.
+    // The registry is another program's undocumented on-disk detail (see `Registered`,
+    // which states it "must never be load-bearing beyond 'use it when it is there'"), and
+    // in the same 2026-08-02 sample 1 of 5 live `claude` processes had no record after
+    // 1h17m for reasons never identified. Tier 2 exists because tier 1 can be absent for
+    // reasons we do not control — which is also why the uniqueness rescue below was
+    // narrowed rather than deleted.
+    //
+    // The caller's process started at `since`, so its session's FIRST event
     // follows shortly AFTER — never before. The two sides of this window mean different
     // things and are sized differently on purpose: below is a clock-skew allowance on an
     // impossibility, above is a real tolerance for how long a session may take to write.
@@ -266,13 +359,27 @@ pub fn resolve_owned_session(dir: &Path, want: &Wanted, rivals: &[u64]) -> Optio
         // start. Without this, two tabs opened seconds apart in one project each see the
         // other's session as plausibly their own, which is the defect this feature has
         // now been through twice: once with the tabs one way round, once the other.
-        let after: Vec<(u64, PathBuf)> = candidates(dir)
+        // Which session each rival is running, read once for the whole call (R5.4).
+        let claims = rival_claims(rivals, &read);
+        // Whether any rival could still be THIS candidate's writer, per candidate. A rival
+        // that names another session is not merely out-voted, it is out of the question —
+        // and D3's rescue keys on this *effective* emptiness rather than on `rivals.len()`.
+        // Testing the raw list instead makes the two rules cancel: a rival far enough out
+        // to have vetoed us also puts the log outside the slack, so lifting the veto
+        // changes nothing. That is not hypothetical — it is this feature's own reported
+        // timeline (rival at +28s, first event at +900s).
+        // Contested-ness travels WITH each candidate rather than being accumulated across
+        // the loop: a rival that contests some other candidate says nothing about this one,
+        // and the rescue is decided for the single candidate that survives.
+        let after: Vec<(u64, PathBuf, bool)> = candidates(dir)
             .into_iter()
             .filter_map(|p| {
-                let first = first_event(&p)?;
+                let (first, content_id) = head_facts(&p);
+                let first = first?;
                 if first + FIRST_EVENT_LEAD_MS < since {
                     return None; // predates us: impossible
                 }
+                let cand_id = candidate_identity(&p, content_id);
                 // `<= first`, with NO skew allowance — deliberately asymmetric with the
                 // test above, because the two comparisons mean different things.
                 //
@@ -284,27 +391,66 @@ pub fn resolve_owned_session(dir: &Path, want: &Wanted, rivals: &[u64]) -> Optio
                 // symmetry, and it blanked the panel of the tab that actually wrote the
                 // log whenever a second tab opened within LEAD of it — the ordinary
                 // workflow, and a worse failure than the one it was fixing.
-                let outranked = rivals.iter().any(|&r| r > since && r <= first);
-                (!outranked).then_some((first, p))
+                //
+                // D9's three outcomes replace the bare start-time test. A rival is only
+                // *inferred* to outrank us when nothing is known about it; when its own
+                // record names a session, that record answers the question directly and
+                // timing is not consulted at all.
+                let mut outranked = false;
+                let mut contested = false;
+                for (r_start, r_id) in &claims {
+                    match claim_of(r_id.as_deref(), cand_id.as_deref()) {
+                        // Outcome 1 — it owns this log. Absolute: no distance, slack or
+                        // uniqueness rule can hand it to us.
+                        Claim::OwnsIt => {
+                            outranked = true;
+                            contested = true;
+                        }
+                        // Outcome 2 — it is writing some other session, or has written
+                        // nothing at all. Either way it did not write THIS log, so it
+                        // neither vetoes nor counts against the rescue.
+                        Claim::Elsewhere => {}
+                        // Outcome 3 — nothing known: the original timing veto stands.
+                        Claim::Unknown => {
+                            contested = true;
+                            if *r_start > since && *r_start <= first {
+                                outranked = true;
+                            }
+                        }
+                    }
+                }
+                (!outranked).then_some((first, p, contested))
             })
             .collect();
-        // Uniqueness discriminates where distance cannot, and the rival test above is
-        // what makes it safe: if exactly one session began after us and no better-placed
-        // process exists, it is ours however long the user sat at the splash before
-        // typing. The alternative is a panel empty for the life of the tab, since `since`
-        // is the process start and never moves — no re-resolution can rescue a first
-        // event past the slack.
+        // Uniqueness discriminates where distance cannot: if exactly one session began
+        // after us and nothing else can account for it, it is ours however long the user
+        // sat at the splash before typing. The alternative is a panel empty for the life
+        // of the tab, since `since` is the process start and never moves.
         //
-        // With two or more, uniqueness proves nothing and proximity takes over: the
-        // nearest inside the slack, or nothing.
+        // TWO conditions gate it, and each closes a defect this feature actually shipped:
+        //
+        // - `!contested` — no rival could still be THIS candidate's writer. Keying on the
+        //   raw rival count instead makes the veto fix inert: for a rival to have silenced
+        //   us at all it must satisfy `since < r <= first`, which forces
+        //   `first - since >= r - since`, so any rival far enough out to veto also pushes
+        //   the log past the slack. Lifting the veto then changes nothing and the writer
+        //   stays empty — on this feature's own reported timeline.
+        //
+        // - `rivals_known` — the caller actually enumerated. An empty rival list is also
+        //   what a FAILED read looks like (an unreadable cwd, ours or a rival's), and
+        //   since this arm adopts at unbounded distance with `owned: true`, granting it on
+        //   a failed read would confirm a foreign log and latch it.
+        //
+        // With two or more candidates, uniqueness proves nothing and proximity takes over:
+        // the nearest inside the slack, or nothing.
         let owned = match after.len() {
-            1 => after.into_iter().next(),
+            1 if !after[0].2 && rivals_known => after.into_iter().next(),
             _ => after
                 .into_iter()
-                .filter(|(first, _)| *first <= since.saturating_add(FIRST_EVENT_SLACK_MS))
-                .min_by_key(|(first, _)| first.abs_diff(since)),
+                .filter(|(first, _, _)| *first <= since.saturating_add(FIRST_EVENT_SLACK_MS))
+                .min_by_key(|(first, _, _)| first.abs_diff(since)),
         };
-        if let Some((_, path)) = owned {
+        if let Some((_, path, _)) = owned {
             return Some(Resolved {
                 last_event_ms: last_event_in_tail(&path),
                 path,
@@ -318,14 +464,21 @@ pub fn resolve_owned_session(dir: &Path, want: &Wanted, rivals: &[u64]) -> Optio
 /// Resolve the log for `dir`, preferring one the caller can prove is theirs and
 /// falling back to ranking the directory when nothing confirms.
 ///
-/// **Production calls [`resolve_owned_session`], not this.** This is the
-/// ranked-fallback contract, retained under test with no production caller: it is
+/// **Production calls [`resolve_owned_session`], not this.**
+///
+/// Its behavior is **unchanged** by the rival-assignment work, and structurally so rather
+/// than test-by-test: it hard-codes `&[]` with `rivals_known: true`, so every rule that
+/// change introduced — the per-rival record check, the effective-set gate, the
+/// known/unknown flag — is inert here by construction. The uniqueness rescue is
+/// unconditionally enabled on this path, exactly as before.
+///
+/// This is the ranked-fallback contract, retained under test with no production caller: it is
 /// the only thing keeping [`most_recent_session`]'s ranking, the `owned: false` half
 /// of [`Resolved`], and the app's displacement/re-attach rules exercised. Its
 /// fallback answers "the session that most recently wrote here", which may belong to
 /// any application — never "this tab's session".
 pub fn resolve_session(dir: &Path, want: &Wanted) -> Option<Resolved> {
-    resolve_owned_session(dir, want, &[]).or_else(|| {
+    resolve_owned_session(dir, want, &[], true).or_else(|| {
         most_recent_session(dir).map(|(path, last_event_ms)| Resolved {
             path,
             last_event_ms,
@@ -334,21 +487,96 @@ pub fn resolve_session(dir: &Path, want: &Wanted) -> Option<Resolved> {
     })
 }
 
-/// The first parseable event time in `log`, read from the head — bounded like the
-/// tail read, since only the opening records matter.
-fn first_event(log: &Path) -> Option<u64> {
-    let f = std::fs::File::open(log).ok()?;
+/// What one bounded head read of `log` tells us: when it began, and which session its own
+/// lines say is writing it.
+///
+/// Both come from a **single** read because both are needed per candidate and the read is
+/// the expensive part. `session_id` is the field D13 turns on: it answers "which session is
+/// *writing* this file", where the filename stem only answers "which session *created* it".
+/// The two disagree for a resumed / forked / compacted transcript, which is precisely the
+/// case where trusting the stem hands a live rival's log to the wrong tab.
+fn head_facts(log: &Path) -> (Option<u64>, Option<String>) {
+    let Ok(f) = std::fs::File::open(log) else {
+        return (None, None);
+    };
     let mut buf = Vec::new();
-    f.take(activity::TAIL_CAP).read_to_end(&mut buf).ok()?;
-    String::from_utf8_lossy(&buf)
+    if f.take(activity::TAIL_CAP).read_to_end(&mut buf).is_err() {
+        return (None, None);
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut first = None;
+    let mut session_id = None;
+    for v in text
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter_map(|v| {
-            v.get("timestamp")
+    {
+        if let Some(t) = v
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(telemetry::parse_ts)
+        {
+            first = Some(first.map_or(t, |cur: u64| cur.min(t)));
+        }
+        if session_id.is_none() {
+            session_id = v
+                .get("sessionId")
+                .or_else(|| v.get("session_id"))
                 .and_then(Value::as_str)
-                .and_then(telemetry::parse_ts)
+                .map(str::to_string);
+        }
+    }
+    (first, session_id)
+}
+
+/// How a live rival relates to one candidate log — D9's three outcomes.
+enum Claim {
+    /// Its record names THIS log: the rival owns it and we must never take it.
+    OwnsIt,
+    /// Its record names some OTHER session: it is writing elsewhere, or nowhere, and
+    /// either way it did not write this log. It does not veto.
+    Elsewhere,
+    /// No record, or one that failed validation. Nothing is known, so the start-time
+    /// veto — the only rule available before this change — still applies.
+    Unknown,
+}
+
+/// Which session each rival is running, read ONCE per resolution rather than per candidate
+/// (R5.4: 16 candidates × 3 rivals must cost 3 reads, not 48).
+fn rival_claims(
+    rivals: &[Rival],
+    read: &impl Fn(u32) -> Option<Registered>,
+) -> Vec<(u64, Option<String>)> {
+    rivals
+        .iter()
+        .map(|rv| {
+            let id = read(rv.pid)
+                .and_then(|reg| validated_session_id(&reg, rv.started_ms).map(str::to_string));
+            (rv.started_ms, id)
         })
-        .min()
+        .collect()
+}
+
+/// Classify one rival against one candidate.
+fn claim_of(rival_id: Option<&str>, candidate_id: Option<&str>) -> Claim {
+    match (rival_id, candidate_id) {
+        (Some(r), Some(c)) if r == c => Claim::OwnsIt,
+        (Some(_), _) => Claim::Elsewhere,
+        (None, _) => Claim::Unknown,
+    }
+}
+
+/// The identity of a candidate log: what its own lines say, else its filename stem.
+///
+/// The stem is a **fallback, not a peer**. When the content id is unreadable we know less,
+/// not more, so the comparison must not be allowed to conclude "different session" from it
+/// (R1.5) — callers treat a stem-only match as evidence of ownership and a stem-only
+/// mismatch as no evidence at all.
+fn candidate_identity(path: &Path, content_id: Option<String>) -> Option<String> {
+    content_id.or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+    })
 }
 
 /// The `*.jsonl` files worth considering, newest-touched first and capped.
@@ -558,11 +786,38 @@ pub struct Watch {
     pub want: Wanted,
     /// Whether `log` was confirmed to be the caller's.
     pub owned: bool,
-    /// Start times of the other live `claude` processes in this project — see
-    /// [`resolve_owned_session`]. Captured at spawn alongside `want`.
-    pub rivals: Vec<u64>,
+    /// The other live `claude` processes in this project — see [`resolve_owned_session`].
+    ///
+    /// **Shared, not captured.** Membership changes during an open: a sibling that starts
+    /// `claude` after the panel opened would never veto, so its log could be adopted with
+    /// `owned: true`; a sibling that exits would keep vetoing and silence a tab that now
+    /// legitimately owns its log. The caller republishes through this handle from the
+    /// thread that already enumerates processes; the watcher reads it under the lock and
+    /// clones, never holding it across file I/O.
+    pub rivals: RivalHandle,
     /// Set by the caller once it has attached; the watcher then stops re-resolving.
     pub attached: Arc<AtomicBool>,
+}
+
+/// The live rival set, shared between the producer (`app`) and the watch thread.
+pub type RivalHandle = Arc<Mutex<RivalSet>>;
+
+/// The rivals, and whether that list is a COMPLETE enumeration.
+///
+/// `known: false` is the safe default — it withholds the uniqueness rescue — and it is
+/// what [`Default`] yields, so a caller that forgets to publish cannot accidentally grant
+/// the strongest branch in the resolver.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RivalSet {
+    pub list: Vec<Rival>,
+    pub known: bool,
+}
+
+impl RivalSet {
+    /// A fully-enumerated set.
+    pub fn known(list: Vec<Rival>) -> Self {
+        RivalSet { list, known: true }
+    }
 }
 
 /// One snapshot, and whether the log it came from was confirmed to be the caller's.
@@ -642,8 +897,13 @@ impl LogWatcher {
                     path: newest,
                     owned: newly_owned,
                     ..
-                }) = resolve_owned_session(&dir, &want, &rivals)
-                {
+                }) = {
+                    // Re-read membership AND each rival's record on every re-resolution:
+                    // a sibling in its first ~2s has no record yet, and that is exactly
+                    // the state in which it would otherwise keep vetoing us.
+                    let snapshot = rivals.lock().map(|g| g.clone()).unwrap_or_default();
+                    resolve_owned_session(&dir, &want, &snapshot.list, snapshot.known)
+                } {
                     if Some(&newest) != target.as_ref() {
                         owned = newly_owned;
                         target = Some(newest);
@@ -762,6 +1022,383 @@ impl LogWatcher {
 mod tests {
     use super::*;
 
+    /// A rival identified only by when it started — the shape every tier-2 test used
+    /// before rivals carried a pid. The pid is irrelevant to the timing veto, so these
+    /// get a distinct dummy that resolves to no registry file, which is exactly the
+    /// "no record, fall back to the start-time veto" case they were written for.
+    fn rival(started_ms: u64) -> Rival {
+        Rival {
+            pid: u32::MAX,
+            started_ms,
+        }
+    }
+
+    /// Epoch millis -> RFC3339 UTC, so a test can state a time once as a number instead of
+    /// keeping a hand-computed string in sync with it.
+    fn iso(ms: u64) -> String {
+        let secs = (ms / 1000) as i64;
+        let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        let (h, mi, sec) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+        format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{sec:02}.000Z")
+    }
+
+    /// A rival that registered its own session, `drift_ms` after its process start.
+    fn registered_rival(started_ms: u64, session_id: &str, drift_ms: u64) -> Registered {
+        Registered {
+            session_id: session_id.to_string(),
+            cwd: PathBuf::from("/proj"),
+            started_at_ms: started_ms + drift_ms,
+        }
+    }
+
+    /// Write a log whose FIRST event is `first_ms`, carrying `content_id` on its lines.
+    fn write_log(dir: &Path, stem: &str, first_ms: u64, content_id: Option<&str>) {
+        let ts = iso(first_ms);
+        let sid = match content_id {
+            Some(id) => format!(",\"sessionId\":\"{id}\""),
+            None => String::new(),
+        };
+        std::fs::write(
+            dir.join(format!("{stem}.jsonl")),
+            format!("{{\"type\":\"assistant\",\"timestamp\":\"{ts}\"{sid},\"message\":{{}}}}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_content_id_falls_back_to_the_stem_and_keeps_the_veto() {
+        // R1.5 — the content id is a SHARPER signal than the stem, not a replacement that
+        // may fail open. A log whose head carries no `sessionId` tells us less, so the
+        // comparison must not be allowed to conclude "a different session" from it.
+        //
+        // Here the rival's record names the log's STEM. If the missing content id were
+        // treated as "no match", the rival would be disqualified (outcome 2), the effective
+        // set would empty, and we would adopt the rival's own live log with `owned: true`.
+        const OURS: u64 = 1_785_240_000_000;
+        const RIVAL_START: u64 = OURS - 5_000; // earlier than us: no timing veto to fall back on
+        let dir = temp_dir("no-content-id");
+        write_log(&dir, "theirs", OURS + 1_000, None); // no sessionId on the line
+
+        let want = Wanted {
+            session_id: None,
+            since_ms: Some(OURS),
+        };
+        let read = |_: u32| Some(registered_rival(RIVAL_START, "theirs", 1_000));
+        assert_eq!(
+            resolve_owned_session_with(
+                &dir,
+                &want,
+                &[Rival {
+                    pid: 9,
+                    started_ms: RIVAL_START,
+                }],
+                true,
+                read,
+            ),
+            None,
+            "unreadable content id must not read as 'a different session'"
+        );
+    }
+
+    #[test]
+    fn each_rival_registry_is_read_once_per_resolution_not_once_per_candidate() {
+        // R5.4 — the read is per RIVAL, hoisted out of the candidate loop. Placed naively
+        // inside the per-candidate filter it would be O(candidates x rivals) file reads on
+        // every fs event, stacked on the 16-candidate head reads resolution already pays.
+        const OURS: u64 = 1_785_240_000_000;
+        let dir = temp_dir("read-count");
+        for i in 0..8 {
+            write_log(
+                &dir,
+                &format!("log{i}"),
+                OURS + 1_000 + i,
+                Some(&format!("log{i}")),
+            );
+        }
+
+        let calls = std::cell::Cell::new(0usize);
+        let read = |_: u32| {
+            calls.set(calls.get() + 1);
+            None
+        };
+        let want = Wanted {
+            session_id: None,
+            since_ms: Some(OURS),
+        };
+        let rivals: Vec<Rival> = (1..=3)
+            .map(|pid| Rival {
+                pid,
+                started_ms: OURS - 1_000,
+            })
+            .collect();
+
+        let _ = resolve_owned_session_with(&dir, &want, &rivals, true, read);
+        assert_eq!(
+            calls.get(),
+            3,
+            "8 candidates x 3 rivals must cost 3 registry reads, not 24"
+        );
+    }
+
+    #[test]
+    fn the_rival_handle_is_read_live_not_captured() {
+        // R6.2 — membership churn in BOTH directions. The watcher holds a handle, so a
+        // sibling that starts `claude` after the panel opened begins vetoing, and one that
+        // exits stops. Captured-by-value, both are wrong for the life of the open: the new
+        // rival never vetoes (its log can be adopted with `owned: true` — F2), and the dead
+        // one vetoes forever (silencing a tab that now owns its log).
+        //
+        // Exercised through the same lock-then-clone the watch callback performs, since
+        // driving a real fs event would test `notify`, not this rule.
+        const OURS: u64 = 1_785_240_000_000;
+        const FIRST: u64 = OURS + 30_000;
+        let dir = temp_dir("live-rival-handle");
+        write_log(&dir, "log", FIRST, Some("log"));
+        let want = Wanted {
+            session_id: None,
+            since_ms: Some(OURS),
+        };
+        let read = |_: u32| None; // no records: the timing veto governs
+        let handle: RivalHandle = Arc::new(Mutex::new(RivalSet::known(Vec::new())));
+
+        let resolve = |h: &RivalHandle| {
+            let snap = h.lock().map(|g| g.clone()).unwrap_or_default();
+            resolve_owned_session_with(&dir, &want, &snap.list, snap.known, read)
+        };
+
+        assert!(resolve(&handle).is_some(), "no rivals yet: the log is ours");
+
+        // A sibling starts mid-open, between us and the log's first event.
+        handle.lock().unwrap().list.push(Rival {
+            pid: 4242,
+            started_ms: OURS + 10_000,
+        });
+        assert_eq!(
+            resolve(&handle),
+            None,
+            "a rival that appeared after open must still be able to outrank us"
+        );
+
+        // ...and exits again.
+        handle.lock().unwrap().list.clear();
+        assert!(
+            resolve(&handle).is_some(),
+            "a rival that exited must stop vetoing"
+        );
+    }
+
+    // ---- rival-assignment: the reported defect, end to end ----
+
+    const A_PID: u32 = 5550;
+    const B_PID: u32 = 5771;
+
+    #[test]
+    fn the_writer_keeps_its_log_when_an_idle_registered_sibling_cannot_have_written_it() {
+        // R0.1 + R2.3 — THE discriminating test. Tab A starts, tab B starts 28s later and
+        // stays idle, A types 15 minutes in and writes the only log.
+        //
+        // Before this change: A's log was vetoed by B on start times alone, A resolved to
+        // `None`, and B adopted A's log via uniqueness with `owned: true`.
+        //
+        // An implementation that gates the rescue on the RAW rival list also fails here:
+        // B stops vetoing, but `rivals.len() == 1` keeps the slack filter on and 900s is
+        // far outside it. Only the effective set — empty once B is disqualified — lets A
+        // through. Two separate L2 review passes were needed to find that.
+        const A_START: u64 = 1_785_240_000_000;
+        const B_START: u64 = A_START + 28_000;
+        const FIRST: u64 = A_START + 900_000;
+
+        let dir = temp_dir("writer-keeps-its-log");
+        write_log(&dir, "a-session", FIRST, Some("a-session"));
+
+        let want_a = Wanted {
+            session_id: None,
+            since_ms: Some(A_START),
+        };
+        // B registered ~2s after starting, naming its OWN session, which has no log yet.
+        let read = |pid: u32| match pid {
+            B_PID => Some(registered_rival(B_START, "b-session", 2_000)),
+            _ => None,
+        };
+
+        let a = resolve_owned_session_with(
+            &dir,
+            &want_a,
+            &[Rival {
+                pid: B_PID,
+                started_ms: B_START,
+            }],
+            true,
+            read,
+        )
+        .expect("A wrote this log and must keep it");
+        assert_eq!(a.path.file_name().unwrap(), "a-session.jsonl");
+        assert!(a.owned);
+
+        // And the idle sibling gets nothing rather than A's dashboard (F2).
+        let want_b = Wanted {
+            session_id: None,
+            since_ms: Some(B_START),
+        };
+        assert_eq!(
+            resolve_owned_session_with(
+                &dir,
+                &want_b,
+                &[Rival {
+                    pid: A_PID,
+                    started_ms: A_START
+                }],
+                true,
+                read,
+            ),
+            None,
+            "B is 900s from this log and did not write it"
+        );
+    }
+
+    #[test]
+    fn a_rival_that_owns_the_log_vetoes_absolutely() {
+        // R1.1 — the record names THIS log. No distance, slack or uniqueness rule may
+        // hand it to us, even though we would otherwise be a perfect timing match.
+        const OURS: u64 = 1_785_240_000_000;
+        const RIVAL_START: u64 = OURS - 5_000; // started BEFORE us: no timing veto at all
+        let dir = temp_dir("rival-owns-it");
+        write_log(&dir, "theirs", OURS + 1_000, Some("theirs"));
+
+        let want = Wanted {
+            session_id: None,
+            since_ms: Some(OURS),
+        };
+        let read = |_: u32| Some(registered_rival(RIVAL_START, "theirs", 1_000));
+        assert_eq!(
+            resolve_owned_session_with(
+                &dir,
+                &want,
+                &[Rival {
+                    pid: 9,
+                    started_ms: RIVAL_START
+                }],
+                true,
+                read,
+            ),
+            None,
+            "its own record says it is writing this file"
+        );
+    }
+
+    #[test]
+    fn the_content_session_id_beats_the_filename_stem() {
+        // R1.4 / D13 — a forked or compacted transcript keeps appending to the ORIGINAL
+        // file, so its `sessionId` and the filename disagree. Comparing against the stem
+        // alone reads that as "a different session", disqualifies the true writer, and —
+        // because the effective set then goes empty — adopts its live log at unbounded
+        // distance with `owned: true`. The content id is what closes it.
+        const OURS: u64 = 1_785_240_000_000;
+        const RIVAL_START: u64 = OURS - 5_000;
+        let dir = temp_dir("content-id-wins");
+        // filename stem `old-file`, but the lines say `forked-session` is writing.
+        write_log(&dir, "old-file", OURS + 1_000, Some("forked-session"));
+
+        let want = Wanted {
+            session_id: None,
+            since_ms: Some(OURS),
+        };
+        let read = |_: u32| Some(registered_rival(RIVAL_START, "forked-session", 1_000));
+        assert_eq!(
+            resolve_owned_session_with(
+                &dir,
+                &want,
+                &[Rival {
+                    pid: 9,
+                    started_ms: RIVAL_START
+                }],
+                true,
+                read,
+            ),
+            None,
+            "the rival IS the writer; the stem disagreeing must not disqualify it"
+        );
+    }
+
+    #[test]
+    fn an_unknown_rival_set_never_earns_the_unbounded_rescue() {
+        // R4.3 / D12 — the same input that succeeds with `rivals_known: true` must fail
+        // with `false`. An empty rival list is also what a FAILED enumeration looks like,
+        // and this arm adopts at any distance with `owned: true`.
+        const OURS: u64 = 1_785_240_000_000;
+        let dir = temp_dir("unknown-rivals");
+        write_log(&dir, "far-away", OURS + 5_000_000, Some("far-away"));
+        let want = Wanted {
+            session_id: None,
+            since_ms: Some(OURS),
+        };
+        let read = |_: u32| None;
+
+        assert!(
+            resolve_owned_session_with(&dir, &want, &[], true, read).is_some(),
+            "known-empty: the sole candidate is ours"
+        );
+        assert_eq!(
+            resolve_owned_session_with(&dir, &want, &[], false, read),
+            None,
+            "unknown: the same emptiness proves nothing"
+        );
+    }
+
+    #[test]
+    fn a_stale_rival_record_falls_back_to_the_timing_veto() {
+        // R3.1 / R1.3 — a record that PREDATES the process now holding that pid is a
+        // recycled-pid artefact. It must not be believed, and the rival then behaves
+        // exactly as it did before this change.
+        const OURS: u64 = 1_785_240_000_000;
+        const RIVAL_START: u64 = OURS + 10_000;
+        const FIRST: u64 = OURS + 30_000;
+        let dir = temp_dir("stale-rival-record");
+        write_log(&dir, "log", FIRST, Some("log"));
+        let want = Wanted {
+            session_id: None,
+            since_ms: Some(OURS),
+        };
+        // Written 60s BEFORE this process started: impossible, therefore stale.
+        let stale = |_: u32| {
+            Some(Registered {
+                session_id: "someone-else".to_string(),
+                cwd: PathBuf::from("/proj"),
+                started_at_ms: RIVAL_START - 60_000,
+            })
+        };
+        assert_eq!(
+            resolve_owned_session_with(
+                &dir,
+                &want,
+                &[Rival {
+                    pid: 9,
+                    started_ms: RIVAL_START
+                }],
+                true,
+                stale,
+            ),
+            None,
+            "unbelievable record -> the start-time veto still applies"
+        );
+    }
+
+    /// A fully-enumerated empty rival set, behind the handle `Watch` now takes.
+    /// `known: true` because these tests genuinely have no rivals — as opposed to having
+    /// failed to look, which is what `RivalSet::default()` means.
+    fn no_rivals() -> RivalHandle {
+        Arc::new(Mutex::new(RivalSet::known(Vec::new())))
+    }
+
     /// A caller that has not attached yet: the watcher is free to re-resolve.
     fn unattached() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))
@@ -840,7 +1477,7 @@ mod tests {
                 log: Some(log.clone()),
                 want: Wanted::default(),
                 owned: false,
-                rivals: Vec::new(),
+                rivals: no_rivals(),
                 attached: unattached(),
             },
             t,
@@ -928,7 +1565,7 @@ mod tests {
             since_ms: Some(1_785_585_600_000), // 12:00:00Z — tier 2 would take the sibling
         };
         assert_eq!(
-            resolve_owned_session(&dir, &want, &[]),
+            resolve_owned_session(&dir, &want, &[], true),
             None,
             "we know which session is ours; it just has not written yet"
         );
@@ -939,7 +1576,7 @@ mod tests {
             "{\"type\":\"assistant\",\"timestamp\":\"2026-08-01T12:05:00.000Z\",\"message\":{}}\n",
         )
         .unwrap();
-        let r = resolve_owned_session(&dir, &want, &[]).expect("named outright");
+        let r = resolve_owned_session(&dir, &want, &[], true).expect("named outright");
         assert_eq!(
             r.path.file_name().unwrap(),
             "11111111-1111-1111-1111-111111111111.jsonl"
@@ -1091,7 +1728,7 @@ mod tests {
             session_id: Some("00000000-0000-0000-0000-000000000000".into()),
             since_ms: Some(1_785_271_140_000), // 2026-07-28T20:39:00Z — five days later
         };
-        assert_eq!(resolve_owned_session(&dir, &want, &[]), None);
+        assert_eq!(resolve_owned_session(&dir, &want, &[], true), None);
 
         // ...while the retained fallback still degrades to ranking, unchanged. The
         // two functions differ in exactly this: what happens when nothing confirms.
@@ -1117,11 +1754,17 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(resolve_owned_session(&dir, &Wanted::default(), &[]), None);
+        assert_eq!(
+            resolve_owned_session(&dir, &Wanted::default(), &[], true),
+            None
+        );
         // An empty directory is the same answer for a different reason — stated so a
         // future change cannot pass this test by resolving the contents case only.
         let empty = temp_dir("emptyhintemptydir");
-        assert_eq!(resolve_owned_session(&empty, &Wanted::default(), &[]), None);
+        assert_eq!(
+            resolve_owned_session(&empty, &Wanted::default(), &[], true),
+            None
+        );
     }
 
     #[test]
@@ -1148,7 +1791,7 @@ mod tests {
         };
 
         for rival_at in [T + 3_000, T + 1_001, T + 60_000] {
-            let r = resolve_owned_session(&dir, &want, &[rival_at])
+            let r = resolve_owned_session(&dir, &want, &[rival(rival_at)], true)
                 .unwrap_or_else(|| panic!("rival at +{}ms must not take our log", rival_at - T));
             assert_eq!(r.path.file_name().unwrap(), "mine.jsonl");
         }
@@ -1156,11 +1799,11 @@ mod tests {
         // A rival that started at or before the write DOES outrank us — the boundary,
         // straddled so neither side can drift.
         assert!(
-            resolve_owned_session(&dir, &want, &[T + 1_000]).is_none(),
+            resolve_owned_session(&dir, &want, &[rival(T + 1_000)], true).is_none(),
             "a rival that existed exactly at the write is a plausible writer"
         );
         assert!(
-            resolve_owned_session(&dir, &want, &[T + 999]).is_none(),
+            resolve_owned_session(&dir, &want, &[rival(T + 999)], true).is_none(),
             "and so is one that started just before it"
         );
     }
@@ -1195,7 +1838,8 @@ mod tests {
                     session_id: None,
                     since_ms: Some(A_START),
                 },
-                &[B_START],
+                &[rival(B_START)],
+                true,
             ),
             None,
             "the later process wrote that log; tab A owns nothing"
@@ -1209,7 +1853,8 @@ mod tests {
                 session_id: None,
                 since_ms: Some(B_START),
             },
-            &[A_START],
+            &[rival(A_START)],
+            true,
         )
         .expect("tab B wrote it");
         assert_eq!(r.path.file_name().unwrap(), "tabB.jsonl");
@@ -1225,6 +1870,7 @@ mod tests {
                     since_ms: Some(A_START),
                 },
                 &[],
+                true,
             )
             .is_some(),
             "documents what knowing nothing about rivals costs"
@@ -1253,14 +1899,14 @@ mod tests {
             since_ms: Some(SINCE),
         };
         assert!(
-            resolve_owned_session(&dir, &want, &[]).is_some(),
+            resolve_owned_session(&dir, &want, &[], true).is_some(),
             "sole unrivalled candidate since we started"
         );
 
         // The moment anything else can account for it, it is refused: a rival process
         // that started in between...
         assert_eq!(
-            resolve_owned_session(&dir, &want, &[SINCE + 60_000]),
+            resolve_owned_session(&dir, &want, &[rival(SINCE + 60_000)], true),
             None,
             "a later process wrote it"
         );
@@ -1278,7 +1924,7 @@ mod tests {
             "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T10:04:30.000Z\",\"message\":{}}\n",
         )
         .unwrap();
-        let r = resolve_owned_session(&rival, &want, &[]).expect("the prompt one confirms");
+        let r = resolve_owned_session(&rival, &want, &[], true).expect("the prompt one confirms");
         assert_eq!(r.path.file_name().unwrap(), "prompt.jsonl");
     }
 
@@ -1306,6 +1952,7 @@ mod tests {
                     since_ms: Some(1_785_233_088_000), // 2026-07-28T10:04:48Z
                 },
                 &[],
+                true,
             ),
             None,
             "a session older than this process is not a candidate, sole or otherwise"
@@ -1338,7 +1985,8 @@ mod tests {
             "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T12:02:01.000Z\",\"message\":{}}\n",
         )
         .unwrap();
-        let r = resolve_owned_session(&dir, &since, &[]).expect("the inside candidate confirms");
+        let r =
+            resolve_owned_session(&dir, &since, &[], true).expect("the inside candidate confirms");
         assert_eq!(r.path.file_name().unwrap(), "inside.jsonl");
         assert!(r.owned);
 
@@ -1354,13 +2002,13 @@ mod tests {
             "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T12:02:01.000Z\",\"message\":{}}\n",
         )
         .unwrap();
-        let sole =
-            resolve_owned_session(&dir2, &since, &[]).expect("sole candidate, no rival claims it");
+        let sole = resolve_owned_session(&dir2, &since, &[], true)
+            .expect("sole candidate, no rival claims it");
         assert_eq!(sole.path.file_name().unwrap(), "outside.jsonl");
 
         // ...but a rival process that started between us and that log owns it instead.
         assert_eq!(
-            resolve_owned_session(&dir2, &since, &[S + 60_000]),
+            resolve_owned_session(&dir2, &since, &[rival(S + 60_000)], true),
             None,
             "a process that started closer to the write has the better claim"
         );
@@ -1390,7 +2038,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_owned_session(&dir, &since, &[]),
+            resolve_owned_session(&dir, &since, &[], true),
             None,
             "a log whose first event predates the process is a different session"
         );
@@ -1403,7 +2051,7 @@ mod tests {
             "{\"type\":\"assistant\",\"timestamp\":\"2026-07-28T11:59:58.000Z\",\"message\":{}}\n",
         )
         .unwrap();
-        let r = resolve_owned_session(&dir2, &since, &[]).expect("clock skew is tolerated");
+        let r = resolve_owned_session(&dir2, &since, &[], true).expect("clock skew is tolerated");
         assert_eq!(r.path.file_name().unwrap(), "skewed.jsonl");
         assert!(r.owned);
     }
@@ -1426,7 +2074,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            resolve_owned_session(&inside, &since, &[]).is_some(),
+            resolve_owned_session(&inside, &since, &[], true).is_some(),
             "exactly FIRST_EVENT_LEAD_MS early still confirms"
         );
 
@@ -1438,7 +2086,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_owned_session(&outside, &since, &[]),
+            resolve_owned_session(&outside, &since, &[], true),
             None,
             "one millisecond past the allowance is a different session"
         );
@@ -1473,6 +2121,7 @@ mod tests {
                 since_ms: Some(1_785_240_000_000), // 2026-07-28T12:00:00Z
             },
             &[],
+            true,
         )
         .expect("both qualify; one must win");
         assert_eq!(
@@ -1513,6 +2162,7 @@ mod tests {
                 since_ms: Some(TAB1_START),
             },
             &[],
+            true,
         )
         .expect("tab 1's own session");
         assert_eq!(r.path.file_name().unwrap(), "c2abd08b.jsonl");
@@ -1526,6 +2176,7 @@ mod tests {
                     since_ms: Some(TAB2_START),
                 },
                 &[],
+                true,
             ),
             None,
             "tab 2's claude did not exist when this log was written"
@@ -1653,7 +2304,7 @@ mod tests {
                     since_ms: None,
                 },
                 owned: false,
-                rivals: Vec::new(),
+                rivals: no_rivals(),
                 attached: unattached(),
             },
             t,
@@ -1707,7 +2358,7 @@ mod tests {
                     since_ms: None,
                 },
                 owned: false,
-                rivals: Vec::new(),
+                rivals: no_rivals(),
                 attached: unattached(),
             },
             SessionTelemetry::new(),
@@ -1765,7 +2416,7 @@ mod tests {
                 log: None,
                 want: Wanted::default(),
                 owned: false,
-                rivals: Vec::new(),
+                rivals: no_rivals(),
                 attached: unattached(),
             },
             SessionTelemetry::new(),
@@ -1809,7 +2460,7 @@ mod tests {
                     log: None,
                     want: Wanted::default(),
                     owned: false,
-                    rivals: Vec::new(),
+                    rivals: no_rivals(),
                     attached: unattached()
                 },
                 SessionTelemetry::new(),
@@ -1854,7 +2505,7 @@ mod tests {
                     since_ms: None,
                 },
                 owned: true,
-                rivals: Vec::new(),
+                rivals: no_rivals(),
                 attached: Arc::new(AtomicBool::new(true)), // the caller already attached
             },
             t,
@@ -1925,7 +2576,7 @@ mod tests {
                 log: Some(mine.clone()),
                 want: Wanted::default(),
                 owned: false,
-                rivals: Vec::new(),
+                rivals: no_rivals(),
                 attached,
             },
             t,
@@ -2015,7 +2666,7 @@ mod tests {
                     since_ms: None,
                 },
                 owned: false,
-                rivals: Vec::new(),
+                rivals: no_rivals(),
                 attached: attached.clone(),
             },
             t,
@@ -2098,7 +2749,7 @@ mod tests {
                 log: Some(log.clone()),
                 want: Wanted::default(),
                 owned: false,
-                rivals: Vec::new(),
+                rivals: no_rivals(),
                 attached: unattached(),
             },
             t,
@@ -2162,7 +2813,7 @@ mod tests {
                 log: Some(log.clone()),
                 want: Wanted::default(),
                 owned: false,
-                rivals: Vec::new(),
+                rivals: no_rivals(),
                 attached: unattached(),
             },
             t,
