@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ai_monitor::telemetry::{SessionTelemetry, TelemetrySnapshot};
 use ai_monitor::{
@@ -59,6 +59,11 @@ pub struct AiMonitorOverlay {
     /// while, then open the panel) left the app attached while the watcher still
     /// believed it was free to switch logs and reset the accumulator underneath it.
     attached_flag: Arc<AtomicBool>,
+    /// The live rival set the watcher reads (D11/R6.2). Held here so membership can be
+    /// republished during an open without dropping and respawning the watcher.
+    rivals: ai_monitor::RivalHandle,
+    /// Guards against overlapping `refresh_rivals` workers — see that method.
+    refreshing: Arc<AtomicBool>,
     /// `[ai_monitor] context_window`, re-read on each open.
     context_window: Option<u64>,
     /// Whether this tab's process tree holds a `claude` process at all — the
@@ -84,6 +89,8 @@ impl AiMonitorOverlay {
             attached_flag: Arc::new(AtomicBool::new(false)),
             context_window: None,
             tab_has_claude: false,
+            rivals: Arc::new(Mutex::new(ai_monitor::RivalSet::default())),
+            refreshing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -175,8 +182,30 @@ impl AiMonitorOverlay {
             // it is displayed, so a foreign log is never folded into a
             // `SessionTelemetry` in the first place. `resolve_session`'s ranked
             // fallback remains public and under test; it has no production caller.
-            let rivals = hint.rival_starts.clone();
-            let resolved = resolve_owned_session(&dir, &want, &rivals);
+            // The rival set travels by HANDLE, not by value: membership changes during an
+            // open (a sibling starts or exits `claude`), and a frozen list gets both
+            // directions wrong — see `ai_monitor::Watch::rivals`. `rivals_known` rides
+            // with it, because an empty list from a failed read must never earn the
+            // unbounded uniqueness rescue.
+            // `publish_rivals_into` STORES the handle in `self.rivals` and returns the clone
+            // that `watch_with_rivals` puts in the `Watch`. The L2 checker found this broken:
+            // the handle was built locally, handed to the watcher, and `self.rivals` left
+            // pointing at the one from `new()` — so `refresh_rivals` wrote somewhere nothing
+            // read, and membership was frozen for the life of the open, exactly as before D11.
+            //
+            // This is NOT "unrepresentable" — an earlier comment here claimed that and it was
+            // false. `RivalHandle` is a public alias, so any caller can still build its own
+            // `Arc`. What is true: the store-and-return pairing means the omitted-call
+            // spelling fails the dead-code lint, and `watch_with_rivals` puts the
+            // slot→`Watch` pairing under a test that a *substituted* handle fails (M9).
+            // A return value discarded by `open()` itself (M8) is caught by NOTHING — see
+            // `specs/ai-monitor-rival-assignment/loop.md` § Partly covered. Naming the
+            // mutation this seam actually catches, rather than the one it does not, because
+            // three iterations of this loop each shipped a comment claiming more
+            // verification than existed.
+            let rivals = publish_rivals_into(&mut self.rivals, &hint);
+            let resolved =
+                resolve_owned_session(&dir, &want, &hint.rival_starts, hint.rivals_known);
             let owned = resolved.as_ref().is_some_and(|r| r.owned);
             let log = resolved.map(|r| r.path);
             // Seed on THIS thread, exactly where `backfill` ran before: publish the
@@ -201,14 +230,7 @@ impl AiMonitorOverlay {
             // disagree: work for a while, then open the panel, and the app was attached
             // while the watcher was not.
             self.watcher = LogWatcher::spawn(
-                Watch {
-                    dir,
-                    log,
-                    want,
-                    owned,
-                    rivals,
-                    attached: self.attached_flag.clone(),
-                },
+                watch_with_rivals(rivals, dir, log, want, owned, self.attached_flag.clone()),
                 telemetry,
                 offset,
                 move || {
@@ -232,6 +254,58 @@ impl AiMonitorOverlay {
         self.attached_flag
             .store(self.attach.attached, Ordering::Relaxed);
         self.latest = Some(snap);
+    }
+
+    /// Re-enumerate the live rivals into the shared handle (D11/R6.2).
+    ///
+    /// On a WORKER THREAD, never here: `hint_for` spawns `/bin/ps` and calls
+    /// `proc_pidinfo` per `claude`, and this runs on the winit event loop after every
+    /// metadata sync. The handle exists precisely so the answer can arrive late — the
+    /// watcher reads whatever is current at its next re-resolution.
+    ///
+    /// A failed lookup publishes `RivalSet::default()`, i.e. `known: false`, which
+    /// WITHHOLDS the uniqueness rescue. Failing toward "we do not know" is the whole
+    /// point of the flag: the alternative grants the resolver's strongest branch on the
+    /// strength of a read that did not work.
+    ///
+    /// TWO guards, because the trigger is far hotter than "once per metadata sync" reads:
+    /// `on_active_changed` is reached from the `OverlayPending` arm, which is *also* the
+    /// ai-monitor watcher's own wake — so while a session is writing, this fires per
+    /// append burst, not on the worker's 500 ms tick.
+    ///
+    /// - **Attached ⇒ nothing.** Re-resolution stops once the panel has attached, so
+    ///   membership can no longer change the answer; continuing to read would be pure
+    ///   cost, and R6.3 requires the reads to stop.
+    /// - **One in flight at a time.** `hint_for` forks `/bin/ps` and can block up to
+    ///   250 ms inside `resolved_root`, so at these rates refreshes would otherwise
+    ///   overlap and land out of order — a stale set overwriting a fresher one.
+    fn refresh_rivals(&self, shell_pid: Option<u32>) {
+        let Some(pid) = shell_pid else { return };
+        if self.attached_flag.load(Ordering::Relaxed) {
+            return; // R6.3 — attached: the watcher no longer re-resolves
+        }
+        if self.refreshing.swap(true, Ordering::AcqRel) {
+            return; // one outstanding refresh is enough
+        }
+        let handle = self.rivals.clone();
+        // Cleared by `Drop`, not by a statement at the end of the closure. A panic anywhere
+        // in `hint_for` would skip a manual `store(false)` and latch this `true` for the
+        // life of the process — rival refresh silently dead forever, with nothing to
+        // indicate it. Low probability, unbounded consequence, four lines to remove.
+        let inflight = InFlight(self.refreshing.clone());
+        std::thread::spawn(move || {
+            let set = match tabsession::hint_for(pid) {
+                Some(h) => ai_monitor::RivalSet {
+                    list: h.rival_starts,
+                    known: h.rivals_known,
+                },
+                None => ai_monitor::RivalSet::default(),
+            };
+            if let Ok(mut g) = handle.lock() {
+                *g = set;
+            }
+            drop(inflight);
+        });
     }
 
     /// Hide + stop the watcher (D6).
@@ -346,6 +420,56 @@ fn pane_cwd_with(
     // there is nothing to re-root to, so yield `None` and let the caller keep the cwd it was
     // passed — which for a non-tmux tab is already the right answer.
     (root != shell_pid).then(|| cwd_of(root))?
+}
+
+/// Clears the in-flight flag on drop, so a panicking refresh worker cannot latch it.
+struct InFlight(Arc<AtomicBool>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Build the [`Watch`] whose rival handle is *the one stored in `slot`*.
+///
+/// The pairing lives in one function so a test can assert it (`Arc::ptr_eq`) without an
+/// `EventLoopProxy`. This is the seam that actually catches the iteration-2 defect: pinning
+/// only `publish_rivals_into` left `open()` free to discard its return and hand `Watch` a
+/// fresh `Arc` — the identical bug, with no test and no lint failing. Verified by mutation.
+fn watch_with_rivals(
+    rivals: ai_monitor::RivalHandle,
+    dir: PathBuf,
+    log: Option<PathBuf>,
+    want: Wanted,
+    owned: bool,
+    attached: Arc<AtomicBool>,
+) -> Watch {
+    Watch {
+        dir,
+        log,
+        want,
+        owned,
+        rivals,
+        attached,
+    }
+}
+
+/// Install `hint`'s rivals into `slot` and return the clone for [`ai_monitor::Watch`].
+///
+/// Free-standing, and taking the slot by `&mut`, for one reason: the overlay needs an
+/// `EventLoopProxy` to construct, so a method could only ever be verified by re-implementing
+/// it in the test — which is exactly how the original miswiring survived. Here a test drives
+/// the real code.
+fn publish_rivals_into(
+    slot: &mut ai_monitor::RivalHandle,
+    hint: &tabsession::SessionHint,
+) -> ai_monitor::RivalHandle {
+    *slot = Arc::new(Mutex::new(ai_monitor::RivalSet {
+        list: hint.rival_starts.clone(),
+        known: hint.rivals_known,
+    }));
+    slot.clone()
 }
 
 /// Wall-clock millis since the epoch, saturating.
@@ -567,6 +691,12 @@ impl Overlay for AiMonitorOverlay {
             .changed(self.visible, cwd.as_deref(), shell_pid)
         {
             self.open(cwd, shell_pid);
+        } else if self.visible {
+            // Same tab, still open: republish the rival set rather than re-opening. D6
+            // fires this after EVERY metadata sync, so this is the cadence D11 wants —
+            // and it is why the refresh must not re-run `open`, which would drop the
+            // watcher and re-run the full backfill (the storm `Repoint` exists to stop).
+            self.refresh_rivals(shell_pid);
         }
     }
 }
@@ -574,9 +704,105 @@ impl Overlay for AiMonitorOverlay {
 #[cfg(test)]
 mod tests {
     use super::{drain_to_newest, pane_cwd_with, proves_ownership, Attachment, Repoint};
+    use crate::tabsession;
     use ai_monitor::telemetry::TelemetrySnapshot;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+
+    // ---- rival-assignment R6.2: the handle the watcher reads is the one we refresh ----
+
+    #[test]
+    fn publish_rivals_stores_the_same_handle_it_hands_to_the_watcher() {
+        // REGRESSION. The first implementation built the handle locally in `open()`, moved
+        // it into `Watch`, and never assigned `self.rivals` — so `refresh_rivals` wrote
+        // into the `Arc` from `new()` that nothing read. Membership stayed frozen for the
+        // life of the open, which is precisely the state D11 exists to end: a sibling that
+        // starts `claude` after the panel opened never vetoes, and its log can be adopted
+        // with `owned: true`, then latched.
+        //
+        // The suite could not see it — every rival test drove the resolver directly. This
+        // drives the REAL wiring function: the handle handed to the watcher and the handle
+        // the refresher writes must be one allocation.
+        let mut slot: ai_monitor::RivalHandle =
+            Arc::new(Mutex::new(ai_monitor::RivalSet::default()));
+        let stale = slot.clone(); // stands in for the handle from `new()`
+        let hint = tabsession::SessionHint {
+            session_id: None,
+            started_ms: Some(1_000),
+            rival_starts: vec![ai_monitor::Rival {
+                pid: 42,
+                started_ms: 999,
+            }],
+            rivals_known: true,
+        };
+
+        let for_watcher = super::publish_rivals_into(&mut slot, &hint);
+
+        assert!(
+            Arc::ptr_eq(&slot, &for_watcher),
+            "the stored handle and the watched handle must be one allocation"
+        );
+        assert!(
+            !Arc::ptr_eq(&stale, &for_watcher),
+            "a fresh Arc per open, so a previous open's watcher cannot observe this set"
+        );
+
+        // A refresh written through the stored slot is visible to the watcher's clone.
+        slot.lock().unwrap().list.clear();
+        assert!(
+            for_watcher.lock().unwrap().list.is_empty(),
+            "a refresh must be observable by the watcher"
+        );
+        assert!(
+            !stale.lock().unwrap().known,
+            "and the orphaned handle stays at its safe default"
+        );
+    }
+
+    #[test]
+    fn the_watch_carries_the_handle_that_was_stored_not_a_fresh_one() {
+        // REGRESSION, one level up from `publish_rivals_stores_...`. Pinning only the
+        // publish helper left `open()` free to call it, DISCARD the return, and hand
+        // `Watch` a brand-new `Arc` — the identical iteration-2 defect, which the L2
+        // checker reproduced with zero tests and zero lints failing.
+        //
+        // This asserts the pairing `open()` actually relies on: the handle inside the
+        // `Watch` must be the same allocation as the one left in the slot.
+        let mut slot: ai_monitor::RivalHandle =
+            Arc::new(Mutex::new(ai_monitor::RivalSet::default()));
+        let hint = tabsession::SessionHint {
+            session_id: None,
+            started_ms: Some(1_000),
+            rival_starts: vec![ai_monitor::Rival {
+                pid: 7,
+                started_ms: 999,
+            }],
+            rivals_known: true,
+        };
+
+        let for_watch = super::publish_rivals_into(&mut slot, &hint);
+        let watch = super::watch_with_rivals(
+            for_watch,
+            PathBuf::from("/tmp/does-not-matter"),
+            None,
+            ai_monitor::Wanted::default(),
+            false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+
+        assert!(
+            Arc::ptr_eq(&slot, &watch.rivals),
+            "the watcher must read the handle refresh_rivals writes"
+        );
+
+        // And a membership change through the slot is visible to the Watch's copy.
+        slot.lock().unwrap().list.clear();
+        assert!(
+            watch.rivals.lock().unwrap().list.is_empty(),
+            "a refresh must reach the watcher, or D11 is inert"
+        );
+    }
 
     // ---- tmux-pane-cwd: the overlay's own cwd resolution (R3.1, R3.3) ----
 

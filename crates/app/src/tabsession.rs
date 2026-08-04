@@ -38,7 +38,16 @@ pub struct SessionHint {
     /// that started at or before its first event — which is the only thing that separates
     /// two tabs whose own timings are indistinguishable. Empty when the process table is
     /// unreadable, which degrades to the timing rule alone.
-    pub rival_starts: Vec<u64>,
+    pub rival_starts: Vec<ai_monitor::Rival>,
+    /// Whether `rival_starts` is a COMPLETE enumeration, as opposed to an empty or partial
+    /// list left by a read that failed.
+    ///
+    /// Load-bearing since the uniqueness rescue was narrowed: an empty rival set is no
+    /// longer a mere degradation, it is the switch that re-enables adopting a sole
+    /// candidate at any distance. Granting that privilege on a failed read would confirm a
+    /// foreign log with `owned: true` and latch it. `false` is the safe value, and it is
+    /// what `Default` yields.
+    pub rivals_known: bool,
 }
 
 impl SessionHint {
@@ -67,21 +76,22 @@ pub fn hint_for(shell_pid: u32) -> Option<SessionHint> {
     let claude = choose_claude(root, shell_pid, |p| table.find_claude(p), cwd_of_pid)?;
     let mine = cwd_of_pid(claude);
     let started = start_ms(claude);
+    // The known/unknown label is decided HERE, not inside `rival_starts` — that function's
+    // contract (empty on an unreadable cwd) is pinned by
+    // `rival_starts_names_every_other_claude_in_the_same_project`, and redefining its
+    // return value would change that test's meaning. One level up costs nothing.
+    let (rivals, rivals_known) =
+        table.rival_starts_checked(claude, mine.as_deref(), cwd_of_pid, start_ms);
     Some(SessionHint {
         // Ask the process what session it is running, before trying to infer it.
         // `--resume` is only the argv spelling of the same question and stays as the
         // fallback for a `claude` old enough not to write the registry file.
         session_id: registered_id(claude, started).or_else(|| table.resume_id(claude)),
         started_ms: started,
-        rival_starts: table.rival_starts(claude, mine.as_deref(), cwd_of_pid, start_ms),
+        rival_starts: rivals,
+        rivals_known,
     })
 }
-
-/// How far after the true process start `claude` may record itself before we stop
-/// believing the record belongs to this process. Measured at 1.3–2.0s across five live
-/// sessions (2026-08-01); a minute is far beyond that and still far below the gap that a
-/// recycled pid would show.
-const REGISTRY_DRIFT_MS: u64 = 60_000;
 
 /// The session id `claude` recorded for its own pid, validated against this process.
 ///
@@ -104,11 +114,10 @@ fn registered_id_with(
 ) -> Option<String> {
     let started = started_ms?;
     let reg = read(pid)?;
-    // `checked_sub` is the stale-file test, not arithmetic hygiene: a record written
-    // BEFORE the process we are asking about started cannot describe it, so `None` here
-    // is the answer rather than an error to paper over with `saturating_sub`.
-    let drift = reg.started_at_ms.checked_sub(started)?;
-    (drift <= REGISTRY_DRIFT_MS).then_some(reg.session_id)
+    // ONE rule, shared with the rival check in `ai_monitor::resolve_owned_session`
+    // (R3.3). It used to live here alone; a second copy for rivals is precisely the
+    // shape that has already produced two defects in this feature.
+    ai_monitor::validated_session_id(&reg, started).map(str::to_string)
 }
 
 /// How long to wait for the tmux root before giving up and deriving from the tab's own shell.
@@ -322,22 +331,69 @@ impl ProcTable {
     /// A rival whose cwd cannot be read is skipped rather than assumed to match: claiming
     /// a rival that is not there would refuse a log that really is ours, and failing to
     /// identify our own session must never be worse than not having looked.
+    #[cfg(test)]
     fn rival_starts(
         &self,
         mine_pid: u32,
         mine_cwd: Option<&std::path::Path>,
         cwd_of: impl Fn(u32) -> Option<PathBuf>,
         start_of: impl Fn(u32) -> Option<u64>,
-    ) -> Vec<u64> {
+    ) -> Vec<ai_monitor::Rival> {
+        self.rival_starts_checked(mine_pid, mine_cwd, cwd_of, start_of)
+            .0
+    }
+
+    // `rival_starts` is no longer on the production path — `hint_for` needs the
+    // known/unknown flag and so calls `rival_starts_checked` directly. It is kept as a
+    // test-only projection rather than deleted so that
+    // `rival_starts_names_every_other_claude_in_the_same_project` keeps passing
+    // **byte-unedited**: that test pins the "an unreadable cwd claims nothing" contract,
+    // and rewriting it in the same change that redefines emptiness is exactly the move
+    // that would hide a regression in it (R4.4).
+
+    /// [`rival_starts`](Self::rival_starts) plus whether the enumeration was **complete**.
+    ///
+    /// Three ways to come back empty-or-short without having actually looked, and all three
+    /// must report `false`. Each drop is individually correct for the veto — inventing a
+    /// rival we cannot read would refuse a log that really is ours — but since the rescue
+    /// was narrowed, the same drop *also* decides whether an unbounded adopt is permitted,
+    /// and there it must not be trusted:
+    ///
+    /// 1. our own cwd is unreadable, so no rival can be placed in our project at all;
+    /// 2. a rival's cwd is unreadable, so it cannot be matched against ours;
+    /// 3. a rival's start time is unreadable, so it cannot be ordered.
+    fn rival_starts_checked(
+        &self,
+        mine_pid: u32,
+        mine_cwd: Option<&std::path::Path>,
+        cwd_of: impl Fn(u32) -> Option<PathBuf>,
+        start_of: impl Fn(u32) -> Option<u64>,
+    ) -> (Vec<ai_monitor::Rival>, bool) {
         let Some(mine_cwd) = mine_cwd else {
-            return Vec::new(); // cannot compare projects; claim nothing
+            return (Vec::new(), false); // (1) cannot compare projects; claim nothing
         };
-        self.rows
-            .iter()
-            .filter(|(pid, _)| **pid != mine_pid && self.is_claude(**pid))
-            .filter(|(pid, _)| cwd_of(**pid).as_deref() == Some(mine_cwd))
-            .filter_map(|(pid, _)| start_of(*pid))
-            .collect()
+        let mut rivals = Vec::new();
+        let mut known = true;
+        for pid in self
+            .rows
+            .keys()
+            .copied()
+            .filter(|pid| *pid != mine_pid && self.is_claude(*pid))
+        {
+            let Some(cwd) = cwd_of(pid) else {
+                known = false; // (2)
+                continue;
+            };
+            if cwd.as_path() != mine_cwd {
+                continue; // a different project: correctly not a rival
+            }
+            let Some(started_ms) = start_of(pid) else {
+                known = false; // (3)
+                continue;
+            };
+            rivals.push(ai_monitor::Rival { pid, started_ms });
+        }
+        (rivals, known)
     }
 
     fn resume_id(&self, pid: u32) -> Option<String> {
@@ -475,9 +531,18 @@ mod tests {
             Some("2b1ca0f2-8a99-4aff-90f1-115839f17f01")
         );
         // Exactly at the drift limit, and one millisecond past it.
-        assert!(registered_id_with(reg(START + REGISTRY_DRIFT_MS), 45326, Some(START)).is_some());
+        assert!(registered_id_with(
+            reg(START + ai_monitor::REGISTRY_DRIFT_MS),
+            45326,
+            Some(START)
+        )
+        .is_some());
         assert_eq!(
-            registered_id_with(reg(START + REGISTRY_DRIFT_MS + 1), 45326, Some(START)),
+            registered_id_with(
+                reg(START + ai_monitor::REGISTRY_DRIFT_MS + 1),
+                45326,
+                Some(START)
+            ),
             None
         );
         // Written BEFORE this process existed: a leftover from the pid's last owner.
@@ -490,6 +555,64 @@ mod tests {
         // No record, or no readable process start: infer nothing.
         assert_eq!(registered_id_with(|_| None, 45326, Some(START)), None);
         assert_eq!(registered_id_with(reg(START + 1_700), 45326, None), None);
+    }
+
+    /// Rivals now carry `(pid, started_ms)`; these assertions are about the START TIMES
+    /// they always were about, so project the payload and leave the expectations alone.
+    fn starts_of(rivals: Vec<ai_monitor::Rival>) -> Vec<u64> {
+        rivals.into_iter().map(|r| r.started_ms).collect()
+    }
+
+    // ---- rival-assignment R4: known-empty vs unknown ----
+
+    #[test]
+    fn a_fully_enumerated_empty_set_is_known() {
+        // R4.1 — the process table was read, every rival was placeable, and none was a
+        // rival. Only this state may re-enable the unbounded uniqueness rescue.
+        let t = ProcTable::parse(SAMPLE);
+        let proj = PathBuf::from("/proj/a");
+        let elsewhere = |_: u32| Some(PathBuf::from("/proj/elsewhere"));
+        let start = |pid: u32| Some(1_000_000 + u64::from(pid));
+        let (rivals, known) = t.rival_starts_checked(35303, Some(&proj), elsewhere, start);
+        assert!(rivals.is_empty(), "nobody else works in our project");
+        assert!(known, "and we could see that for every one of them");
+    }
+
+    #[test]
+    fn an_unreadable_own_cwd_is_unknown_not_empty() {
+        // R4.2 — path (1). The old code returned an empty vec here and the caller could
+        // not tell it apart from "no rivals exist".
+        let t = ProcTable::parse(SAMPLE);
+        let same = |_: u32| Some(PathBuf::from("/proj/a"));
+        let start = |pid: u32| Some(1_000_000 + u64::from(pid));
+        let (rivals, known) = t.rival_starts_checked(35303, None, same, start);
+        assert!(rivals.is_empty());
+        assert!(
+            !known,
+            "an empty list from a failed read must not read as known-empty"
+        );
+    }
+
+    #[test]
+    fn a_rival_dropped_for_an_unreadable_read_is_unknown() {
+        // R4.3 — paths (2) and (3). The single rival is dropped, the list ends up empty,
+        // and that emptiness must NOT grant the rescue. This is the failure path the L2
+        // review found on its third pass, after the first version of D12 listed only two
+        // ways to come back empty.
+        let t = ProcTable::parse(SAMPLE);
+        let proj = PathBuf::from("/proj/a");
+        let start = |pid: u32| Some(1_000_000 + u64::from(pid));
+
+        // (2) the rival's own cwd cannot be read
+        let (rivals, known) = t.rival_starts_checked(35303, Some(&proj), |_| None, start);
+        assert!(rivals.is_empty());
+        assert!(!known, "cwd unreadable -> unknown");
+
+        // (3) the rival's start time cannot be read
+        let same = |_: u32| Some(PathBuf::from("/proj/a"));
+        let (rivals, known) = t.rival_starts_checked(35303, Some(&proj), same, |_| None);
+        assert!(rivals.is_empty());
+        assert!(!known, "start unreadable -> unknown");
     }
 
     #[test]
@@ -510,7 +633,7 @@ mod tests {
 
         // From 35303's point of view: its sibling tab counts, Warp-in-another-project
         // does not, and it never lists itself.
-        let mut got = t.rival_starts(35303, Some(&proj), cwd, start);
+        let mut got = starts_of(t.rival_starts(35303, Some(&proj), cwd, start));
         got.sort_unstable();
         assert_eq!(
             got,
@@ -521,7 +644,7 @@ mod tests {
         // Warp working in the SAME project is a rival like any other — the rule is about
         // which process wrote the log, not which application it belongs to.
         let same = |_: u32| Some(PathBuf::from("/proj/a"));
-        let mut got = t.rival_starts(35303, Some(&proj), same, start);
+        let mut got = starts_of(t.rival_starts(35303, Some(&proj), same, start));
         got.sort_unstable();
         assert_eq!(got, vec![1_010_502, 1_035_404]);
 

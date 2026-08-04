@@ -34,7 +34,16 @@ Round 1 goal (verifying the original implementation) passed all gates; see git h
 | protected fallback-test bodies edited | `== 0` of 5 | extract each named fn body from `git show HEAD:crates/ai-monitor/src/lib.rs` and from the working tree, byte-diff |
 | `.snap` files changed | `== 0` of 9 | `git status --porcelain crates/app/src/snapshots/` prints nothing |
 | clippy warnings | `== 0` | the Gate-1 lint command |
-| existing tier-2 tests | all pass, bodies unedited | `two_tabs_on_one_project_get_their_own_sessions`, `a_session_started_by_this_tab_beats_a_more_active_foreign_one`, `the_upper_bound_is_the_same_120s_as_the_lower`, `a_session_that_began_just_before_the_process_start_still_qualifies` |
+| existing tier-2 tests | all pass, bodies unedited | `two_tabs_on_one_project_get_their_own_sessions`, `a_session_started_by_this_tab_beats_a_more_active_foreign_one`, ~~`the_upper_bound_is_the_same_120s_as_the_lower`~~, ~~`a_session_that_began_just_before_the_process_start_still_qualifies`~~ — **STALE, see note** |
+
+> **Note (2026-08-03, from `specs/ai-monitor-rival-assignment`).** Two of the four tier-2
+> tests named above **no longer exist**: `the_upper_bound_is_the_same_120s_as_the_lower`, and
+> `a_session_that_began_just_before_the_process_start_still_qualifies`, which was replaced by
+> `a_log_that_predates_the_process_is_not_that_process_s_session` when the window became
+> asymmetric. A gate that greps for a test that is not there passes vacuously, so this row
+> was silently checking two of four. Corrected here rather than in place so the original
+> contract stays readable; the current protected set is enumerated by name in
+> `specs/ai-monitor-rival-assignment/spec.md` § Constraints, against the tree as it is.
 
 ## Gate 3 — Qualitative
 
