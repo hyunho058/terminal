@@ -17,9 +17,57 @@
 //! degraded-mode rules are decided in exactly one place.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::font_set::FontSet;
 use crate::glyph::{GlyphBitmap, GlyphRasterizer};
+
+/// Source of [`Atlas::epoch`] — the identity of a *texture*, handed out by
+/// [`new_atlas_texture`] and never reused (atlas-swap-bind-invalidation D1/R1.2).
+static NEXT_ATLAS_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// **The only place an atlas texture is born.** Returns the texture, its view and
+/// sampler, and a fresh `epoch` identifying all three.
+///
+/// Routing every creation through here is what makes "new texture ⟹ new epoch"
+/// true *by construction* rather than by comment. That matters because the layers
+/// that sample this texture cache their bind groups keyed on `epoch`: a texture
+/// swapped without a new epoch leaves them sampling the replaced texture with UVs
+/// computed against the new one, which renders as wrong-glyph garbage that
+/// persists for the whole session (D1/R1.1).
+///
+/// **Do not create an atlas texture anywhere else.** If a future `Atlas::resize`
+/// or in-place ppem rebuild swaps the texture without coming through here, `epoch`
+/// freezes and that bug returns — behind a field whose name promises it cannot
+/// (R6.3; spec Known Gap G-b).
+fn new_atlas_texture(
+    device: &wgpu::Device,
+) -> (wgpu::Texture, wgpu::TextureView, wgpu::Sampler, u64) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("glyph-atlas"),
+        size: wgpu::Extent3d {
+            width: ATLAS_SIZE,
+            height: ATLAS_SIZE,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("atlas-sampler"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    // Relaxed is enough: we need uniqueness, not ordering against other memory.
+    let epoch = NEXT_ATLAS_EPOCH.fetch_add(1, Ordering::Relaxed);
+    (texture, view, sampler, epoch)
+}
 
 /// Cache key for a rasterized glyph: the face it came from, the glyph id within
 /// that face, and its synthesized style — so a bold/italic variant caches
@@ -83,6 +131,13 @@ pub struct Atlas {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     sampler: wgpu::Sampler,
+    /// Identity of [`Atlas::texture`], stamped by [`new_atlas_texture`]. Distinct
+    /// from [`Atlas::generation`] and orthogonal to it: `epoch` says *which
+    /// texture*, `generation` says *how many times that texture was repacked*.
+    ///
+    /// Text layers key their cached bind groups on this so a live `apply_config`
+    /// atlas swap cannot leave one sampling the replaced texture (D1/D2).
+    epoch: u64,
     /// One rasterizer per [`FontSet`] face, in chain order; index 0 is the
     /// primary. [`GlyphKey::face`] indexes this vector (D7).
     rasterizers: Vec<GlyphRasterizer>,
@@ -116,31 +171,12 @@ impl Atlas {
         if rasterizers.is_empty() {
             return None;
         }
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("glyph-atlas"),
-            size: wgpu::Extent3d {
-                width: ATLAS_SIZE,
-                height: ATLAS_SIZE,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("atlas-sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
+        let (texture, view, sampler, epoch) = new_atlas_texture(device);
         Some(Atlas {
             texture,
             view,
             sampler,
+            epoch,
             rasterizers,
             cache: HashMap::new(),
             shelf_x: 0,
@@ -160,6 +196,11 @@ impl Atlas {
     }
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+    /// Identity of the underlying texture — see [`Atlas::epoch`] and
+    /// [`new_atlas_texture`]. Unique per texture, unchanged by eviction.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// True when the chain is primary-only, i.e. no fallback face loaded (D4).
@@ -519,5 +560,69 @@ mod tests {
         let a = atlas.solid_entry(&queue);
         let b = atlas.solid_entry(&queue);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn two_atlases_never_share_an_epoch() {
+        // R1.3: the whole fix rests on this. Two atlases built from identical
+        // inputs are still two *textures*, so a consumer keyed on `epoch` must be
+        // able to tell them apart. `generation` cannot do this job — both start at
+        // 0, which is exactly the bug (a swap looked like "nothing changed").
+        //
+        // Only inequality is asserted: the counter is process-global and shared
+        // with every other test running in this binary, so no specific value is
+        // stable.
+        let Some((device, _queue)) = crate::headless() else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        let Ok(fonts) = FontSet::load() else {
+            eprintln!("skipping: no font");
+            return;
+        };
+        let (Some(a), Some(b)) = (
+            Atlas::new(&device, &fonts, 32.0),
+            Atlas::new(&device, &fonts, 32.0),
+        ) else {
+            eprintln!("skipping: atlas build failed");
+            return;
+        };
+        assert_ne!(
+            a.epoch(),
+            b.epoch(),
+            "a fresh atlas is a fresh texture and must carry a fresh epoch"
+        );
+        assert_eq!(
+            (a.generation(), b.generation()),
+            (0, 0),
+            "both generations start at 0 — which is precisely why generation \
+             cannot stand in for texture identity"
+        );
+    }
+
+    #[test]
+    fn eviction_bumps_the_generation_but_not_the_epoch() {
+        // R1.5: the two counters are orthogonal, and the bind-group key depends on
+        // that. Eviction reuses the same texture (and so the same view/sampler), so
+        // rebuilding a bind group for it would produce a byte-identical result —
+        // `epoch` must stay put or every eviction would churn bind groups for
+        // nothing (the G1 idle-CPU regression).
+        let Some((_queue, mut atlas)) = atlas_for_test() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let epoch_before = atlas.epoch();
+        let gen_before = atlas.generation();
+        atlas.evict_for_test();
+        assert_eq!(
+            atlas.epoch(),
+            epoch_before,
+            "eviction reuses the texture, so its identity is unchanged"
+        );
+        assert_eq!(
+            atlas.generation(),
+            gen_before + 1,
+            "eviction still invalidates every UV handed out"
+        );
     }
 }

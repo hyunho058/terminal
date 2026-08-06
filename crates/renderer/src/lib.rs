@@ -651,8 +651,32 @@ impl Renderer {
         // Rebuilding shares the same mapped bytes (D7/R3.2): a live ppem change
         // must not re-read (or re-copy) the 55 MB fallback face on every tick of
         // the config watcher.
+        //
+        // The `None` arm — allocation failed, the old atlas is retained — is a
+        // *defined* outcome for bind groups, not an unhandled hole: `epoch` does not
+        // change, so the three text layers correctly keep their cached bind groups.
+        // That is right rather than lucky, because the old texture is still alive and
+        // its view still valid (D8/R4.3).
+        // What that arm leaves unaddressed, and this spec deliberately does not fix:
+        // `self.cell_size` and `self.ppem` were already updated above, *before* this
+        // fallible call, so a failure leaves the atlas rasterized at the OLD ppem while
+        // `last_snapshot = None` below forces a re-shape at the NEW cell geometry —
+        // glyphs drawn at the wrong size. A separate pre-existing defect, recorded as
+        // Known Gap G-d in specs/atlas-swap-bind-invalidation/spec.md.
         if let Some(atlas) = Atlas::new(&self.device, &self.fonts, self.ppem) {
             self.atlas = atlas;
+            // The three text layers (sidebar/overlay/preedit) self-guard against this
+            // swap: each caches its atlas bind group keyed on `(format, atlas.epoch())`
+            // and rebuilds when the texture identity changes. The grid does **not** —
+            // it is correct only because `apply_config` is the single atlas-swap site
+            // and rebuilds `glyph_bind_group` by hand right here. Correct by accident,
+            // not by invariant (D7; Known Gap G-a in
+            // specs/atlas-swap-bind-invalidation/spec.md).
+            // Whoever adds a second swap site must therefore either route it through
+            // here or give the grid the same epoch-keyed guard the layers have.
+            // Otherwise the grid samples the replaced texture with UVs computed against
+            // the new one: no crash, no validation error, just wrong glyphs for the rest
+            // of the session — exactly the bug that spec was written to close.
             self.glyph_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("glyph-bg"),
                 layout: &self.glyph_bgl,

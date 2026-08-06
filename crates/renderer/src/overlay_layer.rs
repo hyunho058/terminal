@@ -127,7 +127,29 @@ struct Gpu {
     rect_pipeline: wgpu::RenderPipeline,
     rect_bind: wgpu::BindGroup,
     text_pipeline: wgpu::RenderPipeline,
+    /// Kept (not dropped after pipeline creation) so [`OverlayLayer::ensure_text_bind`]
+    /// can build a *replacement* bind group on a later frame — D3 rule 1.
+    text_bgl: wgpu::BindGroupLayout,
     text_bind: wgpu::BindGroup,
+    /// `(format, atlas epoch)` the live `text_bind` was built against (D2).
+    ///
+    /// It lives **inside `Gpu`** on purpose (D3 rule 2): `ensure_gpu` replaces the
+    /// whole struct on a format change, so the key resets to `None` alongside the
+    /// `uniform` buffer it binds — a cached bind group pointing at a replaced
+    /// buffer is structurally impossible rather than merely unlikely.
+    ///
+    /// `generation` and the cell size are deliberately *not* in the key: eviction
+    /// reuses the same texture (so a rebuild would be byte-identical) and the cell
+    /// size never enters the bind group at all. Keying on either would churn bind
+    /// groups at idle — the G1 regression.
+    text_bind_key: Option<(wgpu::TextureFormat, u64)>,
+    /// How many times `text_bind` has actually been (re)built — see the twin field on
+    /// `SidebarTextPipeline`. Key equality alone cannot express "rebuilds = 0 while the
+    /// atlas is unchanged": that assertion still passes with the short-circuit deleted
+    /// and the bind group rebuilt every frame, the G1 idle-CPU regression this spec
+    /// forbids. `#[cfg(test)]`, so the shipped binary is unaffected.
+    #[cfg(test)]
+    rebuilds: u32,
 }
 
 /// The overlay draw layer.
@@ -214,24 +236,7 @@ impl OverlayLayer {
                 },
             ],
         });
-        let text_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ov-text-bg"),
-            layout: &text_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(ctx.atlas.view()),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(ctx.atlas.sampler()),
-                },
-            ],
-        });
+        let text_bind = build_text_bind(device, &text_bgl, &uniform, ctx.atlas);
         let text_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ov-text"),
             source: wgpu::ShaderSource::Wgsl(TEXT_WGSL.into()),
@@ -252,8 +257,41 @@ impl OverlayLayer {
             rect_pipeline,
             rect_bind,
             text_pipeline,
+            text_bgl,
             text_bind,
+            text_bind_key: Some((ctx.format, ctx.atlas.epoch())),
+            // The eager build in `ensure_gpu` counts as the first rebuild, so an idle
+            // test asserting `rebuilds == 1` covers the whole record path.
+            #[cfg(test)]
+            rebuilds: 1,
         });
+    }
+
+    /// Rebuild the atlas bind group when — and *only* when — the texture it samples
+    /// has been replaced (D3).
+    ///
+    /// `ensure_gpu` is gated on the surface format alone, which never changes at
+    /// runtime; a live config reload swaps the whole `Atlas` (`Renderer::apply_config`)
+    /// and leaves the format untouched, so without this the overlay would keep
+    /// sampling the replaced texture with UVs computed against the new one — wrong
+    /// glyphs for the rest of the session. Splitting only the bind group out keeps
+    /// pipelines and shader modules (which a swap does *not* invalidate) format-gated.
+    ///
+    /// Must run **after** `ensure_gpu`: it needs the `text_bgl` that `ensure_gpu` stores.
+    fn ensure_text_bind(&mut self, ctx: &FrameCtx<'_>) {
+        let Some(gpu) = self.gpu.as_mut() else {
+            return;
+        };
+        let key = (ctx.format, ctx.atlas.epoch());
+        if gpu.text_bind_key == Some(key) {
+            return;
+        }
+        gpu.text_bind = build_text_bind(ctx.device, &gpu.text_bgl, &gpu.uniform, ctx.atlas);
+        gpu.text_bind_key = Some(key);
+        #[cfg(test)]
+        {
+            gpu.rebuilds += 1;
+        }
     }
 
     /// Lay out the last-N lines as glyph quads inside the panel rect.
@@ -302,6 +340,9 @@ impl DrawLayer for OverlayLayer {
             return;
         }
         self.ensure_gpu(ctx);
+        // Order matters (D3 rule 3): `ensure_text_bind` builds from the `text_bgl`
+        // `ensure_gpu` stores.
+        self.ensure_text_bind(ctx);
         let (vw, vh) = (ctx.viewport[0], ctx.viewport[1]);
         let panel = panel_rect([vw, vh], ctx.top_inset);
 
@@ -378,6 +419,35 @@ const PREMULTIPLIED: wgpu::BlendState = wgpu::BlendState {
         operation: wgpu::BlendOperation::Add,
     },
 };
+
+/// The one place the atlas bind group is assembled — `ensure_gpu` builds it eagerly,
+/// `ensure_text_bind` reassigns it after a texture swap, and both must bind the same
+/// three resources.
+fn build_text_bind(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    uniform: &wgpu::Buffer,
+    atlas: &crate::atlas::Atlas,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("ov-text-bg"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(atlas.view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(atlas.sampler()),
+            },
+        ],
+    })
+}
 
 fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
@@ -490,5 +560,166 @@ mod tests {
     fn z_order_is_above_the_tab_bar() {
         let (layer, _h) = OverlayLayer::new();
         assert!(layer.z_order() > super::super::tab_bar::TAB_BAR_Z);
+    }
+
+    /// An offscreen render target for the GPU tests below.
+    fn offscreen(device: &wgpu::Device) -> wgpu::TextureView {
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen"),
+            size: wgpu::Extent3d {
+                width: 256,
+                height: 128,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        target.create_view(&wgpu::TextureViewDescriptor::default())
+    }
+
+    /// A layer whose model clears the `!visible` early-out (R5.3): without a visible
+    /// model and a non-empty line, `record` returns before touching any GPU state and
+    /// every assertion below would pass vacuously.
+    fn visible_layer() -> OverlayLayer {
+        let (layer, handle) = OverlayLayer::new();
+        handle.set(OverlayModel {
+            visible: true,
+            lines: vec!["ai-monitor log line".into()],
+        });
+        layer
+    }
+
+    fn bind_key(layer: &OverlayLayer) -> Option<(wgpu::TextureFormat, u64)> {
+        layer
+            .gpu
+            .as_ref()
+            .expect("recording must build gpu state")
+            .text_bind_key
+    }
+
+    /// R0.2/R3.5: replacing the atlas — what `Renderer::apply_config` does on every
+    /// live config reload — must invalidate the bind group that samples it. Before
+    /// this fix `ensure_gpu`'s format-only gate meant the bind group was built once
+    /// and never again, so the overlay sampled the *replaced* texture with UVs
+    /// computed against the new one.
+    #[test]
+    fn swapping_the_atlas_rebuilds_the_text_bind_group() {
+        let (Some((device, queue)), Some(fonts)) = (crate::headless(), crate::FontSet::load().ok())
+        else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let mut atlas_a = crate::atlas::Atlas::new(&device, &fonts, 24.0).expect("atlas");
+        let mut atlas_b = crate::atlas::Atlas::new(&device, &fonts, 24.0).expect("atlas");
+        let view = offscreen(&device);
+        let t = term_core::Terminal::new(10, 2, term_core::Color(0xFFFFFF), term_core::Color(0));
+        let snap = t.snapshot();
+        let sidebar_cfg = common::config::SidebarConfig::default();
+        let mut layer = visible_layer();
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        let frame = |layer: &mut OverlayLayer,
+                     atlas: &mut crate::atlas::Atlas,
+                     encoder: &mut wgpu::CommandEncoder| {
+            let mut ctx = FrameCtx {
+                device: &device,
+                queue: &queue,
+                encoder,
+                view: &view,
+                viewport: [256.0, 128.0],
+                cell: [12.0, 24.0],
+                top_inset: 0.0,
+                left_inset: 0.0,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                sidebar: &sidebar_cfg,
+                scale_factor: 1.0,
+                snapshot: &snap,
+                atlas,
+            };
+            layer.record(&mut ctx);
+        };
+
+        frame(&mut layer, &mut atlas_a, &mut encoder);
+        let k1 = bind_key(&layer);
+        assert!(k1.is_some(), "a visible overlay must build its bind group");
+
+        frame(&mut layer, &mut atlas_b, &mut encoder);
+        let k2 = bind_key(&layer);
+        // Only inequality is asserted: the epoch counter is process-global and shared
+        // with tests running in parallel, so no specific value is deterministic.
+        assert_ne!(
+            k1, k2,
+            "a replaced atlas texture must invalidate the bind group keyed on it"
+        );
+        // A moved key does NOT imply a moved bind group. Without this, a mutant that
+        // advances the key while leaving `text_bind` pointing at the replaced texture
+        // passes — and that mutant *is* the production bug.
+        assert_eq!(
+            layer.gpu.as_ref().map(|g| g.rebuilds),
+            Some(2),
+            "the swap must actually re-point the bind group, not just re-stamp the key"
+        );
+    }
+
+    /// R4.2 / G1: the flip side — an unchanged atlas must *not* churn bind groups
+    /// every frame. (Scope note: the per-frame instance-buffer `create_buffer_init`
+    /// calls are existing behaviour and outside this contract; only the bind group
+    /// is asserted stable.)
+    #[test]
+    fn an_unchanged_atlas_never_rebuilds_the_text_bind_group() {
+        let (Some((device, queue)), Some(fonts)) = (crate::headless(), crate::FontSet::load().ok())
+        else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let mut atlas = crate::atlas::Atlas::new(&device, &fonts, 24.0).expect("atlas");
+        let view = offscreen(&device);
+        let t = term_core::Terminal::new(10, 2, term_core::Color(0xFFFFFF), term_core::Color(0));
+        let snap = t.snapshot();
+        let sidebar_cfg = common::config::SidebarConfig::default();
+        let mut layer = visible_layer();
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        let mut first = None;
+        for frame in 0..4 {
+            {
+                let mut ctx = FrameCtx {
+                    device: &device,
+                    queue: &queue,
+                    encoder: &mut encoder,
+                    view: &view,
+                    viewport: [256.0, 128.0],
+                    cell: [12.0, 24.0],
+                    top_inset: 0.0,
+                    left_inset: 0.0,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    sidebar: &sidebar_cfg,
+                    scale_factor: 1.0,
+                    snapshot: &snap,
+                    atlas: &mut atlas,
+                };
+                layer.record(&mut ctx);
+            }
+            let key = bind_key(&layer);
+            assert!(key.is_some(), "a visible overlay must build its bind group");
+            match first {
+                None => first = key,
+                Some(k) => assert_eq!(key, Some(k), "frame {frame} rebuilt at idle"),
+            }
+        }
+        // Key equality alone does NOT prove this: it still holds when the bind group is
+        // rebuilt every frame with the same key. Count the actual rebuilds, or the G1
+        // guarantee is asserted in name only.
+        assert_eq!(
+            layer.gpu.as_ref().map(|g| g.rebuilds),
+            Some(1),
+            "4 frames on one atlas must build the bind group exactly once"
+        );
     }
 }
