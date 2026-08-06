@@ -808,8 +808,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
 /// The glyph pass. Mirrors foundations' shape-pipeline API; instances ride a resident
 /// buffer (`upload_resident`, never `create_buffer_init` per frame — G1). The bind group
-/// is rebuilt on a **composite** key `(format, atlas.generation(), cell)` so a live
-/// `apply_config` atlas swap cannot leave it sampling a dead texture (D8's R8.4 fix).
+/// is rebuilt on the key `(format, atlas.epoch())` so a live `apply_config` atlas swap
+/// cannot leave it sampling the replaced texture (atlas-swap-bind-invalidation D2/D4).
 struct SidebarTextPipeline {
     format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
@@ -817,7 +817,17 @@ struct SidebarTextPipeline {
     quad: wgpu::Buffer,
     uniform: wgpu::Buffer,
     bind: Option<wgpu::BindGroup>,
-    bind_key: Option<(wgpu::TextureFormat, u64, [u32; 2])>,
+    bind_key: Option<(wgpu::TextureFormat, u64)>,
+    /// How many times the bind group has actually been (re)built.
+    ///
+    /// Key equality alone cannot express R2.3's real claim — *"rebuilds = 0 while the
+    /// atlas is unchanged"*. A test that only compares keys still passes when the
+    /// short-circuit below is deleted and the bind group is rebuilt every single frame,
+    /// which is exactly the G1 idle-CPU regression this spec forbids. Counting the
+    /// assignments is what gives that test teeth. `#[cfg(test)]`, so it costs the
+    /// shipped binary nothing.
+    #[cfg(test)]
+    rebuilds: u32,
     instances: Option<wgpu::Buffer>,
 }
 
@@ -877,6 +887,8 @@ impl SidebarTextPipeline {
             uniform,
             bind: None,
             bind_key: None,
+            #[cfg(test)]
+            rebuilds: 0,
             instances: None,
         }
     }
@@ -899,13 +911,30 @@ impl SidebarTextPipeline {
         if text.is_empty() {
             return;
         }
-        // Composite bind key (D8/R8.4): rebuild if the atlas texture may have been
-        // swapped (generation) or replaced by a config-driven cell change.
-        let key = (
-            ctx.format,
-            ctx.atlas.generation(),
-            [ctx.cell[0].to_bits(), ctx.cell[1].to_bits()],
-        );
+        // Bind key (atlas-swap-bind-invalidation D2/R2.1). The key must mirror what the
+        // bind group actually holds — `{uniform, atlas.view(), atlas.sampler()}` — and
+        // nothing else, because a key that moves when the contents don't means a rebuild
+        // every frame: the G1 idle-CPU debt this project already paid off once.
+        //
+        // * `epoch` is the load-bearing field: it is the identity of the *texture*, so it
+        //   is the only signal that `Renderer::apply_config` swapped the whole atlas out
+        //   from under us. Without it the cached bind group keeps sampling the replaced
+        //   texture while UVs are computed against the new one — wrong glyphs, silently,
+        //   for the rest of the session.
+        // * `generation` is deliberately NOT here. It counts evictions *within* one
+        //   texture; eviction reuses the same texture, view and sampler, so rebuilding on
+        //   a bump would produce a byte-identical bind group. The UV invalidation it
+        //   really signals is repaired by re-issuing instances, which `record` already
+        //   does every frame (D5).
+        // * `cell` is deliberately NOT here either. `TextUniforms` is `{viewport, _pad}`,
+        //   so the cell size never enters the bind group at all.
+        // * `format` is retained, but be honest about its status: it is structurally
+        //   redundant today. A format change makes `ensure` replace this whole struct via
+        //   `SidebarTextPipeline::new`, which starts at `bind: None, bind_key: None`, so
+        //   the comparison can never fire. It is kept purely as defence in case this cache
+        //   ever moves outside the format-gated struct — not because it guards anything
+        //   reachable now.
+        let key = (ctx.format, ctx.atlas.epoch());
         if self.bind_key != Some(key) {
             self.bind = Some(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("sidebar-text-bg"),
@@ -926,6 +955,10 @@ impl SidebarTextPipeline {
                 ],
             }));
             self.bind_key = Some(key);
+            #[cfg(test)]
+            {
+                self.rebuilds += 1;
+            }
         }
         ctx.queue.write_buffer(
             &self.uniform,
@@ -1951,6 +1984,233 @@ mod tests {
         assert!(
             a.card_h > g.cell[1],
             "card reserves at least the two card lines"
+        );
+    }
+
+    // ---- atlas-swap-bind-invalidation: the text bind group's invalidation key ----
+    //
+    // These three pin both directions of R2.2–R2.4. They observe the private `bind_key`
+    // directly (D6 contract 4) rather than adding a production accessor, which is why they
+    // live in this file. Every one of them must first get past two early returns —
+    // `TabBar::record`'s `left_inset <= 0` / zero-viewport guard and
+    // `SidebarTextPipeline::draw`'s empty-text guard — or the bind group is never built at
+    // all and the assertions prove nothing (R5.3).
+
+    /// Everything a recorded frame needs but the atlas, which the tests vary themselves.
+    struct SwapFixture {
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        fonts: crate::FontSet,
+        /// Kept alive for `view`.
+        _target: wgpu::Texture,
+        view: wgpu::TextureView,
+        snapshot: term_core::GridSnapshot,
+        sidebar: SidebarConfig,
+    }
+
+    /// `None` when there is no adapter or no system font — the crate skips, never fails
+    /// (R5.5).
+    fn swap_fixture() -> Option<SwapFixture> {
+        let (device, queue) = crate::headless()?;
+        let fonts = crate::FontSet::load().ok()?;
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sidebar-swap-offscreen"),
+            size: wgpu::Extent3d {
+                width: 512,
+                height: 512,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let terminal =
+            term_core::Terminal::new(80, 24, term_core::Color(0xFFFFFF), term_core::Color(0));
+        let snapshot = terminal.snapshot();
+        Some(SwapFixture {
+            device,
+            queue,
+            fonts,
+            _target: target,
+            view,
+            snapshot,
+            sidebar: SidebarConfig::default(),
+        })
+    }
+
+    /// Reset the `thread_local!` singleton (R5.4) and put one card in it, so the layer has
+    /// a title to shape and `draw` sees a non-empty instance list.
+    fn install_one_card() {
+        reset_shared_model();
+        TabModelHandle::shared().set(TabBarModel {
+            titles: vec![SidebarRow {
+                tab_id: 1,
+                title: "project".into(),
+                label: None,
+                program: None,
+            }],
+            active: 0,
+            ..Default::default()
+        });
+    }
+
+    /// Record one frame against `atlas` and hand back the text pipeline's private bind key.
+    fn record_frame(
+        bar: &mut TabBar,
+        fx: &SwapFixture,
+        atlas: &mut crate::atlas::Atlas,
+    ) -> Option<(wgpu::TextureFormat, u64)> {
+        let mut encoder = fx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("sidebar-swap-frame"),
+            });
+        {
+            let mut ctx = FrameCtx {
+                device: &fx.device,
+                queue: &fx.queue,
+                encoder: &mut encoder,
+                view: &fx.view,
+                viewport: [512.0, 512.0],
+                cell: [8.0, 16.0],
+                top_inset: 0.0,
+                // R5.3: a positive band width, or `record` returns before drawing anything.
+                left_inset: 340.0,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                sidebar: &fx.sidebar,
+                scale_factor: 1.0,
+                snapshot: &fx.snapshot,
+                atlas,
+            };
+            bar.record(&mut ctx);
+        }
+        fx.queue.submit(std::iter::once(encoder.finish()));
+        bar.text_pipe.as_ref().and_then(|p| p.bind_key)
+    }
+
+    #[test]
+    fn an_atlas_swap_rebuilds_the_sidebar_text_bind_group() {
+        // R2.2 — the bug itself. `apply_config` replaces the whole `Atlas`, and the old
+        // key `(format, generation, cell)` did not move: `generation` restarts at 0 on a
+        // fresh atlas and `cell` only tracks font size. The cached bind group therefore
+        // kept pointing at the replaced texture while UVs were computed against the new
+        // one. Only `epoch` distinguishes the two textures.
+        let Some(fx) = swap_fixture() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let (Some(mut first), Some(mut second)) = (
+            crate::atlas::Atlas::new(&fx.device, &fx.fonts, 16.0),
+            crate::atlas::Atlas::new(&fx.device, &fx.fonts, 16.0),
+        ) else {
+            eprintln!("skipping: atlas build failed");
+            return;
+        };
+        install_one_card();
+        let (mut bar, _handle) = TabBar::new();
+
+        let before = record_frame(&mut bar, &fx, &mut first);
+        assert!(
+            before.is_some(),
+            "the first frame must actually build a bind group — otherwise this test \
+             passes vacuously through an early return"
+        );
+
+        // The swap: a different `Atlas` instance, exactly as `apply_config` installs.
+        let after = record_frame(&mut bar, &fx, &mut second);
+        assert!(after.is_some(), "the second frame still draws text");
+        assert_ne!(
+            before, after,
+            "a replaced atlas texture must invalidate the cached bind group"
+        );
+        // A moved key does NOT imply a moved bind group. Without this, a mutant that
+        // advances `bind_key` while leaving `bind` pointing at the replaced texture
+        // passes — and that mutant *is* the production bug: no crash, no validation
+        // error, just wrong glyphs for the rest of the session.
+        assert_eq!(
+            bar.text_pipe.as_ref().map(|p| p.rebuilds),
+            Some(2),
+            "the swap must actually re-point the bind group, not just re-stamp the key"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_atlas_never_rebuilds_the_sidebar_text_bind_group() {
+        // R2.3 — the other direction, and the G1 guard. Rebuilding a bind group on every
+        // frame would re-open the idle-CPU debt `docs/architecture.md` records as paid.
+        let Some(fx) = swap_fixture() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let Some(mut atlas) = crate::atlas::Atlas::new(&fx.device, &fx.fonts, 16.0) else {
+            eprintln!("skipping: atlas build failed");
+            return;
+        };
+        install_one_card();
+        let (mut bar, _handle) = TabBar::new();
+
+        let first = record_frame(&mut bar, &fx, &mut atlas);
+        assert!(first.is_some(), "the first frame must build a bind group");
+        for frame in 0..4 {
+            let again = record_frame(&mut bar, &fx, &mut atlas);
+            assert_eq!(
+                first, again,
+                "frame {frame}: an untouched atlas must not churn the bind group"
+            );
+        }
+        // Key equality alone does NOT prove this: it still holds when the bind group is
+        // rebuilt every frame with the same key. Count the actual rebuilds, or the G1
+        // guarantee is asserted in name only.
+        assert_eq!(
+            bar.text_pipe.as_ref().map(|p| p.rebuilds),
+            Some(1),
+            "5 frames on one atlas must build the bind group exactly once"
+        );
+    }
+
+    #[test]
+    fn an_eviction_alone_does_not_rebuild_the_sidebar_text_bind_group() {
+        // R2.4 — eviction reuses the *same* texture (and so the same view and sampler),
+        // bumping `generation` only. A rebuild would hand back a byte-identical bind
+        // group, so the key must not move. What eviction really invalidates is the UVs,
+        // and those are re-issued every frame by `record` (D5) — no bind-group work.
+        let Some(fx) = swap_fixture() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let Some(mut atlas) = crate::atlas::Atlas::new(&fx.device, &fx.fonts, 16.0) else {
+            eprintln!("skipping: atlas build failed");
+            return;
+        };
+        install_one_card();
+        let (mut bar, _handle) = TabBar::new();
+
+        let before = record_frame(&mut bar, &fx, &mut atlas);
+        assert!(before.is_some(), "the first frame must build a bind group");
+        let generation_before = atlas.generation();
+
+        atlas.evict_for_test();
+        assert_ne!(
+            atlas.generation(),
+            generation_before,
+            "the fixture must really have evicted, or this test proves nothing"
+        );
+
+        let after = record_frame(&mut bar, &fx, &mut atlas);
+        assert_eq!(
+            before, after,
+            "eviction reuses the texture, so the bind group stays valid"
+        );
+        // Same reasoning as the swap test, inverted: an unmoved key must also mean an
+        // unrebuilt bind group, not merely a re-stamped one.
+        assert_eq!(
+            bar.text_pipe.as_ref().map(|p| p.rebuilds),
+            Some(1),
+            "eviction must not rebuild the bind group at all"
         );
     }
 }

@@ -216,7 +216,28 @@ struct Gpu {
     rect_pipeline: wgpu::RenderPipeline,
     rect_bind: wgpu::BindGroup,
     text_pipeline: wgpu::RenderPipeline,
+    /// Kept so [`PreeditLayer::ensure_text_bind`] can rebuild `text_bind` on a
+    /// later frame (atlas-swap-bind-invalidation D3 rule 1). Without the layout
+    /// stored here, building a bind group after `ensure_gpu` is impossible.
+    text_bgl: wgpu::BindGroupLayout,
     text_bind: wgpu::BindGroup,
+    /// What `text_bind` was built against: `(surface format, atlas epoch)` (D2).
+    ///
+    /// It lives **inside** `Gpu`, not on the layer: `ensure_gpu` replaces this
+    /// whole struct on a format change, so the key resets to `None` with it and a
+    /// cached bind group pointing at a replaced `uniform` buffer is structurally
+    /// impossible (D3 rule 2). `generation` and cell size are deliberately absent
+    /// — eviction reuses the same texture (a rebuild would be byte-identical) and
+    /// the cell size is not in the bind group at all, so keying on either would
+    /// churn bind groups at idle (the G1 regression).
+    text_bind_key: Option<(wgpu::TextureFormat, u64)>,
+    /// How many times `text_bind` has actually been (re)built — see the twin field on
+    /// `SidebarTextPipeline`. Key equality alone cannot express "rebuilds = 0 while the
+    /// atlas is unchanged": that assertion still passes with the short-circuit deleted
+    /// and the bind group rebuilt every frame, the G1 idle-CPU regression this spec
+    /// forbids. `#[cfg(test)]`, so the shipped binary is unaffected.
+    #[cfg(test)]
+    rebuilds: u32,
 }
 
 /// The inline-preedit draw layer. Register one via `Renderer::add_layer`.
@@ -240,6 +261,10 @@ impl PreeditLayer {
         )
     }
 
+    /// Build the pipelines, shaders and buffers — gated on the **surface format**
+    /// alone, deliberately (atlas-swap-bind-invalidation D3). An atlas swap does
+    /// not invalidate any of this; only the atlas bind group, which
+    /// [`Self::ensure_text_bind`] owns from the second frame on.
     fn ensure_gpu(&mut self, ctx: &FrameCtx<'_>) {
         if self.gpu.as_ref().map(|g| g.format) == Some(ctx.format) {
             return;
@@ -309,24 +334,7 @@ impl PreeditLayer {
                 },
             ],
         });
-        let text_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("preedit-text-bg"),
-            layout: &text_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(ctx.atlas.view()),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(ctx.atlas.sampler()),
-                },
-            ],
-        });
+        let text_bind = build_text_bind(device, &text_bgl, &uniform, ctx.atlas);
         let text_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("preedit-text"),
             source: wgpu::ShaderSource::Wgsl(TEXT_WGSL.into()),
@@ -348,8 +356,43 @@ impl PreeditLayer {
             rect_pipeline,
             rect_bind,
             text_pipeline,
+            text_bgl,
             text_bind,
+            text_bind_key: Some((ctx.format, ctx.atlas.epoch())),
+            // The eager build just above counts as the first rebuild, so an idle test
+            // asserting `rebuilds == 1` covers the whole record path.
+            #[cfg(test)]
+            rebuilds: 1,
         });
+    }
+
+    /// Re-point the atlas bind group at the current atlas when the texture behind
+    /// it was replaced (atlas-swap-bind-invalidation R0.3/R3.1–R3.5).
+    ///
+    /// `Renderer::apply_config` swaps `Atlas` wholesale on every live config
+    /// reload, but [`Self::ensure_gpu`] is format-gated and the surface format
+    /// never changes at runtime — so without this the preedit sampled the
+    /// *replaced* texture with UVs computed against the new one, silently, for the
+    /// rest of the session. Keyed on `(format, epoch)` so it fires exactly on a
+    /// texture swap and never at idle.
+    ///
+    /// `text_bind` stays non-`Option` and is simply reassigned: the draw site
+    /// consumes it unconditionally, and an `Option` there would force an
+    /// `unwrap()`/`expect()` (D3 rule 4, CLAUDE.md's no-`unwrap()` rule).
+    fn ensure_text_bind(&mut self, ctx: &FrameCtx<'_>) {
+        let key = (ctx.format, ctx.atlas.epoch());
+        let Some(gpu) = self.gpu.as_mut() else {
+            return; // no pipelines yet — `ensure_gpu` builds the bind group itself
+        };
+        if gpu.text_bind_key == Some(key) {
+            return;
+        }
+        gpu.text_bind = build_text_bind(ctx.device, &gpu.text_bgl, &gpu.uniform, ctx.atlas);
+        gpu.text_bind_key = Some(key);
+        #[cfg(test)]
+        {
+            gpu.rebuilds += 1;
+        }
     }
 
     /// The glyph quads plus the trailing underline rule, in draw order.
@@ -479,6 +522,9 @@ impl DrawLayer for PreeditLayer {
             return; // not composing / scrolled back / nothing fits
         };
         self.ensure_gpu(ctx);
+        // Order matters: `ensure_text_bind` needs the `text_bgl` the call above
+        // stores, and the draw below needs the re-pointed bind group (D3 rule 3).
+        self.ensure_text_bind(ctx);
 
         // D14: the theme default bg, opaque — NOT the underlying cell's bg. The
         // point is to reliably cover whatever the shell drew in these cells, so the
@@ -549,6 +595,38 @@ impl DrawLayer for PreeditLayer {
 fn linear(packed: u32, a: f32) -> [f32; 4] {
     let [r, g, b] = term_core::Color(packed).to_linear_f32();
     [r, g, b, a]
+}
+
+/// The atlas bind group: `{uniform, atlas view, atlas sampler}`.
+///
+/// One assembly point for both callers — `ensure_gpu`'s eager first build and
+/// `ensure_text_bind`'s post-swap rebuild. They must bind the *same* three resources
+/// or a swap would silently re-point only some of them, so writing the descriptor
+/// twice is a standing invitation for the two copies to drift apart.
+fn build_text_bind(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    uniform: &wgpu::Buffer,
+    atlas: &crate::atlas::Atlas,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("preedit-text-bg"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(atlas.view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(atlas.sampler()),
+            },
+        ],
+    })
 }
 
 fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -815,6 +893,194 @@ mod tests {
         assert!(layer.gpu.is_some(), "recording must build the pipelines");
         handle.set_text(String::new());
         layer.record(&mut ctx); // empty composition: early-out, no pass
+    }
+
+    /// An offscreen render target to record into.
+    fn offscreen(device: &wgpu::Device) -> wgpu::TextureView {
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen"),
+            size: wgpu::Extent3d {
+                width: 128,
+                height: 64,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        target.create_view(&wgpu::TextureViewDescriptor::default())
+    }
+
+    /// Record one frame of a composing preedit against `atlas`.
+    ///
+    /// The 10×2 grid and 12×24 cells are copied from
+    /// `recording_a_composition_builds_its_passes` on purpose: `preedit_geom`
+    /// returns `None` — and `record` never reaches the bind-group code — on a
+    /// smaller grid or a cursor off the viewport (spec R5.3).
+    #[allow(clippy::too_many_arguments)]
+    fn record_frame(
+        layer: &mut PreeditLayer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        atlas: &mut crate::atlas::Atlas,
+        snap: &term_core::GridSnapshot,
+        sidebar: &common::config::SidebarConfig,
+    ) {
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let mut ctx = FrameCtx {
+            device,
+            queue,
+            encoder: &mut encoder,
+            view,
+            viewport: [128.0, 64.0],
+            cell: [12.0, 24.0],
+            top_inset: 0.0,
+            left_inset: 0.0,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            sidebar,
+            scale_factor: 1.0,
+            snapshot: snap,
+            atlas,
+        };
+        layer.record(&mut ctx);
+    }
+
+    /// The `text_bind_key` after at least one record, or `None` if the layer never
+    /// built its GPU state (which would mean the test took an early-out).
+    fn bind_key(layer: &PreeditLayer) -> Option<(wgpu::TextureFormat, u64)> {
+        layer.gpu.as_ref().and_then(|g| g.text_bind_key)
+    }
+
+    #[test]
+    fn atlas_swap_rebuilds_the_text_bind() {
+        // R0.3/R3.5: `Renderer::apply_config` replaces the whole `Atlas`, but
+        // `ensure_gpu` is format-gated and the surface format never changes at
+        // runtime — so before this fix the preedit kept sampling the replaced
+        // texture with UVs computed against the new one, for the rest of the
+        // session. The key must move with the texture.
+        let (Some((device, queue)), Some(fonts)) = (headless(), crate::FontSet::load().ok()) else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let view = offscreen(&device);
+        let t = term_core::Terminal::new(10, 2, term_core::Color(0xFFFFFF), term_core::Color(0));
+        let snap = t.snapshot();
+        let sidebar_cfg = common::config::SidebarConfig::default();
+
+        let (mut layer, handle) = PreeditLayer::new();
+        handle.set_theme(0x101010, 0xE6E1CF);
+        handle.set_text("한글".into());
+
+        let mut atlas = crate::atlas::Atlas::new(&device, &fonts, 24.0).expect("atlas");
+        record_frame(
+            &mut layer,
+            &device,
+            &queue,
+            &view,
+            &mut atlas,
+            &snap,
+            &sidebar_cfg,
+        );
+        let k1 = bind_key(&layer);
+        // Guard against a vacuous pass: if `preedit_geom` had returned `None` the
+        // layer would never have built any GPU state and every assertion below
+        // would be about nothing.
+        assert!(
+            k1.is_some(),
+            "the first record must reach the bind-group code (early-out taken?)"
+        );
+
+        // The swap `apply_config` performs: a brand-new Atlas, hence a new texture.
+        let mut swapped = crate::atlas::Atlas::new(&device, &fonts, 24.0).expect("atlas");
+        record_frame(
+            &mut layer,
+            &device,
+            &queue,
+            &view,
+            &mut swapped,
+            &snap,
+            &sidebar_cfg,
+        );
+        let k2 = bind_key(&layer);
+        assert!(k2.is_some(), "the layer must still hold a bind group");
+        assert_ne!(
+            k1, k2,
+            "an atlas swap must re-point the preedit's atlas bind group"
+        );
+        // A moved key does NOT imply a moved bind group. Without this, a mutant that
+        // advances the key while leaving `text_bind` pointing at the replaced texture
+        // passes — and that mutant *is* the production bug.
+        assert_eq!(
+            layer.gpu.as_ref().map(|g| g.rebuilds),
+            Some(2),
+            "the swap must actually re-point the bind group, not just re-stamp the key"
+        );
+    }
+
+    #[test]
+    fn idle_frames_do_not_rebuild_the_text_bind() {
+        // The other half of the contract (R2.3's shape, G1 idle-CPU constraint):
+        // rebuilding every frame would be a regression, so with the same atlas the
+        // key must not budge. Scope note (R4.2): this is about *bind groups* only —
+        // the per-frame instance `create_buffer_init` calls are existing behaviour.
+        let (Some((device, queue)), Some(fonts)) = (headless(), crate::FontSet::load().ok()) else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let view = offscreen(&device);
+        let t = term_core::Terminal::new(10, 2, term_core::Color(0xFFFFFF), term_core::Color(0));
+        let snap = t.snapshot();
+        let sidebar_cfg = common::config::SidebarConfig::default();
+
+        let (mut layer, handle) = PreeditLayer::new();
+        handle.set_theme(0x101010, 0xE6E1CF);
+        handle.set_text("한글".into());
+
+        let mut atlas = crate::atlas::Atlas::new(&device, &fonts, 24.0).expect("atlas");
+        record_frame(
+            &mut layer,
+            &device,
+            &queue,
+            &view,
+            &mut atlas,
+            &snap,
+            &sidebar_cfg,
+        );
+        let k1 = bind_key(&layer);
+        assert!(
+            k1.is_some(),
+            "the first record must reach the bind-group code (early-out taken?)"
+        );
+
+        for frame in 1..=4 {
+            record_frame(
+                &mut layer,
+                &device,
+                &queue,
+                &view,
+                &mut atlas,
+                &snap,
+                &sidebar_cfg,
+            );
+            assert_eq!(
+                bind_key(&layer),
+                k1,
+                "idle frame {frame} rebuilt the atlas bind group"
+            );
+        }
+        // Key equality alone does NOT prove this: it still holds when the bind group is
+        // rebuilt every frame with the same key. Count the actual rebuilds, or the G1
+        // guarantee is asserted in name only.
+        assert_eq!(
+            layer.gpu.as_ref().map(|g| g.rebuilds),
+            Some(1),
+            "5 frames on one atlas must build the bind group exactly once"
+        );
     }
 
     #[test]
