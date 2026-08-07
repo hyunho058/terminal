@@ -100,3 +100,15 @@ Every gate passes and the Evidence Report is emitted. A 🛑 boundary ends the l
 - check: —
 - note: a verification run that can modify files must start from a committed baseline, so any
   destructive step is recoverable by `git restore` rather than by transcript archaeology.
+
+### L4 — a terminated subagent leaves its scaffolding behind
+- cause: gate-fail
+- source: human-approved
+- form: gate1-command
+- status: active
+- check: `test -z "$(git status --porcelain --untracked-files=all -- crates/ | grep -v '^ M')"`
+- note: a Gate-3 checker killed by a session limit left `crates/renderer/tests/zz_gate3_probe.rs`
+  behind — its own header said "deleted before the check ends", but its cleanup never ran. The
+  stray integration test broke `cargo test` and `cargo fmt --check` on an otherwise green tree,
+  and the failure looked like a code regression. After any subagent run, check `git status` for
+  untracked leftovers before trusting a gate result.
