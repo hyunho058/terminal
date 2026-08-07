@@ -315,7 +315,7 @@ impl SessionTelemetry {
         // `/model` switches it mid-session and every later assistant line carries the
         // new id, so the panel must show the LAST one — first-wins pins the panel to
         // whatever the session happened to start with (measured: a real log ran
-        // `claude-fable-5`, switched, then logged five `claude-opus-5` turns, and the
+        // `claude-fable-5`, switched, then logged two further `claude-opus-5` turns, and the
         // panel still read `claude-fable-5`).
         //
         // Skipping sentinels is what makes last-wins safe. Only a real id may
@@ -807,8 +807,9 @@ impl SessionTelemetry {
 /// Whether a `message.model` value names a model that actually ran.
 ///
 /// `<synthetic>` is a REAL value of that field, not a hypothetical: Claude Code writes
-/// it on records it fabricates locally (28 of them across the measured corpus, against
-/// 28,897 genuine ids). It is a sentinel, not a model, and under the last-wins rule it
+/// it on records it fabricates locally — API-error and session-limit notices, which is
+/// why they land at the TAIL of a log (52 across the measured corpus, against 37,450
+/// genuine ids). It is a sentinel, not a model, and under the last-wins rule it
 /// would blank the panel's model the moment one landed at the tail of a log.
 ///
 /// Matched by SHAPE, not by the one literal: `<...>` is how this log marks "not a real

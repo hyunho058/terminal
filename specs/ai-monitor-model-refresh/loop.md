@@ -80,7 +80,9 @@ directly above, where first-wins is correct because a session id never changes.
 - Any edit under `crates/term-core/**`.
 - Changing `session_id`'s first-wins semantics.
 - Weakening or deleting an existing assertion to make a gate pass.
-- Widening into the context-window/1M problem (out of scope — surface it instead).
+- ~~Widening into the context-window/1M problem~~ — **struck**: the user explicitly chose to
+  fix it alongside, and Scope records that. Left visible rather than deleted so the contract
+  shows the boundary moved by decision, not by drift.
 
 ## Exit criteria
 Every gate passes and the Evidence Report is emitted.

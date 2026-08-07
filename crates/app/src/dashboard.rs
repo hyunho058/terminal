@@ -365,7 +365,7 @@ fn context_tile(t: &TelemetrySnapshot, env: &Env) -> StatTile {
     // 1M-context session logs the same bare model id as a 200k one. The gauge clamps to
     // full alongside it.
     //
-    // Still reachable, and still the right answer, now that `promoted_window` corrects
+    // Reachable only past the largest known tier — unobserved in the measured corpus (max 666,545), but retained because a larger window shipping is exactly when it matters, and still the right answer, now that `promoted_window` corrects
     // the assumption: it only promotes to a window this table KNOWS about, so usage past
     // the largest known tier fits nothing and lands here. The statement is narrower than
     // it was — no longer "your window might be bigger than 200k" (deduced now) but "your

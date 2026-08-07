@@ -1002,6 +1002,33 @@ fn a_trailing_synthetic_line_never_becomes_the_displayed_model() {
     // known" and the app draws a placeholder; `Some("<synthetic>")` would be a claim.
     let s = fold(&assistant("r1", "<synthetic>"));
     assert_eq!(s.model, None);
+
+    // The rule is by SHAPE, not by the one literal — and that generality has to be
+    // pinned, or it is only a comment. Without these two, `is_real_model` simplifies to
+    // `m != "<synthetic>"` and every gate in the workspace still passes, silently
+    // dropping both documented behaviours (found by the Gate-3 checker, which ran
+    // exactly that mutation).
+    let s = fold(&format!(
+        "{}\n{}",
+        assistant("r1", "claude-opus-5"),
+        assistant("r2", "<unknown>"),
+    ));
+    assert_eq!(
+        s.model.as_deref(),
+        Some("claude-opus-5"),
+        "any `<...>` sentinel is refused, not just `<synthetic>`"
+    );
+
+    let s = fold(&format!(
+        "{}\n{}",
+        assistant("r1", "claude-opus-5"),
+        assistant("r2", ""),
+    ));
+    assert_eq!(
+        s.model.as_deref(),
+        Some("claude-opus-5"),
+        "an empty id names nothing and must not overwrite a real one"
+    );
 }
 
 #[test]
