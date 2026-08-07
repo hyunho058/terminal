@@ -744,9 +744,14 @@ mod tests {
     }
 
     /// R7.1 / G1: the flip side — an unchanged atlas must *not* churn bind groups every
-    /// frame. (Scope note: the per-frame layout pass is existing behaviour and outside
-    /// this contract — R7.3's shaping cache is a separate guarantee; only the bind group
-    /// is asserted stable here.)
+    /// frame. (Scope note: **only the bind group** is asserted here, because the panel's
+    /// other per-frame costs are guaranteed elsewhere and asserting them twice would let
+    /// one copy rot: R7.3's `Shaped` cache is what keeps `layout` and the glyph walk off
+    /// an unchanged frame — see
+    /// `an_unchanged_model_is_shaped_once_no_matter_how_many_frames_are_drawn` — and
+    /// `crate::upload_resident` grows one resident buffer instead of creating one per
+    /// frame. A test that folded all three together would fail for three unrelated
+    /// reasons and name none of them.)
     #[test]
     fn an_unchanged_atlas_never_rebuilds_the_text_bind_group() {
         let (Some((device, queue)), Some(fonts)) = (crate::headless(), crate::FontSet::load().ok())

@@ -290,9 +290,15 @@ pub struct Section {
 
 /// Everything the panel draws (D10's ten regions).
 ///
-/// The first four fields plus [`MonitorModel::footer`] are the **pinned chrome**: the
-/// layout lays them out before any section and they are present at every height (R5.1).
-/// The sections share whatever is left.
+/// `title`, `status`, `session`, `tiles` and `footer` are the **pinned chrome**: the layout
+/// places them before any section, so the sections divide only what is left over.
+///
+/// "Pinned" is not the same as "unconditional", and R5.1 records the difference. The header,
+/// the session row and the footer are the **floor** — they are drawn at every height a
+/// window can usefully produce. The **stat grid is the one region that yields**: on a panel
+/// too short to draw a tile row clear of the footer it drops whole rows of `TILE_COLS`, from
+/// the bottom of the design's order, so CONTEXT goes before UPTIME. See
+/// `monitor_layout::tests::r5_1_the_floor_survives_every_height_and_the_stat_grid_yields_whole_rows`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MonitorModel {
     pub visible: bool,

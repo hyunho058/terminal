@@ -434,9 +434,10 @@ fn section(label: &str, empty_state: &str, total: usize, body: SectionBody) -> S
 
 /// TASKS — newest-*updated* first (B6c), one card each.
 ///
-/// The store is a keyed map, which has no order, so the sort is not a nicety: a
-/// `HashMap` iteration would make the pinned snapshots flaky run to run, Rust's
-/// hasher being randomly seeded per process. The key is `updated_ms` because it
+/// The crate hands the tasks over as a `Vec` already sorted by **id**
+/// (`telemetry.rs:358`, which is what makes the snapshots byte-stable), so the sort here
+/// is not deduplicating a `HashMap` order — it is what turns that arbitrary-but-stable id
+/// order into the display order. The key is `updated_ms` because it
 /// surfaces the task that just changed and because the crate already evicts by it —
 /// display order and eviction order agree instead of fighting. Ties fall through to
 /// `created_ms` then the id, so the order is total.

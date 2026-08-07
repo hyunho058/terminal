@@ -55,8 +55,8 @@ use crate::hyperlink::{
 use crate::input::{
     self, encode_key, hover_card, hover_cursor, is_double_click, is_sidebar_toggle_chord,
     pixel_to_cell, press_dismisses_modals, sidebar_press, sidebar_region, suppress_key, tab_action,
-    wheel_bytes, wheel_lines, wheel_scroll, ReleaseTarget, ResizeDrag, ResizeEdge, SidebarAction,
-    TabAction, WheelDelta,
+    wheel_bytes, wheel_lines, wheel_scroll, PersistTarget, PressRoute, ReleaseTarget, ResizeDrag,
+    ResizeEdge, SidebarAction, TabAction, WheelDelta,
 };
 use crate::seam::{
     AppCtx, AppRequest, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayCommand,
@@ -1412,17 +1412,16 @@ impl Running {
     /// Idempotent — clearing `resize_drag` first means a later `Released` after a
     /// focus-loss commit finds nothing armed and does not write a second time.
     fn finish_resize(&mut self) {
-        // Which edge was dragged decides which value is written: a panel drag must not
-        // rewrite `[sidebar]`, and vice versa. Reading it off the gesture rather than from
-        // "whatever changed" is what keeps a release from persisting a field the user never
-        // touched.
-        match self.resize_drag.take().map(|drag| drag.edge) {
-            Some(ResizeEdge::Sidebar) => self.persist_sidebar(),
+        // Which edge was dragged decides which table is written — `input::persist_target`
+        // owns that rule, so the "a panel drag must not rewrite `[sidebar]`" half of R6.1
+        // is a test rather than a comment on this match.
+        match input::persist_target(self.resize_drag.take()) {
+            Some(PersistTarget::Sidebar) => self.persist_sidebar(),
             // R6.1: a released panel drag writes `[ai_monitor].width_px`. It writes `open`
             // alongside it, which does not violate D8's "only the chord" rule — the value
             // written is the chord's own intent, read back from the renderer, not a state
             // this gesture decided.
-            Some(ResizeEdge::Monitor) => self.persist_monitor(),
+            Some(PersistTarget::AiMonitor) => self.persist_monitor(),
             None => {}
         }
     }
@@ -2381,8 +2380,11 @@ impl ApplicationHandler<UserEvent> for App {
                     // `begin_rename_row` opens the field afterwards.
                     inner.overlays.command(&OverlayCommand::Cancel);
                 }
-                if let Some(action) = action {
-                    match action {
+                // R9.5/D17: the sidebar-then-panel-then-grid order is `input::press_route`'s
+                // decision, not this `match`'s shape — reordering these arms now changes
+                // nothing, and changing the rule fails a test.
+                match input::press_route(action, inner.in_monitor_grab_band()) {
+                    PressRoute::Sidebar(action) => match action {
                         SidebarAction::Switch(i) => {
                             // A second click on the SAME card opens the rename field on it
                             // (sticky-tab-title): the title is edited by clicking the title,
@@ -2422,30 +2424,27 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         SidebarAction::BeginResize => inner.begin_resize(ResizeEdge::Sidebar),
                         SidebarAction::Inert => {}
+                    },
+                    PressRoute::MonitorEdge => inner.begin_resize(ResizeEdge::Monitor),
+                    PressRoute::Grid => {
+                        if let Some(cell) = inner.cursor_cell() {
+                            // Over a real grid cell → anchor a selection and arm the drag
+                            // (selection-input). Nothing is shown until the focus leaves
+                            // this cell; a press in the dead band (cursor_cell → None)
+                            // arms nothing.
+                            inner.drag_anchor = cell;
+                            inner.dragging = true;
+                            inner.drag_moved = false;
+                            // Sample ⌘ at press (hyperlinks D22). The drag is armed exactly
+                            // as before either way — ⌘ adds a gesture here, it removes none.
+                            inner.link_cmd_at_press = inner.mods.super_key();
+                            // Start a fresh latch (terminal-scroll D6). The drag freezes the
+                            // viewport while `scrollback` D2's auto-increment keeps drifting
+                            // it, so any snap raised in that window is recorded here and
+                            // replayed on release rather than lost.
+                            inner.drag_latch = DragLatch::default();
+                        }
                     }
-                } else if inner.in_monitor_grab_band() {
-                    // The panel's grab band, tested only after the sidebar's `hit_test`
-                    // declined the press — which is what makes R9.5 an *ordering* rule
-                    // rather than a coin flip. On a narrow window a 440px sidebar and a
-                    // 300px panel can put both bands under one pointer; the sidebar wins,
-                    // because it is the older and more frequently used affordance.
-                    inner.begin_resize(ResizeEdge::Monitor);
-                } else if let Some(cell) = inner.cursor_cell() {
-                    // Not a sidebar region and over a real grid cell → anchor a
-                    // selection and arm the drag (selection-input). Nothing is shown
-                    // until the focus leaves this cell; a press in the dead band
-                    // (cursor_cell → None) arms nothing.
-                    inner.drag_anchor = cell;
-                    inner.dragging = true;
-                    inner.drag_moved = false;
-                    // Sample ⌘ at press (hyperlinks D22). The drag is armed exactly as
-                    // before either way — ⌘ adds a gesture here, it removes none.
-                    inner.link_cmd_at_press = inner.mods.super_key();
-                    // Start a fresh latch (terminal-scroll D6). The drag freezes the
-                    // viewport while `scrollback` D2's auto-increment keeps drifting it,
-                    // so any snap raised in that window is recorded here and replayed on
-                    // release rather than lost.
-                    inner.drag_latch = DragLatch::default();
                 }
             }
 

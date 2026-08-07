@@ -218,8 +218,15 @@ pub fn layout(model: &MonitorModel, panel: [f32; 4], scale: f64, cell: [f32; 2])
     // divide what is genuinely left rather than pushing the footer off the bottom.
     let y = p.header(model, m.panel[1]);
     let y = p.session(model, y);
-    let y = p.tiles(model, y);
-    let footer_top = p.footer(model);
+    // The footer is pinned to the bottom, so its top edge is the ceiling for *everything*
+    // elastic — the stat grid as much as the sections. Resolved before either is laid out
+    // (it is a pure function of the panel rect, so nothing has to be drawn to know it):
+    // without this the grid, which stacks downward from the session row, painted its
+    // second row straight across the footer on a short panel instead of yielding it.
+    // "The footer survives any height" has to mean legible, not merely emitted.
+    let footer_top = p.footer_top();
+    let y = p.tiles(model, y, footer_top);
+    p.footer(model);
     p.sections(model, y, footer_top);
     p.out
 }
@@ -629,8 +636,20 @@ impl Painter {
         y
     }
 
-    /// The stat grid, three tiles per row.
-    fn tiles(&mut self, model: &MonitorModel, y: f32) -> f32 {
+    /// The stat grid, three tiles per row, stopping at `ceiling` (the pinned footer's top).
+    ///
+    /// **This is where the panel's height degradation actually happens, and its order is a
+    /// decision, not an accident.** The chrome D10 pins is not all equally pinnable: on a
+    /// short window the header, session row and footer still fit when the 3x2 grid does
+    /// not, so the grid is what yields — and it yields **whole rows from the bottom**,
+    /// because `ty` is a function of the row index alone, so the first tile that does not
+    /// fit ends the loop for its entire row and every row after it. That mirrors D18's
+    /// headings-drop-from-the-bottom rule rather than inventing a second direction.
+    ///
+    /// Dropping a *partial* row would be the bad failure: UPTIME and IDLE present with
+    /// ERRORS missing reads as "no errors recorded", which is a different claim from "this
+    /// window is too short to show the tile".
+    fn tiles(&mut self, model: &MonitorModel, y: f32, ceiling: f32) -> f32 {
         let m = self.m;
         if model.tiles.is_empty() || m.inner_w <= 0.0 {
             return y;
@@ -650,7 +669,7 @@ impl Painter {
             let row = (i / TILE_COLS) as f32;
             let col = (i % TILE_COLS) as f32;
             let ty = top + row * (th + gap);
-            if !self.fits(ty, th) {
+            if !self.fits(ty, th) || ty + th > ceiling + FIT_EPS {
                 break;
             }
             let rect = Rect {
@@ -681,18 +700,36 @@ impl Painter {
         }
     }
 
-    /// The footer, pinned to the panel's bottom edge. Returns its top `y` — the ceiling
-    /// the sections must stay above.
+    /// The `y` the pinned footer's band starts at — the ceiling every elastic region must
+    /// stay above — or the panel's bottom when there is no room for a footer at all.
     ///
-    /// The design's `q` keycap is deliberately absent (D1/R1.4): the panel consumes no
-    /// keystroke but the chord, so drawing a keycap would promise a binding that does not
-    /// exist and would cost a terminal user their `less` quit key if it did.
-    fn footer(&mut self, model: &MonitorModel) -> f32 {
+    /// Split out from [`footer`](Painter::footer) because the stat grid needs this number
+    /// *before* the footer is painted, and re-deriving it there would let the two drift:
+    /// one copy would eventually round differently and the grid would creep back over the
+    /// footer it is supposed to yield to.
+    ///
+    /// [`footer`]: Painter::footer
+    fn footer_top(&self) -> f32 {
         let m = self.m;
         let h = m.line + m.s(GAP);
         let top = m.bottom() - h;
         if m.inner_w <= 0.0 || !self.fits(top, h) {
-            return m.bottom();
+            m.bottom()
+        } else {
+            top
+        }
+    }
+
+    /// The footer, pinned to the panel's bottom edge.
+    ///
+    /// The design's `q` keycap is deliberately absent (D1/R1.4): the panel consumes no
+    /// keystroke but the chord, so drawing a keycap would promise a binding that does not
+    /// exist and would cost a terminal user their `less` quit key if it did.
+    fn footer(&mut self, model: &MonitorModel) {
+        let m = self.m;
+        let top = self.footer_top();
+        if top >= m.bottom() {
+            return;
         }
         self.rule(
             m.panel[0],
@@ -707,7 +744,6 @@ impl Painter {
             &model.footer,
             ColorRole::TextFaint,
         );
-        top
     }
 
     /// The six content sections, sharing everything the pinned chrome left.
@@ -1452,6 +1488,119 @@ mod tests {
         assert!(draw.runs.is_empty(), "no text fits");
     }
 
+    // ---- R5.1 / D10 / D18: the floor, and what yields ----
+
+    /// R5.1 as amended, swept across every panel height a window can produce.
+    ///
+    /// **R5.1's Given used to read "Any panel height" and the code did not honour it** —
+    /// found by the Gate-3 checker, which measured the stat grid vanishing entirely on a
+    /// short panel. D10's intent is unchanged (the panel does not drop regions on a
+    /// whim); what is recorded here is the shape of the one place it cannot hold, so the
+    /// yielding is a rule with a direction instead of whatever the arithmetic happened to
+    /// do. The three properties, at every height in the sweep:
+    ///
+    /// * the **floor** — header title, session row, footer — is drawn. These three are
+    ///   what makes the band recognisable as the ai-monitor at all; a panel that loses
+    ///   them looks broken rather than short.
+    /// * the tiles drawn are a **prefix** of the model's, in whole rows of `TILE_COLS`.
+    ///   A partial row is the failure that matters: UPTIME and IDLE without ERRORS reads
+    ///   as "no errors", which is a claim, not a shortfall.
+    /// * the count is **monotonic** in the height and no tile crosses the pinned footer.
+    ///   Monotonic is what makes a window drag feel like a window drag: dragging taller
+    ///   may add a row and may never take one away.
+    ///
+    /// The sweep starts at 80px because that is the first height the floor itself fits
+    /// (the session row's baseline needs ~65px); below that there is no arrangement of
+    /// three stacked lines that works, which the spec's Known Gap records.
+    #[test]
+    fn r5_1_the_floor_survives_every_height_and_the_stat_grid_yields_whole_rows() {
+        const TITLE: &str = "MONITOR-TITLE";
+        const SESSION: &str = "SESSION-ROW";
+        const FOOTER: &str = "FOOTER-STAMP";
+        let tile_label = |i: usize| format!("TILE{i}");
+
+        let mut m = model(
+            (0..6)
+                .map(|i| rows_section(&format!("S{i}"), 4, 4))
+                .collect(),
+        );
+        m.title = TITLE.into();
+        m.session.name = SESSION.into();
+        m.footer = FOOTER.into();
+        m.tiles = (0..6)
+            .map(|i| StatTile::new(tile_label(i), "1", ColorRole::Teal))
+            .collect();
+
+        let mut prev = 0usize;
+        let mut saw_partial_grid = false;
+        let mut h = 80.0f32;
+        while h <= 900.0 {
+            let draw = layout(&m, [0.0, 0.0, 430.0, h], 1.0, CELL);
+            let texts = run_texts(&draw);
+            for pinned in [TITLE, SESSION, FOOTER] {
+                assert!(
+                    texts.iter().any(|t| t == pinned),
+                    "the floor lost {pinned} at height {h}"
+                );
+            }
+
+            let drawn: Vec<bool> = (0..6)
+                .map(|i| texts.iter().any(|t| *t == tile_label(i)))
+                .collect();
+            let n = drawn.iter().filter(|d| **d).count();
+            assert_eq!(
+                &drawn[..n],
+                &vec![true; n][..],
+                "height {h} drew {n} tiles but not the first {n}: {drawn:?}"
+            );
+            assert_eq!(
+                n % TILE_COLS,
+                0,
+                "height {h} drew a partial row of {n} tiles"
+            );
+            assert!(
+                n >= prev,
+                "height {h} dropped a tile that {} px drew ({prev} → {n})",
+                h - 2.0
+            );
+            if n > 0 && n < m.tiles.len() {
+                saw_partial_grid = true;
+            }
+            prev = n;
+
+            // Nothing the grid draws may cross the footer. The footer's text sits half a
+            // GAP below its rule (see `footer`), and `scale` is 1 here, so its run's `y`
+            // less that half-gap is the pinned ceiling.
+            let footer_y = draw
+                .runs
+                .iter()
+                .find(|r| r.text == FOOTER)
+                .map(|r| r.rect.y - GAP * 0.5)
+                .expect("the footer was asserted present above");
+            for s in draw
+                .shapes
+                .iter()
+                .filter(|s| s.kind == crate::sidebar_shapes::KIND_ROUNDED_BOX && s.geom[1] > 0.0)
+            {
+                assert!(
+                    s.bbox[1] + s.bbox[3] <= footer_y + FIT_EPS,
+                    "a stat tile at height {h} runs to {}, past the footer at {footer_y}",
+                    s.bbox[1] + s.bbox[3]
+                );
+            }
+            h += 2.0;
+        }
+        // The sweep is only meaningful if it actually crossed both boundaries.
+        assert!(
+            saw_partial_grid,
+            "the sweep never caught the grid mid-yield"
+        );
+        assert_eq!(
+            prev, 6,
+            "the sweep never reached a height drawing the whole grid"
+        );
+    }
+
     // ---- R5.4 / R5.5: the context gauge ----
 
     #[test]
@@ -1473,29 +1622,66 @@ mod tests {
         assert_eq!(some, none + 2, "Some(0.45) draws the track and its fill");
     }
 
+    /// R5.4: the fill really is `tile.gauge` **of the track**, at several fractions.
+    ///
+    /// `GAUGE_TOL` is 0.02 and it is not slack. A capsule's `seg` endpoints are inset by
+    /// half its thickness at each end — the round caps paint the rest — so the measured
+    /// segment ratio deviates from the requested fraction by `r·|2f−1| / (w − 2r)`, at
+    /// most 1.3% of the track at this size. Everything above that is the fraction.
+    ///
+    /// The window this assertion used to carry (`0.35..0.55` for a single `f = 0.45`) was
+    /// wide enough that a bar ignoring `StatTile::gauge` and painting a constant half
+    /// passed it — and passed the whole workspace with it. A gauge that is not
+    /// proportional is not a gauge, so the tolerance has to be tight enough to say so.
     #[test]
     fn r5_4_the_gauge_fill_is_proportional() {
-        let mut m = model(Vec::new());
-        m.tiles = vec![StatTile::new("CONTEXT", "45%", ColorRole::Teal).with_gauge(0.45)];
-        let draw = layout(&m, [0.0, 0.0, 430.0, 400.0], 1.0, CELL);
-        // The gauge is the only pair of horizontal capsules at half the gauge thickness
-        // (the header accent shares the thickness but runs vertically; the rules are
-        // thinner).
-        let gauge: Vec<&SidebarShape> = draw
-            .shapes
-            .iter()
-            .filter(|s| {
-                s.kind == crate::sidebar_shapes::KIND_CAPSULE
-                    && (s.geom[0] - GAUGE_H * 0.5).abs() < FIT_EPS
-                    && (s.seg[1] - s.seg[3]).abs() < FIT_EPS
-            })
-            .collect();
-        assert_eq!(gauge.len(), 2, "a track and its fill");
-        let span = |s: &SidebarShape| s.seg[2] - s.seg[0];
-        let ratio = span(gauge[1]) / span(gauge[0]);
+        const GAUGE_TOL: f32 = 0.02;
+
+        // `(track span, fill span)` for a CONTEXT tile drawn at `f`.
+        let gauge = |f: f32| -> (f32, f32) {
+            let mut m = model(Vec::new());
+            m.tiles = vec![StatTile::new("CONTEXT", "45%", ColorRole::Teal).with_gauge(f)];
+            let draw = layout(&m, [0.0, 0.0, 430.0, 400.0], 1.0, CELL);
+            // The gauge is the only pair of horizontal capsules at half the gauge
+            // thickness (the header accent shares the thickness but runs vertically; the
+            // rules are thinner).
+            let bars: Vec<&SidebarShape> = draw
+                .shapes
+                .iter()
+                .filter(|s| {
+                    s.kind == crate::sidebar_shapes::KIND_CAPSULE
+                        && (s.geom[0] - GAUGE_H * 0.5).abs() < FIT_EPS
+                        && (s.seg[1] - s.seg[3]).abs() < FIT_EPS
+                })
+                .collect();
+            assert_eq!(bars.len(), 2, "a track and its fill at gauge {f}");
+            let span = |s: &SidebarShape| s.seg[2] - s.seg[0];
+            (span(bars[0]), span(bars[1]))
+        };
+
+        for f in [0.2f32, 0.45, 0.75, 0.9] {
+            let (track, fill) = gauge(f);
+            assert!(
+                track > 0.0,
+                "a track with no width is not a fraction of anything"
+            );
+            let ratio = fill / track;
+            assert!(
+                (ratio - f).abs() < GAUGE_TOL,
+                "gauge {f} drew fill/track = {ratio} ({fill}px of {track}px)"
+            );
+        }
+
+        // Two fractions must be a proportional distance apart, not merely both plausible:
+        // this is what pins the *slope*, so a bar keyed on anything but `gauge` — a
+        // constant, the tile index, the value string's length — moves the wrong amount.
+        let (track, quarter) = gauge(0.25);
+        let (_, three_quarters) = gauge(0.75);
+        let delta = (three_quarters - quarter) / track;
         assert!(
-            (0.35..0.55).contains(&ratio),
-            "fill/track = {ratio}, expected ~0.45"
+            (delta - 0.5).abs() < GAUGE_TOL,
+            "0.25 drew {quarter}px and 0.75 drew {three_quarters}px of a {track}px track: \
+             {delta} of a track apart, expected half"
         );
     }
 

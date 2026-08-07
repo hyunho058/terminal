@@ -104,6 +104,50 @@ pub fn sidebar_press(
     })
 }
 
+/// Which of the three things a left press can land on claims it (D17/R9.5).
+///
+/// The variants are the app's three press consumers in priority order, and the order is
+/// the whole content of this type — see [`press_route`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PressRoute {
+    /// The sidebar claimed it; do this action.
+    Sidebar(SidebarAction),
+    /// The sidebar declined and the pointer is in the ai-monitor panel's grab band: arm a
+    /// [`ResizeEdge::Monitor`] resize.
+    MonitorEdge,
+    /// Neither piece of chrome claimed it — the terminal grid gets the press.
+    Grid,
+}
+
+/// Resolve a left press between the sidebar, the panel's grab band, and the grid —
+/// **the ordering rule of D17/R9.5, as a function rather than as the order two `else if`
+/// arms happen to sit in.**
+///
+/// D17 calls an unordered hit test "a coin flip at the overlap", and until this existed
+/// the rule *was* source order: swapping the two arms in `terminal_app`'s press handler
+/// changed which edge a shared pointer armed, and nothing anywhere would have failed.
+/// That is the specific thing this function exists to make impossible.
+///
+/// **The sidebar wins**, because it is the older and more frequently used affordance, and
+/// it wins with *any* action — not only `BeginResize`. A tab card that overlaps the panel's
+/// band is still a tab switch; the panel's edge is reachable only where the sidebar
+/// declined the press outright, which is also why `Inert` (sidebar dead space) beats the
+/// panel rather than falling through to it.
+///
+/// Note what does *not* justify leaving this implicit: D4 currently keeps the two edges at
+/// least `MIN_TERMINAL_COLS` apart, so a live window is not supposed to be able to put one
+/// pointer in both 6px bands. But the two hit tests read their geometry from two different
+/// places (`left_inset` via `SidebarLayoutInput`, `right_inset` via
+/// [`in_monitor_grab_band`]), and a rule that is only correct because *another* decision's
+/// arithmetic happens to hold is the kind that breaks silently when that arithmetic moves.
+pub fn press_route(sidebar: Option<SidebarAction>, in_monitor_band: bool) -> PressRoute {
+    match (sidebar, in_monitor_band) {
+        (Some(action), _) => PressRoute::Sidebar(action),
+        (None, true) => PressRoute::MonitorEdge,
+        (None, false) => PressRoute::Grid,
+    }
+}
+
 /// Which draggable edge a resize grabbed (ai-monitor-right-panel D17).
 ///
 /// The two edges face opposite ways, so the pointer means opposite things to them — this
@@ -135,6 +179,34 @@ pub struct ResizeDrag {
     /// is mirrored, not shared, and a drag must keep applying the pointer to the edge the
     /// user actually grabbed even after the other one has moved underneath it.
     pub edge: ResizeEdge,
+}
+
+/// Which `config.toml` table a released resize writes (R6.1/D6/D8).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PersistTarget {
+    /// `[sidebar]`, via `common::config::save_sidebar`.
+    Sidebar,
+    /// `[ai_monitor]`, via `common::config::save_ai_monitor`.
+    AiMonitor,
+}
+
+/// What a left-release persists, decided by the **edge the gesture recorded** — never by
+/// "whichever value looks like it changed" (R6.1/D8).
+///
+/// D17 gives the two drags one `Option<ResizeDrag>` slot between them, so this is the one
+/// line where a panel drag could rewrite `[sidebar]`. Reading the edge off the gesture is
+/// what keeps a release from persisting a field the user never touched — and lifting the
+/// decision out of `TerminalApp::finish_resize` is what makes it assertable, since that
+/// method needs a live window, a renderer and a config path.
+///
+/// `None` (nothing armed) writes nothing: `finish_resize` clears the slot before
+/// dispatching, so a `Released` arriving after a focus-loss commit finds the slot empty and
+/// does not write a second time.
+pub fn persist_target(drag: Option<ResizeDrag>) -> Option<PersistTarget> {
+    match drag?.edge {
+        ResizeEdge::Sidebar => Some(PersistTarget::Sidebar),
+        ResizeEdge::Monitor => Some(PersistTarget::AiMonitor),
+    }
 }
 
 /// Is this the **Cmd+Shift+S** sidebar toggle chord (tab-resize D17a)?
@@ -2208,6 +2280,107 @@ mod tests {
         assert!(in_monitor_grab_band(998.0, 1000.0, 2.0, 1.0));
         assert!(in_monitor_grab_band(999.9, 1000.0, 2.0, 1.0));
         assert!(!in_monitor_grab_band(1000.0, 1000.0, 2.0, 1.0));
+    }
+
+    /// R6.1/D8 — a released panel drag writes `[ai_monitor]`, a released sidebar drag
+    /// writes `[sidebar]`, and the edge the gesture recorded is the only thing that decides.
+    ///
+    /// The two drags share one `Option<ResizeDrag>` slot (D17), so this is the single line
+    /// where they could cross-write. `TerminalApp::finish_resize` needs a live window, a
+    /// renderer and a config path, so what is assertable is the decision it dispatches on;
+    /// the file half — that `save_ai_monitor` leaves `[sidebar]` byte-identical — is
+    /// `common::config`'s `the_two_writers_do_not_touch_each_others_tables`.
+    #[test]
+    fn r6_1_a_released_drag_persists_its_own_edges_table() {
+        let drag = |edge| {
+            Some(ResizeDrag {
+                grab_offset: 7.0,
+                edge,
+            })
+        };
+        assert_eq!(
+            persist_target(drag(ResizeEdge::Monitor)),
+            Some(PersistTarget::AiMonitor),
+            "a panel drag must not rewrite [sidebar]"
+        );
+        assert_eq!(
+            persist_target(drag(ResizeEdge::Sidebar)),
+            Some(PersistTarget::Sidebar),
+            "…and a sidebar drag must not rewrite [ai_monitor]"
+        );
+
+        // The grab offset is not part of the decision: no drag distance on either edge
+        // makes it write the other one's table.
+        for grab_offset in [-6.0_f32, 0.0, 6.0, 900.0] {
+            assert_eq!(
+                persist_target(Some(ResizeDrag {
+                    grab_offset,
+                    edge: ResizeEdge::Monitor,
+                })),
+                Some(PersistTarget::AiMonitor),
+                "offset {grab_offset} changed the target"
+            );
+        }
+
+        // Nothing armed → nothing written. This arm is what makes `finish_resize`
+        // idempotent: a `Released` after a focus-loss commit must not write a second time.
+        assert_eq!(persist_target(None), None);
+    }
+
+    /// R9.5/D17 — with the pointer genuinely inside **both** grab bands, the sidebar's
+    /// edge is the one that arms.
+    ///
+    /// Driven through both real hit tests, not through hand-written booleans: the point of
+    /// the requirement is the *overlap*, so the test builds a geometry where both functions
+    /// independently say yes about the same pixel, and asserts what `press_route` does with
+    /// that. Before `press_route` existed the answer was the order of two `else if` arms in
+    /// `terminal_app`, which no test could reach.
+    #[test]
+    fn r9_5_the_sidebars_edge_wins_an_overlap() {
+        // A 740px window with a 444px sidebar and a 300px panel: the sidebar's band is
+        // [438, 444) and the panel's is [440, 446), so x = 442 is inside both.
+        let (viewport_w, sidebar_w, right_inset, x) = (740.0_f32, 444.0_f32, 300.0_f32, 442.0_f64);
+        let inp = SidebarLayoutInput {
+            sidebar_w,
+            viewport: [viewport_w, 900.0],
+            ..layout_input(sidebar_w, 3)
+        };
+        let sidebar = sidebar_press((x, 400.0), &inp, 0.0, false);
+        let panel = in_monitor_grab_band(x, viewport_w, right_inset, 1.0);
+        assert_eq!(
+            sidebar,
+            Some(SidebarAction::BeginResize),
+            "premise: the sidebar's own grab band must claim this pixel"
+        );
+        assert!(panel, "premise: the panel's grab band must claim it too");
+
+        assert_eq!(
+            press_route(sidebar, panel),
+            PressRoute::Sidebar(SidebarAction::BeginResize),
+            "both edges under one pointer: the sidebar's wins (D17)"
+        );
+
+        // The panel's edge is still reachable — the rule is an ordering, not a veto.
+        assert_eq!(press_route(None, panel), PressRoute::MonitorEdge);
+        // …and with neither claiming it, the grid keeps the press.
+        assert_eq!(press_route(None, false), PressRoute::Grid);
+
+        // The sidebar wins with ANY action, not only its own edge: a card, the new-tab
+        // button, even sidebar dead space beats the panel's band. Otherwise a press that
+        // overlapped both would switch tabs *and* start resizing the panel, or worse,
+        // resize the panel instead of switching.
+        for action in [
+            SidebarAction::Switch(0),
+            SidebarAction::NewTab,
+            SidebarAction::Collapse,
+            SidebarAction::Inert,
+        ] {
+            assert_eq!(
+                press_route(Some(action), true),
+                PressRoute::Sidebar(action),
+                "{action:?} lost to the panel's grab band"
+            );
+        }
     }
 
     #[test]

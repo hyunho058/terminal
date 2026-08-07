@@ -27,12 +27,32 @@ use term_core::Color;
 
 use crate::tabs::Tabs;
 
+/// The one thing [`refit`] does with the tab set (R0.2).
+///
+/// A trait rather than a bare `&mut Tabs` so R0.2's middle clause — "`resize_all` was
+/// called **with the new count**" — can be asserted at all. `Tabs` cannot be built under
+/// `cargo test`: it holds an `EventLoopProxy`, which only an `EventLoop` mints, which winit
+/// builds only on the process's main thread, while libtest runs tests on worker threads.
+/// [`Tabs`] is the sole production implementor; the only other one is the spy below.
+pub trait RefitTarget {
+    fn resize_all(&mut self, cols: u16, rows: u16);
+}
+
+impl RefitTarget for Tabs {
+    fn resize_all(&mut self, cols: u16, rows: u16) {
+        // Qualified, not `self.resize_all(..)`: the inherent method and this one share a
+        // name, and while inherent methods do win resolution, relying on that to avoid
+        // infinite recursion is not a thing to leave to a reader.
+        Tabs::resize_all(self, cols, rows)
+    }
+}
+
 /// Re-fit the grid to the renderer's current geometry and resize **every** tab (D6).
 /// Reads [`Renderer::grid_size`] itself — after any inset change is already applied — so
 /// it can never be handed a stale column count; resizes background tabs too, since a tab
 /// left at the old width renders wrapped garbage the moment it is switched to. Returns the
 /// new `(cols, rows)`.
-pub fn refit(renderer: &Renderer, tabs: &mut Tabs) -> (u16, u16) {
+pub fn refit(renderer: &Renderer, tabs: &mut impl RefitTarget) -> (u16, u16) {
     let (cols, rows) = renderer.grid_size();
     tabs.resize_all(cols, rows);
     (cols, rows)
@@ -66,6 +86,80 @@ fn preedit_theme(cfg: &Config) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records what [`refit`] handed it, in order.
+    #[derive(Default)]
+    struct SpyTabs(Vec<(u16, u16)>);
+
+    impl RefitTarget for SpyTabs {
+        fn resize_all(&mut self, cols: u16, rows: u16) {
+            self.0.push((cols, rows));
+        }
+    }
+
+    /// R0.2 — the reflow reaches the tabs, and it reaches them with the **new** count.
+    ///
+    /// Opening the ai-monitor panel is the change under test because it is the one R0.2
+    /// names: the inset moves, `grid_size` reports fewer columns, and `refit` must carry
+    /// *that* number rather than the one it saw last frame. A `refit` that re-sent the old
+    /// count would still return something plausible, which is why the spy asserts the whole
+    /// call sequence and not just the final value.
+    ///
+    /// **Two coverage limits, stated rather than implied.**
+    ///
+    /// * **The PTY half of R0.2 is not asserted here, and is not reachable under
+    ///   `cargo test`.** "The PTY received the matching window size" lives in
+    ///   `Session::resize`, and a `Session` needs an `EventLoopProxy` for its reader
+    ///   thread — hence an `EventLoop`, which winit builds only on the process's main
+    ///   thread while libtest runs tests on workers. `Tabs`'s own fan-out over *background*
+    ///   tabs (R5.1) is unreachable for the same reason: it is a loop over `Session`s.
+    ///   Both are recorded as limits in `specs/ai-monitor-right-panel/spec.md`.
+    /// * **This test needs a GPU adapter and a system font** for `Renderer::new_headless`,
+    ///   and skips without either — the same guard the renderer crate's own GPU tests use.
+    #[test]
+    fn r0_2_refit_hands_the_live_grid_size_to_the_tabs() {
+        let cfg = Config::default();
+        let Ok(mut renderer) = Renderer::new_headless(1800, 900, 1.0, &cfg) else {
+            eprintln!("skipping r0_2_refit_hands_the_live_grid_size_to_the_tabs: no GPU/font");
+            return;
+        };
+        let mut tabs = SpyTabs::default();
+
+        let closed = refit(&renderer, &mut tabs);
+        assert_eq!(
+            closed,
+            renderer.grid_size(),
+            "refit must return the size it fitted to"
+        );
+        assert_eq!(tabs.0, vec![closed], "…and hand that same size to the tabs");
+
+        // Open the panel: the band is reserved, so the column count drops (R0.1).
+        renderer.set_monitor_open(true);
+        assert!(
+            renderer.right_inset() > 0.0,
+            "premise: the panel reserved a band at this window size"
+        );
+        let open = refit(&renderer, &mut tabs);
+        assert!(
+            open.0 < closed.0,
+            "the panel must cost the terminal columns: {} → {}",
+            closed.0,
+            open.0
+        );
+        assert_eq!(open.1, closed.1, "rows are unaffected (R0.1)");
+        assert_eq!(open, renderer.grid_size());
+        assert_eq!(
+            tabs.0,
+            vec![closed, open],
+            "the second refit must carry the NEW count, not repeat the first"
+        );
+
+        // Closing gives the columns back, exactly (R0.3).
+        renderer.set_monitor_open(false);
+        let reopened = refit(&renderer, &mut tabs);
+        assert_eq!(reopened, closed, "closing restores the original size");
+        assert_eq!(tabs.0, vec![closed, open, closed]);
+    }
 
     /// R7.5: the preedit rides the reloaded theme, background first.
     #[test]

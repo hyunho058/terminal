@@ -591,14 +591,42 @@ scope:
 - **In-panel scrolling is out of scope**, so on a short window some rows are only reachable
   by making the window taller. D10 keeps every section present and marks the shortfall with
   `+N more`, but there is no way to read the hidden rows.
-- **The `+N more` marker cannot be exhaustive at extreme sizes.** With enough sections and
-  little enough height, a section may show zero rows and only its heading. This is intended
-  (the region still announces itself) but it means the panel can be opened at a size where
-  it carries almost no data.
+- **A short panel loses rows, then loses the stat grid.** Two distinct shortfalls, both
+  intended, and the second was invisible until the Gate-3 checker measured for it:
+  - **Sections.** With enough sections and little enough height, a section shows zero rows
+    and only its heading, so `+N more` is not exhaustive. The region still announces itself,
+    but the panel can be opened at a size where it carries almost no data.
+  - **The stat grid.** Below the height the floor plus a tile row needs — ~155px for the
+    first row and ~217px for the second, at 430px wide, a 16px cell and scale 1 — the grid
+    yields, **whole rows at a time, from the bottom** (R5.1). So a short panel shows
+    UPTIME/IDLE/ERRORS without IN·OUT/CACHE/CONTEXT, and a shorter one shows no tiles at
+    all. The grid stopping at the pinned footer rather than painting across it is what
+    makes this a yield instead of a collision; `monitor_layout::Painter::footer_top` is the
+    single ceiling both the grid and the sections read.
+  - **Below ~65px even the floor breaks down, and there is no rule for what it does.** A
+    header band plus a session line plus a footer line do not fit in that height in any
+    arrangement, and what the layout does under it is arithmetic rather than a decision: the
+    header stops fitting below ~38px, the session row below ~65px, and where two of the
+    three do fit they overlap. Left as is deliberately — that is a window the terminal
+    itself is unusable in, and a fourth degradation rule for it would be more mechanism than
+    the case is worth. The R5.1 sweep test therefore starts at 80px and asserts nothing
+    below it.
 - **The UTC offset is the offset *now*, applied to historical timestamps.** Resolved per
   model rebuild in `overlay.rs` (D19), never per timestamp and never watched: a session
   spanning a DST transition renders pre-transition SKILLS times an hour off, and a timezone
   change mid-session is not observed until the next rebuild.
+- **R0.2's PTY clause is not covered by any test, and cannot be under `cargo test`.**
+  Raised by the Gate-3 check, which found `settings::refit` and `Tabs::resize_all`
+  referenced by zero tests. Two of R0.2's three clauses are now pinned by
+  `settings::tests::r0_2_refit_hands_the_live_grid_size_to_the_tabs` — `refit` runs, and it
+  hands `resize_all` the renderer's *new* `grid_size()` rather than a repeat of the last
+  one — through a `RefitTarget` spy. The third ("the PTY received the matching window
+  size") and R5.1's "background tabs too" fan-out both live inside `Session`, which needs an
+  `EventLoopProxy`; that needs an `EventLoop`, which winit builds only on the process's main
+  thread, while libtest runs tests on worker threads. So a `Session` — and therefore a
+  `Tabs` — cannot be constructed in this test harness at all. Both clauses are verified by
+  running the app, not by CI. The spy test itself also needs a GPU adapter and a system font
+  for `Renderer::new_headless` and skips without them, like the renderer crate's GPU tests.
 - **Test churn reaches beyond `dashboard.rs`.** D16 invalidates
   `pixel_to_cell_clamps_past_the_far_edge` (`crates/app/src/input.rs:719`), which asserts the
   far-edge clamp D16 removes; it is rewritten to assert `None` past the panel boundary.
@@ -765,10 +793,29 @@ scope:
 
 ### R5: The panel renders the design's ten regions from live telemetry
 
-#### R5.1: Chrome regions are pinned
-- **Given**: Any panel height
+#### R5.1: Chrome regions are pinned — and the stat grid is the one that yields
+> **Corrected after the Gate-3 check, and the first draft of this requirement was
+> unsatisfiable.** It read "**Given**: Any panel height → header, session row, stat grid and
+> footer are always present", and no implementation ever met it: measured against the panel's
+> own metrics (430px wide, 16px cell, scale 1), the pinned header, session row and footer
+> already spend the first ~65px, the first stat row cannot be drawn clear of the footer below
+> ~155px, and the second below ~217px. The Gate-3 checker found this by sweeping heights;
+> before it, nothing in the workspace touched a short panel at all.
+>
+> D10's *intent* is unchanged and is not being softened here — the panel does not drop a
+> region to save space. What changes is that "any height" was a promise the arithmetic cannot
+> keep, and a requirement no code can satisfy tests nothing. So this requirement now names the
+> floor, and gives the yielding a **direction** — the same move D18 made for the section
+> headings, and for the same reason: which region goes has to be a rule, not whatever the
+> loop happened to do.
+- **Given**: A panel tall enough for the floor to stack — ~65px at a 16px cell and scale 1
 - **When**: The panel is laid out
-- **Then**: Header, session row, stat grid and footer are always present
+- **Then**: The header, the session row and the footer are drawn. That is the **floor** and
+  it never yields. The **stat grid** is what yields, and it yields **whole rows from the
+  bottom** of the design's order — CONTEXT before UPTIME — mirroring D18's
+  headings-drop-from-the-bottom rule and D4's "the accessory gives way, the identity does
+  not". The tiles drawn are always a prefix of that order: never a partial row, never a gap,
+  and never fewer than a shorter panel drew.
 
 #### R5.2: The status pill has exactly three states
 > **Threshold pinned during T4**: "stale" was left unquantified here. The implementation uses
