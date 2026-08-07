@@ -216,15 +216,27 @@ pub fn layout(model: &MonitorModel, panel: [f32; 4], scale: f64, cell: [f32; 2])
     p.panel_bg();
     // D18 step 1: the pinned chrome is laid out before anything elastic, so the sections
     // divide what is genuinely left rather than pushing the footer off the bottom.
-    let y = p.header(model, m.panel[1]);
-    let y = p.session(model, y);
-    // The footer is pinned to the bottom, so its top edge is the ceiling for *everything*
-    // elastic — the stat grid as much as the sections. Resolved before either is laid out
-    // (it is a pure function of the panel rect, so nothing has to be drawn to know it):
-    // without this the grid, which stacks downward from the session row, painted its
-    // second row straight across the footer on a short panel instead of yielding it.
+    //
+    // The footer is pinned to the bottom, so its top edge is the ceiling for *everything
+    // else the panel draws* — the header band and the session row as much as the stat grid
+    // and the sections. Resolved before any of them (it is a pure function of the panel
+    // rect, so nothing has to be drawn to know it): a region that only asks "am I inside
+    // the panel?" stacks downward from the top and paints across the pinned footer on a
+    // short panel instead of yielding to it. That is **one** defect with several sites, and
+    // fixing it at the grid alone left the session row with the identical bug — its glyphs
+    // ran through the footer's at every height in `[64.8, 87.2)` px at 430px wide, and from
+    // `26.4px` up in the band where the header did not fit and the row took the panel's top.
     // "The footer survives any height" has to mean legible, not merely emitted.
     let footer_top = p.footer_top();
+    // The session row rides the header: `None` is "the header band did not fit", and the
+    // session must not float up to the panel's top edge to take the space. A bare identity
+    // line under no header reads as a stray row rather than a panel — and it would
+    // *vanish* again as the window grew and the header reclaimed the top, which is exactly
+    // the take-a-region-away-on-a-drag that the height sweep forbids for the tiles.
+    let y = match p.header(model, m.panel[1], footer_top) {
+        Some(y) => p.session(model, y, footer_top),
+        None => m.panel[1],
+    };
     let y = p.tiles(model, y, footer_top);
     p.footer(model);
     p.sections(model, y, footer_top);
@@ -505,17 +517,24 @@ impl Painter {
         ));
     }
 
-    /// Header band: accent bar, title, status pill.
+    /// Header band: accent bar, title, status pill. Returns the `y` below the band, or
+    /// `None` when the band was dropped — which is also the caller's signal that the
+    /// session row has nothing to hang off (see [`layout`]).
+    ///
+    /// `ceiling` is the pinned footer's top edge. The band is a filled rect, not a text
+    /// line, so a header that fits the panel but crosses the footer does not merely crowd
+    /// it — it repaints the footer's background out from under it and drops the hairline
+    /// rule inside the band.
     ///
     /// The design's `✕` close button is **not** drawn. D16 makes the whole band
     /// pointer-inert, so a close affordance would be a control that looks clickable and is
     /// not — the same trade D15 already rejected for the sidebar's toggle row. The panel
     /// closes with the chord that opened it (D1).
-    fn header(&mut self, model: &MonitorModel, y: f32) -> f32 {
+    fn header(&mut self, model: &MonitorModel, y: f32, ceiling: f32) -> Option<f32> {
         let m = self.m;
         let h = m.line + m.s(2.0 * HEADER_PAD_Y);
-        if !self.fits(y, h) || m.inner_w <= 0.0 {
-            return y;
+        if !self.fits(y, h) || y + h > ceiling + FIT_EPS || m.inner_w <= 0.0 {
+            return None;
         }
         self.fill_rect(
             Rect {
@@ -552,7 +571,7 @@ impl Painter {
             y + h,
             ColorRole::Hairline,
         );
-        y + h
+        Some(y + h)
     }
 
     /// The status pill, right-aligned on the header line. Returns its left edge (the
@@ -605,14 +624,24 @@ impl Painter {
     }
 
     /// The session identity line, plus the detached wording when there is one (R5.3).
-    fn session(&mut self, model: &MonitorModel, y: f32) -> f32 {
+    ///
+    /// `ceiling` is the pinned footer's top edge — **the same ceiling [`tiles`] reads, and
+    /// for the same reason.** Fitting inside the panel is not enough: the footer is pinned
+    /// to the bottom, so a row that only checked the panel's bottom edge drew its glyphs
+    /// straight through the footer's on a short panel (measured at 430px wide, a 16px cell
+    /// and scale 1: 7.2px of overlap at an 80px panel, and some overlap at every height
+    /// below 87.2px). Yielding the row leaves the footer legible; the panel bottom on its
+    /// own cannot tell the difference.
+    ///
+    /// [`tiles`]: Painter::tiles
+    fn session(&mut self, model: &MonitorModel, y: f32, ceiling: f32) -> f32 {
         let m = self.m;
         if m.inner_w <= 0.0 {
             return y;
         }
         let s = &model.session;
         let mut y = y + m.s(GAP);
-        if !self.fits(y, m.line) {
+        if !self.fits(y, m.line) || y + m.line > ceiling + FIT_EPS {
             return y;
         }
         self.run_seq(
@@ -628,7 +657,10 @@ impl Painter {
         );
         y += m.line;
         if let Some(note) = &s.note {
-            if self.fits(y, m.line) {
+            // The detached wording is a second line and yields on its own terms: it is the
+            // one part of the session row that can be dropped while the identity line it
+            // qualifies still reads.
+            if self.fits(y, m.line) && y + m.line <= ceiling + FIT_EPS {
                 self.text(m.inner_x, y, m.inner_w, note, ColorRole::TextMuted);
                 y += m.line;
             }
@@ -1490,33 +1522,62 @@ mod tests {
 
     // ---- R5.1 / D10 / D18: the floor, and what yields ----
 
-    /// R5.1 as amended, swept across every panel height a window can produce.
+    /// R5.1 as amended, swept across every panel height a window can produce — **starting
+    /// below the floor**, because that is where the last two defects in this file lived.
     ///
     /// **R5.1's Given used to read "Any panel height" and the code did not honour it** —
     /// found by the Gate-3 checker, which measured the stat grid vanishing entirely on a
     /// short panel. D10's intent is unchanged (the panel does not drop regions on a
     /// whim); what is recorded here is the shape of the one place it cannot hold, so the
     /// yielding is a rule with a direction instead of whatever the arithmetic happened to
-    /// do. The three properties, at every height in the sweep:
+    /// do.
     ///
-    /// * the **floor** — header title, session row, footer — is drawn. These three are
-    ///   what makes the band recognisable as the ai-monitor at all; a panel that loses
-    ///   them looks broken rather than short.
-    /// * the tiles drawn are a **prefix** of the model's, in whole rows of `TILE_COLS`.
-    ///   A partial row is the failure that matters: UPTIME and IDLE without ERRORS reads
-    ///   as "no errors", which is a claim, not a shortfall.
-    /// * the count is **monotonic** in the height and no tile crosses the pinned footer.
+    /// **The sweep used to start at 80px, and that was the hole the second defect fell
+    /// through** (Gate-3 checker, iteration 2). 80px is *inside* the band where the floor
+    /// does not stack, and the floor check was presence-only — `any(|t| t == pinned)` —
+    /// so a session row drawn straight through the footer's glyphs satisfied it. The sweep
+    /// now starts at 2px and asserts the regions against **each other**, which is the only
+    /// form of the assertion that can tell "drawn" from "readable".
+    ///
+    /// The properties, at every height in the sweep:
+    ///
+    /// * **No two floor regions' line boxes overlap.** This is the probe; everything else
+    ///   is presence, and presence cannot see a collision.
+    /// * **The floor yields in a fixed order, at measured heights**, asserted as an *iff*
+    ///   so a region that reappears 2px early — back across the footer — fails as loudly
+    ///   as one that goes missing. The order is the constants' own order: the footer
+    ///   outlasts the header band, which outlasts the session row. Every region above the
+    ///   footer reads `Painter::footer_top` as its ceiling, so the pinned footer is the
+    ///   last thing standing, which is what "the footer survives any height" has to mean.
+    /// * The tiles drawn are a **prefix** of the model's, in whole rows of `TILE_COLS`,
+    ///   and never before the whole floor is up. A partial row is the failure that
+    ///   matters: UPTIME and IDLE without ERRORS reads as "no errors", which is a claim,
+    ///   not a shortfall.
+    /// * The count is **monotonic** in the height and no tile crosses the pinned footer.
     ///   Monotonic is what makes a window drag feel like a window drag: dragging taller
-    ///   may add a row and may never take one away.
-    ///
-    /// The sweep starts at 80px because that is the first height the floor itself fits
-    /// (the session row's baseline needs ~65px); below that there is no arrangement of
-    /// three stacked lines that works, which the spec's Known Gap records.
+    ///   may add a row and may never take one away. The floor's own iffs give it the same
+    ///   property, which is why the session row is not allowed to squat at the panel's top
+    ///   when the header is dropped (see `layout`) — that state would appear at 52.8px and
+    ///   disappear again at 64.8px.
     #[test]
     fn r5_1_the_floor_survives_every_height_and_the_stat_grid_yields_whole_rows() {
         const TITLE: &str = "MONITOR-TITLE";
         const SESSION: &str = "SESSION-ROW";
         const FOOTER: &str = "FOOTER-STAMP";
+        // Measured off this panel — 430px wide, a 16px cell, scale 1 — by sweeping the
+        // real `layout` in 0.1px steps, not derived by hand: `line` = 16 × 1.15 = 18.4, the
+        // header band = line + 2·10 = 38.4, the footer band = line + 8 = 26.4.
+        //
+        //   26.4px  the footer band first clears the panel's top edge
+        //   64.8px  the header band first clears the footer's rule (38.4 ≤ h − 26.4)
+        //   91.2px  the session line box first clears it (46.4 + 18.4 ≤ h − 26.4) — the floor
+        //
+        // A token change (`LINE_FACTOR`, `GAP`, `HEADER_PAD_Y`) moves these, and it should:
+        // the numbers are a measurement of the design's own spacing, and the spec's Known
+        // Gap quotes them.
+        const FOOTER_MIN: f32 = 26.4;
+        const HEADER_MIN: f32 = 64.8;
+        const FLOOR: f32 = 91.2;
         let tile_label = |i: usize| format!("TILE{i}");
 
         let mut m = model(
@@ -1533,15 +1594,48 @@ mod tests {
 
         let mut prev = 0usize;
         let mut saw_partial_grid = false;
-        let mut h = 80.0f32;
+        let mut overlaps: Vec<String> = Vec::new();
+        let mut bands = [false; 4];
+        // 2px steps from 2px: no height in the sweep lands within `FIT_EPS` of a threshold,
+        // so each `h >= …` below is unambiguous.
+        let mut h = 2.0f32;
         while h <= 900.0 {
             let draw = layout(&m, [0.0, 0.0, 430.0, h], 1.0, CELL);
             let texts = run_texts(&draw);
-            for pinned in [TITLE, SESSION, FOOTER] {
-                assert!(
+            for (pinned, min) in [(TITLE, HEADER_MIN), (SESSION, FLOOR), (FOOTER, FOOTER_MIN)] {
+                assert_eq!(
                     texts.iter().any(|t| t == pinned),
-                    "the floor lost {pinned} at height {h}"
+                    h >= min,
+                    "at height {h}, {pinned} drawn should be {}",
+                    h >= min
                 );
+            }
+            bands[[h >= FOOTER_MIN, h >= HEADER_MIN, h >= FLOOR]
+                .iter()
+                .filter(|b| **b)
+                .count()] = true;
+
+            // Presence is not legibility. Three runs can each be emitted and still land on
+            // top of one another, which is what the `any(...)` checks above cannot see —
+            // so every pair of floor line boxes is measured against every other.
+            let boxes: Vec<(&str, f32, f32)> = [TITLE, SESSION, FOOTER]
+                .iter()
+                .filter_map(|name| {
+                    draw.runs
+                        .iter()
+                        .find(|r| r.text == *name)
+                        .map(|r| (*name, r.rect.y, r.rect.y + r.rect.h))
+                })
+                .collect();
+            for (i, (an, a0, a1)) in boxes.iter().enumerate() {
+                for (bn, b0, b1) in &boxes[i + 1..] {
+                    let over = a1.min(*b1) - a0.max(*b0);
+                    if over > FIT_EPS {
+                        overlaps.push(format!(
+                            "h={h}: {an} @ y={a0}..{a1} overlaps {bn} @ y={b0}..{b1} by {over}px"
+                        ));
+                    }
+                }
             }
 
             let drawn: Vec<bool> = (0..6)
@@ -1563,6 +1657,13 @@ mod tests {
                 "height {h} dropped a tile that {} px drew ({prev} → {n})",
                 h - 2.0
             );
+            // The grid is the accessory (R5.1/D4): it may not outlive the identity it
+            // decorates, so no tile may be drawn at a height the floor itself does not
+            // survive.
+            assert!(
+                n == 0 || h >= FLOOR,
+                "height {h} drew {n} tiles below the floor"
+            );
             if n > 0 && n < m.tiles.len() {
                 saw_partial_grid = true;
             }
@@ -1570,27 +1671,38 @@ mod tests {
 
             // Nothing the grid draws may cross the footer. The footer's text sits half a
             // GAP below its rule (see `footer`), and `scale` is 1 here, so its run's `y`
-            // less that half-gap is the pinned ceiling.
-            let footer_y = draw
+            // less that half-gap is the pinned ceiling. Below `FOOTER_MIN` there is no
+            // footer to cross — and, per the assertion above, no tile either.
+            if let Some(footer_y) = draw
                 .runs
                 .iter()
                 .find(|r| r.text == FOOTER)
                 .map(|r| r.rect.y - GAP * 0.5)
-                .expect("the footer was asserted present above");
-            for s in draw
-                .shapes
-                .iter()
-                .filter(|s| s.kind == crate::sidebar_shapes::KIND_ROUNDED_BOX && s.geom[1] > 0.0)
             {
-                assert!(
-                    s.bbox[1] + s.bbox[3] <= footer_y + FIT_EPS,
-                    "a stat tile at height {h} runs to {}, past the footer at {footer_y}",
-                    s.bbox[1] + s.bbox[3]
-                );
+                for s in draw.shapes.iter().filter(|s| {
+                    s.kind == crate::sidebar_shapes::KIND_ROUNDED_BOX && s.geom[1] > 0.0
+                }) {
+                    assert!(
+                        s.bbox[1] + s.bbox[3] <= footer_y + FIT_EPS,
+                        "a stat tile at height {h} runs to {}, past the footer at {footer_y}",
+                        s.bbox[1] + s.bbox[3]
+                    );
+                }
             }
             h += 2.0;
         }
-        // The sweep is only meaningful if it actually crossed both boundaries.
+        assert!(
+            overlaps.is_empty(),
+            "floor regions overlapped at {} heights:\n{}",
+            overlaps.len(),
+            overlaps.join("\n")
+        );
+        // The sweep is only meaningful if it actually crossed every boundary: all four
+        // rungs of the ladder (nothing, footer, +header, +session) and both grid edges.
+        assert_eq!(
+            bands, [true; 4],
+            "the sweep skipped a rung of the yield ladder: {bands:?}"
+        );
         assert!(
             saw_partial_grid,
             "the sweep never caught the grid mid-yield"

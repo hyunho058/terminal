@@ -596,21 +596,47 @@ scope:
   - **Sections.** With enough sections and little enough height, a section shows zero rows
     and only its heading, so `+N more` is not exhaustive. The region still announces itself,
     but the panel can be opened at a size where it carries almost no data.
-  - **The stat grid.** Below the height the floor plus a tile row needs — ~155px for the
-    first row and ~217px for the second, at 430px wide, a 16px cell and scale 1 — the grid
+  - **The stat grid.** Below the height the floor plus a tile row needs — 155.0px for the
+    first row and 216.8px for the second, at 430px wide, a 16px cell and scale 1 — the grid
     yields, **whole rows at a time, from the bottom** (R5.1). So a short panel shows
     UPTIME/IDLE/ERRORS without IN·OUT/CACHE/CONTEXT, and a shorter one shows no tiles at
     all. The grid stopping at the pinned footer rather than painting across it is what
     makes this a yield instead of a collision; `monitor_layout::Painter::footer_top` is the
-    single ceiling both the grid and the sections read.
-  - **Below ~65px even the floor breaks down, and there is no rule for what it does.** A
-    header band plus a session line plus a footer line do not fit in that height in any
-    arrangement, and what the layout does under it is arithmetic rather than a decision: the
-    header stops fitting below ~38px, the session row below ~65px, and where two of the
-    three do fit they overlap. Left as is deliberately — that is a window the terminal
-    itself is unusable in, and a fourth degradation rule for it would be more mechanism than
-    the case is worth. The R5.1 sweep test therefore starts at 80px and asserts nothing
-    below it.
+    single ceiling every region above the footer reads.
+  - **Below 91.2px the floor yields too — in a fixed order, and the "~65px" this document
+    used to print was wrong twice over.** Corrected by the Gate-3 checker on iteration 2;
+    the numbers here are measured by sweeping `monitor_layout::layout` itself in 0.1px
+    steps at 430px wide, a 16px cell and scale 1, not derived by hand. The order is the
+    pin order in reverse, because every region above the footer now reads `footer_top` as
+    its ceiling and so the bottom-pinned footer is the last one standing:
+
+    | height | what is drawn |
+    |--------|---------------|
+    | `< 26.4px` | the panel's background and left border alone |
+    | `>= 26.4px` | the footer |
+    | `>= 64.8px` | the header band joins it |
+    | `>= 91.2px` | the session row joins them — **the floor**, and the first height a stat row can be measured against |
+
+    ~65px was the height the session row's line box first fits inside the *panel*, which
+    says nothing about the pinned footer it then painted straight over: at 80px — where
+    the R5.1 sweep test used to start — the session row and the footer's own glyphs
+    overlapped by 7.2px, and some overlap persisted at every height below 87.2px. The
+    second error ran the other way: "the session row stops fitting below ~65px" was false
+    because a header band that did not fit returned its `y` unchanged and let the session
+    row take the panel's top edge, so the row drew as low as 26.4px — and across that whole
+    band (26.4px to 38.4px) it sat on top of the footer. Neither state exists now. The
+    session row hangs off the header band (no header, no session row: a bare identity line
+    under nothing is a stray row, and it would vanish again as the window grew and the
+    header reclaimed the top), and both read the footer's ceiling. This is still a window
+    the terminal itself is unusable in, and the panel gains no new *content* rule for it —
+    what it gains is a defined yield order, and the R5.1 sweep test now starts at 2px and
+    asserts that order plus pairwise non-overlap, instead of starting at 80px and stepping
+    around the band. One consequence is worth stating rather than discovering: D18's
+    allocator divides whatever the pinned chrome left regardless of which chrome survived,
+    so between 63.8px and 64.8px a section *heading* is drawn while the header band is
+    not. It collides with nothing — the footer's ceiling bounds it like everything else —
+    and the alternative would be a fifth rule gating content on the header, for a 1px band
+    of an already unusable window.
 - **The UTC offset is the offset *now*, applied to historical timestamps.** Resolved per
   model rebuild in `overlay.rs` (D19), never per timestamp and never watched: a session
   spanning a DST transition renders pre-transition SKILLS times an hour off, and a timezone
@@ -627,6 +653,20 @@ scope:
   `Tabs` — cannot be constructed in this test harness at all. Both clauses are verified by
   running the app, not by CI. The spy test itself also needs a GPU adapter and a system font
   for `Renderer::new_headless` and skips without them, like the renderer crate's GPU tests.
+- **R9.5's Given is a window state D4's arithmetic currently makes unreachable, and the test
+  is kept anyway.** Raised by the Gate-3 checker on iteration 2; until now it was argued only
+  in `input::press_route`'s doc comment, while this document stated the Given as if it were a
+  reachable state. It is not: `monitor_band_px` caps the panel's band at
+  `width - left_inset - MIN_TERMINAL_COLS * cell_w` (`crates/renderer/src/lib.rs`), and
+  `sync_left_inset` re-derives that cap on every sidebar change, so the panel's left edge sits
+  at least 20 columns right of `left_inset` while the sidebar's 6px grab band ends *at*
+  `left_inset` — no window size lets one pointer fall in both bands. The rule is pinned
+  regardless, deliberately: the two hit tests read their geometry from different places
+  (`left_inset` through `SidebarLayoutInput`, `right_inset` through `in_monitor_grab_band`),
+  so which edge a shared pointer arms must not depend on *another* decision's arithmetic
+  continuing to hold. Dropping the test because the state is currently unreachable would put
+  D17's ordering back where it was — in the order two `else if` arms happen to sit in, which
+  D17 calls "a coin flip at the overlap" — and the loss would be silent the day D4's cap moves.
 - **Test churn reaches beyond `dashboard.rs`.** D16 invalidates
   `pixel_to_cell_clamps_past_the_far_edge` (`crates/app/src/input.rs:719`), which asserts the
   far-edge clamp D16 removes; it is rewritten to assert `None` past the panel boundary.
@@ -808,14 +848,29 @@ scope:
 > floor, and gives the yielding a **direction** — the same move D18 made for the section
 > headings, and for the same reason: which region goes has to be a rule, not whatever the
 > loop happened to do.
-- **Given**: A panel tall enough for the floor to stack — ~65px at a 16px cell and scale 1
+>
+> **Corrected again by the Gate-3 checker on iteration 2: the floor is 91.2px, not ~65px,
+> and the first correction closed the defect for the stat grid only.** ~65px is where the
+> session row's line box first fits inside the *panel* — which says nothing about the footer
+> pinned to the panel's bottom. The session row went on checking that bottom edge alone while
+> the grid was given `footer_top` as a ceiling, so it kept drawing through the footer's own
+> glyphs: 7.2px of overlap at an 80px panel, which was precisely where this requirement's
+> sweep test started. Every region above the footer now reads the same ceiling, and the floor
+> is the height at which the three stack **clear of each other**, measured off the code rather
+> than estimated. Below it the floor yields in the reverse of its pin order (footer, then
+> header band, then session row — the Known Gap tabulates the heights), which the sweep test
+> now asserts from 2px up instead of starting above the band.
+- **Given**: A panel at least **91.2px** tall — measured at 430px wide, a 16px cell and
+  scale 1, the first height at which the header band, the session row and the pinned footer
+  stack without overlapping
 - **When**: The panel is laid out
 - **Then**: The header, the session row and the footer are drawn. That is the **floor** and
-  it never yields. The **stat grid** is what yields, and it yields **whole rows from the
-  bottom** of the design's order — CONTEXT before UPTIME — mirroring D18's
+  it never yields above that height. The **stat grid** is what yields, and it yields **whole
+  rows from the bottom** of the design's order — CONTEXT before UPTIME — mirroring D18's
   headings-drop-from-the-bottom rule and D4's "the accessory gives way, the identity does
   not". The tiles drawn are always a prefix of that order: never a partial row, never a gap,
-  and never fewer than a shorter panel drew.
+  never fewer than a shorter panel drew, and never present at a height the floor itself does
+  not survive.
 
 #### R5.2: The status pill has exactly three states
 > **Threshold pinned during T4**: "stale" was left unquantified here. The implementation uses
@@ -1006,6 +1061,13 @@ scope:
   armed
 
 #### R9.5: The sidebar's edge wins an overlap
+> **The Given is unreachable today, and that is deliberate — see the Known Gap** (raised by
+> the Gate-3 checker on iteration 2). D4's cap keeps the two grab bands at least
+> `MIN_TERMINAL_COLS` apart, so no window size puts one pointer in both. The rule is pinned
+> as a pure ordering over `press_route`'s inputs precisely so it does not inherit that
+> arithmetic: the two hit tests read their geometry from different places, and an ordering
+> that is only correct because another decision's numbers happen to hold breaks silently
+> when they move.
 - **Given**: A window narrow enough that both grab bands contain the pointer
 - **When**: A press is resolved
 - **Then**: The sidebar's resize is armed, not the panel's

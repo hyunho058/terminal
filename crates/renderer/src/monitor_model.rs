@@ -295,9 +295,14 @@ pub struct Section {
 ///
 /// "Pinned" is not the same as "unconditional", and R5.1 records the difference. The header,
 /// the session row and the footer are the **floor** — they are drawn at every height a
-/// window can usefully produce. The **stat grid is the one region that yields**: on a panel
-/// too short to draw a tile row clear of the footer it drops whole rows of `TILE_COLS`, from
-/// the bottom of the design's order, so CONTEXT goes before UPTIME. See
+/// window can usefully produce, which is measured, not assumed: 91.2px at 430px wide, a 16px
+/// cell and scale 1. The **stat grid is the one region that yields above the floor**: on a
+/// panel too short to draw a tile row clear of the footer it drops whole rows of
+/// `TILE_COLS`, from the bottom of the design's order, so CONTEXT goes before UPTIME. Below
+/// the floor the floor itself yields, in the reverse of its pin order — the bottom-pinned
+/// footer outlasts the header band, which outlasts the session row — because every region
+/// above the footer reads `monitor_layout::Painter::footer_top` as its ceiling rather than
+/// the panel's bottom edge. See
 /// `monitor_layout::tests::r5_1_the_floor_survives_every_height_and_the_stat_grid_yields_whole_rows`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MonitorModel {
