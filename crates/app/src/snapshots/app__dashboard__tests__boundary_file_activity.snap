@@ -1,9 +1,12 @@
 ---
 source: crates/app/src/dashboard.rs
-expression: "file_activity(&t).join(\"\\n\")"
+expression: project_section(&file_activity(&t))
 ---
-── File Activity +1 more ───────────────────────────────────────────────────────────────────────────────
-  READ  ✓ …/renderer/atlas.rs 430ms
-  GREP  ✓ src/.*/mod\.rs 1.2s
-  WRITE ✗ …/src/dashboard.rs 1m02s
-  LIST  ✓ **/*.toml —
+  FILE ACTIVITY (total 7)
+    row  READ Teal           ✓ "…/renderer/atlas.rs" value="430ms" AccentGreen
+    row  GREP TextMuted      ✓ "src/.*/mod\\.rs" value="1.2s" TextMuted
+    row  READ Teal           ✓ "…phglyphglyphglyphglyphglyphglyphglyphglyphglyphglyphglyphglyphglyphglyphglyphglyphglyphglyph.rs" value="88ms" AccentGreen
+    row  GREP TextMuted      ✓ "nested/dir/nested/dir/nested/dir/nested/dir/nested/dir/nested/dir/nested/dir/nested/dir/nested/…" value="310ms" AccentGreen
+    row  WRITE Magenta       ✗ "…/src/dashboard.rs" value="1m02s" Rose
+    row  LIST TextMuted      ✓ "**/*.toml" value="—" TextMuted
+    row  READ Teal           ✓ "Cargo.toml" value="12ms" AccentGreen

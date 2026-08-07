@@ -50,6 +50,20 @@ const DEDUPE_CAP: usize = 64;
 /// bounds each key's value, so neither dimension of that structure can grow without
 /// limit. 8 is ~2x the widest observed content-block split.
 const RETRY_IDS_CAP: usize = 8;
+/// Distinct names the cumulative tool tally keeps (D12). The key is a string the
+/// LOG supplies and MCP tool names are effectively unbounded, so an uncapped map is
+/// a slow leak on a long session. 64 mirrors `DEDUPE_CAP` rather than inventing a
+/// new magnitude.
+///
+/// On overflow the smallest **incumbents** are merged into `tool_calls_other` —
+/// never the arriving name. Evicting (or merging) the smallest entry overall is the
+/// obvious implementation and is wrong: once 64 names sit at count >= 2, every
+/// genuinely new tool enters at 1, is instantly the smallest, and is dropped
+/// forever no matter how heavily it is later used.
+const TALLY_CAP: usize = 64;
+/// Merging runs in ONE batch down to this watermark, so the O(n log n) scan is
+/// amortised over the next 16 new names instead of running on every one.
+const TALLY_WATERMARK: usize = 48;
 
 // ---- value types --------------------------------------------------------------
 
@@ -170,6 +184,27 @@ pub struct TelemetrySnapshot {
     pub subagents: Vec<Subagent>,
     /// `(taskId, entry)`, in a deterministic id order. Display order is the app's.
     pub tasks: Vec<(String, TaskEntry)>,
+    // cumulative call counters (D3) — a DIFFERENT quantity from the rings above.
+    // Those are bounded display windows: on a 3-hour session everything older than
+    // the last `TOOLS_CAP` calls is gone, so counting a ring would print a number
+    // that LOOKS cumulative and is not.
+    /// `(tool name, calls)` over the whole session, in a deterministic NAME order.
+    /// Ordering by count would be a ranking, and ranking is presentation (SD4).
+    /// Bounded at `TALLY_CAP` names; the overflow lands in `tool_calls_other`.
+    pub tool_calls: Vec<(String, u64)>,
+    /// Calls merged out of `tool_calls` when it overflowed its name cap. It names
+    /// nothing and never drains, so it belongs in no ranking and in no bar
+    /// denominator (D12) — but it is what keeps the tally's sum honest.
+    pub tool_calls_other: u64,
+    /// Every call folded, as its OWN scalar — deliberately not a sum over
+    /// `tool_calls`, which is bounded, so the headline number is immune to the map's
+    /// cap. It equals `tool_calls`'s sum plus `tool_calls_other` by construction.
+    pub total_tool_calls: u64,
+    /// Calls whose `tool_result` carried `is_error: true`, folded at the one place
+    /// `ok` is derived. Kept apart from the `parse_errors` family below: those count
+    /// PARSER faults, which is a different fact — displaying one under the other's
+    /// label would be a lie about what failed.
+    pub failed_tool_calls: u64,
     // diagnostics — kept apart so a mis-sized tail window (benign) is never
     // conflated with a changed result format (a real regression)
     pub parse_errors: u64,
@@ -218,6 +253,12 @@ pub struct SessionTelemetry {
     files: VecDeque<FileActivity>,
     subagents: VecDeque<Subagent>,
     tasks: HashMap<String, TaskEntry>,
+
+    // cumulative counters (D3/D12) — independent of the rings above
+    tool_calls: HashMap<String, u64>,
+    tool_calls_other: u64,
+    total_tool_calls: u64,
+    failed_tool_calls: u64,
 
     pending: HashMap<String, Pending>,
     pending_order: VecDeque<String>,
@@ -316,6 +357,16 @@ impl SessionTelemetry {
         // stable. WHICH order to display is the app's policy, not ours.
         tasks.sort_by_key(|t| task_id_key(&t.0));
 
+        // Same reason, same rule: a HashMap has no order, so emit one. By NAME,
+        // not by count — sorting by count is a ranking, and which tools to rank
+        // and show is the app's policy (SD4).
+        let mut tool_calls: Vec<(String, u64)> = self
+            .tool_calls
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        tool_calls.sort_by(|a, b| a.0.cmp(&b.0));
+
         TelemetrySnapshot {
             session_id: self.session_id.clone(),
             model: self.model.clone(),
@@ -331,6 +382,10 @@ impl SessionTelemetry {
             files: self.files.iter().cloned().collect(),
             subagents: self.subagents.iter().cloned().collect(),
             tasks,
+            tool_calls,
+            tool_calls_other: self.tool_calls_other,
+            total_tool_calls: self.total_tool_calls,
+            failed_tool_calls: self.failed_tool_calls,
             parse_errors: self.parse_errors,
             usage_conflicts: self.usage_conflicts,
             orphan_tool_results: self.orphan_tool_results,
@@ -529,6 +584,13 @@ impl SessionTelemetry {
 
         // Only an explicit `true` is a failure — successes routinely omit the field.
         let ok = !it.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+        // The cumulative counters (D3) fold HERE: at the single point `ok` is
+        // derived and BEFORE the per-kind branch below. Every completed call is
+        // therefore counted exactly once whatever ring it lands in (or none, as an
+        // `Agent` does), and the failure count can never disagree with the `ok` the
+        // rings carry — a second `is_error` read elsewhere would be a second source
+        // of truth for one fact.
+        self.tally_call(&p.name, ok);
         let duration_ms = match (p.start_ms, ts) {
             // Clamp a negative interval to None, not zero: zero would render as a
             // real measurement.
@@ -648,6 +710,56 @@ impl SessionTelemetry {
                 }
                 None => break,
             }
+        }
+    }
+
+    // ---- cumulative counters (D3, D12) ----------------------------------------
+
+    /// Fold one completed call into the counters the rings cannot answer for: how
+    /// many calls this session made, how many of them failed, and how they split by
+    /// name. Saturating throughout, like every other accumulator here — no input
+    /// may panic the fold.
+    fn tally_call(&mut self, name: &str, ok: bool) {
+        self.total_tool_calls = self.total_tool_calls.saturating_add(1);
+        if !ok {
+            self.failed_tool_calls = self.failed_tool_calls.saturating_add(1);
+        }
+        if let Some(c) = self.tool_calls.get_mut(name) {
+            *c = c.saturating_add(1);
+            return;
+        }
+        // A name the map does not hold. Merge FIRST and insert AFTER, so the
+        // arriving name is never among the merge candidates: it would enter at 1
+        // and be the smallest entry the instant it existed. That ordering is the
+        // whole of D12's anti-starvation rule — swapping the two lines reproduces
+        // exactly the bug the rule exists to avoid.
+        if self.tool_calls.len() >= TALLY_CAP {
+            self.merge_smallest_incumbents();
+        }
+        self.tool_calls.insert(name.to_string(), 1);
+    }
+
+    /// Merge the smallest incumbents into the `other` bucket, in one batch down to
+    /// `TALLY_WATERMARK`. The sum is conserved — what leaves the map is added to the
+    /// bucket — so the map's sum plus `other` still equals `total_tool_calls`, which
+    /// is what lets the app show a per-name breakdown and a total that agree.
+    fn merge_smallest_incumbents(&mut self) {
+        let excess = self.tool_calls.len().saturating_sub(TALLY_WATERMARK);
+        if excess == 0 {
+            return;
+        }
+        // `(count, name)` so the sort is smallest-first with the NAME as the
+        // tie-break: a HashMap has no order, so equal counts would otherwise merge
+        // a different set on every run of the same input.
+        let mut ranked: Vec<(u64, String)> = self
+            .tool_calls
+            .iter()
+            .map(|(k, v)| (*v, k.clone()))
+            .collect();
+        ranked.sort();
+        for (count, name) in ranked.into_iter().take(excess) {
+            self.tool_calls.remove(&name);
+            self.tool_calls_other = self.tool_calls_other.saturating_add(count);
         }
     }
 

@@ -1,8 +1,0 @@
----
-source: crates/app/src/dashboard.rs
-expression: "summary(&t, now).join(\"\\n\")"
----
-── ai-monitor ──────────────────────────────────────────────────────────────────────────────────────────
- session  5e59b629 · claude-opus-5 · context 59%
- spend    in 45 · out 19.3K · cache 1.9M (billed)
- activity up 45m12s · idle 2m03s (as of last update)

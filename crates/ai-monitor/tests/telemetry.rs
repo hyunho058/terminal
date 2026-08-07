@@ -739,3 +739,210 @@ fn the_per_message_retry_list_is_bounded() {
     );
     assert_eq!(after.usage_conflicts, 0);
 }
+
+// ---- ai-monitor-right-panel R2: cumulative session counters ------------------
+//
+// The rings above are bounded DISPLAY windows; these are session facts. Counting a
+// ring would print a number that looks cumulative and is not, which is the defect
+// D3 exists to remove.
+
+/// Fold one completed `name` call, `ok` or not. Ids are unique so no pair collides.
+fn call(t: &mut SessionTelemetry, id: &mut usize, name: &str, ok: bool) {
+    *id += 1;
+    let n = *id;
+    t.apply(&format!(
+        r#"{{"type":"tool_use","id":"c{n}","name":"{name}"}}"#
+    ));
+    t.apply(&format!(
+        r#"{{"type":"tool_result","tool_use_id":"c{n}","is_error":{}}}"#,
+        !ok
+    ));
+}
+
+fn count_of(s: &TelemetrySnapshot, name: &str) -> u64 {
+    s.tool_calls
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, c)| *c)
+        .unwrap_or(0)
+}
+
+fn tally_sum(s: &TelemetrySnapshot) -> u64 {
+    s.tool_calls.iter().map(|(_, c)| *c).sum()
+}
+
+#[test]
+fn the_tally_outlives_the_display_ring() {
+    // R2.1 — 200 Bash calls against a 32-entry ring. The ring is what the panel can
+    // list; the tally is what the session did.
+    let mut t = SessionTelemetry::new();
+    let mut id = 0;
+    for _ in 0..200 {
+        call(&mut t, &mut id, "Bash", true);
+    }
+    let s = t.snapshot();
+    assert_eq!(s.tools.len(), 32, "TOOLS_CAP still bounds the display ring");
+    assert_eq!(
+        count_of(&s, "Bash"),
+        200,
+        "the tally is not bounded with it"
+    );
+    assert_eq!(s.total_tool_calls, 200);
+    assert_eq!(s.failed_tool_calls, 0);
+}
+
+#[test]
+fn every_kind_of_completed_call_reaches_the_tally() {
+    // The tally counts CALLS, not ring entries: a Read lands in the file ring, a
+    // Skill in the skills ring, an Agent in neither of those two and a TaskCreate in
+    // no ring at all — but all four are calls the session made, and the design's
+    // total is over calls. Folding at the single point `ok` is derived, before the
+    // per-kind branch, is what makes that true without a second traversal.
+    let mut t = SessionTelemetry::new();
+    let mut id = 0;
+    for name in ["Bash", "Read", "Skill", "Agent"] {
+        call(&mut t, &mut id, name, true);
+    }
+    let s = t.snapshot();
+    assert_eq!(s.total_tool_calls, 4);
+    for name in ["Bash", "Read", "Skill", "Agent"] {
+        assert_eq!(count_of(&s, name), 1, "{name} is a call");
+    }
+    assert_eq!(tally_sum(&s) + s.tool_calls_other, s.total_tool_calls);
+}
+
+#[test]
+fn the_grand_total_is_its_own_scalar_not_the_map_sum() {
+    // R2.2 — 187 calls across 70 names, i.e. past the 64-name cap, so a total
+    // derived by summing the map would under-report by everything the cap merged
+    // away. The total is its own counter; the identity `map + other == total` is
+    // what keeps the two from drifting apart.
+    let mut t = SessionTelemetry::new();
+    let mut id = 0;
+    for i in 0..70 {
+        call(&mut t, &mut id, &format!("tool{i:02}"), true);
+    }
+    for _ in 0..117 {
+        call(&mut t, &mut id, "tool00", true);
+    }
+    let s = t.snapshot();
+    assert_eq!(s.total_tool_calls, 187);
+    assert_eq!(
+        tally_sum(&s) + s.tool_calls_other,
+        187,
+        "the total must be reachable from the parts, not merely plausible"
+    );
+    assert!(s.tool_calls.len() <= 64, "the map is still bounded");
+    assert!(
+        s.tool_calls_other > 0,
+        "70 names past a 64 cap must have merged"
+    );
+    assert_eq!(
+        count_of(&s, "tool00"),
+        117,
+        "a merged name is not banished — its later calls count again, which is the \
+         difference between merging and evicting"
+    );
+}
+
+#[test]
+fn failed_calls_are_counted_apart_from_parser_faults() {
+    // R2.3 — `parse_errors` counts PARSER faults. A tool that ran and failed is a
+    // different fact, and putting one under the other's label would misreport what
+    // broke. Fold both here so the two counters are seen to move independently.
+    let mut t = SessionTelemetry::new();
+    let mut id = 0;
+    for i in 0..6 {
+        call(&mut t, &mut id, "Bash", i % 2 != 0);
+    }
+    t.apply("not json at all");
+    let s = t.snapshot();
+    assert_eq!(s.failed_tool_calls, 3, "three is_error:true results");
+    assert_eq!(s.total_tool_calls, 6, "a failure is still a call");
+    assert_eq!(s.parse_errors, 1, "the malformed line, and nothing else");
+    assert_ne!(
+        s.failed_tool_calls, s.parse_errors,
+        "distinct fields for distinct facts"
+    );
+}
+
+#[test]
+fn a_new_name_survives_the_cap_and_incumbents_are_merged() {
+    // R2.4 — the anti-starvation rule (D12), stated as a test because the obvious
+    // implementation is wrong. With 64 incumbents at count >= 2, "merge the smallest
+    // entry" merges the ARRIVING name: it enters at 1 and is the smallest thing in
+    // the map the instant it exists. Under that rule no new tool can ever be
+    // recorded again, however heavily it is later used. This test fails if anyone
+    // "simplifies" to evict-smallest.
+    let mut t = SessionTelemetry::new();
+    let mut id = 0;
+    for i in 0..64 {
+        for _ in 0..2 {
+            call(&mut t, &mut id, &format!("inc{i:02}"), true);
+        }
+    }
+    let before = t.snapshot();
+    assert_eq!(
+        before.tool_calls.len(),
+        64,
+        "premise: the map is exactly full"
+    );
+    assert_eq!(before.tool_calls_other, 0, "premise: nothing merged yet");
+
+    call(&mut t, &mut id, "brandnew", true);
+    let after = t.snapshot();
+
+    assert_eq!(
+        count_of(&after, "brandnew"),
+        1,
+        "the arriving name is retained — it is never a merge candidate"
+    );
+    assert_eq!(
+        after.tool_calls.len(),
+        49,
+        "one batch down to the 48 watermark, then the new name — not a merge per name"
+    );
+    let survivors = (0..64)
+        .filter(|i| count_of(&after, &format!("inc{i:02}")) == 2)
+        .count();
+    assert_eq!(survivors, 48, "16 incumbents merged, the rest untouched");
+    assert_eq!(after.tool_calls_other, 32, "16 incumbents x 2 calls each");
+    assert_eq!(after.total_tool_calls, 129);
+    assert_eq!(
+        tally_sum(&after) + after.tool_calls_other,
+        after.total_tool_calls,
+        "the sum is conserved across a merge"
+    );
+}
+
+#[test]
+fn the_new_counters_default_to_nothing_folded() {
+    // Load-bearing beyond this crate: the app decides its empty state with
+    // `*t == TelemetrySnapshot::default()` (`crates/app/src/dashboard.rs`,
+    // `crates/app/src/overlay.rs`). A counter whose default meant anything other
+    // than "nothing folded" would make an empty session read as an attached one.
+    let fresh = SessionTelemetry::new().snapshot();
+    assert_eq!(fresh, TelemetrySnapshot::default());
+    let d = TelemetrySnapshot::default();
+    assert!(d.tool_calls.is_empty());
+    assert_eq!(d.tool_calls_other, 0);
+    assert_eq!(d.total_tool_calls, 0);
+    assert_eq!(d.failed_tool_calls, 0);
+}
+
+#[test]
+fn the_tally_is_emitted_in_a_deterministic_name_order() {
+    // The `tasks` rule, for the same reason: a HashMap has no order, and an unstable
+    // snapshot would make every downstream assertion flaky. By NAME, not by count —
+    // ranking is presentation, and this crate holds none (SD4).
+    let mut t = SessionTelemetry::new();
+    let mut id = 0;
+    for (name, n) in [("zed", 1), ("alpha", 9), ("mid", 5)] {
+        for _ in 0..n {
+            call(&mut t, &mut id, name, true);
+        }
+    }
+    let s = t.snapshot();
+    let names: Vec<&str> = s.tool_calls.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["alpha", "mid", "zed"]);
+}

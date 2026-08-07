@@ -1,6 +1,6 @@
 //! The tab-rename field (sticky-tab-title D1/D8/D8a): a Cmd+Shift+R modal prompt that
-//! names the active tab, registered through the SD4 `Overlay` seam and drawn via the
-//! renderer's `overlay_layer` in its centred-prompt placement (SD3).
+//! names the active tab, registered through the SD4 `Overlay` seam. It owns no draw
+//! layer of its own: the field paints onto the sidebar card it is renaming (SD3).
 //!
 //! **Why this exists as an in-app field at all.** A sticky title is impossible while the
 //! only channel is OSC 0/2, because that channel belongs to whatever is running: zsh's
@@ -509,6 +509,12 @@ impl Overlay for RenameOverlay {
                 self.refresh_model();
                 Handled::Consumed
             }
+            // Addressed to the ai-monitor overlay (right-panel R6.6). Passing through is
+            // load-bearing, not a formality: this overlay sits at priority 200, ahead of the
+            // ai-monitor's 100, and `OverlayHost::command` stops at the first taker — so
+            // consuming it here would silently eat the launch restore. Matched explicitly
+            // rather than by a wildcard so the next command added still forces a decision.
+            OverlayCommand::RestoreMonitor { .. } => Handled::Passthrough,
         }
     }
 }

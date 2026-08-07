@@ -4,17 +4,21 @@
 //! [`Config`] on change; [`apply`] applies it to the running renderer, tabs and preedit
 //! layer without a restart:
 //! - `renderer.apply_config` re-derives cell metrics, theme clear color, ligature state,
-//!   rebuilds the glyph atlas, and re-fits the sidebar inset via `sync_left_inset`
-//!   (sidebar-row-redesign D4 — so this module no longer touches `set_left_inset`),
+//!   rebuilds the glyph atlas, and re-fits **both** side insets — the sidebar's via
+//!   `sync_left_inset` (sidebar-row-redesign D4 — so this module no longer touches
+//!   `set_left_inset`) and the ai-monitor panel's via `sync_right_inset`
+//!   (ai-monitor-right-panel D21/R4.6, so a reload for an unrelated key cannot drop the
+//!   panel's band while the panel keeps painting),
 //! - [`refit`] re-fits the grid to the new [`Renderer::grid_size`] and resizes every tab,
 //! - each tab's default cell colors are re-themed,
 //! - the inline IME preedit layer is re-themed (hangul-ime R7.5): its colors ride on the
 //!   shared handle rather than `FrameCtx`, so nothing else would update them.
 //!
-//! [`refit`] is the ONE place the grid is re-fitted (D6): every path that can change the
+//! [`refit`] is the ONE place the grid is re-fitted (D6): every path that can change a
 //! reserved inset or the window size — startup, config reload, sidebar collapse/expand,
-//! and `Resized` — calls it, so the "change the inset first, then read `grid_size`"
-//! ordering has a single enforcement point instead of five conventions.
+//! the ai-monitor panel's toggle and edge drag, and `Resized` — calls it, so the "change
+//! the inset first, then read `grid_size`" ordering has a single enforcement point instead
+//! of seven conventions.
 
 use common::config::Config;
 use renderer::preedit_layer::PreeditHandle;

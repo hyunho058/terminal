@@ -17,7 +17,9 @@ pub mod font_set;
 pub mod glyph;
 pub mod image_layer;
 pub mod link_layer;
-pub mod overlay_layer;
+pub mod monitor_layout;
+pub mod monitor_model;
+pub mod monitor_panel;
 pub mod preedit_layer;
 pub mod selection_layer;
 pub mod sidebar_header;
@@ -30,7 +32,7 @@ pub mod tab_bar;
 
 use atlas::{Atlas, GlyphKey};
 use bytemuck::{Pod, Zeroable};
-use common::config::{Config, SidebarConfig};
+use common::config::{AiMonitorConfig, Config, SidebarConfig};
 use font_set::FONT_CANDIDATES;
 use swash::shape::ShapeContext;
 use swash::FontRef;
@@ -129,6 +131,13 @@ pub struct FrameCtx<'a> {
     /// Physical px reserved left of the grid (the vertical tab sidebar paints
     /// this left band). Grid + glyphs shift right by this.
     pub left_inset: f32,
+    /// Physical px reserved right of the grid (the docked ai-monitor panel paints
+    /// this right band). Nothing shifts by it — the grid still starts at
+    /// `left_inset` and merely ends sooner — so unlike `left_inset` it reaches no
+    /// uniform (D21; see [`grid_dims`]). Always equal to [`Renderer::right_inset`]
+    /// (R4.7): a layer that painted a wider band than `grid_size` reserved would
+    /// cover columns the terminal still believes it owns.
+    pub right_inset: f32,
     /// Render-target format — a layer needs it to build its own pipelines.
     pub format: wgpu::TextureFormat,
     /// The live sidebar config (D10). A sidebar layer reads its toggles and width
@@ -199,8 +208,28 @@ pub struct Renderer {
     /// renderer owns this now (D4): it is derived from the sidebar config + override by
     /// `sync_left_inset`, and `set_left_inset`'s argument is ignored.
     left_inset: f32,
+    /// Physical px reserved right of the grid (the docked ai-monitor panel). Costs
+    /// the grid columns exactly as `left_inset` does, but shifts nothing — see
+    /// `grid_dims` for why that difference keeps it out of the uniforms. Derived by
+    /// `sync_right_inset`, never assigned directly (D21).
+    right_inset: f32,
     /// Runtime sidebar overrides (D4), consulted before the config by `effective_sidebar`.
     sidebar_override: SidebarOverride,
+    /// Live ai-monitor config (D6/D21). Refreshed by `apply_config`; the pre-override half
+    /// of `effective_monitor_width`.
+    ai_monitor: AiMonitorConfig,
+    /// Is the panel open? A **runtime** fact, not a config-derived one (D21).
+    ///
+    /// `[ai_monitor].open` is deliberately not read here: the band this reserves is painted
+    /// by `AiMonitorOverlay`'s layer, whose visibility the app owns, so a renderer that
+    /// adopted the file's flag would reserve an empty strip the instant the two disagreed —
+    /// at startup, or on any live reload. The file's flag records the user's intent for a
+    /// restore that belongs to the overlay; the inset follows what is actually painted.
+    monitor_open: bool,
+    /// The panel's runtime width in **logical** px (D6/D21) — a released drag writes here.
+    /// `None` defers to `[ai_monitor].width_px`, exactly as `SidebarOverride::width_px`
+    /// defers to `[sidebar].width_px`.
+    monitor_width_override: Option<f32>,
     ppem: f32,
     ligatures: bool,
     bg_default: u32,
@@ -469,7 +498,11 @@ impl Renderer {
             cell_size,
             top_inset: 0.0,
             left_inset: 0.0,
+            right_inset: 0.0,
             sidebar_override: SidebarOverride::default(),
+            ai_monitor: cfg.ai_monitor.clone(),
+            monitor_open: false,
+            monitor_width_override: None,
             ppem,
             ligatures: cfg.font.ligatures,
             bg_default: cfg.theme.background,
@@ -482,8 +515,9 @@ impl Renderer {
             glyph_count: 0,
             reshape_count: 0,
         };
-        // The startup inset must be right before the first frame (D4).
+        // The startup insets must be right before the first frame (D4/D21).
         renderer.sync_left_inset();
+        renderer.sync_right_inset();
         Ok(renderer)
     }
 
@@ -514,6 +548,7 @@ impl Renderer {
             self.cell_size,
             self.top_inset,
             self.left_inset,
+            self.right_inset,
         )
     }
 
@@ -572,6 +607,12 @@ impl Renderer {
         self.left_inset =
             sidebar_row::sidebar_width_px(&self.effective_sidebar(), self.scale_factor);
         self.write_uniforms();
+        // The sidebar's band is one of the four inputs to D4's cap on the panel's band, so
+        // moving it re-derives the panel's too (R4.3). One tail call rather than four
+        // copies at the sidebar setters: the coupling is real and one-directional
+        // (`sync_right_inset` reads `left_inset`, never the reverse), so stating it once
+        // here is what keeps a future fifth sidebar setter from forgetting it.
+        self.sync_right_inset();
     }
 
     /// Collapse or restore the sidebar at runtime (D4). Returns the reclaimed width to
@@ -622,6 +663,129 @@ impl Renderer {
         self.left_inset
     }
 
+    /// Current right inset in physical px — the band the docked ai-monitor panel
+    /// occupies (D21). `0.0` while the panel is closed, which is the pre-panel
+    /// behavior exactly (R4.2). [`FrameCtx::right_inset`] carries the same value to
+    /// the layers (R4.7).
+    pub fn right_inset(&self) -> f32 {
+        self.right_inset
+    }
+
+    /// The width the panel is **asking** for, in **logical** px — config with the runtime
+    /// override applied, or `0.0` while it is closed (D6/D21). The twin of
+    /// [`effective_sidebar`](Renderer::effective_sidebar).
+    ///
+    /// This is intent, not the band that gets drawn. D4's clamps live one level down, in
+    /// [`monitor_band_px`], because D8 turns on exactly that split: the persisted value is
+    /// what the user dragged to, and a window too narrow to honour it applies a *transient*
+    /// squeeze on top — so re-widening restores the intended width with no user action
+    /// (R4.5), and nothing ever writes the squeezed number back (R6.2).
+    fn effective_monitor_width(&self) -> f32 {
+        if !self.monitor_open {
+            return 0.0;
+        }
+        self.monitor_width_override
+            .unwrap_or(self.ai_monitor.width_px)
+            .max(0.0)
+    }
+
+    /// Re-derive `right_inset` from the effective panel width (config + override + D4's
+    /// clamps) and invalidate the instance cache (D21). The single site that writes the
+    /// inset; called from `assemble`, `apply_config`, `resize`, `sync_left_inset` and the
+    /// three runtime setters.
+    ///
+    /// `sync_left_inset` and `resize` are in that list because the clamp reads the window
+    /// width, the cell width and the sidebar's band: a value derived from four inputs but
+    /// recomputed on only one of them is a stale value waiting to happen — the sidebar
+    /// widening past the point where the panel still fits would otherwise leave the band
+    /// overlapping columns `grid_size` still believes the terminal owns.
+    ///
+    /// Writes **no uniforms**, unlike [`sync_left_inset`](Renderer::sync_left_inset).
+    /// `BgUniforms`/`GlyphUniforms` carry `left_inset` because the grid is *shifted*
+    /// right by it; a right band shifts nothing and only removes columns, which
+    /// `grid_dims` already accounts for. Handing it to the shader as well would make
+    /// the GPU a second author of a fact `grid_size` owns, and the two would disagree
+    /// the first time one of them is updated alone.
+    fn sync_right_inset(&mut self) {
+        let scale = self.scale_factor as f32;
+        let px = monitor_band_px(
+            self.effective_monitor_width() * scale,
+            self.config.width as f32,
+            self.cell_size.0,
+            self.left_inset,
+            common::config::MONITOR_WIDTH_MIN * scale,
+        );
+        if px == self.right_inset {
+            // A drag calls this on every `CursorMoved`, so an unchanged width must not
+            // cost a full re-shape per pointer move.
+            return;
+        }
+        self.right_inset = px;
+        // The column count just moved, so the resident instance buffers were built for
+        // a grid that no longer exists — a content-equal snapshot must not re-present
+        // them (R1.4, the same reason `resize` clears the cache).
+        self.last_snapshot = None;
+    }
+
+    /// Open or close the ai-monitor panel's band (D21/R0.1/R0.3). Two callers, both in the
+    /// app's `terminal_app`: the `Cmd+Shift+M` chord by way of `AppRequest::SetMonitorOpen`
+    /// — the one gesture D8 lets *persist* the open state — and the launch restore that
+    /// replays the persisted flag with no keystroke (R6.6).
+    ///
+    /// Neither passes a width, and that is why this takes none: the band is derived from
+    /// `[ai_monitor].width_px` plus the runtime override, so a width dragged last week comes
+    /// back on the next open (R4.5).
+    ///
+    /// Separate from [`set_monitor_width`](Renderer::set_monitor_width) on purpose: a
+    /// force-close (R4.4) must not look like a width of zero, or the next re-widening
+    /// would have nothing to restore.
+    pub fn set_monitor_open(&mut self, open: bool) {
+        self.monitor_open = open;
+        self.sync_right_inset();
+    }
+
+    /// Whether the panel is open — the **intent**, which a width-forced close leaves alone
+    /// (D8/R6.3). `right_inset() == 0.0` while this is `true` is exactly R4.4's state.
+    pub fn monitor_open(&self) -> bool {
+        self.monitor_open
+    }
+
+    /// Set the panel's logical width at runtime (D6/D21), clamped to the design's
+    /// 300–760 drag band — the public backing for the edge drag, which does not go through
+    /// `Config::load_from`'s clamp.
+    ///
+    /// Unlike [`set_left_inset`](Renderer::set_left_inset) this is a real setter, but it
+    /// still routes through `sync_right_inset` rather than assigning the inset, so the next
+    /// `apply_config` re-derives the same band instead of silently dropping it while the
+    /// panel keeps painting (R4.6).
+    pub fn set_monitor_width(&mut self, logical_px: f32) {
+        self.monitor_width_override = Some(clamp_monitor_width(logical_px));
+        self.sync_right_inset();
+    }
+
+    /// The panel's effective width in **logical** px — config with the runtime override
+    /// applied (D6). This is the value a drag release persists: the *intent*, readable even
+    /// while a narrow window is squeezing the drawn band (D8/R6.2), and non-zero even while
+    /// the panel is closed, exactly as `sidebar_width_logical` is.
+    pub fn monitor_width_logical(&self) -> f32 {
+        self.monitor_width_override
+            .unwrap_or(self.ai_monitor.width_px)
+    }
+
+    /// Drop the runtime panel-width override so the config file is authoritative again
+    /// (D6, mirroring [`clear_sidebar_override`](Renderer::clear_sidebar_override)).
+    ///
+    /// Called when a delivered config carries a `width_px` that is not our own echo — i.e.
+    /// a real human edit, which should win (R6.5). The open state is **not** cleared with
+    /// it. `[ai_monitor].open` is read from the file exactly once, at launch, and the app
+    /// replays it by *opening the overlay and the band together* (R6.6); adopting the file's
+    /// flag again mid-session would reserve a band with no overlay painting into it — an
+    /// empty strip appearing on an unrelated config edit.
+    pub fn clear_monitor_override(&mut self) {
+        self.monitor_width_override = None;
+        self.sync_right_inset();
+    }
+
     /// The window backing scale factor. A sidebar `DrawLayer` multiplies logical-px
     /// [`SidebarConfig::width_px`] / `SidebarMetrics` by this to get physical px
     /// (D1/D10); `FrameCtx.scale_factor` carries the same value to layers.
@@ -645,6 +809,9 @@ impl Renderer {
         self.clear = to_wgpu_color(cfg.theme.background);
         // Sidebar toggles/width/accent reach layers via `FrameCtx.sidebar` (D10).
         self.sidebar = cfg.sidebar.clone();
+        // The panel's persisted width is the pre-override half of `effective_monitor_width`
+        // (D6), so a live reload has to refresh it before `sync_right_inset` runs below.
+        self.ai_monitor = cfg.ai_monitor.clone();
 
         // Rebuild the atlas at the new ppem so glyphs re-rasterize (size + ligature
         // changes need fresh coverage), then re-point the glyph bind group at it.
@@ -703,6 +870,9 @@ impl Renderer {
         // runtime override — a saved config must not undo a runtime collapse (D4). This
         // also calls write_uniforms.
         self.sync_left_inset();
+        // Same rule on the right edge (D21): a live reload for an unrelated key must
+        // re-derive the panel's band, not drop it while the panel keeps painting (R4.6).
+        self.sync_right_inset();
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -715,6 +885,12 @@ impl Renderer {
         // not re-present buffers built for the old size (R1.4).
         self.last_snapshot = None;
         self.write_uniforms();
+        // The window width is D4's other cap input: narrowing squeezes (and eventually
+        // force-closes) the panel's band, and widening restores it at the intended width
+        // with no keystroke (R4.4/R4.5). Both directions are *this* call — the caller
+        // re-fits the grid immediately after, so a stale inset here would resize every tab
+        // to a column count the panel then paints over.
+        self.sync_right_inset();
     }
 
     /// Number of cache **misses** so far — frames that actually re-shaped the grid.
@@ -878,6 +1054,7 @@ impl Renderer {
                 cell,
                 top_inset: self.top_inset,
                 left_inset: self.left_inset,
+                right_inset: self.right_inset,
                 format: self.config.format,
                 sidebar: &self.sidebar,
                 scale_factor: self.scale_factor,
@@ -1402,23 +1579,78 @@ fn cell_size_px(cfg: &Config, scale_factor: f64) -> (f32, f32) {
 }
 
 /// Cols × rows that fit a framebuffer, reserving `top_inset` px above the grid
-/// (e.g. a tab bar) and `left_inset` px to its left (e.g. a vertical tab
-/// sidebar). Only the height below the top inset holds rows; only the width to
-/// the right of the left inset holds cols. Kept as a free function so the inset
-/// arithmetic is unit-testable without a GPU surface. Both floors at ≥1 so a
-/// pathological inset larger than the window still yields a drawable grid.
+/// (e.g. a tab bar), `left_inset` px to its left (e.g. a vertical tab sidebar)
+/// and `right_inset` px to its right (the docked ai-monitor panel). Only the
+/// height below the top inset holds rows; only the width *between* the two side
+/// insets holds cols. Kept as a free function so the inset arithmetic is
+/// unit-testable without a GPU surface. Both floors at ≥1 so a pathological inset
+/// larger than the window still yields a drawable grid.
+///
+/// `right_inset` is the reason no shader or uniform changed for the panel (D21).
+/// `BgUniforms`/`GlyphUniforms` carry `left_inset` because the grid is *shifted*
+/// right by it — every cell's origin moves. A right band shifts nothing: the grid
+/// still starts at `left_inset` and simply ends sooner, which is entirely
+/// expressible as a smaller column count. Feeding it to the shader as well would
+/// make the GPU a second author of the same fact, and one of the two authors would
+/// eventually be updated alone.
 fn grid_dims(
     width: f32,
     height: f32,
     cell: (f32, f32),
     top_inset: f32,
     left_inset: f32,
+    right_inset: f32,
 ) -> (u16, u16) {
-    let usable_w = (width - left_inset).max(0.0);
+    let usable_w = (width - left_inset - right_inset).max(0.0);
     let cols = (usable_w / cell.0).floor().max(1.0) as u16;
     let usable_h = (height - top_inset).max(0.0);
     let rows = (usable_h / cell.1).floor().max(1.0) as u16;
     (cols, rows)
+}
+
+/// Columns the terminal keeps no matter how narrow the window gets (D4). The smallest
+/// width at which a shell prompt plus a short command is still readable; below it the
+/// terminal stops being usable at all, and the terminal is the application — the panel is
+/// the accessory, so the panel is what yields.
+pub const MIN_TERMINAL_COLS: u16 = 20;
+
+/// The panel's requested width clamped to the design's drag band (D6). Non-finite input
+/// falls back to the minimum rather than propagating a `NaN` into the inset arithmetic,
+/// where every later comparison would silently answer `false`.
+fn clamp_monitor_width(raw: f32) -> f32 {
+    if !raw.is_finite() {
+        return common::config::MONITOR_WIDTH_MIN;
+    }
+    raw.clamp(
+        common::config::MONITOR_WIDTH_MIN,
+        common::config::MONITOR_WIDTH_MAX,
+    )
+}
+
+/// The band the ai-monitor panel may actually occupy, in **physical** px — D4's clamp,
+/// applied to the panel's asking width at layout time (R4.3/R4.4).
+///
+/// Two rules, in order:
+/// 1. The terminal keeps [`MIN_TERMINAL_COLS`] columns, so the band is capped at whatever
+///    is left of the window once the sidebar's band and those columns are paid for. The
+///    check is arithmetically identical to `grid_dims(..) .0 >= MIN_TERMINAL_COLS` —
+///    `floor(x) >= 20 ⟺ x >= 20` — which is why the sidebar's width is accounted for
+///    automatically rather than by a second rule here.
+/// 2. When even `min_px` does not fit inside that cap the band is **zero** and the panel is
+///    not drawn: a 40px sliver of a 430px design is not a smaller panel, it is a broken one.
+///
+/// It never touches the panel's *intent* (D8). A window narrow enough to trip rule 2
+/// force-closes the band and leaves `[ai_monitor].open` and the persisted width exactly as
+/// they were, so widening the window restores the panel with no keystroke (R4.5/R6.2/R6.3).
+fn monitor_band_px(intent_px: f32, width: f32, cell_w: f32, left_inset: f32, min_px: f32) -> f32 {
+    if !(intent_px.is_finite() && intent_px > 0.0) {
+        return 0.0;
+    }
+    let cap = width - left_inset - MIN_TERMINAL_COLS as f32 * cell_w;
+    if cap < min_px {
+        return 0.0;
+    }
+    intent_px.min(cap)
 }
 
 fn to_wgpu_color(packed: u32) -> wgpu::Color {
@@ -1485,37 +1717,73 @@ mod tests {
     #[test]
     fn top_inset_reserves_rows_for_the_tab_bar() {
         // 800px tall, 20px cells → 40 rows with no inset.
-        let (_, rows0) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0, 0.0);
+        let (_, rows0) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0, 0.0, 0.0);
         assert_eq!(rows0, 40);
         // A 40px tab bar (2 rows) reserves the top band → 38 rows below it.
-        let (cols, rows1) = grid_dims(1200.0, 800.0, (10.0, 20.0), 40.0, 0.0);
+        let (cols, rows1) = grid_dims(1200.0, 800.0, (10.0, 20.0), 40.0, 0.0, 0.0);
         assert_eq!(rows1, 38, "grid rows shrink by the inset, not the cols");
         assert_eq!(cols, 120, "top inset never affects column count");
         // A pathological inset taller than the window still yields ≥1 row.
-        let (_, rows2) = grid_dims(1200.0, 800.0, (10.0, 20.0), 10_000.0, 0.0);
+        let (_, rows2) = grid_dims(1200.0, 800.0, (10.0, 20.0), 10_000.0, 0.0, 0.0);
         assert_eq!(rows2, 1);
     }
 
     #[test]
     fn left_inset_reserves_cols_for_the_sidebar() {
         // 1200px wide, 10px cells → 120 cols with no inset.
-        let (cols0, _) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0, 0.0);
+        let (cols0, _) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0, 0.0, 0.0);
         assert_eq!(cols0, 120);
         // A 200px sidebar (20 cols) reserves the left band → 100 cols beside it,
         // rows unchanged (R1.1).
-        let (cols1, rows1) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0, 200.0);
+        let (cols1, rows1) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0, 200.0, 0.0);
         assert_eq!(cols1, 100, "grid cols shrink by the left inset");
         assert_eq!(rows1, 40, "left inset never affects row count");
         // A pathological inset wider than the window still yields ≥1 col (R1.2).
-        let (cols2, _) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0, 10_000.0);
+        let (cols2, _) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0, 10_000.0, 0.0);
         assert_eq!(cols2, 1);
         // Zero-inset invariance (R4.1): left_inset == 0.0 reproduces the no-inset
         // column count exactly.
-        let (cols_z, rows_z) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0, 0.0);
+        let (cols_z, rows_z) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0, 0.0, 0.0);
         assert_eq!((cols_z, rows_z), (120, 40));
         // Both insets compose independently (cols from left, rows from top).
-        let (cols_b, rows_b) = grid_dims(1200.0, 800.0, (10.0, 20.0), 40.0, 200.0);
+        let (cols_b, rows_b) = grid_dims(1200.0, 800.0, (10.0, 20.0), 40.0, 200.0, 0.0);
         assert_eq!((cols_b, rows_b), (100, 38));
+    }
+
+    #[test]
+    fn right_inset_reserves_cols_for_the_ai_monitor_panel() {
+        // R4.1: the two side bands come off the *same* width — 1200 − 200 − 300 = 700px
+        // of grid, i.e. 70 cols at 10px cells — and neither touches the rows.
+        let (cols, rows) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0, 200.0, 300.0);
+        assert_eq!(cols, 70, "cols come off both bands, not just the left one");
+        assert_eq!(rows, 40, "no side inset ever affects the row count");
+        // Rows still answer to the top inset alone, with both side bands present.
+        let both = grid_dims(1200.0, 800.0, (10.0, 20.0), 40.0, 200.0, 300.0);
+        assert_eq!(both, (70, 38));
+
+        // R4.2 (zero-inset invariance): with the panel closed the result is exactly the
+        // pre-panel five-argument form's, for every combination of the other two insets.
+        // Pinned as literals rather than compared against a helper — a helper sharing
+        // this function's body would agree with it even if both were wrong.
+        for (top, left, want) in [
+            (0.0, 0.0, (120, 40)),
+            (0.0, 200.0, (100, 40)),
+            (40.0, 0.0, (120, 38)),
+            (40.0, 200.0, (100, 38)),
+        ] {
+            assert_eq!(
+                grid_dims(1200.0, 800.0, (10.0, 20.0), top, left, 0.0),
+                want,
+                "right_inset 0.0 must be a no-op at top={top} left={left}"
+            );
+        }
+
+        // A panel wider than the window still leaves a drawable column, like the left
+        // band does (R1.2) — the floor is on the total, not per inset.
+        let (cols_p, _) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0, 0.0, 10_000.0);
+        assert_eq!(cols_p, 1);
+        let (cols_q, _) = grid_dims(1200.0, 800.0, (10.0, 20.0), 0.0, 700.0, 700.0);
+        assert_eq!(cols_q, 1, "two bands that together exceed the window");
     }
 
     #[test]
@@ -2742,6 +3010,7 @@ mod tests {
             cell: [12.0, 24.0],
             top_inset: 0.0,
             left_inset: 0.0,
+            right_inset: 0.0,
             format: wgpu::TextureFormat::Rgba8Unorm,
             sidebar: &SidebarConfig::default(),
             scale_factor: 1.0,
@@ -2811,6 +3080,7 @@ mod tests {
             cell: [cw, 24.0],
             top_inset: 0.0,
             left_inset: 0.0,
+            right_inset: 0.0,
             format: wgpu::TextureFormat::Rgba8Unorm,
             sidebar: &sidebar_cfg,
             scale_factor: 1.0,
@@ -2922,6 +3192,298 @@ mod tests {
             r.reshape_count(),
             4,
             "apply_config must invalidate the cache"
+        );
+    }
+
+    #[test]
+    fn frame_ctx_carries_the_panels_right_inset() {
+        // R4.7: what a layer is told the panel occupies must be what `grid_size` took
+        // away from the terminal. If the two ever disagreed the panel would paint over
+        // columns the terminal still believed it owned — the failure this pins is
+        // silent, so it is asserted through a real frame rather than by inspection.
+        // Needs a GPU.
+        let cfg = Config::default();
+        let Ok(mut r) = Renderer::new_headless(1200, 800, 1.0, &cfg) else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        let target = r.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen"),
+            size: wgpu::Extent3d {
+                width: 1200,
+                height: 800,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: r.surface_format(),
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut t = term_core::Terminal::new(8, 2, term_core::Color(0xFFFFFF), term_core::Color(0));
+        t.advance(b"hello");
+        let snap = t.snapshot();
+
+        /// Records what the frame actually handed the layer.
+        struct Probe(std::rc::Rc<std::cell::Cell<f32>>);
+        impl DrawLayer for Probe {
+            fn z_order(&self) -> i32 {
+                100
+            }
+            fn record(&mut self, ctx: &mut FrameCtx<'_>) {
+                self.0.set(ctx.right_inset);
+            }
+        }
+        let seen = std::rc::Rc::new(std::cell::Cell::new(f32::NAN));
+        r.add_layer(Box::new(Probe(seen.clone())));
+
+        // Closed panel: no band, and the grid is whatever it always was (R4.2).
+        r.draw_to(&view, &snap);
+        assert_eq!(r.right_inset(), 0.0, "closed panel reserves nothing");
+        assert_eq!(seen.get(), r.right_inset());
+        let (cols_closed, rows_closed) = r.grid_size();
+        r.draw_to(&view, &snap); // settle the instance cache before measuring it
+        let settled = r.reshape_count();
+
+        // Opening the panel: the layer sees the live inset, the grid pays for it in
+        // columns only, and the resident buffers — built for the wider grid — are
+        // dropped even though the snapshot did not change. The width comes from
+        // `[ai_monitor].width_px` (default 430) — the chord carries no width of its own.
+        r.set_monitor_open(true);
+        r.draw_to(&view, &snap);
+        assert_eq!(
+            r.right_inset(),
+            430.0,
+            "1.0 scale → logical px are physical"
+        );
+        assert_eq!(
+            seen.get(),
+            r.right_inset(),
+            "FrameCtx must carry the renderer's live inset"
+        );
+        let (cols_open, rows_open) = r.grid_size();
+        assert!(cols_open < cols_closed, "the band costs the grid columns");
+        assert_eq!(rows_open, rows_closed, "and never costs it rows");
+        assert_eq!(
+            r.reshape_count(),
+            settled + 1,
+            "a moved inset must invalidate the instance cache (R1.4)"
+        );
+
+        // An unchanged width is not a change: a drag calls the setter on every pointer
+        // move, which must not re-shape the grid per move.
+        let after_open = r.reshape_count();
+        r.set_monitor_width(430.0);
+        r.draw_to(&view, &snap);
+        assert_eq!(
+            r.reshape_count(),
+            after_open,
+            "re-setting the same width must not re-shape"
+        );
+
+        // Closing returns exactly the columns the panel took (R4.2/R0.3).
+        r.set_monitor_open(false);
+        r.draw_to(&view, &snap);
+        assert_eq!(seen.get(), 0.0);
+        assert_eq!(r.grid_size(), (cols_closed, rows_closed));
+    }
+
+    /// R4.3/R4.4/R4.5/R6.2: the window squeezes the band, force-closes it, and gives it
+    /// back — all without touching the width the user asked for. Needs a GPU.
+    #[test]
+    fn a_narrow_window_squeezes_then_force_closes_the_panel_without_losing_its_width() {
+        let cfg = Config::default();
+        let Ok(mut r) = Renderer::new_headless(1200, 800, 1.0, &cfg) else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        // Default sidebar 340px, 8px cells → the cap is 1200 − 340 − 20·8 = 700px.
+        assert_eq!(r.left_inset(), 340.0);
+        let cell_w = r.cell_size().0;
+        assert_eq!(
+            cell_w, 8.0,
+            "the arithmetic below is pinned to this cell width"
+        );
+
+        r.set_monitor_open(true);
+        assert_eq!(r.right_inset(), 430.0, "the asking width fits the cap");
+        assert!(r.grid_size().0 >= MIN_TERMINAL_COLS);
+
+        // Narrow until the cap bites: 900 − 340 − 160 = 400px of allowance.
+        r.resize(900, 800);
+        assert_eq!(r.right_inset(), 400.0, "R4.3: squeezed to keep 20 columns");
+        assert_eq!(
+            r.grid_size().0,
+            MIN_TERMINAL_COLS,
+            "the terminal is left exactly its floor, never less"
+        );
+        assert_eq!(
+            r.monitor_width_logical(),
+            430.0,
+            "R6.2: the squeeze is a display clamp — the intent is untouched"
+        );
+
+        // Narrower still: 780 − 340 − 160 = 280px, under the panel's 300px minimum.
+        r.resize(780, 800);
+        assert_eq!(r.right_inset(), 0.0, "R4.4: no sliver — the band closes");
+        assert!(
+            r.monitor_open(),
+            "R6.3: a width-forced close is not a user action; the intent stays open"
+        );
+
+        // Widening restores it with no keystroke, at the width the user asked for (R4.5).
+        r.resize(1200, 800);
+        assert_eq!(r.right_inset(), 430.0);
+
+        // The sidebar is the cap's fourth input: widening it re-derives the band too.
+        r.set_sidebar_width(440.0);
+        assert_eq!(r.right_inset(), 430.0, "1200 − 440 − 160 = 600 still fits");
+        r.resize(940, 800);
+        assert_eq!(
+            r.right_inset(),
+            340.0,
+            "940 − 440 − 160 leaves 340px, so the wider sidebar squeezes the panel"
+        );
+        r.set_sidebar_collapsed(true);
+        assert_eq!(
+            r.right_inset(),
+            430.0,
+            "collapsing the sidebar hands the allowance back to the panel"
+        );
+    }
+
+    /// R6.6 — the renderer's half of the launch restore: a persisted `open = true` comes
+    /// back at the persisted `width_px`, and comes back only when the app asks. Needs a GPU.
+    #[test]
+    fn a_persisted_open_panel_restores_at_its_persisted_width() {
+        let mut cfg = Config::default();
+        cfg.ai_monitor.width_px = 520.0;
+        cfg.ai_monitor.open = true; // as the last session left it
+        let Ok(mut r) = Renderer::new_headless(1800, 900, 1.0, &cfg) else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+
+        // The band is NOT derived from the flag. Deriving it here would reserve a strip at
+        // startup — and again on every config reload, since `apply_config` re-runs the same
+        // derivation — before the overlay has resolved a session to paint into it, which is
+        // an empty column of window with live terminal output missing beside it. The flag
+        // belongs to the app, which opens the overlay and the band in one act.
+        assert_eq!(r.right_inset(), 0.0, "a flag alone reserves nothing");
+        assert!(!r.monitor_open());
+        let (cols_closed, rows_closed) = r.grid_size();
+
+        // What the app's launch restore does, and all it does: no width of its own, because
+        // the persisted one is already the renderer's to find.
+        r.set_monitor_open(true);
+        assert_eq!(
+            r.right_inset(),
+            520.0,
+            "the panel comes back at the width the user dragged to, not the 430 default"
+        );
+        assert_eq!(r.monitor_width_logical(), 520.0);
+        assert!(r.grid_size().0 < cols_closed, "and the terminal reflows");
+        assert_eq!(r.grid_size().1, rows_closed, "columns only, never rows");
+
+        // A restore sets no override — the file is still authoritative, so a hand edit to
+        // `width_px` takes effect on the next reload rather than being outranked for the
+        // session by a width nobody dragged (R6.5).
+        let mut edited = cfg.clone();
+        edited.ai_monitor.width_px = 610.0;
+        r.apply_config(&edited);
+        assert_eq!(r.right_inset(), 610.0);
+        assert!(
+            r.monitor_open(),
+            "and the reload leaves the restored panel open"
+        );
+    }
+
+    /// R4.6 + D6's override precedence: a live reload for an unrelated key re-derives the
+    /// panel's band instead of dropping it, a dragged width outranks the file for the
+    /// session, and clearing the override hands authority back. Needs a GPU.
+    #[test]
+    fn a_config_reload_re_derives_the_panel_band_and_the_override_outranks_the_file() {
+        let cfg = Config::default();
+        let Ok(mut r) = Renderer::new_headless(1200, 800, 1.0, &cfg) else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        r.set_monitor_open(true);
+        r.set_monitor_width(520.0);
+        assert_eq!(r.right_inset(), 520.0);
+
+        // A reload for a field the panel knows nothing about. `set_left_inset`'s trap is
+        // that a plain setter's value would be silently dropped here while the panel kept
+        // painting; `sync_right_inset` inside `apply_config` is what prevents it.
+        let mut other = Config::default();
+        other.theme.background = 0x00_11_22;
+        r.apply_config(&other);
+        assert_eq!(
+            r.right_inset(),
+            520.0,
+            "R4.6: the inset survives the reload"
+        );
+
+        // The file disagreeing with the drag does not win — the override is the session's
+        // authority (D6), or dragging would be undone by any unrelated save.
+        let mut narrower = Config::default();
+        narrower.ai_monitor.width_px = 320.0;
+        r.apply_config(&narrower);
+        assert_eq!(r.right_inset(), 520.0, "the drag outranks the file");
+
+        // …until a genuine human edit clears it, which is what keeps `width_px`
+        // hand-editable after the first drag (R6.5).
+        r.clear_monitor_override();
+        assert_eq!(r.right_inset(), 320.0, "the file is authoritative again");
+        assert_eq!(r.monitor_width_logical(), 320.0);
+    }
+
+    #[test]
+    fn monitor_band_is_capped_by_the_terminals_column_floor() {
+        // R4.3: 1200px window, a 340px sidebar and 8px cells leave 1200 − 340 − 160 = 700px
+        // for the panel. Asking for less is granted verbatim; asking for more is capped.
+        assert_eq!(monitor_band_px(430.0, 1200.0, 8.0, 340.0, 300.0), 430.0);
+        assert_eq!(monitor_band_px(760.0, 1200.0, 8.0, 340.0, 300.0), 700.0);
+        // The cap is exactly `grid_dims`'s 20-column boundary, not one column off.
+        let capped = monitor_band_px(760.0, 1200.0, 8.0, 340.0, 300.0);
+        assert_eq!(
+            grid_dims(1200.0, 800.0, (8.0, 16.0), 0.0, 340.0, capped).0,
+            20
+        );
+        assert_eq!(
+            grid_dims(1200.0, 800.0, (8.0, 16.0), 0.0, 340.0, capped + 1.0).0,
+            19,
+            "one px past the cap really does cost the twentieth column"
+        );
+
+        // R4.4: once the allowance falls under the panel's own minimum the band is zero —
+        // never a sliver, and never a negative number handed to `grid_dims`.
+        assert_eq!(monitor_band_px(430.0, 780.0, 8.0, 340.0, 300.0), 0.0);
+        assert_eq!(monitor_band_px(430.0, 100.0, 8.0, 340.0, 300.0), 0.0);
+        // Exactly at the minimum the panel still draws — the rule is `<`, not `<=`.
+        assert_eq!(monitor_band_px(430.0, 800.0, 8.0, 340.0, 300.0), 300.0);
+
+        // A closed panel (or a garbage width) reserves nothing, which R4.2 needs to be
+        // bit-identical to the pre-panel behaviour.
+        assert_eq!(monitor_band_px(0.0, 1200.0, 8.0, 340.0, 300.0), 0.0);
+        assert_eq!(monitor_band_px(f32::NAN, 1200.0, 8.0, 340.0, 300.0), 0.0);
+    }
+
+    #[test]
+    fn monitor_width_clamps_to_the_designs_drag_band() {
+        assert_eq!(clamp_monitor_width(430.0), 430.0);
+        assert_eq!(clamp_monitor_width(10.0), common::config::MONITOR_WIDTH_MIN);
+        assert_eq!(
+            clamp_monitor_width(10_000.0),
+            common::config::MONITOR_WIDTH_MAX
+        );
+        // NaN must not reach the inset arithmetic, where `px == self.right_inset` would
+        // answer false forever and re-shape the grid on every pointer move.
+        assert_eq!(
+            clamp_monitor_width(f32::NAN),
+            common::config::MONITOR_WIDTH_MIN
         );
     }
 }

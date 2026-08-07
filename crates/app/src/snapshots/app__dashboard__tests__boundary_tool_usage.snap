@@ -1,0 +1,14 @@
+---
+source: crates/app/src/dashboard.rs
+expression: project_section(&tool_usage(&t))
+---
+  TOOL USAGE (total 11)
+    bar  Bash            76 1.00
+    bar  Read            58 0.76
+    bar  Grep            31 0.41
+    bar  Edit            27 0.36
+    bar  Write           18 0.24
+    bar  TodoWrite       12 0.16
+    bar  Glob             9 0.12
+    bar  Skill            6 0.08
+    bar  Monitor          4 0.05

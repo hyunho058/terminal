@@ -1,0 +1,26 @@
+---
+source: crates/app/src/dashboard.rs
+expression: "project(&model(None, &env(1_785_226_000_000)))"
+---
+ai-monitor [IDLE]
+  session name="session" id="—" provider="[Claude]" model="—"
+  note —
+  tile UPTIME         — TextPrimary gauge=none
+  tile IDLE           — TextPrimary gauge=none
+  tile ERRORS         0 TextMuted gauge=none
+  tile IN·OUT       —·— TextPrimary gauge=none
+  tile CACHE          — Teal gauge=none
+  tile CONTEXT        — TextMuted gauge=none
+  TASKS (total 0)
+    empty "(no tasks)"
+  ACTIVE AGENTS (total 0)
+    empty "(no agents yet)"
+  SKILLS (total 0)
+    empty "(no skills yet)"
+  FILE ACTIVITY (total 0)
+    empty "(no file activity)"
+  RECENT CALLS (total 0)
+    empty "(no other tool calls)"
+  TOOL USAGE (total 0)
+    empty "(no tool calls yet)"
+  footer "Last update —"

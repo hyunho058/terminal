@@ -1,0 +1,16 @@
+---
+source: crates/app/src/dashboard.rs
+expression: project_section(&recent_calls(&t))
+---
+  RECENT CALLS (total 11)
+    row  —                   ✓ "Bash" value="120ms" AccentGreen
+    row  —                   ✗ "WebFetch" value="760ms" Rose
+    row  —                   ✓ "TodoWrite" value="—" TextMuted
+    row  —                   ✓ "Monitor" value="2.0s" TextMuted
+    row  —                   ✓ "Bash" value="2.7s" TextMuted
+    row  —                   ✓ "WebFetch" value="45.0s" Amber
+    row  —                   ✓ "TodoWrite" value="4.0s" TextMuted
+    row  —                   ✓ "Monitor" value="4.6s" TextMuted
+    row  —                   ✓ "Bash" value="5.2s" TextMuted
+    row  —                   ✓ "WebFetch" value="5.9s" TextMuted
+    row  —                   ✓ "TodoWrite" value="6.5s" TextMuted

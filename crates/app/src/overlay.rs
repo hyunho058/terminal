@@ -1,11 +1,23 @@
-//! ai-monitor overlay (D4): a Cmd+Shift+M toggle overlay showing the active
-//! session's folded Claude JSONL telemetry, registered through the SD4 `Overlay` seam and
-//! drawn via the renderer's `overlay_layer` (SD3). Read-only (C3).
+//! ai-monitor panel (D4): a Cmd+Shift+M toggle showing the active session's folded
+//! Claude JSONL telemetry, registered through the SD4 `Overlay` seam and drawn as a
+//! right-docked band by the renderer's `monitor_panel` (SD3). Read-only (C3).
+//!
+//! **This file is impure by design, and that is what keeps `dashboard.rs` pure** (D19).
+//! It already reads the config, the clock and the process table; it also resolves the
+//! local UTC offset here and passes it in, so the composer stays a function of its
+//! arguments and its `insta` snapshots stay byte-stable on any machine.
 //!
 //! Visibility-gated watcher lifecycle (D6): opening resolves the active tab's log
 //! (from `cwd`), folds the existing file into a `SessionTelemetry`, and hands that
 //! accumulator to a tail watcher which sends back `Arc<TelemetrySnapshot>`s; hiding
 //! drops the watcher. Switching tabs while open re-points (D5/R3.1).
+//!
+//! **One panel per window, bound to the ACTIVE tab** (D13/R10). Docking changed where the
+//! panel is painted, not what it is attached to: the attachment rule settled by
+//! `specs/overlay-tab-binding` and `specs/ai-monitor-session-isolation` is carried forward
+//! unchanged. What docking *did* add is D3's cumulative counters, which are session totals
+//! rather than capped rings — so a re-point must rebuild them from the new tab's log
+//! instead of continuing the old tab's. [`Session`] is the value that makes that one act.
 
 use std::path::PathBuf;
 
@@ -16,49 +28,55 @@ use ai_monitor::telemetry::{SessionTelemetry, TelemetrySnapshot};
 use ai_monitor::{
     backfill_telemetry, project_dir, resolve_owned_session, LogWatcher, Wanted, Watch,
 };
-use renderer::overlay_layer::{OverlayHandle, OverlayLayer, OverlayModel};
+use renderer::monitor_panel::{MonitorHandle, MonitorPanel};
 use renderer::DrawLayer;
 use winit::event_loop::EventLoopProxy;
 use winit::keyboard::Key;
 
 use crate::dashboard;
-use crate::seam::{AppCtx, Handled, KeyInput, Overlay};
+use crate::seam::{AppCtx, Handled, KeyInput, Overlay, OverlayCommand};
 use crate::tabsession;
 use crate::terminal_app::UserEvent;
 
 pub struct AiMonitorOverlay {
     visible: bool,
-    handle: OverlayHandle,
-    /// The newest snapshot the watcher folded. `None` means exactly one thing: no
-    /// log was resolved for this tab. Because `open()` seeds it from the backfill
-    /// before spawning, it is `Some` immediately after a successful open — never
-    /// "opened but nothing folded yet".
-    latest: Option<Arc<TelemetrySnapshot>>,
+    handle: MonitorHandle,
+    /// Everything that belongs to **one tab's session**, in one slot (D13/R10.1).
+    /// There is exactly one — the panel is per *window*, not per tab — and a re-point
+    /// replaces it whole rather than merging into it (R10.3). See [`Session`].
+    session: Session,
     /// The re-point bookkeeping: which notification this panel was last opened for, and the
     /// rule for deciding whether a new one is a real change (D6/R4.3). Owning it as a unit
     /// rather than as loose fields is what puts the *choice of key* under test — the storm
     /// bug was in which value the call site stored, not in the comparison.
     repoint: Repoint,
     watcher: Option<LogWatcher>,
-    proxy: EventLoopProxy<UserEvent>,
+    /// The event-loop waker handed to every watcher this panel spawns.
+    ///
+    /// **`Option` for a test reason, and the reason is worth the field.** An
+    /// `EventLoopProxy` can only come from a real winit `EventLoop`, which on macOS can
+    /// only be built on the main thread — so while this was non-optional,
+    /// `AiMonitorOverlay` could not be constructed under `cargo test` at all. Every other
+    /// decision in this file was split into a free-standing unit to work around that
+    /// ([`Repoint`], [`Attachment`], [`pane_cwd_with`], [`watch_with_rivals`], and the
+    /// comments on each say so) — but D1's keystroke contract is a *verdict returned by a
+    /// trait method*, and there is no unit to split out: what R1.2/R1.3 require is that
+    /// `Overlay::on_key` itself answers `Passthrough` for `Esc` and `q`. A re-implemented
+    /// copy of that rule in a test body would assert nothing about the shipped one.
+    ///
+    /// Production always holds `Some`: [`AiMonitorOverlay::new`] still takes the proxy by
+    /// value, and the only constructor that produces `None` is `#[cfg(test)]`. A `None`
+    /// waker means a watcher's wake never reaches the loop, which is why that constructor
+    /// is documented as being for the decision paths only.
+    proxy: Option<EventLoopProxy<UserEvent>>,
     /// This window's start time. A log whose last event precedes it stopped being
     /// written before the window existed, so it belongs to some other session.
     /// Captured here rather than at open, because open happens *after* the tab's own
     /// session may have started writing.
-    started_ms: u64,
-    /// Which session is being shown, and whether one has been settled on at all.
-    /// Cleared only by `open()`.
     ///
-    /// Deciding this once, at attach, is the whole point. As a per-frame predicate it
-    /// re-litigates an attachment already on screen and erases a live panel the
-    /// moment the held snapshot ages past the window start.
-    attach: Attachment,
-    /// The same answer, published to the watch thread, which reads it to decide
-    /// whether to keep re-resolving — so the rule has exactly one author. When the
-    /// watcher kept its own copy the two drifted, and the common case (work for a
-    /// while, then open the panel) left the app attached while the watcher still
-    /// believed it was free to switch logs and reset the accumulator underneath it.
-    attached_flag: Arc<AtomicBool>,
+    /// A **window** fact, so it deliberately survives a re-point: it is when *this
+    /// window* opened, not when the active tab's session started.
+    started_ms: u64,
     /// The live rival set the watcher reads (D11/R6.2). Held here so membership can be
     /// republished during an open without dropping and respawning the watcher.
     rivals: ai_monitor::RivalHandle,
@@ -77,16 +95,29 @@ pub struct AiMonitorOverlay {
 
 impl AiMonitorOverlay {
     pub fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+        Self::with_waker(Some(proxy))
+    }
+
+    /// An overlay with **no** event-loop waker, for asserting the decisions that are not
+    /// the watcher — D1's keystroke contract (R1.1/R1.2/R1.3).
+    ///
+    /// A watcher spawned by one of these would fold its log and never wake the loop to
+    /// show it, so this must not be used to exercise the tail path. Drive it with no cwd
+    /// and no shell pid and `open()` spawns nothing at all.
+    #[cfg(test)]
+    fn detached() -> Self {
+        Self::with_waker(None)
+    }
+
+    fn with_waker(proxy: Option<EventLoopProxy<UserEvent>>) -> Self {
         AiMonitorOverlay {
             visible: false,
-            handle: OverlayHandle::default(),
-            latest: None,
+            handle: MonitorHandle::default(),
+            session: Session::default(),
             repoint: Repoint::default(),
             watcher: None,
             proxy,
             started_ms: now_ms(),
-            attach: Attachment::default(),
-            attached_flag: Arc::new(AtomicBool::new(false)),
             context_window: None,
             tab_has_claude: false,
             rivals: Arc::new(Mutex::new(ai_monitor::RivalSet::default())),
@@ -153,11 +184,12 @@ impl AiMonitorOverlay {
         // re-pointing to a tab with no `claude` clears it.
         self.tab_has_claude = h.is_some();
         let hint = h.unwrap_or_default();
-        self.latest = None;
-        self.attach = Attachment::default();
-        // A fresh flag rather than a store: the previous watcher may still be
-        // running for an instant, and it must not observe this open's decision.
-        self.attached_flag = Arc::new(AtomicBool::new(false));
+        // The previous tab's session goes as ONE value, and it goes here — *above* the
+        // `project_dir` branch, so a tab that resolves no log still clears it. That
+        // placement is what makes the worst case survivable: re-pointing to a tab with no
+        // Claude at all would otherwise leave the last tab's snapshot on screen with
+        // nothing ever arriving to replace it (D13/R10.3).
+        self.session.repoint();
         self.watcher = None;
 
         if let Some(dir) = cwd.as_deref().and_then(project_dir) {
@@ -210,11 +242,9 @@ impl AiMonitorOverlay {
             let log = resolved.map(|r| r.path);
             // Seed on THIS thread, exactly where `backfill` ran before: publish the
             // seeded snapshot first, then hand the accumulator to the watch thread.
-            let (telemetry, offset) = match log.as_deref() {
-                Some(p) => backfill_telemetry(p),
-                None => (SessionTelemetry::new(), 0),
-            };
-            self.note(Arc::new(telemetry.snapshot()), owned);
+            let (telemetry, offset) = backfill_from_scratch(log.as_deref());
+            self.session
+                .note(Arc::new(telemetry.snapshot()), self.started_ms, owned);
             let proxy = self.proxy.clone();
             // UNCONDITIONAL — the watch is armed even when the hint knows nothing and
             // strict resolution will therefore answer `None` on every re-resolution
@@ -230,30 +260,25 @@ impl AiMonitorOverlay {
             // disagree: work for a while, then open the panel, and the app was attached
             // while the watcher was not.
             self.watcher = LogWatcher::spawn(
-                watch_with_rivals(rivals, dir, log, want, owned, self.attached_flag.clone()),
+                watch_with_rivals(
+                    rivals,
+                    dir,
+                    log,
+                    want,
+                    owned,
+                    self.session.attached_flag.clone(),
+                ),
                 telemetry,
                 offset,
                 move || {
-                    let _ = proxy.send_event(UserEvent::OverlayPending);
+                    if let Some(p) = proxy.as_ref() {
+                        let _ = p.send_event(UserEvent::OverlayPending);
+                    }
                 },
             );
         }
         self.visible = true;
         self.refresh_model();
-    }
-
-    /// Record a snapshot and, once, the fact that it proved ownership.
-    ///
-    /// `attached` only ever goes false -> true within an open. `last_event_ms` is a
-    /// last-seen value, not a maximum, so a single out-of-order timestamp would
-    /// otherwise revoke an attachment mid-session and blank the panel.
-    fn note(&mut self, snap: Arc<TelemetrySnapshot>, owned: bool) {
-        if !self.attach.admit(&snap, self.started_ms, owned) {
-            return;
-        }
-        self.attached_flag
-            .store(self.attach.attached, Ordering::Relaxed);
-        self.latest = Some(snap);
     }
 
     /// Re-enumerate the live rivals into the shared handle (D11/R6.2).
@@ -281,7 +306,7 @@ impl AiMonitorOverlay {
     ///   overlap and land out of order — a stale set overwriting a fresher one.
     fn refresh_rivals(&self, shell_pid: Option<u32>) {
         let Some(pid) = shell_pid else { return };
-        if self.attached_flag.load(Ordering::Relaxed) {
+        if self.session.attached_flag.load(Ordering::Relaxed) {
             return; // R6.3 — attached: the watcher no longer re-resolves
         }
         if self.refreshing.swap(true, Ordering::AcqRel) {
@@ -315,22 +340,24 @@ impl AiMonitorOverlay {
         self.refresh_model();
     }
 
-    /// Push the current visibility + composed lines into the draw layer.
+    /// Push the current visibility + composed model into the draw layer.
     ///
-    /// All layout lives in [`crate::dashboard`] (F5) — this is wiring: supply the
-    /// clock, hand over the snapshot, publish the result.
+    /// Composition policy lives in [`crate::dashboard`] and pixel layout in
+    /// `renderer::monitor_layout` (F5) — this is wiring: supply the impure inputs (clock,
+    /// UTC offset, config, process-tree answer), hand over the snapshot, publish the
+    /// result. `visible` is stamped here rather than in the composer because whether the
+    /// user is looking is this file's fact, not the snapshot's.
     fn refresh_model(&self) {
         let env = dashboard::Env {
             now_ms: now_ms(),
-            attached: self.attach.attached,
+            attached: self.session.attach.attached,
             context_window: self.context_window,
             tab_has_claude: self.tab_has_claude,
+            utc_offset_secs: local_utc_offset_secs(),
         };
-        let lines = dashboard::compose(self.latest.as_deref(), &env);
-        self.handle.set(OverlayModel {
-            visible: self.visible,
-            lines,
-        });
+        let mut model = dashboard::model(self.session.latest.as_deref(), &env);
+        model.visible = self.visible;
+        self.handle.set(model);
     }
 }
 
@@ -483,6 +510,123 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+/// Seconds to add to a UTC epoch to get local wall-clock time, from `NSTimeZone` (D7/D19).
+///
+/// The original dashboard chose a relative age (`12s ago`) because `std` alone cannot
+/// resolve a local timezone and a UTC clock on a local-session dashboard is worse than no
+/// clock. That reasoning assumed `std` was the only option: this is a macOS-only app that
+/// already depends on `objc2` for platform bindings, so the offset is available for the
+/// asking and the constraint is removed rather than worked around.
+///
+/// Resolved **here**, per model rebuild, and passed into the pure composer — never called
+/// from `dashboard.rs`, which would make its output machine- and season-dependent and
+/// flake the snapshots that pin composition policy (D19).
+///
+/// Two accepted limits, both recorded as Known Gaps: it is the offset *now* applied to
+/// every timestamp on the frame (a session spanning a DST transition renders its earlier
+/// rows an hour off), and a timezone change mid-session is not observed until the next
+/// rebuild. `secondsFromGMT` is an `NSInteger`; a value outside `i32` is not a real
+/// timezone, so it falls back to UTC rather than wrapping into a plausible-looking one.
+fn local_utc_offset_secs() -> i32 {
+    i32::try_from(objc2_foundation::NSTimeZone::localTimeZone().secondsFromGMT()).unwrap_or(0)
+}
+
+/// The one tab session the panel is showing (D13/R10.1).
+///
+/// **Why this is a struct rather than three fields on the overlay.** The panel is per
+/// *window* and re-points to whichever tab is active, so every field in here has the
+/// lifetime of one attachment and none of them may survive a tab switch. As loose fields
+/// that rule was three separate assignments in the middle of `open()`, and nothing could
+/// test it: `AiMonitorOverlay` needs an `EventLoopProxy`, which needs a real winit
+/// `EventLoop` (main-thread-only, once per process on macOS), so a test could only
+/// re-implement the reset in its own body — which is exactly the shape this file has been
+/// burned by twice before (see [`Attachment`] and [`Repoint`]). One value with one
+/// [`repoint`](Session::repoint) puts the reset itself under test.
+///
+/// **What is deliberately NOT in here** is as load-bearing as what is:
+/// - the panel's **width** (R10.4). It is a window property, and this file holds no width
+///   at all: the chord records `AppCtx::set_monitor_open` → `AppRequest::SetMonitorOpen`,
+///   a bare `bool`, and the width is derived one layer down from `[ai_monitor].width_px`
+///   plus the runtime override. There is therefore no per-tab width to carry across a
+///   switch, and no value a switch could carry it *in* — so a switch cannot move the band
+///   and cannot refit the grid.
+/// - `started_ms`, which is when *this window* opened.
+///
+/// The cumulative counters D3 added (`total_tool_calls`, the per-name tally,
+/// `failed_tool_calls`) live inside the snapshot held here, so they are re-pointed by the
+/// same act that re-points everything else — tab A's 200 `bash` calls leave with tab A's
+/// `Session`, and tab B's are folded from scratch by [`backfill_from_scratch`] (R10.3).
+#[derive(Default)]
+struct Session {
+    /// The newest snapshot the watcher folded. `None` means exactly one thing: no
+    /// log was resolved for this tab. Because `open()` seeds it from the backfill
+    /// before spawning, it is `Some` immediately after a successful open — never
+    /// "opened but nothing folded yet".
+    latest: Option<Arc<TelemetrySnapshot>>,
+    /// Which session is being shown, and whether one has been settled on at all.
+    /// Cleared only by [`repoint`](Session::repoint), i.e. only by `open()`.
+    ///
+    /// Deciding this once, at attach, is the whole point. As a per-frame predicate it
+    /// re-litigates an attachment already on screen and erases a live panel the
+    /// moment the held snapshot ages past the window start.
+    attach: Attachment,
+    /// The same answer, published to the watch thread, which reads it to decide
+    /// whether to keep re-resolving — so the rule has exactly one author. When the
+    /// watcher kept its own copy the two drifted, and the common case (work for a
+    /// while, then open the panel) left the app attached while the watcher still
+    /// believed it was free to switch logs and reset the accumulator underneath it.
+    attached_flag: Arc<AtomicBool>,
+}
+
+impl Session {
+    /// Drop the previous tab's session entirely (R10.3).
+    ///
+    /// A whole-value overwrite, not a field-by-field clear, so a field added later is
+    /// re-pointed by default instead of leaking by default — the failure mode here is
+    /// silent and looks like data: tab A's tally rendered under tab B's heading.
+    ///
+    /// The `attached_flag` is replaced with a **fresh allocation** rather than stored
+    /// `false`: the previous watcher may still be running for an instant, and it must not
+    /// observe this open's decision — nor may this open's decision be undone by a
+    /// callback still in flight for the old tab.
+    fn repoint(&mut self) {
+        *self = Session::default();
+    }
+
+    /// Record a snapshot and, once, the fact that it proved ownership.
+    ///
+    /// `attached` only ever goes false -> true within an open. `last_event_ms` is a
+    /// last-seen value, not a maximum, so a single out-of-order timestamp would
+    /// otherwise revoke an attachment mid-session and blank the panel.
+    fn note(&mut self, snap: Arc<TelemetrySnapshot>, started_ms: u64, owned: bool) {
+        if !self.attach.admit(&snap, started_ms, owned) {
+            return;
+        }
+        self.attached_flag
+            .store(self.attach.attached, Ordering::Relaxed);
+        self.latest = Some(snap);
+    }
+}
+
+/// Fold this tab's log into a **fresh** accumulator, and report where the tail resumes.
+///
+/// The pair is one contract, which is why it is produced in one place. The accumulator is
+/// new every time — the cumulative counters D3 added are session facts, so a re-point must
+/// rebuild them from the new tab's log rather than continue the old tab's totals (R10.3).
+/// The `u64` is the byte count *already folded into it*, which `LogWatcher::spawn` takes as
+/// its start offset; handing the watcher a fresh accumulator with offset `0` would re-read
+/// the whole file and fold every line a second time. That failure is invisible in the
+/// rings — they are capped, so they would still look right — while `total_tool_calls` read
+/// 400 for 200 calls and every usage bar kept its proportions.
+///
+/// A tab with no resolvable log yields an empty accumulator, never the previous tab's.
+fn backfill_from_scratch(log: Option<&std::path::Path>) -> (SessionTelemetry, u64) {
+    match log {
+        Some(p) => backfill_telemetry(p),
+        None => (SessionTelemetry::new(), 0),
+    }
 }
 
 /// Everything the overlay knows about *which* session it is showing.
@@ -661,15 +805,29 @@ impl Overlay for AiMonitorOverlay {
             } else {
                 self.open(ctx.active_cwd.clone(), ctx.active_shell_pid);
             }
+            // Reserve (or release) the band the panel paints. The renderer derives
+            // `right_inset` from this, so it is what makes the panel *docked* rather
+            // than an overlay: the grid loses those columns instead of being covered.
+            //
+            // Open/closed is all that crosses. The *width* comes from
+            // `[ai_monitor].width_px` plus the runtime override, clamped by D4's
+            // 20-column terminal floor — none of which this file knows or should: the
+            // chord's only decision is whether the panel is up. That is also what makes
+            // this the one writer of `[ai_monitor].open` (D8): `terminal_app` persists on
+            // exactly this request, and the launch restore takes a different route that
+            // never reaches the persistence path (R6.3/R6.6).
+            ctx.set_monitor_open(self.visible);
             ctx.request_redraw();
             return Handled::Consumed; // R2.1 — never reaches the shell
         }
-        // A monitor doesn't capture other keys.
+        // A monitor doesn't capture other keys (D1/R1.2/R1.3): no `Esc`, no `q`. The
+        // panel never takes focus, so an `Esc` handler here would fire while the user is
+        // in `vim`'s insert mode, and `q` is the key that quits `less`.
         Handled::Passthrough
     }
 
     fn layer(&self) -> Box<dyn DrawLayer> {
-        Box::new(OverlayLayer::from_handle(self.handle.clone()))
+        Box::new(MonitorPanel::from_handle(self.handle.clone()))
     }
 
     fn poll(&mut self) -> bool {
@@ -679,10 +837,35 @@ impl Overlay for AiMonitorOverlay {
         let newest = drain_to_newest(&watcher.rx);
         let changed = newest.is_some();
         if let Some(update) = newest {
-            self.note(update.snap, update.owned);
+            self.session
+                .note(update.snap, self.started_ms, update.owned);
             self.refresh_model();
         }
         changed
+    }
+
+    /// The launch restore (R6.6): reopen the panel because `[ai_monitor].open` says the
+    /// last session left it open.
+    ///
+    /// **It goes through `open()`, exactly as the chord does, and that is the requirement
+    /// rather than an implementation detail.** Everything that makes the panel show
+    /// anything happens in there — resolving *this tab's* log, folding it into a fresh
+    /// accumulator, spawning the tail watcher. Setting `visible = true` here instead would
+    /// reserve the band and paint an empty panel that never fills, because nothing calls
+    /// `open()` for a panel that is already open.
+    ///
+    /// Guarded on `!self.visible` for the reason `Repoint` exists: re-opening a live panel
+    /// drops and respawns the watcher and re-runs the whole backfill.
+    fn on_command(&mut self, cmd: &OverlayCommand) -> Handled {
+        match cmd {
+            OverlayCommand::RestoreMonitor { cwd, shell_pid } => {
+                if !self.visible {
+                    self.open(cwd.clone(), *shell_pid);
+                }
+                Handled::Consumed
+            }
+            _ => Handled::Passthrough,
+        }
     }
 
     fn on_active_changed(&mut self, cwd: Option<PathBuf>, shell_pid: Option<u32>) {
@@ -703,12 +886,227 @@ impl Overlay for AiMonitorOverlay {
 
 #[cfg(test)]
 mod tests {
-    use super::{drain_to_newest, pane_cwd_with, proves_ownership, Attachment, Repoint};
+    use super::{
+        backfill_from_scratch, drain_to_newest, pane_cwd_with, proves_ownership, AiMonitorOverlay,
+        Attachment, Repoint, Session,
+    };
+    use crate::seam::{AppCtx, AppRequest, Handled, KeyInput, Overlay, WriteProbe};
     use crate::tabsession;
     use ai_monitor::telemetry::TelemetrySnapshot;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
+    use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+    // ---- ai-monitor-right-panel R1: Cmd+Shift+M is the ONLY key the panel consumes ----
+    //
+    // D1 rejected all three of the design's keys, and the rejection is not a preference:
+    // the panel never takes focus. It is a painted band, not a focusable view, so a
+    // panel-level `Esc` handler fires while the user is in `vim`'s insert mode — the panel
+    // closes and they are still inserting — and a `q` handler fires while `less` is paged
+    // open. "No terminal keystroke is ever intercepted" is the invariant that matters for
+    // a terminal, and one chord that toggles both ways is the only rule that holds it.
+    //
+    // These drive the REAL `Overlay::on_key`, which is why `detached()` exists: a verdict
+    // returned by a trait method is the one decision in this file that cannot be split
+    // into a free-standing unit and tested there instead. A test that re-implemented the
+    // `is_toggle` branch in its own body would assert nothing about the shipped one.
+
+    fn chord(key: Key, text: Option<&str>, mods: ModifiersState) -> KeyInput {
+        KeyInput {
+            key,
+            text: text.map(str::to_owned),
+            mods,
+        }
+    }
+
+    /// Cmd+Shift+M.
+    fn toggle_chord() -> KeyInput {
+        chord(
+            Key::Character("m".into()),
+            Some("m"),
+            ModifiersState::SUPER | ModifiersState::SHIFT,
+        )
+    }
+
+    /// Deliver one key to the overlay and report the verdict, whether anything reached the
+    /// PTY, and what the overlay asked the app to do. The `WriteProbe` is the production
+    /// wrapper — `terminal_app` wraps the active tab's writer in exactly this before both
+    /// dispatch points — so "the byte reached the writer" is measured the way the app
+    /// measures it, not by a stand-in.
+    fn deliver(
+        overlay: &mut AiMonitorOverlay,
+        input: &KeyInput,
+        pty: &mut Vec<u8>,
+    ) -> (Handled, bool, Vec<AppRequest>) {
+        let mut probe = WriteProbe::new(pty);
+        let mut ctx = AppCtx::new(&mut probe, 1, 0, None);
+        let verdict = overlay.on_key(input, &mut ctx);
+        let requests = ctx.take_requests();
+        (verdict, probe.wrote(), requests)
+    }
+
+    /// What `terminal_app` step 4 would send to the shell for this key, if dispatch let it
+    /// through. Reproducing the encoding here would prove nothing, so this calls the real
+    /// `encode_key` the default path calls.
+    fn to_pty(input: &KeyInput) -> Option<Vec<u8>> {
+        crate::input::encode_key(&input.key, input.text.as_deref(), input.mods, false)
+    }
+
+    #[test]
+    fn r1_1_the_chord_toggles_the_panel_both_ways() {
+        // One chord, both directions (D1). A separate close key is what D1 refused, so
+        // "opens" without "closes" would leave the panel unclosable by keyboard.
+        let mut overlay = AiMonitorOverlay::detached();
+        let mut pty = Vec::new();
+        assert!(!overlay.visible(), "premise: the panel starts closed");
+
+        let (verdict, wrote, requests) = deliver(&mut overlay, &toggle_chord(), &mut pty);
+        assert!(overlay.visible(), "the chord must open a closed panel");
+        assert_eq!(
+            verdict,
+            Handled::Consumed,
+            "and must be swallowed — an `m` reaching zsh on every toggle is the bug \
+             `Handled::Consumed` exists to prevent"
+        );
+        assert!(
+            !wrote,
+            "the toggle is not user input; nothing may reach the PTY"
+        );
+        assert_eq!(
+            requests,
+            vec![AppRequest::SetMonitorOpen(true)],
+            "the band must be reserved through the deferred path — the overlay cannot \
+             touch the Renderer, so a missing request is a panel with no columns"
+        );
+
+        let (verdict, _, requests) = deliver(&mut overlay, &toggle_chord(), &mut pty);
+        assert!(
+            !overlay.visible(),
+            "the SAME chord must close an open panel"
+        );
+        assert_eq!(verdict, Handled::Consumed);
+        assert_eq!(
+            requests,
+            vec![AppRequest::SetMonitorOpen(false)],
+            "and must release the band, or the terminal keeps losing the columns"
+        );
+        assert!(
+            pty.is_empty(),
+            "no keystroke of a toggle ever reaches the shell"
+        );
+    }
+
+    #[test]
+    fn r1_2_r1_3_esc_and_q_reach_the_pty_while_the_panel_is_open() {
+        // THE D1 test. Both keys are delivered with the panel OPEN, which is the state a
+        // panel-level close handler would fire in — with it closed, every overlay passes
+        // everything through and the assertion would be vacuous.
+        let mut overlay = AiMonitorOverlay::detached();
+        let mut pty = Vec::new();
+        let _ = deliver(&mut overlay, &toggle_chord(), &mut pty);
+        assert!(overlay.visible(), "premise: the panel is open");
+
+        // R1.2 — `Esc` while `vim` is in insert mode. The design closes the panel here;
+        // D1 does not, because the panel never took focus and the user is still inserting.
+        let esc = chord(Key::Named(NamedKey::Escape), None, ModifiersState::empty());
+        let (verdict, wrote, requests) = deliver(&mut overlay, &esc, &mut pty);
+        assert_eq!(
+            verdict,
+            Handled::Passthrough,
+            "Esc must fall through to the shell — consuming it strands `vim` in insert mode"
+        );
+        assert!(
+            overlay.visible(),
+            "and the panel must NOT close underneath the user"
+        );
+        assert!(
+            !wrote,
+            "the overlay writes nothing itself; the default path does"
+        );
+        assert!(requests.is_empty(), "and asks the app for nothing");
+        assert_eq!(
+            to_pty(&esc).as_deref(),
+            Some(&[0x1b][..]),
+            "and the byte the default path then sends is ESC itself"
+        );
+
+        // R1.3 — `q` while `less` is paging. An ordinary character, and the panel has no
+        // claim on it.
+        let q = chord(
+            Key::Character("q".into()),
+            Some("q"),
+            ModifiersState::empty(),
+        );
+        let (verdict, wrote, requests) = deliver(&mut overlay, &q, &mut pty);
+        assert_eq!(
+            verdict,
+            Handled::Passthrough,
+            "`q` must reach `less`, which it quits"
+        );
+        assert!(overlay.visible());
+        assert!(!wrote);
+        assert!(requests.is_empty());
+        assert_eq!(to_pty(&q).as_deref(), Some(&b"q"[..]));
+
+        // Nothing between the overlay and the shell claims either key either: the two
+        // interceptors that sit after overlay dispatch in `terminal_app` are the sidebar
+        // chord and the tab chords, and a bare `Esc`/`q` is neither. Without this, the
+        // passthrough above could be true while the key still never arrived.
+        for input in [&esc, &q] {
+            assert!(
+                !crate::input::is_sidebar_toggle_chord(&input.key, &input.mods),
+                "the sidebar chord must not claim a bare terminal key"
+            );
+            assert!(
+                crate::input::tab_action(&input.key, &input.mods).is_none(),
+                "nor may a tab chord"
+            );
+        }
+    }
+
+    #[test]
+    fn r1_2_r1_3_the_panel_consumes_nothing_but_its_own_chord() {
+        // The general form of the two cases above, because D1's promise is about *every*
+        // keystroke, not two of them. A close key added for any other key — the design also
+        // draws a header `✕`, and `w`/`Backspace`/`Enter` are the usual next guesses —
+        // fails here.
+        let mut overlay = AiMonitorOverlay::detached();
+        let mut pty = Vec::new();
+        let _ = deliver(&mut overlay, &toggle_chord(), &mut pty);
+
+        let plain = ModifiersState::empty();
+        for input in [
+            chord(Key::Named(NamedKey::Escape), None, plain),
+            chord(Key::Character("q".into()), Some("q"), plain),
+            chord(Key::Character("Q".into()), Some("Q"), ModifiersState::SHIFT),
+            chord(Key::Named(NamedKey::Enter), None, plain),
+            chord(Key::Named(NamedKey::Backspace), None, plain),
+            chord(Key::Named(NamedKey::Space), Some(" "), plain),
+            chord(Key::Named(NamedKey::ArrowUp), None, plain),
+            // Cmd+M is the design's toggle and macOS's minimise — D1 rejected it, so the
+            // panel must not answer to it either.
+            chord(Key::Character("m".into()), Some("m"), ModifiersState::SUPER),
+            // Shift+M without Cmd is a capital M someone is typing.
+            chord(Key::Character("M".into()), Some("M"), ModifiersState::SHIFT),
+        ] {
+            let (verdict, wrote, requests) = deliver(&mut overlay, &input, &mut pty);
+            assert_eq!(
+                verdict,
+                Handled::Passthrough,
+                "{:?} was intercepted by the panel",
+                input.key
+            );
+            assert!(!wrote, "{:?} made the panel write to the PTY", input.key);
+            assert!(requests.is_empty(), "{:?} moved the band", input.key);
+            assert!(
+                overlay.visible(),
+                "{:?} closed the panel — only the chord may",
+                input.key
+            );
+        }
+    }
 
     // ---- rival-assignment R6.2: the handle the watcher reads is the one we refresh ----
 
@@ -1202,5 +1600,316 @@ mod tests {
         // R4.2 — nothing queued must not rewrite the model or request a redraw.
         let (_tx, rx) = mpsc::channel::<u32>();
         assert_eq!(drain_to_newest(&rx), None);
+    }
+
+    // ---- ai-monitor-right-panel R10: one panel per window, re-pointed on tab switch ----
+    //
+    // D13 carries the attachment rule forward from `overlay-tab-binding` and
+    // `ai-monitor-session-isolation` UNCHANGED; docking changed where the panel is painted,
+    // not what it is attached to. What is new is D3's cumulative counters, and they are
+    // exactly the kind of state a re-point can leak: the display rings are capped, so a
+    // stale ring looks plausible, while `total_tool_calls` and the per-name tally are
+    // session totals that would read as tab B's history while being tab A's.
+    //
+    // These drive `Session` — the value `open()` throws away and rebuilds — because
+    // `AiMonitorOverlay` needs an `EventLoopProxy` and cannot be constructed under
+    // `cargo test`. That is the same reason `Repoint` and `Attachment` are structs.
+
+    const LAUNCHED: u64 = 1_785_226_000_000;
+
+    /// A snapshot for `session`, backed by `calls` cumulative `Bash` calls (D3).
+    fn tallied(session: &str, calls: u64) -> Arc<TelemetrySnapshot> {
+        Arc::new(TelemetrySnapshot {
+            session_id: Some(session.into()),
+            tool_calls: vec![("Bash".into(), calls)],
+            total_tool_calls: calls,
+            failed_tool_calls: calls / 10,
+            ..snap_at(Some(LAUNCHED + 1))
+        })
+    }
+
+    /// What the panel would render as the session total — `dashboard::model` reads exactly
+    /// this slot, so `None` is an empty panel and `Some` is whatever it holds.
+    fn shown_total(s: &Session) -> Option<u64> {
+        s.latest.as_ref().map(|snap| snap.total_tool_calls)
+    }
+
+    #[test]
+    fn a_repoint_shows_the_new_tabs_counters_and_never_the_old_tabs() {
+        // R10.3 — THE leak test. Tab A has 200 `Bash` calls on the panel; the user switches
+        // to tab B, whose log holds 3. Both failure modes below were run as mutations and
+        // both are silent in production, because the panel still looks like a dashboard —
+        // the display rings are capped, so a stale ring reads as plausible, while
+        // `total_tool_calls` and the per-name tally are session totals shown under the
+        // wrong tab's heading:
+        //
+        // - `repoint()` made a no-op: the panel keeps rendering tab A's 200 forever, since
+        //   tab A's identity also survives in `attach` and `Attachment::admit` then refuses
+        //   tab B by the `(Some(mine), Some(theirs))` arm. Caught at the first assert after
+        //   the switch.
+        // - `repoint()` reduced to `self.latest = None`: tab A's identity survives alone,
+        //   so every one of tab B's snapshots is refused and the panel stays permanently
+        //   empty on a tab that has data. Caught at the `attached` assert below.
+        let mut s = Session::default();
+
+        s.note(tallied("tab-a", 200), LAUNCHED, true);
+        assert_eq!(shown_total(&s), Some(200), "premise: tab A is on the panel");
+        assert!(s.attach.attached && s.attached_flag.load(Ordering::Relaxed));
+        let flag_a = s.attached_flag.clone();
+
+        s.repoint(); // the user switches tabs; `open()` does this above every branch
+
+        assert_eq!(
+            shown_total(&s),
+            None,
+            "tab A's counters leave with tab A — nothing is on the panel until tab B folds"
+        );
+        assert!(
+            !s.attach.attached,
+            "and no attachment survives to refuse tab B"
+        );
+        assert!(
+            !Arc::ptr_eq(&flag_a, &s.attached_flag),
+            "a FRESH flag, not a store: tab A's watcher may still be running for an \
+             instant and must not observe this open's decision"
+        );
+
+        s.note(tallied("tab-b", 3), LAUNCHED, true);
+        assert_eq!(
+            shown_total(&s),
+            Some(3),
+            "tab B's log only: 203 would be an accumulated counter, 200 a refused re-point"
+        );
+        assert_eq!(
+            s.latest.as_ref().and_then(|snap| snap.tool_calls.first()),
+            Some(&("Bash".to_string(), 3)),
+            "and the per-name tally is tab B's too, not a merge of the two"
+        );
+    }
+
+    #[test]
+    fn repointing_to_a_tab_with_no_log_empties_the_panel() {
+        // R10.3, the case that makes the *placement* of the reset load-bearing. `open()`
+        // calls `repoint()` ABOVE the `project_dir` branch, so a tab with no resolvable log
+        // clears the previous tab and then notes nothing. Move the reset inside the branch
+        // and tab A's 200 calls stay on screen with no watcher running and nothing that can
+        // ever replace them — the panel would claim a session the tab does not have.
+        let mut s = Session::default();
+        s.note(tallied("tab-a", 200), LAUNCHED, true);
+
+        s.repoint();
+        // `open()`'s no-log arm: an empty accumulator, and no `note` (it lives in the
+        // branch), so the slot stays empty.
+        let (telemetry, offset) = backfill_from_scratch(None);
+        assert_eq!(offset, 0, "nothing folded, so nothing to skip");
+        assert_eq!(
+            telemetry.snapshot(),
+            TelemetrySnapshot::default(),
+            "a tab with no log folds an EMPTY accumulator, never the previous tab's"
+        );
+        assert_eq!(shown_total(&s), None, "and the panel shows that emptiness");
+    }
+
+    #[test]
+    fn each_open_folds_the_new_tabs_log_into_a_fresh_accumulator() {
+        // R10.3's other half, against real files and the real fold. Two logs, two opens:
+        // the second must report its own log's totals, so a `backfill_from_scratch` that
+        // reused or continued an accumulator reads 203 here.
+        //
+        // The offset assertions are the no-double-count half. The pair this function
+        // returns is a contract — a fresh accumulator plus the byte count already folded
+        // into it — and `LogWatcher::spawn` resumes its tail at that offset. Passing 0
+        // instead re-reads the whole file and folds every line twice: the rings would still
+        // look right (they are capped) while `total_tool_calls` read 400 for 200 calls.
+        // The watcher's own "resume at the offset, emit each append once" behaviour is
+        // pinned in `ai-monitor` (`tail_emits_each_append_exactly_once`); what is pinned
+        // here is the value `open()` hands it.
+        let dir = temp_dir("repoint-fold");
+        let a = dir.join("tab-a.jsonl");
+        let b = dir.join("tab-b.jsonl");
+        std::fs::write(&a, bash_calls(0, 200)).unwrap();
+        std::fs::write(&b, bash_calls(1_000, 3)).unwrap();
+
+        let (mut ta, off_a) = backfill_from_scratch(Some(&a));
+        assert_eq!(ta.snapshot().total_tool_calls, 200, "premise: tab A's log");
+        assert_eq!(
+            off_a,
+            std::fs::metadata(&a).unwrap().len(),
+            "the tail resumes at EOF — not one backfilled byte is folded a second time"
+        );
+
+        let (tb, off_b) = backfill_from_scratch(Some(&b));
+        let sb = tb.snapshot();
+        assert_eq!(
+            sb.total_tool_calls, 3,
+            "tab B's log only — 203 means the accumulator was carried across the re-point"
+        );
+        assert_eq!(sb.tool_calls, vec![("Bash".to_string(), 3)]);
+        assert_eq!(off_b, std::fs::metadata(&b).unwrap().len());
+
+        // What the watcher does with the pair, done here deterministically: resume at the
+        // offset and fold what follows. One more call must read 201, not 401.
+        std::fs::write(&a, bash_calls(0, 200) + &bash_calls(500, 1)).unwrap();
+        let bytes = std::fs::read(&a).unwrap();
+        let tail = String::from_utf8_lossy(&bytes[off_a as usize..]).into_owned();
+        for line in tail.lines() {
+            ta.apply(line);
+        }
+        assert_eq!(
+            ta.snapshot().total_tool_calls,
+            201,
+            "an offset of 0 would have re-folded the whole file: 401"
+        );
+    }
+
+    #[test]
+    fn the_panel_holds_one_session_and_re_points_it_in_place() {
+        // R10.1 — "exactly one panel, showing the ACTIVE tab's session". The *count* of
+        // panels is a registration fact one level up: `main.rs` registers one
+        // `AiMonitorOverlay`, which owns one `MonitorHandle`, and `layer()` hands the
+        // renderer a `MonitorPanel` cloned from it — so every drawn panel reads one model.
+        // What this file owns is the other half, asserted here: that one panel shows one
+        // tab at a time, by re-pointing a single slot rather than accumulating tabs.
+        let mut s = Session::default();
+        for (tab, calls) in [("tab-a", 200_u64), ("tab-b", 3), ("tab-c", 41)] {
+            s.repoint();
+            s.note(tallied(tab, calls), LAUNCHED, true);
+            assert_eq!(s.attach.session_id.as_deref(), Some(tab));
+            assert_eq!(
+                shown_total(&s),
+                Some(calls),
+                "the panel shows the active tab, and only it"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_tabs_re_points_the_panel_and_then_settles() {
+        // R10.2 — the switch itself, driven through the same `opened` -> `changed`
+        // transition `open()` and `on_active_changed` perform. Re-opening re-keys, which is
+        // what makes the re-point converge instead of firing on every subsequent metadata
+        // sync (the storm `Repoint` exists to stop).
+        let mut r = Repoint::default();
+        r.opened(Some(PathBuf::from("/proj/a")), Some(101), |_| None);
+
+        assert!(
+            r.changed(true, Some(Path::new("/proj/b")), Some(202)),
+            "a tab switch is a real change: `on_active_changed` re-opens on tab B"
+        );
+        r.opened(Some(PathBuf::from("/proj/b")), Some(202), |_| None);
+        assert!(
+            !r.changed(true, Some(Path::new("/proj/b")), Some(202)),
+            "and the panel then settles on tab B"
+        );
+        assert!(
+            r.changed(true, Some(Path::new("/proj/a")), Some(101)),
+            "switching back re-points again — the panel follows the ACTIVE tab, always"
+        );
+    }
+
+    #[test]
+    fn a_launch_restore_must_fold_a_log_or_the_panel_it_reopens_is_empty() {
+        // R6.6 — why `on_command`'s restore calls `open()` instead of setting `visible`.
+        //
+        // `dashboard::model` renders `Session::latest`, and the only thing that ever fills
+        // that slot is `note()`, fed by the backfill `open()` runs and then by the watcher
+        // `open()` spawns. A restore that merely flipped `visible` would reserve the band
+        // over a `Session` in exactly the state below — and, holding no watcher, would stay
+        // there for the life of the window: a panel that is open, correctly sized, and
+        // permanently blank. That reads as "the ai-monitor is broken", not as "the restore
+        // is incomplete", which is why it is pinned rather than left to review.
+        //
+        // Scope note: the `open()` call itself is not reachable from here —
+        // `AiMonitorOverlay` needs an `EventLoopProxy`, which needs a real winit `EventLoop`
+        // (main-thread-only, once per process on macOS). What is driven is the work `open()`
+        // does that a `visible = true` restore would skip.
+        let empty = Session::default();
+        assert_eq!(
+            shown_total(&empty),
+            None,
+            "premise: a Session nobody folded into renders nothing at all"
+        );
+
+        let dir = temp_dir("launch-restore");
+        let log = dir.join("restored.jsonl");
+        std::fs::write(&log, bash_calls(0, 7)).unwrap();
+
+        let (telemetry, offset) = backfill_from_scratch(Some(&log));
+        let mut restored = Session::default();
+        restored.note(Arc::new(telemetry.snapshot()), LAUNCHED, true);
+        assert_eq!(
+            shown_total(&restored),
+            Some(7),
+            "a restore resolves and folds this tab's log, exactly as the chord does"
+        );
+        assert!(
+            restored.attach.attached,
+            "and attaches, so the watcher's later snapshots are admitted"
+        );
+        assert_eq!(
+            offset,
+            std::fs::metadata(&log).unwrap().len(),
+            "with the tail resuming at EOF — a restore must not double-count the backfill"
+        );
+    }
+
+    #[test]
+    fn a_tab_switch_has_no_route_to_the_panels_width() {
+        // R10.4 — the panel's width is a WINDOW property, so a tab switch cannot change it
+        // and therefore cannot change the column count or trigger `settings::refit`. The
+        // property is structural rather than computed, so it is pinned structurally: from
+        // this file there must be no *value* a width could travel in.
+        //
+        // Half one, a COMPILE-TIME pin: `on_active_changed` (the tab switch) is handed a
+        // cwd and a pid and nothing else — no `AppCtx`, hence no `AppRequest`. Give it one
+        // and this coercion stops compiling. `on_command`, the launch restore's route
+        // (R6.6), is held to the same rule for the same reason.
+        let _: fn(&mut AiMonitorOverlay, Option<PathBuf>, Option<u32>) =
+            <AiMonitorOverlay as Overlay>::on_active_changed;
+        let _: fn(&mut AiMonitorOverlay, &crate::seam::OverlayCommand) -> crate::seam::Handled =
+            <AiMonitorOverlay as Overlay>::on_command;
+
+        // Half two, the seam this file *does* reach: even the chord — the one path that
+        // holds an `AppCtx` — records a bare `bool`. This is what replaced a `PANEL_WIDTH_PX`
+        // const travelling as `SetMonitorWidth(f32)`, and it is the stronger form of the
+        // same guarantee: there is no longer a width in this crate's seam to send at all,
+        // so a switch could not move the band even if it somehow acquired a context.
+        let mut sink = Vec::new();
+        let mut ctx = crate::seam::AppCtx::new(&mut sink, 1, 0, None);
+        ctx.set_monitor_open(true);
+        assert_eq!(
+            ctx.take_requests(),
+            vec![crate::seam::AppRequest::SetMonitorOpen(true)],
+            "the chord decides open/closed; the width comes from config + override"
+        );
+
+        // There is no per-tab width to carry either: `Session` — everything a re-point
+        // rebuilds — holds none, and this file now names no width constant.
+        //
+        // What this canNOT see from here is the other side of that seam: whether
+        // `terminal_app`'s handling of `SetMonitorOpen` refits only on a column change.
+        // The predicate is pinned (`input::needs_refit`); that `apply_monitor_open` is its
+        // only caller belongs to the file that owns it.
+    }
+
+    /// `n` completed `Bash` calls as JSONL, with ids from `first` so two files never
+    /// collide when their folds are compared.
+    fn bash_calls(first: usize, n: usize) -> String {
+        (first..first + n)
+            .map(|i| {
+                format!(
+                    "{{\"type\":\"tool_use\",\"id\":\"c{i}\",\"name\":\"Bash\"}}\n\
+                     {{\"type\":\"tool_result\",\"tool_use_id\":\"c{i}\",\"is_error\":false}}\n"
+                )
+            })
+            .collect()
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let mut base = std::env::temp_dir();
+        base.push(format!("app-overlay-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
     }
 }

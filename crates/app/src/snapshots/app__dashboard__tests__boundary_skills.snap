@@ -1,8 +1,9 @@
 ---
 source: crates/app/src/dashboard.rs
-expression: "skills(&t, now).join(\"\\n\")"
+expression: "project_section(&skills(&t, &env(now)))"
 ---
-── Skills +1 more ──────────────────────────────────────────────────────────────────────────────────────
-  harness-ops:loop · 4m ago
-  insta-review · 8m ago
-  run-term · 12m ago
+  SKILLS (total 4)
+    row  —                   — "harness-ops:loop" value="at 08:02:40" TextMuted
+    row  —                   — "insta-review" value="at 07:58:40" TextMuted
+    row  —                   — "run-term" value="at 07:54:40" TextMuted
+    row  —                   — "specify" value="at 07:50:40" TextMuted

@@ -1,9 +1,0 @@
----
-source: crates/app/src/dashboard.rs
-expression: "other_tools(&t).join(\"\\n\")"
----
-── Other Tools +7 more ─────────────────────────────────────────────────────────────────────────────────
-  ✓ Bash 120ms
-  ✗ WebFetch 760ms
-  ✓ TodoWrite —
-  ✓ Monitor 2.0s

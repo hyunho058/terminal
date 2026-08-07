@@ -15,7 +15,7 @@ Inferred from `requirements-interview-outputs/mac-terminal/insights.md`.
 | **Glyph atlas** | GPU texture packing rasterized glyphs. `swash` rasterizes; the atlas is a pending feature. |
 | **Ligature** | Multi-char glyph (e.g. `!=`, `=>`). Config `font.ligatures`; handled during swash shaping. |
 | **IME** | Input Method Editor (e.g. Korean 한글). winit delivers composed text via `KeyEvent::text`. |
-| **ai-monitor** | A toggle overlay that watches the active session's logs (`~/.claude/projects/**/*.jsonl`). Native, Rust-rewritten. A future feature. |
+| **ai-monitor** | A right-docked, drag-resizable panel (`Cmd+Shift+M`) that watches the active tab's session logs (`~/.claude/projects/**/*.jsonl`). It **reserves** terminal columns rather than covering them. Native, Rust-rewritten. Shipped. |
 
 ## Invariants
 

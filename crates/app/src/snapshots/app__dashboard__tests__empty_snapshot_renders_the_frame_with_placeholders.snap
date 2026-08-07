@@ -1,8 +1,0 @@
----
-source: crates/app/src/dashboard.rs
-expression: "summary(&t, 1_785_226_000_000).join(\"\\n\")"
----
-── ai-monitor ──────────────────────────────────────────────────────────────────────────────────────────
- session  — · —
- spend    in — · out — · cache — (billed)
- activity — (as of last update)

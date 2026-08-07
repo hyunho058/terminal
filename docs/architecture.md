@@ -44,10 +44,18 @@ zsh ──PTY──> reader thread ──mpsc──> [wake] winit loop
 
 ## Deferred / known gaps
 
+- **G4** The ai-monitor is a **right-docked panel**, not an overlay: it reserves columns
+  via `Renderer::right_inset` (the symmetric twin of `left_inset`), so opening it reflows the
+  terminal rather than covering it. `Grid::resize` has no rewrap, so that reflow currently
+  truncates rows wider than the narrowed grid — non-destructive reflow is specified separately
+  in `specs/grid-reflow/spec.md` and is a declared dependency of the panel.
 - **G1** Performance *numbers* still unconfirmed — CI checks build/test, not
   fps/latency; committing the thresholds remains a human decision. (The idle-CPU
   debt from PR #2 — a full re-shape every frame at idle — has since been fixed: the
-  renderer skips re-shape on an unchanged snapshot, re-presenting cached buffers.)
+  renderer skips re-shape on an unchanged snapshot, re-presenting cached buffers. The
+  ai-monitor panel carries its **own** shaping cache — keyed on the model, panel rect, cell
+  metrics and atlas identity — because the terminal's re-shape skip does not cover it and the
+  layer it replaced re-laid-out its text every frame.)
 - **G2** ~~Inline-image protocol undecided~~ — **resolved**: the Kitty graphics-APC
   protocol shipped (`term-core::image::parse_graphics_apc`).
 - **G3** ~~Glyph atlas not yet wired into the shader~~ — **resolved**: glyphs render
