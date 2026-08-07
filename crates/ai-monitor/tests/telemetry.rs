@@ -946,3 +946,89 @@ fn the_tally_is_emitted_in_a_deterministic_name_order() {
     let names: Vec<&str> = s.tool_calls.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(names, ["alpha", "mid", "zed"]);
 }
+
+// ---- ai-monitor-model-refresh: the model is the CURRENT one ------------------
+
+/// One assistant line, in the shape real logs use.
+fn assistant(id: &str, model: &str) -> String {
+    format!(
+        r#"{{"type":"assistant","sessionId":"64c00dbb","requestId":"{id}","message":{{"id":"{id}","model":"{model}","usage":{{"output_tokens":1}}}}}}"#
+    )
+}
+
+#[test]
+fn a_mid_session_model_switch_reaches_the_snapshot() {
+    // The real-log repro (`64c00dbb`): the session ran `claude-fable-5`, the user ran
+    // `/model`, and five later assistant turns logged `claude-opus-5`. First-write-wins
+    // pinned the panel to `claude-fable-5` for the rest of the session.
+    let s = fold(&format!(
+        "{}\n{}\n{}\n{}\n{}",
+        assistant("r1", "claude-fable-5"),
+        assistant("r2", "claude-fable-5"),
+        // `/model` — the switch itself logs no model, so only the turns after it show it.
+        r#"{"type":"user","message":{"role":"user","content":"<command-name>/model</command-name>"}}"#,
+        assistant("r3", "claude-opus-5"),
+        assistant("r4", "claude-opus-5"),
+    ));
+    assert_eq!(
+        s.model.as_deref(),
+        Some("claude-opus-5"),
+        "the model the session is running NOW, not the one it started with"
+    );
+}
+
+#[test]
+fn a_trailing_synthetic_line_never_becomes_the_displayed_model() {
+    // `<synthetic>` is a REAL `message.model` value — Claude Code writes it on records
+    // it fabricates locally. Under an unguarded last-wins it lands at the tail of a log
+    // and blanks the panel's model; it must be skipped, not folded.
+    let s = fold(&format!(
+        "{}\n{}",
+        assistant("r1", "claude-opus-5"),
+        assistant("r2", "<synthetic>"),
+    ));
+    assert_eq!(s.model.as_deref(), Some("claude-opus-5"));
+
+    // ... and it does not become the model when it arrives FIRST either: skipping means
+    // skipping, so the first real id still populates the field afterwards.
+    let s = fold(&format!(
+        "{}\n{}",
+        assistant("r1", "<synthetic>"),
+        assistant("r2", "claude-opus-5"),
+    ));
+    assert_eq!(s.model.as_deref(), Some("claude-opus-5"));
+
+    // A log of nothing but sentinels leaves the field empty — `None` reads as "not
+    // known" and the app draws a placeholder; `Some("<synthetic>")` would be a claim.
+    let s = fold(&assistant("r1", "<synthetic>"));
+    assert_eq!(s.model, None);
+}
+
+#[test]
+fn the_very_first_fold_still_populates_the_model() {
+    // The half of the old behaviour that was correct. Last-wins with no prior value is
+    // still a write — a guard that only ever *replaced* an existing id would leave the
+    // panel blank for the whole of a single-model session.
+    let s = fold(&assistant("r1", "claude-opus-5"));
+    assert_eq!(s.model.as_deref(), Some("claude-opus-5"));
+}
+
+#[test]
+fn the_session_id_keeps_its_first_wins_rule() {
+    // Deliberately NOT symmetrical with the model above, and the asymmetry is the
+    // point: a session id names the file and never changes, so the first one seen is
+    // the answer. A second id in the stream is another session's line leaking in (the
+    // watcher reads a tail, and rival sessions share a directory) — adopting it would
+    // silently re-label the panel. Flipping both folds "for consistency" is a
+    // regression, not a cleanup.
+    let s = fold(
+        r#"{"type":"assistant","sessionId":"first","message":{"id":"a","model":"claude-opus-5"}}
+{"type":"assistant","sessionId":"second","message":{"id":"b","model":"claude-fable-5"}}"#,
+    );
+    assert_eq!(s.session_id.as_deref(), Some("first"), "first-wins holds");
+    assert_eq!(
+        s.model.as_deref(),
+        Some("claude-fable-5"),
+        "last-wins holds"
+    );
+}

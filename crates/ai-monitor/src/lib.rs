@@ -1515,6 +1515,109 @@ mod tests {
     }
 
     #[test]
+    fn backfill_and_tail_agree_on_the_model_across_the_boundary() {
+        // Two paths reach the same field and they must not disagree: `open()` folds the
+        // whole file from scratch, then the watcher tails only what is appended after
+        // it. A rule that read one line at a time differently from a batch — say,
+        // "replace only when the value differs from the previous LINE" — would agree on
+        // both of these separately and disagree the moment a `/model` switch landed
+        // across the seam, which is precisely where a live session puts it.
+        //
+        // Three placements of the switch relative to the boundary, and the invariant is
+        // the same each time: tailing from a mid-file offset must land on exactly what
+        // folding the finished file yields.
+        use std::io::Write;
+        use std::time::Duration;
+
+        let fable = |id: &str| {
+            format!(
+                r#"{{"type":"assistant","requestId":"{id}","message":{{"id":"{id}","model":"claude-fable-5","usage":{{"output_tokens":1}}}}}}"#
+            )
+        };
+        let opus = |id: &str| {
+            format!(
+                r#"{{"type":"assistant","requestId":"{id}","message":{{"id":"{id}","model":"claude-opus-5","usage":{{"output_tokens":1}}}}}}"#
+            )
+        };
+        let synthetic = |id: &str| {
+            format!(
+                r#"{{"type":"assistant","requestId":"{id}","message":{{"id":"{id}","model":"<synthetic>","usage":{{"output_tokens":1}}}}}}"#
+            )
+        };
+
+        // (tag, lines present at open, lines appended afterwards)
+        let cases: [(&str, Vec<String>, Vec<String>); 3] = [
+            // The switch is IN the tail — the backfill has only ever seen fable.
+            (
+                "switchintail",
+                vec![fable("a"), fable("b")],
+                vec![opus("c"), opus("d")],
+            ),
+            // The switch is in the BACKFILL — the tail only ever sees opus.
+            (
+                "switchinbackfill",
+                vec![fable("a"), opus("b")],
+                vec![opus("c")],
+            ),
+            // Nothing but a sentinel arrives after the switch: it must not undo it.
+            (
+                "sentinelaftertheswitch",
+                vec![fable("a"), opus("b")],
+                vec![synthetic("c")],
+            ),
+        ];
+
+        for (tag, seeded, appended) in cases {
+            let dir = temp_dir(tag);
+            let log = dir.join("s.jsonl");
+            std::fs::write(&log, format!("{}\n", seeded.join("\n"))).unwrap();
+
+            let (t, off) = backfill_telemetry(&log);
+            let at_open = t.snapshot().model.clone();
+            let w = LogWatcher::spawn(
+                Watch {
+                    dir: dir.clone(),
+                    log: Some(log.clone()),
+                    want: Wanted::default(),
+                    owned: false,
+                    rivals: no_rivals(),
+                    attached: unattached(),
+                },
+                t,
+                off,
+                || {},
+            )
+            .expect("spawn");
+
+            {
+                let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+                for line in &appended {
+                    writeln!(f, "{line}").unwrap();
+                }
+            }
+
+            let mut tailed = at_open;
+            while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(3)) {
+                tailed = s.snap.model.clone();
+            }
+
+            // The reference: the same bytes, folded in one pass by a fresh accumulator —
+            // what `open()` on the finished file would have produced.
+            let (whole, _) = backfill_telemetry(&log);
+            assert_eq!(
+                tailed,
+                whole.snapshot().model,
+                "{tag}: backfill+tail must converge on what a from-scratch fold yields"
+            );
+            assert_eq!(
+                tailed.as_deref(),
+                Some("claude-opus-5"),
+                "{tag}: and that is the model the session ended on"
+            );
+        }
+    }
+
+    #[test]
     fn the_registry_names_a_session_and_shrugs_at_anything_odd() {
         // The shape `claude` actually writes, taken verbatim from a live file.
         let root = temp_dir("registry");

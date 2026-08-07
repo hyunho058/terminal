@@ -166,6 +166,10 @@ pub struct TaskEntry {
 pub struct TelemetrySnapshot {
     // identity
     pub session_id: Option<String>,
+    /// The model the session is running **now** — the last real `message.model` folded,
+    /// not the first. The two differ whenever the user ran `/model`, and the field's
+    /// whole purpose is to answer "what is running", so first-wins would be a lie about
+    /// the live session. Sentinel values (`<synthetic>`) are never folded here.
     pub model: Option<String>,
     // tokens: four cumulative COST counters (D2) ...
     pub total_input: u64,
@@ -306,12 +310,24 @@ impl SessionTelemetry {
                 .or_else(|| str_at(&v, "session_id"))
                 .map(str::to_string);
         }
-        if self.model.is_none() {
-            self.model = v
-                .pointer("/message/model")
-                .and_then(Value::as_str)
-                .or_else(|| v.get("model").and_then(Value::as_str))
-                .map(str::to_string);
+        // Identity, but NOT the rule the `session_id` fold above uses. A session id is
+        // fixed for the life of a file, so first-wins is correct there. A model is not:
+        // `/model` switches it mid-session and every later assistant line carries the
+        // new id, so the panel must show the LAST one — first-wins pins the panel to
+        // whatever the session happened to start with (measured: a real log ran
+        // `claude-fable-5`, switched, then logged five `claude-opus-5` turns, and the
+        // panel still read `claude-fable-5`).
+        //
+        // Skipping sentinels is what makes last-wins safe. Only a real id may
+        // overwrite; a sentinel neither overwrites nor blocks, so the first real fold
+        // still populates the field and a trailing `<synthetic>` cannot blank it.
+        if let Some(m) = v
+            .pointer("/message/model")
+            .and_then(Value::as_str)
+            .or_else(|| v.get("model").and_then(Value::as_str))
+            .filter(|m| is_real_model(m))
+        {
+            self.model = Some(m.to_string());
         }
 
         self.fold_usage(&v);
@@ -787,6 +803,27 @@ impl SessionTelemetry {
 }
 
 // ---- helpers ------------------------------------------------------------------
+
+/// Whether a `message.model` value names a model that actually ran.
+///
+/// `<synthetic>` is a REAL value of that field, not a hypothetical: Claude Code writes
+/// it on records it fabricates locally (28 of them across the measured corpus, against
+/// 28,897 genuine ids). It is a sentinel, not a model, and under the last-wins rule it
+/// would blank the panel's model the moment one landed at the tail of a log.
+///
+/// Matched by SHAPE, not by the one literal: `<...>` is how this log marks "not a real
+/// value", so a future `<none>`/`<unknown>` must be refused on the same grounds. A
+/// genuine id is a bare slug (`claude-opus-5`) and can never take this form, so the
+/// shape test cannot reject one. Empty is refused for the same reason — it names
+/// nothing, and `Some("")` on the panel is indistinguishable from a bug.
+///
+/// This is a mechanism, not presentation (SD4): the crate must decide what to fold, and
+/// "is this a model id" is a property of the datum. Which of the folded ids to SHOW,
+/// and how, stays the app's.
+fn is_real_model(m: &str) -> bool {
+    let sentinel = m.is_empty() || (m.starts_with('<') && m.ends_with('>'));
+    !sentinel
+}
 
 /// Record a `requestId` against a message key, bounded (D6): the dedupe map caps the
 /// number of KEYS, this caps each key's value, so neither dimension grows without limit.

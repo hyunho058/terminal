@@ -68,13 +68,28 @@ const DONE: char = '◯';
 ///
 /// Longest-prefix, then default — one rule, no second mechanism. Note there is no
 /// suffix parsing: model ids carry no bracketed context-window marker in any of the
-/// 28,925 logged values, so a `[1m]`-style rule would be unreachable code.
+/// 28,925 logged values, so a `[1m]`-style rule would be unreachable code. (Re-verified
+/// since: every `[1m]` occurrence in a real log is prose inside a message, never a
+/// field — the window genuinely cannot be READ.)
+///
+/// These are therefore the window a session is **assumed** to have, and the assumption
+/// is the small one: the same bare id is logged whether the session opened a 200k or a
+/// 1M window, so guessing large would over-report headroom on every ordinary session.
+/// What cannot be read can still be DEDUCED — see [`WINDOW_TIERS`] and
+/// [`promoted_window`], which correct the assumption from observed usage.
 const MODEL_WINDOWS: &[(&str, u64)] = &[
     ("claude-opus-", 200_000),
     ("claude-sonnet-", 200_000),
     ("claude-haiku-", 200_000),
     ("claude-fable-", 200_000),
 ];
+
+/// The context-window sizes a Claude session can actually have, smallest first.
+///
+/// Two, because two exist: the standard window and the 1M tier. Ascending order is
+/// load-bearing — [`promoted_window`] takes the first that fits, which is the smallest,
+/// and a mis-sorted table would over-state the window and under-report occupancy.
+const WINDOW_TIERS: &[u64] = &[200_000, 1_000_000];
 
 /// Everything the composer needs that the snapshot does not carry. Injected rather
 /// than read, which is what keeps [`model`] pure and the snapshots byte-stable.
@@ -110,18 +125,55 @@ pub struct Env {
     pub utc_offset_secs: i32,
 }
 
-/// The window for `model`, or `None` when no prefix matches.
+/// The **assumed** window for `model`, or `None` when no prefix matches.
 ///
 /// `None` is load-bearing: the caller omits the percentage entirely rather than
 /// assuming a denominator. A confident percentage against a guessed window is a
 /// false statement about how much room the session has left, and `<synthetic>`
 /// matches nothing.
+///
+/// `Some` is an assumption, not a reading — the id records no window. Callers that
+/// have observed usage should correct it through [`promoted_window`] rather than
+/// treat this number as measured.
 pub fn context_window(model: &str) -> Option<u64> {
     MODEL_WINDOWS
         .iter()
         .filter(|(p, _)| model.starts_with(p))
         .max_by_key(|(p, _)| p.len())
         .map(|(_, w)| *w)
+}
+
+/// Correct an assumed window against what the session has demonstrably used.
+///
+/// The log records no window, so [`context_window`]'s answer is a guess — and it
+/// guesses small (see `MODEL_WINDOWS`). But `used` is a **measurement**: the tokens the
+/// API actually accepted in one turn. A turn of 514,930 tokens is proof the window was
+/// never 200k, whatever the id says, and against the assumed 200k it renders as a
+/// useless `>100%` on a session that is barely half full.
+///
+/// So: promote to the smallest known tier that fits the measurement. Three properties
+/// make this a deduction rather than a second guess, and each is pinned by a test —
+///
+/// * **Evidence only.** `used <= assumed` returns `assumed` untouched, so a session
+///   that never exceeds its assumed window is bit-for-bit unaffected. The model NAME is
+///   never consulted here; naming a model that *can* run 1M would be exactly the hunch
+///   this must not make.
+/// * **Smallest fit.** The first tier that fits, not the largest — 514,930 proves the
+///   window is >200k and nothing more, so claiming more headroom than proven would be
+///   the original bug pointed the other way.
+/// * **No fit, no promotion.** Usage past the largest tier promotes to nothing and
+///   keeps `assumed`, so the caller's `>100%` still fires. That state is reachable and
+///   still means the right thing — "the window is wrong, and this table cannot say what
+///   it is" — which is what `[ai_monitor] context_window` exists to resolve.
+fn promoted_window(assumed: u64, used: u64) -> u64 {
+    if used <= assumed {
+        return assumed;
+    }
+    WINDOW_TIERS
+        .iter()
+        .copied()
+        .find(|&tier| tier > assumed && tier >= used)
+        .unwrap_or(assumed)
 }
 
 /// How long a session may go quiet before the pill reads IDLE rather than CONNECTED
@@ -310,8 +362,15 @@ fn context_tile(t: &TelemetrySnapshot, env: &Env) -> StatTile {
     };
     // `>100%` because a percentage over 100 is self-evidently impossible and reads as a
     // broken dashboard, when what it means is that the assumed window is too small — a
-    // 1M-context session logs the same bare model id as a 200k one. `[ai_monitor]
-    // context_window` is how a user resolves it. The gauge clamps to full alongside it.
+    // 1M-context session logs the same bare model id as a 200k one. The gauge clamps to
+    // full alongside it.
+    //
+    // Still reachable, and still the right answer, now that `promoted_window` corrects
+    // the assumption: it only promotes to a window this table KNOWS about, so usage past
+    // the largest known tier fits nothing and lands here. The statement is narrower than
+    // it was — no longer "your window might be bigger than 200k" (deduced now) but "your
+    // window is bigger than any size this build knows" — and `[ai_monitor]
+    // context_window` remains how a user resolves it.
     let value = if pct > 100 {
         ">100%".to_string()
     } else {
@@ -758,11 +817,16 @@ pub fn context_pct(t: &TelemetrySnapshot, env: &Env) -> Option<u64> {
     if t.context_used == 0 {
         return None;
     }
-    // The configured window wins over the table: the table can only guess from a
-    // model id that does not record the window.
+    // The configured window wins over the table AND over the deduction below: the
+    // table can only guess from a model id that does not record the window, and a
+    // deduction is still an inference. A user who has stated the window has knowledge
+    // neither of them has, so nothing may overrule it — which is why this returns
+    // before `promoted_window` is ever consulted.
     let window = match env.context_window {
         Some(w) => w,
-        None => context_window(t.model.as_deref()?)?,
+        // Assumed from the id, then corrected by measurement. The correction is inert
+        // unless the session has itself proved the assumption wrong.
+        None => promoted_window(context_window(t.model.as_deref()?)?, t.context_used),
     };
     if window == 0 {
         return None;
@@ -2403,7 +2467,13 @@ mod tests {
         assert_eq!(tile.gauge, Some(0.45));
         // Over the assumed window the *number* is refused, not the gauge: the reading is
         // real, the denominator is what is wrong.
-        t.context_used = 256_551;
+        //
+        // The INPUT moved (256,551 -> 1,256,551) when window promotion landed; the two
+        // assertions below are untouched. 256,551 is no longer a `>100%` case at all —
+        // it is evidence of a 1M window and now reads 26% — so leaving it here would
+        // have pinned the promotion OFF and silently re-frozen the bug. Past every tier
+        // `WINDOW_TIERS` knows, nothing fits, so the clamp is still what fires.
+        t.context_used = 1_256_551;
         let m = model(Some(&t), &env(now));
         assert_eq!(tile_of(&m, "CONTEXT").value, ">100%");
         assert_eq!(tile_of(&m, "CONTEXT").gauge, Some(1.0));
@@ -2440,9 +2510,111 @@ mod tests {
         };
         assert_eq!(tile_of(&model(Some(&t), &e), "CONTEXT").value, "26%");
         // ... and without it, the honest refusal rather than an impossible number.
+        //
+        // This half needed a bigger reading once promotion landed: at 256,551 the
+        // deduction now reaches the same 1M window the config states, so the contrast
+        // the assertion below is drawing no longer exists at that size. Past every known
+        // tier it does. What the config uniquely buys is pinned separately, by
+        // `a_configured_window_outranks_the_deduced_one`.
+        t.context_used = 1_256_551;
         assert_eq!(
             tile_of(&model(Some(&t), &env(now)), "CONTEXT").value,
             ">100%"
+        );
+    }
+
+    #[test]
+    fn the_1m_repro_a_session_bigger_than_200k_is_measured_against_the_tier_that_fits() {
+        // Measured on a real 1M-context session: one turn reached 514,930 tokens of
+        // context. Against the assumed 200k that is 257% — clamped to a useless
+        // `>100%` on a session that is barely half full. The number is not a guess: the
+        // API accepted those tokens, so the window was never 200k.
+        let (mut t, now) = populated();
+        t.context_used = 514_930;
+        let m = model(Some(&t), &env(now));
+        let tile = tile_of(&m, "CONTEXT");
+        assert_eq!(tile.value, "51%", "514,930 of the 1M window that fits it");
+        assert_eq!(
+            tile.gauge,
+            Some(0.51),
+            "and a gauge that is half full, not full"
+        );
+    }
+
+    #[test]
+    fn promotion_fires_on_evidence_only_never_on_the_model_name() {
+        // The whole safety property: `claude-opus-5` CAN run a 1M window, and that fact
+        // is never consulted. Only the session's own usage moves the denominator, so a
+        // session inside its assumed window is bit-for-bit what it was before.
+        let (mut t, now) = populated();
+        for (used, pct) in [(90_000u64, "45%"), (150_000, "75%"), (200_000, "100%")] {
+            t.context_used = used;
+            assert_eq!(
+                tile_of(&model(Some(&t), &env(now)), "CONTEXT").value,
+                pct,
+                "{used} is within the assumed 200k — measured against 200k"
+            );
+        }
+        // One token past it is evidence, and the smallest tier that fits takes over.
+        t.context_used = 200_001;
+        assert_eq!(tile_of(&model(Some(&t), &env(now)), "CONTEXT").value, "20%");
+        // The unit rule behind both, including the exact boundaries.
+        assert_eq!(promoted_window(200_000, 199_999), 200_000);
+        assert_eq!(
+            promoted_window(200_000, 200_000),
+            200_000,
+            "fits: no promotion"
+        );
+        assert_eq!(promoted_window(200_000, 200_001), 1_000_000);
+        assert_eq!(promoted_window(200_000, 1_000_000), 1_000_000, "exact fit");
+        // `promoted_window` takes the FIRST tier that fits, so "first" has to mean
+        // "smallest". Only one tier sits above 200k today, so a mis-sorted table would
+        // change no output and no behavioural test could catch it — pinned here before a
+        // third tier makes the ordering silently load-bearing.
+        assert!(
+            WINDOW_TIERS.windows(2).all(|w| w[0] < w[1]),
+            "WINDOW_TIERS must be strictly ascending"
+        );
+    }
+
+    #[test]
+    fn usage_past_every_known_tier_still_refuses_the_number() {
+        // The `>100%` clamp is not dead code after promotion — it is what remains when
+        // the deduction has nothing to deduce. A session past 1M fits no tier this build
+        // knows, so the panel says so instead of inventing a denominator.
+        let (mut t, now) = populated();
+        t.context_used = 1_000_001;
+        let m = model(Some(&t), &env(now));
+        let tile = tile_of(&m, "CONTEXT");
+        assert_eq!(tile.value, ">100%");
+        assert_eq!(tile.gauge, Some(1.0));
+        assert_eq!(
+            promoted_window(200_000, 1_000_001),
+            200_000,
+            "no tier fits, so the assumption stands and the caller clamps"
+        );
+    }
+
+    #[test]
+    fn a_configured_window_outranks_the_deduced_one() {
+        // `[ai_monitor] context_window` is knowledge; promotion is inference. The one
+        // case that separates them is a config NARROWER than what the usage would
+        // deduce — if the deduction could overrule it, this reads 51%.
+        let (mut t, now) = populated();
+        t.context_used = 514_930;
+        let e = Env {
+            context_window: Some(200_000),
+            ..env(now)
+        };
+        assert_eq!(
+            tile_of(&model(Some(&t), &e), "CONTEXT").value,
+            ">100%",
+            "the user said 200k; the panel does not argue"
+        );
+        assert_eq!(
+            tile_of(&model(Some(&t), &env(now)), "CONTEXT").value,
+            "51%",
+            "and without the config, the deduction does its job"
         );
     }
 
