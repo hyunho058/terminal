@@ -70,4 +70,33 @@ correcting an overstated limit in the spec's own prose.
 Every gate passes and the Evidence Report is emitted. A 🛑 boundary ends the loop in escalation.
 
 ## Lessons
-_(none yet — this is the first run of this contract)_
+
+### L1 — never `git checkout --` an uncommitted working tree
+- cause: escalation
+- source: human-approved
+- form: gate1-command
+- status: active
+- check: `test -z "$(git status --porcelain -- crates/ | head -1)" || git stash list >/dev/null`
+- note: iteration 1 mutation-tested a gate script, then reverted with `git checkout -- <file>`
+  on a tree where the WHOLE feature was uncommitted — reverting to HEAD wiped ~1400 lines of
+  T5/T6 work. Recovered only because the subagent transcript held the Write+Edit sequence.
+  Mutate a scratchpad copy, or commit first. Never `checkout --` to undo a test mutation.
+
+### L2 — a name-absence grep must scan production code only
+- cause: gate-fail
+- source: human-approved
+- form: gate1-command
+- status: active
+- check: `sh specs/ai-monitor-right-panel/check-deleted-mechanism.sh`
+- note: the first R3.3 gate grepped the whole file and matched the string literals inside the
+  test that asserts those names are absent — it failed precisely when the requirement held.
+  The check must cut at `#[cfg(test)]` and fail loudly if that boundary is missing.
+
+### L3 — commit before verifying
+- cause: escalation
+- source: human-approved
+- form: context
+- status: active
+- check: —
+- note: a verification run that can modify files must start from a committed baseline, so any
+  destructive step is recoverable by `git restore` rather than by transcript archaeology.
