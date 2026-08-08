@@ -1109,12 +1109,8 @@ impl Overlay for AiMonitorOverlay {
     fn on_active_changed(&mut self, cwd: Option<PathBuf>, shell_pid: Option<u32>) {
         let visible = self.visible;
         let tab_changed = self.repoint.changed(visible, cwd.as_deref(), shell_pid);
-        // The order, and the laziness, live in `tick_action` — one author for both. Bound to
-        // a local rather than matched inline: the thunk borrows `self` mutably (arming writes
-        // the baseline), and a temporary in a `match` scrutinee lives until the end of the
-        // match, which would hold that borrow across the arms that call `open`.
-        let action = tick_action(tab_changed, visible, || self.session_rotated());
-        match action {
+        // The order, and the laziness, live in `tick_action` — one author for both.
+        match tick_action(tab_changed, visible, || self.session_rotated()) {
             // A tab change and a rotation take the SAME action, and deliberately so.
             // `open()` is the whole re-point in both cases: `Session::repoint` drops the
             // old attachment and its flag, the accumulator is rebuilt from scratch
@@ -2563,6 +2559,20 @@ mod tests {
         assert!(
             production.contains("self.opened_on = baseline_from(&hint);"),
             "open() must record the baseline, or nothing is compared against anything"
+        );
+        // And the two lines that CONNECT the tested rule to production. A checker mutated
+        // each to a constant — `|| false`, and `|_| None` for the registry read — and all
+        // 524 tests stayed green with rotation detection completely dead. These are the most
+        // load-bearing lines in the feature precisely because everything either side of them
+        // is well covered: the rule is unit-tested, `open()` is pinned above, and neither
+        // notices that nothing calls the one or feeds the other.
+        assert!(
+            production.contains("|| self.session_rotated()"),
+            "the tick must actually ASK, or the rule below it is dead code"
+        );
+        assert!(
+            production.contains("session_rotated_with(ai_monitor::registered_session,"),
+            "and it must ask the real registry, not a stub"
         );
     }
 
