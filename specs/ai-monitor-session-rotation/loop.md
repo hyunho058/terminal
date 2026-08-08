@@ -203,6 +203,45 @@ because lessons do not propagate between contracts (skill rule), and all three w
   step is recoverable by `git restore` rather than by transcript archaeology. Baseline for
   this run: `c89ee4f`, clean tree, 18 suites / 1119 tests green.
 
+### L5 — mutation-test from a file backup, never from `git restore`
+- cause: escalation
+- source: (pending human approval)
+- form: context
+- status: active
+- check: —
+- note: this run tripped L1 again in a milder form. Iterations 1 and 2 were committed before
+  mutating, iteration 3 was not, and the `git restore` between two mutations silently reverted
+  ~200 lines of uncommitted work back to the last commit — visible only as a test count that
+  dropped from 521 to 515. Committing first is necessary but not sufficient, because the loop
+  keeps producing uncommitted work between commits. The harness must `cp` the file to the
+  scratchpad and restore from THAT, so the restore is scoped to the mutation regardless of
+  what else is in flight.
+
+### L6 — pin the lines that CONNECT a tested rule to production
+- cause: gate-fail
+- source: (pending human approval)
+- form: gate3-item
+- status: active
+- check: "Wiring: for every pure rule added, is the call site that invokes it, and the impure
+  input that feeds it, pinned by something? A rule can be exhaustively unit-tested and still
+  be dead code."
+- note: three checker rounds each found the same class in a new place — the arming write-back,
+  `open()`'s baseline assignment, then `|| self.session_rotated()` and the `registered_session`
+  argument. Each mutated to a constant with the entire suite green. Well-covered code on both
+  sides of a seam is what HIDES the seam: the rule's tests pass because the rule is right, and
+  the call site's tests pass because nothing tests the call site.
+
+### L7 — do not assert a compiler constraint you have not compiled
+- cause: gate-fail
+- source: (pending human approval)
+- form: context
+- status: active
+- check: —
+- note: the same call site got two successive comments claiming a borrow error that does not
+  exist — first to justify a `RefCell`, then to justify a local binding. Both were disproved by
+  a checker simply writing the "impossible" form and building it. If a comment explains why the
+  obvious shape cannot work, compile the obvious shape first.
+
 ### L4 — a terminated subagent leaves its scaffolding behind
 - cause: gate-fail
 - source: human-approved
