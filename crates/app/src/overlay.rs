@@ -19,6 +19,7 @@
 //! rather than capped rings — so a re-point must rebuild them from the new tab's log
 //! instead of continuing the old tab's. [`Session`] is the value that makes that one act.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -95,9 +96,12 @@ pub struct AiMonitorOverlay {
     /// rotation check compares against. See [`OpenedOn`] and [`session_rotated_with`].
     ///
     /// Same lifecycle as `tab_has_claude`: re-decided on every `open()`, never merged.
-    /// `None` whenever either half is missing (no `claude` in this tab, or one that named
-    /// no session yet), which disables the check rather than guessing.
-    opened_on: Option<OpenedOn>,
+    /// `None` only when the tab has no `claude` at all; a `claude` that has not yet named a
+    /// session is `Some` with a `None` id, which the first valid record ARMS.
+    ///
+    /// `RefCell` for exactly that arming: it happens inside `session_rotated`, which is
+    /// `&self` because the call site reads `self.visible` in the same expression.
+    opened_on: RefCell<Option<OpenedOn>>,
 }
 
 impl AiMonitorOverlay {
@@ -127,7 +131,7 @@ impl AiMonitorOverlay {
             started_ms: now_ms(),
             context_window: None,
             tab_has_claude: false,
-            opened_on: None,
+            opened_on: RefCell::new(None),
             rivals: Arc::new(Mutex::new(ai_monitor::RivalSet::default())),
             refreshing: Arc::new(AtomicBool::new(false)),
         }
@@ -201,12 +205,16 @@ impl AiMonitorOverlay {
         // Requiring all three parts is what makes the check evidence-based rather than a
         // hunch, and it is also what makes it self-limiting: no id at open means no
         // rotation can be detected for this open, which is honest, cheap, and cannot storm.
-        self.opened_on = match (hint.pid, hint.started_ms, hint.session_id.clone()) {
-            (Some(pid), Some(process_start_ms), Some(session_id)) => Some(OpenedOn {
+        *self.opened_on.get_mut() = match (hint.pid, hint.started_ms) {
+            (Some(pid), Some(process_start_ms)) => Some(OpenedOn {
                 pid,
                 process_start_ms,
-                session_id,
+                // May be `None` — a `claude` younger than its first registry record, with no
+                // `--resume` in argv, names nothing yet. That is armable, not terminal.
+                session_id: hint.session_id.clone(),
             }),
+            // No `claude` under this tab, or no measurable start for one: there is no
+            // process to re-ask, so the check disables itself for this open.
             _ => None,
         };
         // The previous tab's session goes as ONE value, and it goes here — *above* the
@@ -309,18 +317,46 @@ impl AiMonitorOverlay {
     /// Has the tab's session been rotated under us? See [`session_rotated_with`], which
     /// holds the rule; this supplies the one impure input.
     ///
-    /// Runs on the metadata tick (`tabmeta::worker::TICK`, 500 ms) rather than on a
-    /// directory event, and that is required by the chosen behaviour, not incidental: the
-    /// gap between `/clear` and the replacement session's first written line is exactly
-    /// the window in which the project directory is SILENT, so an fs-event-driven check
-    /// would not fire until the new log already existed — the one moment the panel is
-    /// meant to stop showing the old numbers.
+    /// **The cadence, corrected.** An earlier draft of this comment said "the metadata tick,
+    /// 500 ms". That was wrong in both directions, and the right answer was already written
+    /// 20 lines below in `refresh_rivals`. The path is `OverlayPending` ->
+    /// `feed_agent_states` -> `notify_active_changed` -> here, and `OverlayPending` is *also*
+    /// the ai-monitor watcher's own wake — so while a session is writing this fires **per
+    /// append burst**, much hotter than 500 ms. Colder, too: the tabmeta worker wakes the
+    /// loop only when a `TabMeta` actually changed (`tabmeta::worker::publish_if_changed`),
+    /// so an idle tab produces no tick at all. There is no cadence here to lean on.
     ///
-    /// **Cost, stated plainly:** one read of a ~500-byte JSON file per tick, only while
-    /// the panel is open and only while `opened_on` is `Some`. No process listing, no
-    /// fork, nothing added to the closed-panel or no-`claude` paths.
+    /// **So why no debounce?** Because the read was measured rather than assumed:
+    /// `registered_session` costs **14 µs** warm (20k iterations, release, on the real
+    /// `~/.claude/sessions/` — a 429-byte mean record plus a `serde_json` parse). The wake it
+    /// rides on already runs `telemetry.snapshot()`, which deep-clones five rings and the
+    /// task map and sorts. A debounce would add a clock to a module whose approved design
+    /// (right-panel D2, pinned by `r7_4_the_loop_still_waits_and_the_panel_schedules_no_wake`)
+    /// says it schedules nothing against one — a real cost, to save 14 µs against an 8 ms
+    /// input-to-screen goal. The first draft added that clock. This is the correction.
+    ///
+    /// **Cost, stated plainly:** one 14 µs read per wake, only while the panel is open and
+    /// only while the tab has a `claude` to ask. A closed panel and a tab with no `claude`
+    /// add nothing at all — no read, no fork, no clock.
     fn session_rotated(&self) -> bool {
-        session_rotated_with(ai_monitor::registered_session, self.opened_on.as_ref())
+        // Scoped so the shared borrow is released before the `Arm` arm takes a mutable one.
+        let outcome = {
+            let baseline = self.opened_on.borrow();
+            session_rotated_with(ai_monitor::registered_session, baseline.as_ref())
+        };
+        match outcome {
+            Rotation::Rotated => true,
+            // Learning an id we never had is an arrival, not a rotation: record it and let
+            // this wake fall through to the rival refresh. The NEXT `/clear` then has a
+            // baseline to be measured against, which is the whole point of arming.
+            Rotation::Arm(id) => {
+                if let Some(prev) = self.opened_on.borrow_mut().as_mut() {
+                    prev.session_id = Some(id);
+                }
+                false
+            }
+            Rotation::None => false,
+        }
     }
 
     /// Re-enumerate the live rivals into the shared handle (D11/R6.2).
@@ -830,17 +866,38 @@ fn tick_action(tab_changed: bool, visible: bool, rotated: impl FnOnce() -> bool)
 /// The identity an `open()` was based on: the tab's `claude` process, and the session that
 /// process named at the time.
 ///
-/// Recorded so the panel can ask the SAME process the same question again on the metadata
-/// tick without re-running `hint_for` (which forks `/bin/ps`). All three fields are
-/// required — a pid alone is not an identity, because `~/.claude/sessions/` files outlive
-/// their processes and a recycled pid presents a stranger's record.
+/// Recorded so the panel can ask the SAME process the same question again without re-running
+/// `hint_for` (which forks `/bin/ps`). The pid is **not** an identity on its own —
+/// `~/.claude/sessions/` files outlive their processes, so a recycled pid presents a
+/// stranger's record — which is why `process_start_ms` rides with it and every re-read goes
+/// through [`ai_monitor::validated_session_id`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OpenedOn {
     pid: u32,
     /// The process start `hint_for` measured, i.e. what `validated_session_id` compares
     /// the re-read record against.
     process_start_ms: u64,
-    session_id: String,
+    /// The session that process named at open — the baseline a rotation is measured from.
+    ///
+    /// **`None` is armable, not terminal.** A `claude` measured 1.1-2.2s from start to its
+    /// first registry record can easily be younger than that when the panel opens, and with
+    /// no `--resume` in argv the hint then names no session at all. The first tick that
+    /// reads a valid record fills this in ([`Rotation::Arm`]) — *without* re-pointing,
+    /// because learning an id we never had is an arrival, not a rotation. Leaving it `None`
+    /// for the life of the open, as the first draft of this did, left such a panel
+    /// permanently blind to `/clear` while looking perfectly healthy.
+    session_id: Option<String>,
+}
+
+/// What a registry re-read means for the panel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Rotation {
+    /// Nothing to do: same session, no readable record, or a record we may not believe.
+    None,
+    /// We had no baseline and now have one. Record it; do **not** re-point.
+    Arm(String),
+    /// The tab's own process names a different session than the one on screen.
+    Rotated,
 }
 
 /// Has the tab's own process moved to a **different** session than this open was based on?
@@ -857,36 +914,43 @@ struct OpenedOn {
 /// being pulled to a *sibling's* session by mere file activity, and nothing here restores
 /// that. `refresh_rivals` keeps its attached early-return untouched.
 ///
-/// **Both sides must be known.** A record that cannot be read, or that fails
+/// **Failure means "no rotation".** A record that cannot be read, or that fails
 /// [`ai_monitor::validated_session_id`] against the process start recorded at open, answers
-/// `false` — the panel keeps what it has. Failing toward "no rotation" is the safe
-/// direction: the cost is the pre-existing bug for one tick, where the other direction
-/// would tear down a live attachment on a failed file read.
+/// [`Rotation::None`] — the panel keeps what it has. The cost of being wrong this way is the
+/// pre-existing bug for one more wake; the other direction tears down a live attachment on a
+/// transient file read.
 ///
-/// **A storm is structurally impossible**, and not by a guard. Both sides of the comparison
-/// come from one source (`~/.claude/sessions/<pid>.json`, through
-/// `ai_monitor::registered_session`), and `open()` rewrites `opened_on` from a fresh
-/// `hint_for` — so after a re-point the next tick compares the new id against itself. If
-/// that `hint_for` fails, `opened_on` becomes `None` and the check disables itself rather
-/// than re-firing.
+/// **On storms.** An earlier draft of this comment claimed a storm was *structurally
+/// impossible* because both sides of the comparison read one source. That was wrong, and the
+/// counter-example is worth keeping: `hint_for` fills `session_id` from
+/// `registered_id(..).or_else(|| table.resume_id(..))`, so under `claude --resume <id>` the
+/// baseline can come from **argv** while this check always reads the **registry**. If the
+/// registry read inside `open()` then fails transiently, the two disagree and a spurious
+/// re-point follows. What is true is weaker and sufficient: any disagreement converges in one
+/// iteration, because `open()` rewrites the baseline from whatever it resolved — so the cost is
+/// one spurious re-point, not a sustained storm.
 fn session_rotated_with(
     read: impl FnOnce(u32) -> Option<ai_monitor::Registered>,
     opened_on: Option<&OpenedOn>,
-) -> bool {
+) -> Rotation {
     let Some(prev) = opened_on else {
-        return false; // no claude, or one that named no session — nothing to compare
+        return Rotation::None; // no `claude` in this tab — nothing to ask
     };
     let Some(reg) = read(prev.pid) else {
-        return false; // no record right now; keep what is on screen
+        return Rotation::None; // no record right now; keep what is on screen
     };
     // The SAME guard our own id got at open (`tabsession::registered_id_with`) and every
     // rival's gets in `resolve_owned_session`. A stale file left by a dead process whose
     // pid has been reused would otherwise read as a rotation and re-point the panel onto a
     // stranger's session — the exact failure this feature exists to prevent, arrived at
     // from the other side.
-    match ai_monitor::validated_session_id(&reg, prev.process_start_ms) {
-        Some(current) => current != prev.session_id,
-        None => false,
+    let Some(current) = ai_monitor::validated_session_id(&reg, prev.process_start_ms) else {
+        return Rotation::None;
+    };
+    match prev.session_id.as_deref() {
+        Some(base) if base == current => Rotation::None,
+        Some(_) => Rotation::Rotated,
+        None => Rotation::Arm(current.to_string()),
     }
 }
 
@@ -1024,18 +1088,26 @@ impl Overlay for AiMonitorOverlay {
             // (R10.3) rather than continued, and the watcher is respawned wanting the id
             // the tab's process names *now*.
             //
-            // Routing a rotation through `open()` is also what gives the chosen gap
-            // behaviour for free. Between the `/clear` and the replacement session's first
-            // written line there is no file to resolve, so strict resolution answers
-            // `None`, nothing is backfilled and `latest` is cleared — the panel drops to
-            // the "has not written a log yet" empty state at once instead of holding
-            // numbers from a session that has ended, and the freshly-spawned watcher (now
-            // unattached) adopts the new log the moment it appears.
+            // Routing a rotation through `open()` also settles what the panel shows in the
+            // gap, and the honest answer is "usually there is no gap". Measured on the
+            // 88187 chain: `/clear` opens the successor log within ~5 ms and writes the
+            // `/clear` command into it as one of its first records — the marker lives at
+            // the START of the successor, not the end of the predecessor. So by the time
+            // this fires the new file almost always exists, strict resolution finds it, and
+            // the panel re-points straight onto it. When it does not, resolution answers
+            // `None`, nothing is backfilled and `latest` is cleared, so the panel shows the
+            // "has not written a log yet" empty state rather than a dead session's numbers,
+            // and the freshly-spawned watcher (now unattached) adopts the log when it lands.
+            //
+            // WHEN this fires is a separate question and is NOT established — see
+            // `session_rotated`. It depends on when `claude` rewrites its registry record
+            // after a `/clear`, which historical logs cannot show, because only the final
+            // state of `~/.claude/sessions/<pid>.json` survives.
             Tick::Reopen => self.open(cwd, shell_pid),
             // Same tab, same session: republish the rival set rather than re-opening. D6
-            // fires this after EVERY metadata sync, so this is the cadence D11 wants —
-            // and it is why the refresh must not re-run `open`, which would drop the
-            // watcher and re-run the full backfill (the storm `Repoint` exists to stop).
+            // fires this on every wake, which is the cadence D11 wants — and it is why the
+            // refresh must not re-run `open`, which would drop the watcher and re-run the
+            // full backfill (the storm `Repoint` exists to stop).
             Tick::RefreshRivals => self.refresh_rivals(shell_pid),
             Tick::Idle => {}
         }
@@ -1047,7 +1119,7 @@ mod tests {
     use super::{
         backfill_from_scratch, drain_to_newest, pane_cwd_with, proves_ownership,
         session_rotated_with, tick_action, AiMonitorOverlay, Attachment, OpenedOn, Repoint,
-        Session, Tick,
+        Rotation, Session, Tick,
     };
     use crate::seam::{AppCtx, AppRequest, Handled, KeyInput, Overlay, WriteProbe};
     use crate::tabsession;
@@ -2095,7 +2167,16 @@ mod tests {
         OpenedOn {
             pid: PID,
             process_start_ms: PROC_START,
-            session_id: session_id.to_string(),
+            session_id: Some(session_id.to_string()),
+        }
+    }
+
+    /// A panel that opened while its `claude` had not yet written a registry record.
+    fn opened_unnamed() -> OpenedOn {
+        OpenedOn {
+            pid: PID,
+            process_start_ms: PROC_START,
+            session_id: None,
         }
     }
 
@@ -2114,42 +2195,48 @@ mod tests {
         // process now names `d554e3c6`. Nothing about the tab changed — same cwd, same shell
         // pid, same `claude` — so nothing else in the app will ever ask again, and the panel
         // tails a file that is never appended to for the rest of the session.
-        assert!(
+        assert_eq!(
             session_rotated_with(
                 |pid| (pid == PID).then(|| record(AFTER, 1_500)),
                 Some(&opened_on(BEFORE))
             ),
-            "the process names a different session than this open was based on"
+            Rotation::Rotated
         );
     }
 
     #[test]
     fn the_same_session_is_not_a_rotation() {
-        // The inert case, and it is the one that runs 99.9% of the time — every 500 ms tick
-        // for the whole life of an open panel. It must not re-point, because `open()` drops
-        // the watcher, re-runs the full backfill and makes two 250 ms-budgeted `tmux` calls
-        // on the event-loop thread.
-        assert!(!session_rotated_with(
-            |_| Some(record(BEFORE, 1_500)),
-            Some(&opened_on(BEFORE))
-        ));
+        // The inert case, and it is the one that runs almost always — on every wake for the
+        // whole life of an open panel. It must not re-point, because `open()` drops the
+        // watcher, re-runs the full backfill and makes two 250 ms-budgeted `tmux` calls on
+        // the event-loop thread.
+        assert_eq!(
+            session_rotated_with(|_| Some(record(BEFORE, 1_500)), Some(&opened_on(BEFORE))),
+            Rotation::None
+        );
     }
 
     #[test]
-    fn recency_in_the_log_directory_is_not_evidence_of_rotation() {
-        // R6.3 / session-isolation D2 / rival-assignment D3, from the other side. A sibling
-        // tab writing a newer, larger log in the SAME project directory is exactly what the
-        // attach latch exists to ignore, and this feature must not smuggle it back in.
+    fn only_the_opened_on_pids_record_can_rotate_the_panel() {
+        // Authority is per-PROCESS, and this is the assertion that says so with content
+        // rather than with a comment. A sibling tab's `claude` (pid 42) has rotated to a
+        // different session; ours (pid 88187) has not. Reading "a claude" instead of "the
+        // claude this open resolved against" would re-point on the sibling's `/clear` —
+        // which is `ai-monitor-rival-assignment` D3 broken from a new direction.
         //
-        // The proof is structural and worth stating: `session_rotated_with` takes no
-        // directory, no path and no file list — there is no argument through which a rival's
-        // log could reach it. Its only input is what OUR process says about ITSELF. So the
-        // whole class is answered by the signature, and this asserts the consequence: with
-        // the registry unmoved, no amount of directory activity produces a re-point.
-        assert!(!session_rotated_with(
-            |_| Some(record(BEFORE, 1_500)),
-            Some(&opened_on(BEFORE))
-        ));
+        // The stronger statement is structural and holds for the whole class: the signature
+        // takes no directory, no path and no file list, so a rival's LOG cannot reach this
+        // rule through any argument at all. Only a rival's registry record could, and only
+        // by being read under the wrong pid — which is exactly what this pins.
+        let rivals_moved = |pid: u32| match pid {
+            42 => Some(record(AFTER, 1_500)),
+            _ => Some(record(BEFORE, 1_500)),
+        };
+        assert_eq!(
+            session_rotated_with(rivals_moved, Some(&opened_on(BEFORE))),
+            Rotation::None,
+            "the sibling rotated; we did not"
+        );
     }
 
     #[test]
@@ -2160,8 +2247,9 @@ mod tests {
         // very failure this feature exists to prevent, arrived at from the opposite
         // direction. `validated_session_id` is the one guard, shared with `tabsession` and
         // with the rival check, and it must be applied to the RE-read too, not only at open.
-        assert!(
-            !session_rotated_with(|_| Some(record(AFTER, -1)), Some(&opened_on(BEFORE))),
+        assert_eq!(
+            session_rotated_with(|_| Some(record(AFTER, -1)), Some(&opened_on(BEFORE))),
+            Rotation::None,
             "a record written before the process started cannot describe it"
         );
     }
@@ -2170,38 +2258,67 @@ mod tests {
     fn a_record_written_long_after_the_process_started_is_not_believed_either() {
         // The other half of the same guard: `REGISTRY_DRIFT_MS` is 60s, measured against
         // 1.3-2.2s in the field. A record an hour late is a stale file, not our process.
-        assert!(!session_rotated_with(
-            |_| Some(record(AFTER, 3_600_000)),
-            Some(&opened_on(BEFORE))
-        ));
+        assert_eq!(
+            session_rotated_with(|_| Some(record(AFTER, 3_600_000)), Some(&opened_on(BEFORE))),
+            Rotation::None
+        );
     }
 
     #[test]
     fn an_unreadable_record_keeps_what_is_on_screen() {
         // Fail toward "no rotation". The cost of being wrong this way is the pre-existing
-        // bug for one 500 ms tick; the cost of the other direction is tearing down a live
+        // bug for one more wake; the cost of the other direction is tearing down a live
         // attachment — blanking a panel someone is reading — on a transient file read.
-        assert!(!session_rotated_with(|_| None, Some(&opened_on(BEFORE))));
+        assert_eq!(
+            session_rotated_with(|_| None, Some(&opened_on(BEFORE))),
+            Rotation::None
+        );
     }
 
     #[test]
-    fn an_open_that_named_no_session_disables_the_check() {
-        // No `claude` in this tab, or one too young to have written a registry record. There
-        // is no baseline to compare against, so there is no evidence of anything — and a
-        // check that fired here would be guessing. `open()` clears `opened_on` on every
-        // re-point precisely so a previous tab's id cannot linger and be compared against a
-        // new tab's process.
-        assert!(!session_rotated_with(
-            |_| panic!("must not read a registry record with no baseline to compare it to"),
-            None
-        ));
+    fn a_tab_with_no_claude_never_reads_a_record() {
+        // Nothing to ask. `open()` clears the baseline on every re-point precisely so a
+        // previous tab's id cannot linger and be compared against a new tab's process.
+        assert_eq!(
+            session_rotated_with(
+                |_| panic!("must not read a record with no process to ask"),
+                None
+            ),
+            Rotation::None
+        );
+    }
+
+    #[test]
+    fn a_panel_opened_before_its_session_was_named_arms_instead_of_re_pointing() {
+        // REGRESSION, and it was silent. A `claude` takes 1.1-2.2s to write its registry
+        // record; open the panel inside that window with no `--resume` in argv and the hint
+        // names no session. The first draft left the baseline `None` for the life of the
+        // open and nothing re-armed it — tier-2 dating still attached the right log, so the
+        // panel looked perfectly healthy while being permanently blind to `/clear`.
+        //
+        // Arming must NOT re-point: learning an id we never had is an arrival, and
+        // re-opening here would drop a live watcher and re-run a full backfill for nothing.
+        assert_eq!(
+            session_rotated_with(|_| Some(record(BEFORE, 1_500)), Some(&opened_unnamed())),
+            Rotation::Arm(BEFORE.to_string()),
+            "record the id; do not re-point on it"
+        );
+    }
+
+    #[test]
+    fn arming_still_refuses_a_record_it_may_not_believe() {
+        // The pid-reuse guard is not skipped just because we have no baseline to lose.
+        // Arming from a stranger's record would plant a false baseline that then makes the
+        // tab's own real session look like a rotation.
+        assert_eq!(
+            session_rotated_with(|_| Some(record(AFTER, -1)), Some(&opened_unnamed())),
+            Rotation::None
+        );
     }
 
     #[test]
     fn the_record_is_read_for_the_pid_the_panel_opened_on() {
         // Not "some claude", not "the newest claude" — the one this open resolved against.
-        // Reading a different pid would compare our session id against another process's
-        // and re-point on every tick.
         let asked = std::cell::Cell::new(None);
         let _ = session_rotated_with(
             |pid| {
@@ -2222,7 +2339,7 @@ mod tests {
 
     #[test]
     fn no_rotation_falls_through_to_the_rival_refresh() {
-        // The rotation check is ADDITIVE: it must not displace D11's per-tick republish,
+        // The rotation check is ADDITIVE: it must not displace D11's per-wake republish,
         // which is what keeps rival membership live during an unattached open.
         assert_eq!(tick_action(false, true, || false), Tick::RefreshRivals);
     }
@@ -2231,7 +2348,7 @@ mod tests {
     fn a_tab_change_outranks_the_rotation_check_and_never_asks_it() {
         // Ordering, and the file read it saves. A tab switch re-opens regardless, and
         // `open()` re-reads the hint from scratch — so asking here would be a wasted read
-        // whose answer is discarded, on the event-loop thread, after every metadata sync.
+        // whose answer is discarded, on the event-loop thread, after every wake.
         assert_eq!(
             tick_action(true, true, || panic!(
                 "a tab change must not consult the registry"
@@ -2243,8 +2360,8 @@ mod tests {
     #[test]
     fn a_closed_panel_never_reads_the_registry() {
         // The cost claim, pinned. Nothing is on screen to be stale, so a closed panel must
-        // add exactly zero I/O to the 500 ms metadata tick — which fires for the whole life
-        // of the process whether or not anyone has ever pressed Cmd+Shift+M.
+        // add exactly zero I/O to a wake — and wakes arrive for the whole life of the
+        // process whether or not anyone has ever pressed Cmd+Shift+M.
         assert_eq!(
             tick_action(false, false, || panic!(
                 "a closed panel must not read anything"

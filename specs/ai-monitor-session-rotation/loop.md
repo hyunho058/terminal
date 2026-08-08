@@ -11,15 +11,21 @@ retired file forever.
 one `claude` process, pid 88187):
 
 ```
-a3dc815b  /clear=0  06:03:20 -> 06:31:47   <- the session at process start
-fc326d50  /clear=1  06:31:54 -> 06:32:20
-3150bf9c  /clear=1  06:32:28 -> 06:32:48
-d554e3c6  /clear=1  06:32:54 -> 06:33:26
+a3dc815b  06:03:20.527 -> 06:31:47.313   <- the session at process start
+fc326d50  06:31:54.833 -> 06:32:20.813   <- /clear at index 3 of THIS file
+3150bf9c  06:32:28.016 -> 06:32:48.218   <- /clear at index 3
+d554e3c6  06:32:54.034 -> 06:33:26.853   <- /clear at index 3
 ```
 
-Each file's LAST record is the `/clear`; a new `<uuid>.jsonl` opens immediately after. The
-old file is abandoned, never truncated or reused — so nothing in the tail path fires and
-the panel's "last event" clock stops with it.
+A new `<uuid>.jsonl` opens and the old one is abandoned — never truncated or reused — so
+nothing in the tail path fires and the panel's "last event" clock stops with it.
+
+> **Corrected in iteration 2.** The first draft of this contract said "each file's LAST
+> record is the `/clear`". Wrong: the marker lands at **index 3 of the SUCCESSOR**, ~5 ms
+> after the rotation, not at the end of the predecessor. The diagnosis is unaffected, but the
+> corrected timing matters — the replacement log almost always **already exists** by the time
+> a re-point runs, so the "gap" this contract asked the user to choose behaviour for is
+> milliseconds, not seconds, and the empty state will rarely be seen.
 
 **Root cause** — attachment is latched, deliberately, on both sides:
 
@@ -132,6 +138,29 @@ the overlay's attached-path check, tests for all of it, doc/comment corrections,
 
 ## Exit criteria
 Every gate passes and the Evidence Report is emitted. A 🛑 boundary ends the loop in escalation.
+
+## Measured facts (iteration 2)
+
+Recorded so later work argues with numbers rather than with adjectives.
+
+| Fact | Value | How |
+|------|-------|-----|
+| `registered_session` cost | **14 µs** warm | 20k iterations, release, real `~/.claude/sessions/` |
+| registry record size | 429 B mean | the 8 live records |
+| successor log appears after `/clear` | **~5 ms** | 88187 chain, `/clear` at index 3 of the successor |
+| wake path cadence | **no floor, no ceiling** | `OverlayPending` fires per append burst; `tabmeta::worker::publish_if_changed` wakes only on a *changed* `TabMeta`, so an idle tab produces none |
+| registry rotation latency | **UNMEASURED** | historical logs cannot show it — only the final state of `~/.claude/sessions/<pid>.json` survives. Measure with `fswatch` on the registry file + project dir across one live `/clear`. |
+
+## Known gaps (accurate, not exhaustive-by-assumption)
+
+1. **`claude` restarted in the same tab** — different pid, and `Repoint::changed` keys on
+   (cwd, shell_pid), which a restart leaves untouched. A cached-pid check cannot see it.
+2. **Two `claude` under one tab** — `tabsession::find_claude` BFS-picks one; a `/clear` in
+   the other is invisible.
+3. **When the re-point fires is not established.** The signal is correct; its promptness is
+   not measured. See the table above.
+4. Covered, and worth naming because it was not designed for: an in-session `/resume` rotates
+   the session id **within one pid**, so it is followed by the same mechanism.
 
 ## Lessons
 
