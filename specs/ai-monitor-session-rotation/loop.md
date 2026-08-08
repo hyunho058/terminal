@@ -149,7 +149,8 @@ Recorded so later work argues with numbers rather than with adjectives.
 | registry record size | 429 B mean | the 8 live records |
 | successor log appears after `/clear` | **~5 ms** | 88187 chain, `/clear` at index 3 of the successor |
 | wake path cadence | **no floor, no ceiling** | `OverlayPending` fires per append burst; `tabmeta::worker::publish_if_changed` wakes only on a *changed* `TabMeta`, so an idle tab produces none |
-| registry rotation latency | **UNMEASURED** | historical logs cannot show it — only the final state of `~/.claude/sessions/<pid>.json` survives. Measure with `fswatch` on the registry file + project dir across one live `/clear`. |
+| registry rotation latency | **the registry LEADS the new log by 120 ms** | caught live on a real `/clear` (pid 50936, 2026-08-08): old log last write `12:15:16.343`, registry rewritten `12:15:20.677` naming the new session, new log created `12:15:20.797`. One sample, but it settles the direction: the answer is already correct before there is a file to attach to. |
+| wake availability after `/clear` | **none, until iteration 5** | the terminal is quiet; the attached watcher dropped sibling-file events; `publish_if_changed` wakes only on a changed `TabMeta`. The signal was prompt and correct and nothing read it. |
 
 ## Known gaps (accurate, not exhaustive-by-assumption)
 
@@ -159,8 +160,12 @@ Recorded so later work argues with numbers rather than with adjectives.
    still names the old session — so the check answers "no rotation" with apparent confidence.
 2. **Two `claude` under one tab** — `tabsession::find_claude` BFS-picks one; a `/clear` in
    the other is invisible.
-3. **When the re-point fires is not established.** The signal is correct; its promptness is
-   not measured. See the table above.
+3. ~~**When the re-point fires is not established.**~~ **Measured** (see the table): the
+   registry leads the new log by 120 ms, so the answer is ready before the replacement exists.
+   What was missing was not promptness but a *wake* — fixed in iteration 5 by letting a
+   sibling `.jsonl` event wake the caller without being adopted. Left visible rather than
+   deleted: this gap was recorded as "unmeasured" for four iterations while being the reason
+   the user's first two tests failed.
 4. **Arming does not update `Watch.want`.** A panel opened before its session was named arms
    its baseline but keeps resolving on the weaker tier-2 dating path for the rest of that
    open. This follows from "arming must not re-point" rather than from an oversight; the next

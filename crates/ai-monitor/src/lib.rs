@@ -917,6 +917,38 @@ impl LogWatcher {
             let Some(target) = target.clone() else { return };
             let name = target.file_name();
             if !switched && !ev.paths.iter().any(|p| p.file_name() == name) {
+                // Not our file — so we read nothing, exactly as before. But a DIFFERENT
+                // `.jsonl` stirring in this project directory is what a `/clear` looks like
+                // from in here: the session was rotated, a new log opened beside ours, and
+                // ours will never be appended to again.
+                //
+                // We are the only thing watching this directory, and while attached this
+                // branch was the one event that mattered and the one event we dropped. The
+                // caller re-checks which session its process is running on any wake — and
+                // measured on a live rotation, the process rewrites that answer 120 ms
+                // BEFORE the new log is created, so by the time this fires the answer is
+                // already correct. Without the wake it had nothing to fire on: the terminal
+                // is quiet after a `/clear`, and the tab-metadata worker only wakes the loop
+                // when a `TabMeta` actually changed — so the panel sat on a dead session
+                // until the user happened to do something else. Reported from a real run.
+                //
+                // A WAKE, not an update: no snapshot is sent, no file is read, and the
+                // attachment rule is untouched (R6.3 — a sibling's log is still never
+                // adopted here). Deciding what the wake means is the caller's job, and it
+                // has the process-tree knowledge to decide it; this crate does not.
+                //
+                // Cost: one wake per append burst of any OTHER session in the same project
+                // directory. That is the same rate this callback already wakes at for our
+                // own file, and the caller's response is a ~14 µs read; a sibling streaming
+                // in the same project also means the machine is not idle, which is what G1
+                // actually cares about.
+                if ev
+                    .paths
+                    .iter()
+                    .any(|p| p.extension().is_some_and(|e| e == "jsonl"))
+                {
+                    wake();
+                }
                 return;
             }
             // Read everything past our offset; parse whole lines, buffer a partial.
@@ -2813,6 +2845,83 @@ mod tests {
         }
         if let Some(s) = after {
             assert_eq!(s.snap.total_output, 7, "frozen on b — c never adopted");
+        }
+    }
+
+    #[test]
+    fn a_sibling_log_appearing_wakes_the_caller_without_being_adopted() {
+        // `/clear` rotates the session: a NEW log opens beside ours in the same project
+        // directory and ours is never appended to again. From in here that is the only
+        // observable event, and while attached this callback used to drop it — read nothing,
+        // send nothing, wake nothing. The caller then had nothing to notice the rotation on,
+        // because after a `/clear` the terminal is quiet and the tab-metadata worker only
+        // wakes the loop when a `TabMeta` actually changed. Measured on a real run: the panel
+        // sat on the dead session until the user happened to run something else.
+        //
+        // BOTH halves are asserted, and the second is the one R6.3 cares about: the wake
+        // fires, AND no snapshot is sent — the sibling is not adopted, not folded, not read.
+        use std::io::Write;
+        use std::time::Duration;
+
+        let dir = temp_dir("sibling-wake");
+        let ours = dir.join("ours.jsonl");
+        std::fs::write(
+            &ours,
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-08-08T19:00:00.000Z\",\"requestId\":\"a\",\"message\":{\"id\":\"a\",\"usage\":{\"output_tokens\":3}}}\n",
+        )
+        .unwrap();
+        let (t, off) = backfill_telemetry(&ours);
+
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = wakes.clone();
+        let w = LogWatcher::spawn(
+            Watch {
+                dir: dir.clone(),
+                log: Some(ours.clone()),
+                // Attached from the start: this is the state the drop happened in.
+                want: Wanted {
+                    session_id: Some("ours".into()),
+                    since_ms: None,
+                },
+                owned: true,
+                rivals: no_rivals(),
+                attached: Arc::new(AtomicBool::new(true)),
+            },
+            t,
+            off,
+            move || {
+                counter.fetch_add(1, Ordering::Release);
+            },
+        )
+        .expect("spawn");
+
+        // The rotation: a new session's log opens beside ours.
+        let rotated = dir.join("rotated.jsonl");
+        let mut f = std::fs::File::create(&rotated).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","timestamp":"2026-08-08T19:00:20.000Z","requestId":"b","message":{{"id":"b","usage":{{"output_tokens":900}}}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while wakes.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            wakes.load(Ordering::Acquire) > 0,
+            "a sibling log appearing must wake the caller, or a /clear is invisible"
+        );
+
+        // ...and nothing was adopted. `recv_timeout` rather than `try_recv`: a snapshot sent
+        // a moment late would still be a violation, and this must not pass by racing it.
+        match w.rx.recv_timeout(Duration::from_millis(300)) {
+            Err(_) => {}
+            Ok(u) => panic!(
+                "attached: the sibling must never be folded (total_output={})",
+                u.snap.total_output
+            ),
         }
     }
 
