@@ -826,7 +826,18 @@ pub fn context_pct(t: &TelemetrySnapshot, env: &Env) -> Option<u64> {
         Some(w) => w,
         // Assumed from the id, then corrected by measurement. The correction is inert
         // unless the session has itself proved the assumption wrong.
-        None => promoted_window(context_window(t.model.as_deref()?)?, t.context_used),
+        //
+        // Measured against the session HIGH-WATER, never the current reading. The window
+        // is a property of the session; occupancy is a property of the newest turn, and
+        // occupancy falls — a `/compact` took a real session from 517,389 to 53,268. Read
+        // against `context_used` the deduction is amnesiac: it would re-derive a 200k
+        // window from the smaller number and report 27% of a window that session had
+        // already proven it was not on. Evidence of a window's size cannot expire with
+        // the reading that produced it, because a window does not shrink mid-session.
+        None => promoted_window(
+            context_window(t.model.as_deref()?)?,
+            t.context_high_water.max(t.context_used),
+        ),
     };
     if window == 0 {
         return None;
@@ -2538,6 +2549,40 @@ mod tests {
             tile.gauge,
             Some(0.51),
             "and a gauge that is half full, not full"
+        );
+    }
+
+    #[test]
+    fn the_deduced_window_survives_a_compact_that_drops_occupancy() {
+        // The amnesia case, from real logs: a `/compact` took one session from 517,389
+        // tokens of context to 53,268 between two adjacent turns. Read against the
+        // CURRENT occupancy the deduction forgets — 53,268 fits 200k, so the window
+        // silently reverts and the panel reports 27% of a window the session has already
+        // proved it is not on. The high-water is what makes the deduction a property of
+        // the session rather than of the newest line.
+        let (mut t, now) = populated();
+        t.context_used = 517_389;
+        t.context_high_water = 517_389;
+        assert_eq!(tile_of(&model(Some(&t), &env(now)), "CONTEXT").value, "52%");
+
+        // ... then the compact lands. Occupancy really did fall — the gauge must follow
+        // it down — but the DENOMINATOR must not.
+        t.context_used = 53_268;
+        assert_eq!(
+            tile_of(&model(Some(&t), &env(now)), "CONTEXT").value,
+            "5%",
+            "5% of the proven 1M window, not 27% of a window it outgrew"
+        );
+
+        // And the evidence is the high-water alone: a session that never exceeded 200k
+        // is untouched by any of this.
+        let (mut u, _) = populated();
+        u.context_used = 53_268;
+        u.context_high_water = 53_268;
+        assert_eq!(
+            tile_of(&model(Some(&u), &env(now)), "CONTEXT").value,
+            "27%",
+            "no evidence of a bigger window, so the table's 200k stands"
         );
     }
 

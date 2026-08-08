@@ -956,6 +956,14 @@ fn assistant(id: &str, model: &str) -> String {
     )
 }
 
+/// One assistant line carrying usage. `cache_read + input` is what the crate sums into
+/// `context_used`, which is the occupancy a real turn reports.
+fn assistant_usage(id: &str, cache_read: u64, input: u64) -> String {
+    format!(
+        r#"{{"type":"assistant","requestId":"{id}","message":{{"id":"{id}","model":"claude-opus-5","usage":{{"input_tokens":{input},"cache_read_input_tokens":{cache_read},"output_tokens":1}}}}}}"#
+    )
+}
+
 #[test]
 fn a_mid_session_model_switch_reaches_the_snapshot() {
     // The real-log repro (`64c00dbb`): the session ran `claude-fable-5`, the user ran
@@ -1058,4 +1066,36 @@ fn the_session_id_keeps_its_first_wins_rule() {
         Some("claude-fable-5"),
         "last-wins holds"
     );
+}
+
+#[test]
+fn the_context_high_water_is_monotone_while_the_gauge_follows_occupancy_down() {
+    // The gauge and the high-water answer different questions and must diverge when
+    // occupancy falls. `context_used` is "how full is the window now" and legitimately
+    // drops (a `/compact`); `context_high_water` is "how big has the window been proven
+    // to be", and a window does not shrink mid-session, so it never falls.
+    let s = fold(&format!(
+        "{}\n{}",
+        assistant_usage("m1", 500_000, 17_389),
+        assistant_usage("m2", 50_000, 3_268),
+    ));
+    assert_eq!(s.context_used, 53_268, "the gauge follows the newest turn");
+    assert_eq!(
+        s.context_high_water, 517_389,
+        "the evidence of the window's size does not expire with the reading"
+    );
+
+    // Rising is the ordinary case and must still track.
+    let s = fold(&format!(
+        "{}\n{}",
+        assistant_usage("m1", 50_000, 3_268),
+        assistant_usage("m2", 500_000, 17_389),
+    ));
+    assert_eq!(s.context_used, 517_389);
+    assert_eq!(s.context_high_water, 517_389);
+
+    // A session that never grew leaves the two equal — the high-water asserts nothing
+    // extra, so it can never inflate a window on its own.
+    let s = fold(&assistant_usage("m1", 50_000, 3_268));
+    assert_eq!(s.context_used, s.context_high_water);
 }

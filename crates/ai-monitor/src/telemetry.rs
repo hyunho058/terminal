@@ -178,6 +178,13 @@ pub struct TelemetrySnapshot {
     pub total_cache_creation: u64,
     // ... and a latest-value occupancy gauge, which is a different quantity
     pub context_used: u64,
+    /// The largest `context_used` this session has ever reported — monotone, never reset.
+    ///
+    /// The gauge above answers "how full is the window now"; this answers "how big has the
+    /// window been PROVEN to be". They diverge whenever occupancy falls (a `/compact`), and
+    /// the app needs the second to pick a denominator: a window cannot shrink mid-session,
+    /// so evidence of its size must not expire with the reading that produced it.
+    pub context_high_water: u64,
     // time (D3) — the app derives uptime/idle from these
     pub first_event_ms: Option<u64>,
     pub last_event_ms: Option<u64>,
@@ -249,6 +256,7 @@ pub struct SessionTelemetry {
     total_cache_read: u64,
     total_cache_creation: u64,
     context_used: u64,
+    context_high_water: u64,
     first_event_ms: Option<u64>,
     last_event_ms: Option<u64>,
 
@@ -391,6 +399,7 @@ impl SessionTelemetry {
             total_cache_read: self.total_cache_read,
             total_cache_creation: self.total_cache_creation,
             context_used: self.context_used,
+            context_high_water: self.context_high_water,
             first_event_ms: self.first_event_ms,
             last_event_ms: self.last_event_ms,
             tools: self.tools.iter().cloned().collect(),
@@ -508,7 +517,20 @@ impl SessionTelemetry {
         // because cache-read is re-billed in full every turn. Set unconditionally —
         // a guard on `> 0` would leave a stale gauge standing when the newest usage
         // genuinely reports zero context.
-        self.context_used = inp.saturating_add(cr).saturating_add(cc);
+        let used = inp.saturating_add(cr).saturating_add(cc);
+        self.context_used = used;
+        // ... but the HIGH-WATER is a monotone session fact, and it is a different
+        // question from the gauge. `context_used` answers "how full is the window now";
+        // this answers "how big has the window been proven to be". A context window does
+        // not shrink mid-session, so evidence of its size cannot expire — whereas the
+        // gauge legitimately falls (a `/compact` drops it by an order of magnitude).
+        //
+        // Without this the app's window deduction is amnesiac: measured on real logs, a
+        // `/compact` took one session from 517,389 to 53,268, and the panel re-derived a
+        // 200k window from the smaller number — reporting 27% of a window the session had
+        // already proven it was not on. Keeping the maximum is what makes the deduction a
+        // property of the session rather than of the newest line.
+        self.context_high_water = self.context_high_water.max(used);
     }
 
     // ---- tool correlation (D5, D7, D8, D9) ------------------------------------
