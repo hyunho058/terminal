@@ -776,6 +776,35 @@ pub struct LogWatcher {
 ///
 /// A struct rather than five parameters: they are one decision — *which* session this
 /// watch is for — and passing them separately invites a call site that gets the
+/// Does this event concern a `.jsonl` in **our** project directory?
+///
+/// The scope half of the sibling-wake rule (see its call site). Extracted because both of
+/// its conditions are traps that a passing test suite hid:
+///
+/// * **Scope is load-bearing, not tidiness.** When the project directory does not exist at
+///   open, the watch falls back to the projects ROOT, *recursively*, for the life of the
+///   open — so this callback sees every write of every session in every project. That
+///   fallback's cost is justified by "it stops the moment the caller attaches", which is true
+///   of re-resolution and false of a wake, because the wake fires precisely while attached.
+///   Unscoped, one panel opened before its project directory existed would wake the event
+///   loop on unrelated traffic forever.
+/// * **Matching by NAME, not by prefix.** `p.starts_with(dir)` was the first spelling and was
+///   silently wrong: FSEvents reports CANONICAL paths, so a directory reached through a
+///   symlink arrives as `/private/var/...` while `dir` reads `/var/...` and the prefix test
+///   rejects the very event it exists to admit. Project directory names are encoded absolute
+///   cwds (`-Users-me-Projects-thing`), unique among the root's children and identical under
+///   either spelling — so with the fallback watch rooted one level up, matching the name IS
+///   matching the directory.
+fn touches_project_log(paths: &[PathBuf], dir: &Path) -> bool {
+    let Some(ours) = dir.file_name() else {
+        return false;
+    };
+    paths.iter().any(|p| {
+        p.extension().is_some_and(|e| e == "jsonl")
+            && p.parent().and_then(Path::file_name) == Some(ours)
+    })
+}
+
 /// pairing wrong.
 pub struct Watch {
     /// The project directory to watch.
@@ -937,16 +966,34 @@ impl LogWatcher {
                 // adopted here). Deciding what the wake means is the caller's job, and it
                 // has the process-tree knowledge to decide it; this crate does not.
                 //
-                // Cost: one wake per append burst of any OTHER session in the same project
-                // directory. That is the same rate this callback already wakes at for our
-                // own file, and the caller's response is a ~14 µs read; a sibling streaming
-                // in the same project also means the machine is not idle, which is what G1
-                // actually cares about.
-                if ev
-                    .paths
-                    .iter()
-                    .any(|p| p.extension().is_some_and(|e| e == "jsonl"))
-                {
+                // SCOPED TO `dir`, and that is load-bearing rather than tidiness. When the
+                // project directory does not exist at open, the watch above falls back to
+                // the projects ROOT, recursively — so this callback sees every write of
+                // every session in every project on the machine. The fallback's own comment
+                // justifies that cost with "it stops the moment the caller attaches", which
+                // is true of the re-resolution above and false of a wake down here: this
+                // branch runs *while* attached, for the life of the open. Unfiltered, one
+                // panel opened before its project directory existed would wake the event
+                // loop on every other project's traffic, forever — the idle-CPU debt G1
+                // exists to keep out. Our own rotation lands inside `dir`, so the filter
+                // costs the feature nothing.
+                //
+                // Cost with the filter: one wake per append burst of any OTHER session in
+                // THIS project directory. That is the rate this callback already wakes at
+                // for our own file, and the caller's response is a ~14 µs read; a sibling
+                // streaming in the same project also means the machine is not idle.
+                //
+                // Matched on the parent's NAME rather than `p.starts_with(&dir)`, which was
+                // the first spelling and was silently wrong. FSEvents reports CANONICAL
+                // paths: on this machine a temp dir arrives as `/private/var/...` while the
+                // same `dir` reads `/var/...`, so `starts_with` rejected the very event it
+                // was written to admit — the feature would have been dead behind any symlink
+                // in the path, with nothing to indicate it. Project directory names are
+                // encoded absolute cwds (`-Users-me-Projects-thing`), so they are unique
+                // among the root's children and identical under both spellings; with the
+                // fallback watch rooted one level up, matching the name IS matching the
+                // directory.
+                if touches_project_log(&ev.paths, &dir) {
                     wake();
                 }
                 return;
@@ -2846,6 +2893,60 @@ mod tests {
         if let Some(s) = after {
             assert_eq!(s.snap.total_output, 7, "frozen on b — c never adopted");
         }
+    }
+
+    #[test]
+    fn only_a_log_in_our_own_project_directory_is_worth_a_wake() {
+        // F1, and the suite could not see it: deleting the whole scope check left all 66
+        // tests green. The end-to-end sibling-wake test below cannot catch it either — it
+        // watches one directory, so there is no foreign traffic for a filter to reject.
+        let ours = Path::new("/Users/me/.claude/projects/-Users-me-Projects-thing");
+
+        assert!(
+            touches_project_log(&[ours.join("abc.jsonl")], ours),
+            "our own project's log is the whole point"
+        );
+        assert!(
+            !touches_project_log(
+                &[
+                    Path::new("/Users/me/.claude/projects/-Users-me-Projects-other/x.jsonl")
+                        .to_path_buf()
+                ],
+                ours
+            ),
+            "ANOTHER project's log must not wake us — under the recursive projects-root \
+             fallback this is every session on the machine, forever, while attached"
+        );
+        assert!(
+            !touches_project_log(&[ours.join("notes.md")], ours),
+            "only session logs"
+        );
+        assert!(!touches_project_log(&[], ours), "an event naming nothing");
+        assert!(
+            !touches_project_log(&[PathBuf::from("bare.jsonl")], ours),
+            "a path with no parent cannot be shown to be ours"
+        );
+    }
+
+    #[test]
+    fn the_scope_check_survives_the_canonical_path_fsevents_reports() {
+        // THE trap this predicate was rewritten for. FSEvents reports canonical paths, so a
+        // directory reached through a symlink comes back spelled differently than the `dir`
+        // we hold — on macOS every temp dir does exactly this (`/var/...` vs
+        // `/private/var/...`). The first spelling used `p.starts_with(dir)` and therefore
+        // rejected our OWN rotation, which would have left the feature dead behind any
+        // symlink in the path with nothing to indicate it.
+        let held = Path::new("/var/folders/xm/T/-Users-me-Projects-thing");
+        let reported = Path::new("/private/var/folders/xm/T/-Users-me-Projects-thing/a.jsonl");
+
+        assert!(
+            touches_project_log(&[reported.to_path_buf()], held),
+            "same directory, different spelling — must still be ours"
+        );
+        assert!(
+            !reported.starts_with(held),
+            "premise: the prefix test really does fail here, which is why it was replaced"
+        );
     }
 
     #[test]

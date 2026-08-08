@@ -208,8 +208,18 @@ impl AiMonitorOverlay {
         // and re-point on every wake.
         self.opened_on = baseline_from(&hint);
         // Whatever a worker observed before this open is now answered by this open itself.
-        // Leaving it set would re-point once more, immediately, for nothing.
-        self.claude_appeared.store(false, Ordering::Relaxed);
+        //
+        // A FRESH ALLOCATION, not `store(false)`, and for exactly the reason
+        // `Session::repoint` gives for `attached_flag`: a `refresh_rivals` worker spawned by
+        // the previous open may still be inside `hint_for` (which forks `/bin/ps` and can sit
+        // 250 ms in `resolved_root`), and it holds a clone of whatever `Arc` was current when
+        // it started. Clearing in place leaves that worker writing into THIS open's decision —
+        // tab A's worker finding tab A's `claude` and telling tab B's unarmed panel that one
+        // appeared, which costs a spurious full re-point: another fork, two 250 ms-budgeted
+        // tmux waits on the event-loop thread, a watcher respawn and a whole backfill.
+        // Re-allocating orphans the in-flight writer instead, so its answer lands somewhere
+        // nothing reads.
+        self.claude_appeared = Arc::new(AtomicBool::new(false));
         // The previous tab's session goes as ONE value, and it goes here — *above* the
         // `project_dir` branch, so a tab that resolves no log still clears it. That
         // placement is what makes the worst case survivable: re-pointing to a tab with no
@@ -2626,6 +2636,16 @@ mod tests {
         assert!(
             production.contains("session_rotated_with(ai_monitor::registered_session,"),
             "and it must ask the real registry, not a stub"
+        );
+        // A CONCURRENCY fence, unreachable from a unit for the same reason: proving it needs
+        // an in-flight `refresh_rivals` worker, which needs a live process tree. The hazard
+        // is the one `Session::repoint` documents for `attached_flag` — a worker from the
+        // previous open still holds its clone, so clearing in place lets tab A's answer land
+        // in tab B's decision. Re-allocating orphans the writer; `store(false)` does not, and
+        // that mutation passes all 528 tests.
+        assert!(
+            production.contains("self.claude_appeared = Arc::new(AtomicBool::new(false));"),
+            "a re-point must ORPHAN an in-flight worker's flag, not clear it in place"
         );
     }
 
