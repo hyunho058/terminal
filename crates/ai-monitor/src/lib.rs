@@ -776,6 +776,35 @@ pub struct LogWatcher {
 ///
 /// A struct rather than five parameters: they are one decision — *which* session this
 /// watch is for — and passing them separately invites a call site that gets the
+/// Does this event concern a `.jsonl` in **our** project directory?
+///
+/// The scope half of the sibling-wake rule (see its call site). Extracted because both of
+/// its conditions are traps that a passing test suite hid:
+///
+/// * **Scope is load-bearing, not tidiness.** When the project directory does not exist at
+///   open, the watch falls back to the projects ROOT, *recursively*, for the life of the
+///   open — so this callback sees every write of every session in every project. That
+///   fallback's cost is justified by "it stops the moment the caller attaches", which is true
+///   of re-resolution and false of a wake, because the wake fires precisely while attached.
+///   Unscoped, one panel opened before its project directory existed would wake the event
+///   loop on unrelated traffic forever.
+/// * **Matching by NAME, not by prefix.** `p.starts_with(dir)` was the first spelling and was
+///   silently wrong: FSEvents reports CANONICAL paths, so a directory reached through a
+///   symlink arrives as `/private/var/...` while `dir` reads `/var/...` and the prefix test
+///   rejects the very event it exists to admit. Project directory names are encoded absolute
+///   cwds (`-Users-me-Projects-thing`), unique among the root's children and identical under
+///   either spelling — so with the fallback watch rooted one level up, matching the name IS
+///   matching the directory.
+fn touches_project_log(paths: &[PathBuf], dir: &Path) -> bool {
+    let Some(ours) = dir.file_name() else {
+        return false;
+    };
+    paths.iter().any(|p| {
+        p.extension().is_some_and(|e| e == "jsonl")
+            && p.parent().and_then(Path::file_name) == Some(ours)
+    })
+}
+
 /// pairing wrong.
 pub struct Watch {
     /// The project directory to watch.
@@ -917,6 +946,56 @@ impl LogWatcher {
             let Some(target) = target.clone() else { return };
             let name = target.file_name();
             if !switched && !ev.paths.iter().any(|p| p.file_name() == name) {
+                // Not our file — so we read nothing, exactly as before. But a DIFFERENT
+                // `.jsonl` stirring in this project directory is what a `/clear` looks like
+                // from in here: the session was rotated, a new log opened beside ours, and
+                // ours will never be appended to again.
+                //
+                // We are the only thing watching this directory, and while attached this
+                // branch was the one event that mattered and the one event we dropped. The
+                // caller re-checks which session its process is running on any wake — and
+                // measured on a live rotation, the process rewrites that answer 120 ms
+                // BEFORE the new log is created, so by the time this fires the answer is
+                // already correct. Without the wake it had nothing to fire on: the terminal
+                // is quiet after a `/clear`, and the tab-metadata worker only wakes the loop
+                // when a `TabMeta` actually changed — so the panel sat on a dead session
+                // until the user happened to do something else. Reported from a real run.
+                //
+                // A WAKE, not an update: no snapshot is sent, no file is read, and the
+                // attachment rule is untouched (R6.3 — a sibling's log is still never
+                // adopted here). Deciding what the wake means is the caller's job, and it
+                // has the process-tree knowledge to decide it; this crate does not.
+                //
+                // SCOPED TO `dir`, and that is load-bearing rather than tidiness. When the
+                // project directory does not exist at open, the watch above falls back to
+                // the projects ROOT, recursively — so this callback sees every write of
+                // every session in every project on the machine. The fallback's own comment
+                // justifies that cost with "it stops the moment the caller attaches", which
+                // is true of the re-resolution above and false of a wake down here: this
+                // branch runs *while* attached, for the life of the open. Unfiltered, one
+                // panel opened before its project directory existed would wake the event
+                // loop on every other project's traffic, forever — the idle-CPU debt G1
+                // exists to keep out. Our own rotation lands inside `dir`, so the filter
+                // costs the feature nothing.
+                //
+                // Cost with the filter: one wake per append burst of any OTHER session in
+                // THIS project directory. That is the rate this callback already wakes at
+                // for our own file, and the caller's response is a ~14 µs read; a sibling
+                // streaming in the same project also means the machine is not idle.
+                //
+                // Matched on the parent's NAME rather than `p.starts_with(&dir)`, which was
+                // the first spelling and was silently wrong. FSEvents reports CANONICAL
+                // paths: on this machine a temp dir arrives as `/private/var/...` while the
+                // same `dir` reads `/var/...`, so `starts_with` rejected the very event it
+                // was written to admit — the feature would have been dead behind any symlink
+                // in the path, with nothing to indicate it. Project directory names are
+                // encoded absolute cwds (`-Users-me-Projects-thing`), so they are unique
+                // among the root's children and identical under both spellings; with the
+                // fallback watch rooted one level up, matching the name IS matching the
+                // directory.
+                if touches_project_log(&ev.paths, &dir) {
+                    wake();
+                }
                 return;
             }
             // Read everything past our offset; parse whole lines, buffer a partial.
@@ -1512,6 +1591,109 @@ mod tests {
             w.rx.recv_timeout(Duration::from_millis(400)).is_err(),
             "no duplicate snapshots"
         );
+    }
+
+    #[test]
+    fn backfill_and_tail_agree_on_the_model_across_the_boundary() {
+        // Two paths reach the same field and they must not disagree: `open()` folds the
+        // whole file from scratch, then the watcher tails only what is appended after
+        // it. A rule that read one line at a time differently from a batch — say,
+        // "replace only when the value differs from the previous LINE" — would agree on
+        // both of these separately and disagree the moment a `/model` switch landed
+        // across the seam, which is precisely where a live session puts it.
+        //
+        // Three placements of the switch relative to the boundary, and the invariant is
+        // the same each time: tailing from a mid-file offset must land on exactly what
+        // folding the finished file yields.
+        use std::io::Write;
+        use std::time::Duration;
+
+        let fable = |id: &str| {
+            format!(
+                r#"{{"type":"assistant","requestId":"{id}","message":{{"id":"{id}","model":"claude-fable-5","usage":{{"output_tokens":1}}}}}}"#
+            )
+        };
+        let opus = |id: &str| {
+            format!(
+                r#"{{"type":"assistant","requestId":"{id}","message":{{"id":"{id}","model":"claude-opus-5","usage":{{"output_tokens":1}}}}}}"#
+            )
+        };
+        let synthetic = |id: &str| {
+            format!(
+                r#"{{"type":"assistant","requestId":"{id}","message":{{"id":"{id}","model":"<synthetic>","usage":{{"output_tokens":1}}}}}}"#
+            )
+        };
+
+        // (tag, lines present at open, lines appended afterwards)
+        let cases: [(&str, Vec<String>, Vec<String>); 3] = [
+            // The switch is IN the tail — the backfill has only ever seen fable.
+            (
+                "switchintail",
+                vec![fable("a"), fable("b")],
+                vec![opus("c"), opus("d")],
+            ),
+            // The switch is in the BACKFILL — the tail only ever sees opus.
+            (
+                "switchinbackfill",
+                vec![fable("a"), opus("b")],
+                vec![opus("c")],
+            ),
+            // Nothing but a sentinel arrives after the switch: it must not undo it.
+            (
+                "sentinelaftertheswitch",
+                vec![fable("a"), opus("b")],
+                vec![synthetic("c")],
+            ),
+        ];
+
+        for (tag, seeded, appended) in cases {
+            let dir = temp_dir(tag);
+            let log = dir.join("s.jsonl");
+            std::fs::write(&log, format!("{}\n", seeded.join("\n"))).unwrap();
+
+            let (t, off) = backfill_telemetry(&log);
+            let at_open = t.snapshot().model.clone();
+            let w = LogWatcher::spawn(
+                Watch {
+                    dir: dir.clone(),
+                    log: Some(log.clone()),
+                    want: Wanted::default(),
+                    owned: false,
+                    rivals: no_rivals(),
+                    attached: unattached(),
+                },
+                t,
+                off,
+                || {},
+            )
+            .expect("spawn");
+
+            {
+                let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+                for line in &appended {
+                    writeln!(f, "{line}").unwrap();
+                }
+            }
+
+            let mut tailed = at_open;
+            while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(3)) {
+                tailed = s.snap.model.clone();
+            }
+
+            // The reference: the same bytes, folded in one pass by a fresh accumulator —
+            // what `open()` on the finished file would have produced.
+            let (whole, _) = backfill_telemetry(&log);
+            assert_eq!(
+                tailed,
+                whole.snapshot().model,
+                "{tag}: backfill+tail must converge on what a from-scratch fold yields"
+            );
+            assert_eq!(
+                tailed.as_deref(),
+                Some("claude-opus-5"),
+                "{tag}: and that is the model the session ended on"
+            );
+        }
     }
 
     #[test]
@@ -2710,6 +2892,137 @@ mod tests {
         }
         if let Some(s) = after {
             assert_eq!(s.snap.total_output, 7, "frozen on b — c never adopted");
+        }
+    }
+
+    #[test]
+    fn only_a_log_in_our_own_project_directory_is_worth_a_wake() {
+        // F1, and the suite could not see it: deleting the whole scope check left all 66
+        // tests green. The end-to-end sibling-wake test below cannot catch it either — it
+        // watches one directory, so there is no foreign traffic for a filter to reject.
+        let ours = Path::new("/Users/me/.claude/projects/-Users-me-Projects-thing");
+
+        assert!(
+            touches_project_log(&[ours.join("abc.jsonl")], ours),
+            "our own project's log is the whole point"
+        );
+        assert!(
+            !touches_project_log(
+                &[
+                    Path::new("/Users/me/.claude/projects/-Users-me-Projects-other/x.jsonl")
+                        .to_path_buf()
+                ],
+                ours
+            ),
+            "ANOTHER project's log must not wake us — under the recursive projects-root \
+             fallback this is every session on the machine, forever, while attached"
+        );
+        assert!(
+            !touches_project_log(&[ours.join("notes.md")], ours),
+            "only session logs"
+        );
+        assert!(!touches_project_log(&[], ours), "an event naming nothing");
+        assert!(
+            !touches_project_log(&[PathBuf::from("bare.jsonl")], ours),
+            "a path with no parent cannot be shown to be ours"
+        );
+    }
+
+    #[test]
+    fn the_scope_check_survives_the_canonical_path_fsevents_reports() {
+        // THE trap this predicate was rewritten for. FSEvents reports canonical paths, so a
+        // directory reached through a symlink comes back spelled differently than the `dir`
+        // we hold — on macOS every temp dir does exactly this (`/var/...` vs
+        // `/private/var/...`). The first spelling used `p.starts_with(dir)` and therefore
+        // rejected our OWN rotation, which would have left the feature dead behind any
+        // symlink in the path with nothing to indicate it.
+        let held = Path::new("/var/folders/xm/T/-Users-me-Projects-thing");
+        let reported = Path::new("/private/var/folders/xm/T/-Users-me-Projects-thing/a.jsonl");
+
+        assert!(
+            touches_project_log(&[reported.to_path_buf()], held),
+            "same directory, different spelling — must still be ours"
+        );
+        assert!(
+            !reported.starts_with(held),
+            "premise: the prefix test really does fail here, which is why it was replaced"
+        );
+    }
+
+    #[test]
+    fn a_sibling_log_appearing_wakes_the_caller_without_being_adopted() {
+        // `/clear` rotates the session: a NEW log opens beside ours in the same project
+        // directory and ours is never appended to again. From in here that is the only
+        // observable event, and while attached this callback used to drop it — read nothing,
+        // send nothing, wake nothing. The caller then had nothing to notice the rotation on,
+        // because after a `/clear` the terminal is quiet and the tab-metadata worker only
+        // wakes the loop when a `TabMeta` actually changed. Measured on a real run: the panel
+        // sat on the dead session until the user happened to run something else.
+        //
+        // BOTH halves are asserted, and the second is the one R6.3 cares about: the wake
+        // fires, AND no snapshot is sent — the sibling is not adopted, not folded, not read.
+        use std::io::Write;
+        use std::time::Duration;
+
+        let dir = temp_dir("sibling-wake");
+        let ours = dir.join("ours.jsonl");
+        std::fs::write(
+            &ours,
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-08-08T19:00:00.000Z\",\"requestId\":\"a\",\"message\":{\"id\":\"a\",\"usage\":{\"output_tokens\":3}}}\n",
+        )
+        .unwrap();
+        let (t, off) = backfill_telemetry(&ours);
+
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = wakes.clone();
+        let w = LogWatcher::spawn(
+            Watch {
+                dir: dir.clone(),
+                log: Some(ours.clone()),
+                // Attached from the start: this is the state the drop happened in.
+                want: Wanted {
+                    session_id: Some("ours".into()),
+                    since_ms: None,
+                },
+                owned: true,
+                rivals: no_rivals(),
+                attached: Arc::new(AtomicBool::new(true)),
+            },
+            t,
+            off,
+            move || {
+                counter.fetch_add(1, Ordering::Release);
+            },
+        )
+        .expect("spawn");
+
+        // The rotation: a new session's log opens beside ours.
+        let rotated = dir.join("rotated.jsonl");
+        let mut f = std::fs::File::create(&rotated).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","timestamp":"2026-08-08T19:00:20.000Z","requestId":"b","message":{{"id":"b","usage":{{"output_tokens":900}}}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while wakes.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            wakes.load(Ordering::Acquire) > 0,
+            "a sibling log appearing must wake the caller, or a /clear is invisible"
+        );
+
+        // ...and nothing was adopted. `recv_timeout` rather than `try_recv`: a snapshot sent
+        // a moment late would still be a violation, and this must not pass by racing it.
+        match w.rx.recv_timeout(Duration::from_millis(300)) {
+            Err(_) => {}
+            Ok(u) => panic!(
+                "attached: the sibling must never be folded (total_output={})",
+                u.snap.total_output
+            ),
         }
     }
 

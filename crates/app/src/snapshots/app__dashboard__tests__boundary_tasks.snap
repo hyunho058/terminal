@@ -1,9 +1,11 @@
 ---
 source: crates/app/src/dashboard.rs
-expression: "tasks(&t).join(\"\\n\")"
+expression: "project_section(&tasks(&t, &env(now)))"
 ---
-── Tasks +2 more ───────────────────────────────────────────────────────────────────────────────────────
-  Fold usage per message id · in_progress
-  Pin the worked examples · completed · 10m40s
-  Audit the dedupe keying · blocked
-  Measure the model census · in_progress
+  TASKS (total 6)
+    card Amber        "Fold usage per message id" value="" detail="in_progress · updated 1m ago"
+    card AccentGreen  "Pin the worked examples" value="10m40s" detail="completed · updated 1m ago"
+    card TextFaint    "Audit the dedupe keying" value="" detail="blocked · updated 2m ago"
+    card Amber        "Measure the model census" value="" detail="in_progress · updated 6m ago"
+    card AccentGreen  "Wire the overlay seam" value="5m00s" detail="completed · updated 10m ago"
+    card AccentGreen  "Draft the partition manifest" value="20.0s" detail="completed · updated 15m ago"

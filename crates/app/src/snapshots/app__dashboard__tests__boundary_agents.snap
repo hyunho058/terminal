@@ -1,9 +1,10 @@
 ---
 source: crates/app/src/dashboard.rs
-expression: "agents(&t, now).join(\"\\n\")"
+expression: "project_section(&agents(&t, &env(now)))"
 ---
-── Agents +1 more ──────────────────────────────────────────────────────────────────────────────────────
-  ● general-purpose · Gate 3 checker · opus · 1m30s
-  ◯ Explore · map the overlay seam · sonnet · 30s
-  ◯ general-purpose · census message.model · sonnet · 20s
-  ◯ Plan · sequence the build order · sonnet · 50s
+  ACTIVE AGENTS (total 5)
+    card Amber        "● general-purpose" value="1m30s" detail="Gate 3 checker · opus"
+    card TextFaint    "◯ Explore" value="30s" detail="map the overlay seam · sonnet"
+    card TextFaint    "◯ general-purpose" value="20s" detail="census message.model · sonnet"
+    card TextFaint    "◯ Plan" value="50s" detail="sequence the build order · sonnet"
+    card TextFaint    "◯ Explore" value="10s" detail="find the panel budget · sonnet"

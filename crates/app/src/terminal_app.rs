@@ -55,8 +55,8 @@ use crate::hyperlink::{
 use crate::input::{
     self, encode_key, hover_card, hover_cursor, is_double_click, is_sidebar_toggle_chord,
     pixel_to_cell, press_dismisses_modals, sidebar_press, sidebar_region, suppress_key, tab_action,
-    wheel_bytes, wheel_lines, wheel_scroll, ReleaseTarget, ResizeDrag, SidebarAction, TabAction,
-    WheelDelta,
+    wheel_bytes, wheel_lines, wheel_scroll, PersistTarget, PressRoute, ReleaseTarget, ResizeDrag,
+    ResizeEdge, SidebarAction, TabAction, WheelDelta,
 };
 use crate::seam::{
     AppCtx, AppRequest, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayCommand,
@@ -228,6 +228,13 @@ struct Running {
     /// delivery equal to this is suppressed, because FSEvents can report one rename more
     /// than once and a "consume the first match" rule would pay the rebuild on the second.
     written_sidebar: Vec<(f32, bool)>,
+    /// The same latch for `[ai_monitor]`'s `(width_px, open)` pair (right-panel D6/R6.4).
+    ///
+    /// A separate ring rather than a widened tuple: the two tables are written by different
+    /// gestures at different times, and one pair covering both would classify a sidebar
+    /// drag's echo as a *panel* human edit — clearing the panel's override on a gesture that
+    /// never touched it.
+    written_monitor: Vec<(f32, bool)>,
     /// The last `Config` actually applied to the running app (tab-resize D15, as amended).
     ///
     /// Echo suppression compares the **whole** delivered config against this, not just the
@@ -242,6 +249,10 @@ struct Running {
     /// override — otherwise an unrelated reload (a `font.size_pt` edit) would snap the
     /// sidebar back and break D14's promise that the session keeps the dragged width.
     sidebar_override_authoritative: bool,
+    /// The same flag for the panel's width (right-panel D6 × tab-resize D14/D15a): set when
+    /// a write failed, so an unrelated reload cannot snap the panel back to the file's width
+    /// while the session is knowingly out of step with it.
+    monitor_override_authoritative: bool,
     /// Fresh configs delivered by the background watcher (settings feature).
     config_rx: Receiver<Config>,
     /// Kept alive so the watch thread keeps running; dropping it stops watching.
@@ -417,8 +428,10 @@ impl App {
             resize_drag: None,
             config_path,
             written_sidebar: Vec::new(),
+            written_monitor: Vec::new(),
             last_applied_cfg: self.cfg.clone(),
             sidebar_override_authoritative: false,
+            monitor_override_authoritative: false,
             config_rx,
             _config_watcher: config_watcher,
             occluded: false,
@@ -432,6 +445,10 @@ impl App {
             tabmeta_snapshot: TabMetaSnapshot::default(),
         };
         running.sync_tab_model();
+        // The first point at which both halves of a restore are available: the config has
+        // been loaded since `main`, and the active tab now exists, so its cwd resolves to
+        // the directory the panel must open on (R6.6).
+        running.restore_monitor_panel();
         running.redraw();
         Ok(running)
     }
@@ -744,6 +761,17 @@ impl Running {
                     // `SetUserTitle` in this batch, since that sync re-reads the mutated
                     // sessions. If this method ever stops syncing, this line becomes a bug.
                     changed = false;
+                }
+                AppRequest::SetMonitorOpen(open) => {
+                    // The chord decides open-or-closed and nothing else: D6 makes
+                    // `[ai_monitor].width_px` plus a runtime override the authority for the
+                    // width, and the renderer derives the band from those — which is what
+                    // lets a width dragged last week come back on this toggle (R4.5).
+                    //
+                    // `toggle_monitor`, not `apply_monitor_open`: this arm IS the chord, and
+                    // the chord is the one gesture D8 lets write `[ai_monitor].open`
+                    // (R6.3). The launch restore calls the other one.
+                    self.toggle_monitor(open);
                 }
             }
         }
@@ -1215,6 +1243,72 @@ impl Running {
         self.persist_sidebar();
     }
 
+    /// Move the ai-monitor panel's docked band and let the grid follow
+    /// (ai-monitor-right-panel D21, R0.1–R0.3). The order is `toggle_sidebar`'s and
+    /// load-bearing for the same reason: move the inset FIRST, then let `refit` read
+    /// `grid_size`, then redraw.
+    ///
+    /// The only caller of `set_monitor_open`, and it deliberately does **not** persist.
+    /// Persistence is a rule about *gestures* (D8), and this is also the path the launch
+    /// restore takes (R6.6) — a restore that wrote here would make every start rewrite the
+    /// config it just read, which is how a "persisted" value quietly becomes the app's own
+    /// echo. [`toggle_monitor`](Self::toggle_monitor) is the half that remembers.
+    fn apply_monitor_open(&mut self, open: bool) {
+        let before = self.renderer.grid_size();
+        self.renderer.set_monitor_open(open);
+        let after = self.renderer.grid_size();
+        // Refit ONLY when the column count actually moved (R0.2, and `needs_refit`'s own
+        // rationale): `Grid::resize` reallocates every tab's cells, clears the selection
+        // and fires SIGWINCH at zsh. A toggle normally does move it — but on a window too
+        // narrow to fit the panel at all (R4.4) the band stays 0.0 both ways, and an
+        // unguarded refit would then wipe the user's selection in exchange for nothing.
+        if input::needs_refit(before, after) {
+            crate::settings::refit(&self.renderer, &mut self.tabs);
+        }
+        self.redraw();
+    }
+
+    /// The `Cmd+Shift+M` chord: move the band **and remember it**.
+    ///
+    /// Reached only from `AppRequest::SetMonitorOpen`, which only `Overlay::on_key` can
+    /// record — which is what makes D8's "only the chord writes `open`" a property of the
+    /// call graph rather than a convention (R6.3). A width-forced close (R4.4) happens
+    /// inside `sync_right_inset` and never reaches here, which is what leaves the persisted
+    /// flag recording what the user last asked for.
+    fn toggle_monitor(&mut self, open: bool) {
+        self.apply_monitor_open(open);
+        self.persist_monitor();
+    }
+
+    /// Reopen the ai-monitor panel at launch when the last session left it open (R6.6).
+    ///
+    /// Two halves, in one act, because splitting them in time is visible: the overlay's own
+    /// open path resolves this tab's log, folds it and starts the watcher, while the band it
+    /// paints into is the renderer's. Reserving the band without opening the overlay leaves
+    /// an empty strip; opening the overlay without the band paints nothing. Both happen here,
+    /// before the first frame, so neither state is ever drawn.
+    ///
+    /// **Called with the tab's cwd in hand, and that is why it is here rather than earlier.**
+    /// `open()` resolves `~/.claude/projects/**` from the directory it is given; run before
+    /// the first session exists and it would resolve the wrong project, which looks exactly
+    /// like a panel with no data.
+    ///
+    /// Writes nothing back (D8): a restore is not a gesture. It goes through
+    /// `apply_monitor_open`, which has no persistence path at all — and even the value it
+    /// would write is the file's own (`monitor_width_logical` reads `[ai_monitor].width_px`
+    /// while no drag has set an override, and `monitor_open` is the flag we just read), so
+    /// the guard in `persist_monitor` declines it too.
+    fn restore_monitor_panel(&mut self) {
+        if !self.last_applied_cfg.ai_monitor.open {
+            return;
+        }
+        let cwd = self.tabs.active_cwd(&self.tabmeta_snapshot);
+        let shell_pid = self.tabs.active_shell_pid();
+        self.overlays
+            .command(&OverlayCommand::RestoreMonitor { cwd, shell_pid });
+        self.apply_monitor_open(true);
+    }
+
     /// Write the sidebar's size to `config.toml` (tab-resize D2/D16) — the ONE persistence
     /// site, shared by the drag release, focus loss, the Hide/Restore button, and the
     /// toggle chord, so no two entry points can remember differently.
@@ -1234,18 +1328,13 @@ impl Running {
             self.renderer.sidebar_width_logical(),
             self.renderer.sidebar_collapsed(),
         );
-        // Nothing changed since the config we last applied — don't touch the file. A bare
-        // click on the grab band (press + release, no motion) would otherwise rewrite
-        // `config.toml` for a value already on disk: on a fresh install that CREATES the
-        // file out of nothing, and on an existing one it rewrites `340` as `340.0`.
-        //
-        // Compared against `last_applied_cfg` rather than the write history, so the guard
-        // also covers the FIRST gesture of a session, when nothing has been written yet.
+        // Nothing changed since the config we last applied — don't touch the file
+        // (`input::needs_persist` owns that rule, shared with the panel's persist below).
         let on_disk = (
             self.last_applied_cfg.sidebar.width_px,
             self.last_applied_cfg.sidebar.collapsed,
         );
-        if on_disk == pair && !self.sidebar_override_authoritative {
+        if !input::needs_persist(pair, on_disk, self.sidebar_override_authoritative) {
             return;
         }
         match common::config::save_sidebar(&path, pair.0, pair.1) {
@@ -1268,12 +1357,72 @@ impl Running {
         }
     }
 
+    /// Write the ai-monitor panel's size and open state to `config.toml` (D6/D8) — the ONE
+    /// persistence site, shared by the chord and the drag release, so the two cannot
+    /// remember differently. Mirrors `persist_sidebar` in every respect, including that a
+    /// failure warns and is otherwise silent (D14).
+    ///
+    /// **What is written is the intent, never the drawn band** (D8). `monitor_width_logical`
+    /// is the config-plus-override width, which a narrow window's squeeze does not touch, and
+    /// `monitor_open` is the flag only the chord moves — so a window narrowed past R4.4's
+    /// threshold force-closes the panel on screen and this function is not even called
+    /// (nothing re-derives through here), leaving `open = true` on disk to restore from
+    /// (R6.2/R6.3).
+    fn persist_monitor(&mut self) {
+        let Some(path) = self.config_path.clone() else {
+            tracing::warn!("no config path; ai-monitor panel size not persisted");
+            return;
+        };
+        let pair = (
+            self.renderer.monitor_width_logical(),
+            self.renderer.monitor_open(),
+        );
+        // Nothing changed since the config we last applied — don't touch the file
+        // (`input::needs_persist`, shared with `persist_sidebar`). This is also the second
+        // line of defence for R6.6: a launch restore never calls this function, and if it
+        // ever did, the pair it would write is the pair it just read.
+        let on_disk = (
+            self.last_applied_cfg.ai_monitor.width_px,
+            self.last_applied_cfg.ai_monitor.open,
+        );
+        if !input::needs_persist(pair, on_disk, self.monitor_override_authoritative) {
+            return;
+        }
+        match common::config::save_ai_monitor(&path, pair.0, pair.1) {
+            Ok(()) => {
+                // Arm the echo latch ONLY on success (D15/D14×D15a): a failed write leaves
+                // the file disagreeing with the override on purpose.
+                input::remember_write(&mut self.written_monitor, pair);
+                self.monitor_override_authoritative = false;
+                // Fold the written values into the applied-config baseline, so the echo this
+                // write provokes compares equal and is suppressed — while a delivery that
+                // ALSO changes another field still differs, and applies (R6.4).
+                self.last_applied_cfg.ai_monitor.width_px = pair.0;
+                self.last_applied_cfg.ai_monitor.open = pair.1;
+            }
+            Err(e) => {
+                tracing::warn!("ai-monitor panel size not saved: {e}");
+                self.written_monitor.clear();
+                self.monitor_override_authoritative = true;
+            }
+        }
+    }
+
     /// End an in-flight resize: commit the width and persist it (tab-resize D2/R7.3/R7.6).
     /// Idempotent — clearing `resize_drag` first means a later `Released` after a
     /// focus-loss commit finds nothing armed and does not write a second time.
     fn finish_resize(&mut self) {
-        if self.resize_drag.take().is_some() {
-            self.persist_sidebar();
+        // Which edge was dragged decides which table is written — `input::persist_target`
+        // owns that rule, so the "a panel drag must not rewrite `[sidebar]`" half of R6.1
+        // is a test rather than a comment on this match.
+        match input::persist_target(self.resize_drag.take()) {
+            Some(PersistTarget::Sidebar) => self.persist_sidebar(),
+            // R6.1: a released panel drag writes `[ai_monitor].width_px`. It writes `open`
+            // alongside it, which does not violate D8's "only the chord" rule — the value
+            // written is the chord's own intent, read back from the renderer, not a state
+            // this gesture decided.
+            Some(PersistTarget::AiMonitor) => self.persist_monitor(),
+            None => {}
         }
     }
 
@@ -1283,17 +1432,28 @@ impl Running {
         input::release_target(self.resize_drag.is_some(), self.dragging)
     }
 
-    /// Arm a sidebar edge resize at the current pointer (tab-resize D9/D17/R7.1).
+    /// Arm a chrome edge resize at the current pointer (tab-resize D9/D17/R7.1; panel edge
+    /// D17/R9.4).
     ///
     /// Captures the grab offset against the edge's *live* position, once — `drive_resize`
     /// never recomputes it (R3.4). Clears `dragging` to uphold the D17 invariant: nothing
     /// clears it on `Focused(false)`, so a lost `Released` can leave it stale, and a stale
     /// selection drag racing a resize is the one way both could be armed at once.
-    fn begin_resize(&mut self) {
-        let edge_x = self.renderer.left_inset();
+    ///
+    /// One slot for both edges (D17): only one of them can be under the pointer when the
+    /// button goes down, so which edge was grabbed is a field of the gesture, not a second
+    /// gesture.
+    fn begin_resize(&mut self, edge: ResizeEdge) {
+        let edge_x = match edge {
+            ResizeEdge::Sidebar => self.renderer.left_inset(),
+            ResizeEdge::Monitor => {
+                input::monitor_edge_x(self.viewport_w(), self.renderer.right_inset())
+            }
+        };
         self.dragging = false;
         self.resize_drag = Some(ResizeDrag {
             grab_offset: input::resize_grab_offset(self.last_cursor.0, edge_x),
+            edge,
         });
         debug_assert!(
             self.resize_drag.is_some() && !self.dragging,
@@ -1301,13 +1461,76 @@ impl Running {
         );
     }
 
-    /// Advance an in-flight resize to the current pointer (tab-resize D1/D9).
+    /// The framebuffer width in physical px — the same `inner_size` `sidebar_input` reads,
+    /// so the sidebar's geometry, the panel's grab band and `pixel_to_cell`'s right bound
+    /// cannot disagree about where the window's right edge is.
+    fn viewport_w(&self) -> f32 {
+        self.window.inner_size().width as f32
+    }
+
+    /// Is the pointer inside the ai-monitor panel's grab band (D17/R9.4)? The panel half of
+    /// the press routing, kept beside `sidebar_input` so both hit tests read their geometry
+    /// from the same window size.
+    fn in_monitor_grab_band(&self) -> bool {
+        input::in_monitor_grab_band(
+            self.last_cursor.0,
+            self.viewport_w(),
+            self.renderer.right_inset(),
+            self.renderer.scale_factor(),
+        )
+    }
+
+    /// Advance an in-flight resize to the current pointer — dispatching on the edge the
+    /// press grabbed (D17).
+    fn drive_resize(&mut self, drag: ResizeDrag) {
+        match drag.edge {
+            ResizeEdge::Sidebar => self.drive_sidebar_resize(drag),
+            ResizeEdge::Monitor => self.drive_monitor_resize(drag),
+        }
+    }
+
+    /// Advance an in-flight ai-monitor panel resize (D17/R9.6/R9.7).
+    ///
+    /// Order is `drive_sidebar_resize`'s, and load-bearing for the same reasons: set the
+    /// width FIRST so the inset is live, then read `grid_size`, then refit. Hover is not
+    /// re-resolved — the drag owns the pointer.
+    ///
+    /// The width is handed over **raw**; `Renderer::set_monitor_width` owns the 300–760
+    /// clamp, so the band the user sees and the number that gets persisted come from one
+    /// expression. There is no collapse threshold to compare a raw width against here (the
+    /// panel has no collapsed state — D8's `open` flag is the chord's alone), which is the
+    /// one place the two gestures genuinely differ rather than mirror.
+    fn drive_monitor_resize(&mut self, drag: ResizeDrag) {
+        let scale = self.renderer.scale_factor();
+        let viewport_w = self.viewport_w();
+        let raw = input::resize_raw_monitor_width(self.last_cursor.0, drag, viewport_w, scale);
+        // The grid size the tabs are currently fitted to. `settings::refit` is the only
+        // site that resizes them (D6), so this is always their true dimension.
+        let before = self.renderer.grid_size();
+        self.renderer.set_monitor_width(raw);
+
+        // Refit ONLY when the column count actually changed (R9.7). A correctness guard,
+        // not an optimisation, and the identical one `drive_sidebar_resize` documents:
+        // `Grid::resize` reallocates every tab's cells AND clears the selection, so an
+        // unguarded per-pixel refit would wipe the user's selection on every pointer move
+        // and fire a SIGWINCH at zsh on every tab. The band still follows the pointer every
+        // frame — only the grid steps by whole columns.
+        let after = self.renderer.grid_size();
+        if input::needs_refit(before, after) {
+            crate::settings::refit(&self.renderer, &mut self.tabs);
+        }
+        // No scroll re-clamp: the sidebar's list did not move — its geometry is measured
+        // from the LEFT edge, and nothing on the right can change it.
+        self.redraw();
+    }
+
+    /// Advance an in-flight sidebar resize to the current pointer (tab-resize D1/D9).
     ///
     /// Order is load-bearing and copied from `toggle_sidebar` (D6): set the width FIRST so
     /// the inset is live, then re-fit the grid, then rebuild the layout from the new width
     /// and re-clamp the scroll. Hover is deliberately NOT re-resolved — the drag owns the
     /// pointer (R7.4).
-    fn drive_resize(&mut self, drag: ResizeDrag) {
+    fn drive_sidebar_resize(&mut self, drag: ResizeDrag) {
         let scale = self.renderer.scale_factor();
         let raw = input::resize_raw_width(self.last_cursor.0, drag, scale);
         // The grid size the tabs are currently fitted to. `settings::refit` is the only
@@ -1373,7 +1596,15 @@ impl Running {
             self.last_hit = hit;
             self.tab_model.set_hovered(hit);
         }
-        self.set_cursor_icon(hover_cursor(region));
+        // The panel's grab band gets the same `col-resize` affordance, and is asked
+        // second — the same order the press uses (R9.5), so what the cursor promises and
+        // what a press does can never disagree at an overlap. D10 draws no grip on either
+        // edge, so this mapping is the whole of the band's discoverability.
+        let icon = match hover_cursor(region) {
+            CursorIcon::Default if self.in_monitor_grab_band() => CursorIcon::ColResize,
+            other => other,
+        };
+        self.set_cursor_icon(icon);
         self.window.request_redraw();
     }
 
@@ -1499,8 +1730,13 @@ impl Running {
     }
 
     /// Map the latest cursor position to a live-viewport cell, or `None` over the
-    /// sidebar/top band (selection-input). The one geometry the event loop performs,
-    /// via the pure `pixel_to_cell` helper + the renderer's cell/inset accessors.
+    /// sidebar/top band or the docked ai-monitor panel (selection-input; D16). The one
+    /// geometry the event loop performs, via the pure `pixel_to_cell` helper + the
+    /// renderer's cell/inset accessors.
+    ///
+    /// The viewport width comes from the window, matching `sidebar_input` — the renderer's
+    /// surface is configured from the same `inner_size`, so the two cannot disagree about
+    /// where the right edge is.
     fn cursor_cell(&self) -> Option<(u16, u16)> {
         let (cols, rows) = self.tabs.active().terminal.dimensions();
         pixel_to_cell(
@@ -1508,6 +1744,8 @@ impl Running {
             self.renderer.cell_size(),
             self.renderer.left_inset(),
             self.renderer.top_inset(),
+            self.viewport_w(),
+            self.renderer.right_inset(),
             cols,
             rows,
         )
@@ -1979,6 +2217,24 @@ impl ApplicationHandler<UserEvent> for App {
                     {
                         inner.renderer.clear_sidebar_override();
                     }
+                    // The panel's pair is classified the same way, against its OWN write
+                    // history (right-panel D6/R6.4/R6.5). Two independent verdicts, because
+                    // the two gestures are independent: a sidebar drag's echo must not clear
+                    // the panel's override, and a hand edit to `[ai_monitor].width_px` must
+                    // win even though `[sidebar]` in the same file is unchanged.
+                    //
+                    // Both run BEFORE `settings::apply` — `apply_config` re-derives both
+                    // insets from config-plus-override, so clearing afterwards would apply
+                    // the override once and the file's value only on the next reload.
+                    let delivered_monitor = (cfg.ai_monitor.width_px, cfg.ai_monitor.open);
+                    let monitor_delivery =
+                        input::classify_delivery(delivered_monitor, &inner.written_monitor);
+                    if input::should_clear_override(
+                        monitor_delivery,
+                        inner.monitor_override_authoritative,
+                    ) {
+                        inner.renderer.clear_monitor_override();
+                    }
                     crate::settings::apply(
                         &cfg,
                         &mut inner.renderer,
@@ -2124,8 +2380,11 @@ impl ApplicationHandler<UserEvent> for App {
                     // `begin_rename_row` opens the field afterwards.
                     inner.overlays.command(&OverlayCommand::Cancel);
                 }
-                if let Some(action) = action {
-                    match action {
+                // R9.5/D17: the sidebar-then-panel-then-grid order is `input::press_route`'s
+                // decision, not this `match`'s shape — reordering these arms now changes
+                // nothing, and changing the rule fails a test.
+                match input::press_route(action, inner.in_monitor_grab_band()) {
+                    PressRoute::Sidebar(action) => match action {
                         SidebarAction::Switch(i) => {
                             // A second click on the SAME card opens the rename field on it
                             // (sticky-tab-title): the title is edited by clicking the title,
@@ -2163,25 +2422,29 @@ impl ApplicationHandler<UserEvent> for App {
                                 event_loop.exit();
                             }
                         }
-                        SidebarAction::BeginResize => inner.begin_resize(),
+                        SidebarAction::BeginResize => inner.begin_resize(ResizeEdge::Sidebar),
                         SidebarAction::Inert => {}
+                    },
+                    PressRoute::MonitorEdge => inner.begin_resize(ResizeEdge::Monitor),
+                    PressRoute::Grid => {
+                        if let Some(cell) = inner.cursor_cell() {
+                            // Over a real grid cell → anchor a selection and arm the drag
+                            // (selection-input). Nothing is shown until the focus leaves
+                            // this cell; a press in the dead band (cursor_cell → None)
+                            // arms nothing.
+                            inner.drag_anchor = cell;
+                            inner.dragging = true;
+                            inner.drag_moved = false;
+                            // Sample ⌘ at press (hyperlinks D22). The drag is armed exactly
+                            // as before either way — ⌘ adds a gesture here, it removes none.
+                            inner.link_cmd_at_press = inner.mods.super_key();
+                            // Start a fresh latch (terminal-scroll D6). The drag freezes the
+                            // viewport while `scrollback` D2's auto-increment keeps drifting
+                            // it, so any snap raised in that window is recorded here and
+                            // replayed on release rather than lost.
+                            inner.drag_latch = DragLatch::default();
+                        }
                     }
-                } else if let Some(cell) = inner.cursor_cell() {
-                    // Not a sidebar region and over a real grid cell → anchor a
-                    // selection and arm the drag (selection-input). Nothing is shown
-                    // until the focus leaves this cell; a press in the dead band
-                    // (cursor_cell → None) arms nothing.
-                    inner.drag_anchor = cell;
-                    inner.dragging = true;
-                    inner.drag_moved = false;
-                    // Sample ⌘ at press (hyperlinks D22). The drag is armed exactly as
-                    // before either way — ⌘ adds a gesture here, it removes none.
-                    inner.link_cmd_at_press = inner.mods.super_key();
-                    // Start a fresh latch (terminal-scroll D6). The drag freezes the
-                    // viewport while `scrollback` D2's auto-increment keeps drifting it,
-                    // so any snap raised in that window is recorded here and replayed on
-                    // release rather than lost.
-                    inner.drag_latch = DragLatch::default();
                 }
             }
 
@@ -2566,6 +2829,124 @@ fn next_composition_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- ai-monitor-right-panel R7.4 / D2: the panel introduced no repaint timer ----
+
+    /// The production half of a source file — everything above its test module, with
+    /// comment lines dropped so a comment *about* a timer cannot fail the scan.
+    ///
+    /// Split on the **module** marker at column 0, not on `#[cfg(test)]` anywhere: both
+    /// files scanned below carry `#[cfg(test)]` on inline items and inside doc comments,
+    /// and splitting on the first occurrence would silently reduce the scan to the first
+    /// hundred lines — a scan that passes because it looked at almost nothing. The panic
+    /// is the point: a renamed test module must break this loudly, not quietly stop
+    /// checking.
+    fn production_half(name: &str, src: &str) -> String {
+        let (production, tests) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .unwrap_or_else(|| panic!("{name}: no `mod tests` marker to split on"));
+        assert!(
+            !tests.is_empty() && production.len() > src.len() / 4,
+            "{name}: the split found the marker in an implausible place"
+        );
+        production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// R7.4 — asserted at the **source** level, and that is a deliberate choice rather
+    /// than a shortfall.
+    ///
+    /// The runtime form ("open the panel, wait five seconds, count the frames") needs a
+    /// live winit `EventLoop`, which on macOS is main-thread-only and one per process —
+    /// `cargo test` cannot host one. What *can* be pinned exactly is the mechanism: a
+    /// repaint cadence has to come from somewhere, and there are only two somewheres —
+    /// the loop's own control flow, or a wake scheduled against a clock.
+    ///
+    /// Why this matters enough to pin: the design animates three things (the CONNECTED
+    /// dot, the agent ring, the footer dot), and D2 refused all three because the renderer
+    /// holds a *tested* idle-CPU guarantee (G1) that a ~2Hz repaint would silently spend.
+    /// "Silently" is the operative word — a timer added here breaks no test, changes no
+    /// pixel a screenshot would catch, and shows up only as a laptop battery draining
+    /// while the terminal sits untouched. Liveness is carried by colour instead (lime for
+    /// a live session, grey for a stopped one), which costs nothing per frame because
+    /// there are no frames.
+    #[test]
+    fn r7_4_the_loop_still_waits_and_the_panel_schedules_no_wake() {
+        // 1. The loop waits, in exactly one place, and nothing swaps it later. A second
+        //    `set_control_flow` anywhere is the whole failure mode: `Poll` spins and
+        //    `WaitUntil` is a timer by another name.
+        let main_rs = include_str!("main.rs");
+        assert_eq!(
+            main_rs.matches("set_control_flow").count(),
+            1,
+            "the control flow is set once, at startup — a second setter is where a \
+             repaint cadence would enter"
+        );
+        assert!(
+            main_rs.contains("set_control_flow(ControlFlow::Wait)"),
+            "the loop must WAIT for events (docs/architecture.md C6)"
+        );
+        // `main.rs` is scanned whole — it carries no test module, and asserting that is
+        // how this stays true if one is ever added.
+        assert!(
+            !main_rs.contains("mod tests"),
+            "main.rs grew a test module; scan its production half instead"
+        );
+        for (name, production) in [
+            ("main.rs", main_rs.to_string()),
+            (
+                "terminal_app.rs",
+                production_half("terminal_app.rs", include_str!("terminal_app.rs")),
+            ),
+            (
+                "overlay.rs",
+                production_half("overlay.rs", include_str!("overlay.rs")),
+            ),
+        ] {
+            for timer in ["ControlFlow::Poll", "ControlFlow::WaitUntil"] {
+                assert!(
+                    !production.contains(timer),
+                    "`{timer}` in {name} — D2 makes the panel fully static; a timed \
+                     control flow repaints the whole window, not just the band"
+                );
+            }
+            // Only startup may touch the control flow, which is what makes the single
+            // setter asserted above the whole story: a per-event setter would not show up
+            // in a startup count at all.
+            if name != "main.rs" {
+                assert!(
+                    !production.contains("set_control_flow"),
+                    "{name} sets the control flow outside startup"
+                );
+            }
+        }
+
+        // 2. The panel's app-side module schedules nothing against a clock. Its only two
+        //    redraw triggers are `on_key` (a keystroke) and `poll` returning true (a
+        //    watcher update that actually carried a new snapshot) — both events, both
+        //    already under test elsewhere in `overlay.rs`.
+        //
+        //    `now_ms` is not a cadence and is not scanned for: the model records *when*
+        //    it was built (D20's one absolute timestamp qualifying the whole panel), which
+        //    is the opposite of a repaint — it is what let D9 drop the relative age that
+        //    would have needed one.
+        let overlay = production_half("overlay.rs", include_str!("overlay.rs"));
+        for scheduler in [
+            "Duration",
+            "Instant",
+            "thread::sleep",
+            "recv_timeout",
+            "set_timeout",
+        ] {
+            assert!(
+                !overlay.contains(scheduler),
+                "`{scheduler}` in overlay.rs — the panel repaints on events only (D2)"
+            );
+        }
+    }
 
     /// R6.6: a non-empty preedit composes; winit's synthetic empty one clears the
     /// gate — but NOT the ownership (see `ownership_survives_the_pre_commit_preedit`).

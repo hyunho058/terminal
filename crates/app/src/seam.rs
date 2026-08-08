@@ -87,23 +87,41 @@ pub struct AppCtx<'a> {
     requests: Vec<AppRequest>,
 }
 
-/// A tab mutation an overlay asks the app to perform (sticky-tab-title D9/R1.4).
+/// A mutation an overlay asks the app to perform (sticky-tab-title D9/R1.4).
 ///
 /// **Deferred, not immediate, and that is forced by the borrow graph**: `AppCtx` already
-/// holds `&mut` the active session's writer, so it cannot also hold `&mut Tabs`. Handlers
-/// therefore *record* what they want and `terminal_app` applies it after dispatch returns
-/// — the same shape as [`AppCtx::request_redraw`] / [`AppCtx::redraw_requested`], which
-/// solved the identical problem for redraws.
+/// holds `&mut` the active session's writer, so it cannot also hold `&mut Tabs` — nor
+/// `&mut Renderer`. Handlers therefore *record* what they want and `terminal_app` applies
+/// it after dispatch returns — the same shape as [`AppCtx::request_redraw`] /
+/// [`AppCtx::redraw_requested`], which solved the identical problem for redraws.
 ///
-/// Every variant names a [`TabId`], never an index: the card menu can act on a background
-/// tab, and an index would silently mean a different tab if the roster shifted between
-/// the press and the apply.
+/// Every *tab* variant names a [`TabId`], never an index: the card menu can act on a
+/// background tab, and an index would silently mean a different tab if the roster shifted
+/// between the press and the apply.
+///
+/// Every payload here is comparable by identity — a [`TabId`], an `Option<String>`, a
+/// `bool` — so `Eq` is derived. It was briefly absent while the ai-monitor variant carried
+/// a width in logical px, and a float has no total equality; that width turned out never to
+/// cross this seam at all (see [`AppRequest::SetMonitorOpen`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppRequest {
     /// Name a tab, or reset it to its auto label with `None` (R2.2/R2.3).
     SetUserTitle(TabId, Option<String>),
     /// Close a tab (R3.6). Closing the last one exits the app, exactly as Cmd+W does.
     CloseTab(TabId),
+    /// Open or close the band the docked ai-monitor panel occupies on the window's right
+    /// edge (ai-monitor-right-panel D21).
+    ///
+    /// **Open/closed is the whole payload, and that is the point.** The band's *width* is
+    /// not the overlay's to choose: D6 makes `[ai_monitor].width_px` plus the runtime
+    /// override the authority, and the renderer derives the band from those — which is what
+    /// lets a width dragged last week come back on this toggle (R4.5). A variant carrying a
+    /// width would give the panel a second author for a value only the drag and the config
+    /// may set.
+    ///
+    /// A window property, not a tab property — the panel is one per window and re-points
+    /// on a tab switch (D13), so this names no [`TabId`].
+    SetMonitorOpen(bool),
 }
 
 impl<'a> AppCtx<'a> {
@@ -173,6 +191,14 @@ impl<'a> AppCtx<'a> {
     /// Ask the app to close a tab (sticky-tab-title R3.6). Applied after dispatch returns.
     pub fn close_tab(&mut self, tab: TabId) {
         self.requests.push(AppRequest::CloseTab(tab));
+    }
+
+    /// Ask the app to open or close the ai-monitor panel's docked band
+    /// (ai-monitor-right-panel D21). Applied after dispatch returns — see [`AppRequest`]
+    /// for why an overlay cannot touch the renderer directly, and for why the width does
+    /// not travel with it.
+    pub fn set_monitor_open(&mut self, open: bool) {
+        self.requests.push(AppRequest::SetMonitorOpen(open));
     }
 
     /// Drain the requests recorded during dispatch, in the order they were made. Called
@@ -406,6 +432,23 @@ pub enum OverlayCommand {
     /// capturing field can show what is being composed instead of appearing frozen until
     /// the syllable lands. Empty text is winit's clear signal.
     ImePreedit(String),
+    /// Reopen the ai-monitor panel at launch because `[ai_monitor].open` says the last
+    /// session left it open (ai-monitor-right-panel R6.6).
+    ///
+    /// It travels this direction — app → overlay — because the app is what holds the
+    /// config, and it carries the active tab's `cwd` + `shell_pid` because the overlay's
+    /// own open path needs both to resolve *this tab's* session: at launch nothing has
+    /// handed them over yet, since the first `on_active_changed` is still a metadata sync
+    /// away. A restore that arrived without them would resolve the wrong project directory,
+    /// which looks exactly like an empty panel.
+    ///
+    /// Deliberately **not** a keystroke and not an [`AppRequest`]: `on_command` is handed no
+    /// [`AppCtx`], so a restore has no route to the config and cannot be mistaken for the
+    /// gesture D8 reserves the right to persist.
+    RestoreMonitor {
+        cwd: Option<PathBuf>,
+        shell_pid: Option<u32>,
+    },
 }
 
 #[cfg(test)]
@@ -653,6 +696,30 @@ mod tests {
     }
 
     #[test]
+    fn app_ctx_records_a_monitor_toggle_through_the_same_deferred_path() {
+        // ai-monitor-right-panel: the ai-monitor overlay cannot hold `&mut Renderer` for
+        // the reason it cannot hold `&mut Tabs`, so the chord records its intent and
+        // `terminal_app` applies it through `Renderer::set_monitor_open` — the one place
+        // `sync_right_inset` is driven from (D21).
+        //
+        // What crosses is open-or-closed, never a width: the renderer derives the band from
+        // `[ai_monitor].width_px` plus the runtime override, so this seam has no width to
+        // carry and cannot become a second author of one (R10.4).
+        let mut sink = Vec::new();
+        let mut ctx = AppCtx::new(&mut sink, 1, 0, None);
+        ctx.set_monitor_open(true);
+        ctx.set_monitor_open(false); // the close half of the same chord
+        assert_eq!(
+            ctx.take_requests(),
+            vec![
+                AppRequest::SetMonitorOpen(true),
+                AppRequest::SetMonitorOpen(false),
+            ],
+            "order is preserved — the last state recorded is the one that is applied"
+        );
+    }
+
+    #[test]
     fn app_ctx_records_nothing_by_default() {
         // Every existing handler keeps working unchanged: no requests unless one is made.
         let mut sink = Vec::new();
@@ -747,6 +814,31 @@ mod tests {
         };
         assert_eq!(host.command(&rename), Handled::Consumed);
         assert_eq!(seen.get(), 1, "BeginRename stops at the first taker");
+    }
+
+    #[test]
+    fn the_launch_restore_reaches_an_overlay_through_the_command_seam() {
+        // ai-monitor-right-panel R6.6 — the restore's only route. `[ai_monitor].open` is
+        // read by the app, which holds the config; the panel is opened by the overlay,
+        // which holds the watcher. This command is the bridge, and it carries the active
+        // tab's cwd + pid because at launch nothing else has handed them over yet.
+        //
+        // First-wins like `BeginRename` (it is addressed to one owner), not a fan-out.
+        let seen = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut host = OverlayHost::default();
+        for _ in 0..2 {
+            host.register(Box::new(Commandable {
+                got: None,
+                verdict: Handled::Consumed,
+                seen: seen.clone(),
+            }));
+        }
+        let restore = OverlayCommand::RestoreMonitor {
+            cwd: Some(PathBuf::from("/proj/a")),
+            shell_pid: Some(8060),
+        };
+        assert_eq!(host.command(&restore), Handled::Consumed);
+        assert_eq!(seen.get(), 1, "one panel per window, so one taker");
     }
 
     #[test]

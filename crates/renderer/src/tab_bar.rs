@@ -6,7 +6,7 @@
 //! and the item names the app still uses (`terminal_app.rs`) valid verbatim.
 //!
 //! The column-based text helpers ([`char_cols`], [`advance_px`], [`pen_layout`],
-//! [`truncate_cols`], [`layout_line`]) stay here because [`crate::overlay_layer`] and
+//! [`truncate_cols`], [`layout_line`]) stay here because [`crate::monitor_panel`] and
 //! [`crate::preedit_layer`] consume them — so the font-fallback + display-width rules
 //! live in exactly one place and cannot drift into copies. Layout is **column-based**,
 //! not char-based (R5.2/R5.3): a Hangul basename is 2 columns per char, so a fixed

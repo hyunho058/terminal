@@ -1,79 +1,64 @@
-//! ai-monitor dashboard layout — the app-side presentation policy (SD4/D21).
+//! ai-monitor panel composition — the app-side presentation policy (SD4/D11).
 //!
-//! `crates/ai-monitor` accumulates raw numbers; everything about how they *look*
-//! lives here: which sections exist, their order, truncation, the per-model
-//! context-window table, and the placeholder rules. The renderer is untouched
-//! (SD3) — the output is a plain `Vec<String>` drawn as glyphs.
+//! `crates/ai-monitor` accumulates raw numbers; everything about how they *read* lives
+//! here: which sections exist, their order, their wordings, the per-model context-window
+//! table, and the placeholder rules. What this module does **not** do is measure:
+//! [`model`] hands `renderer::monitor_layout` a typed structure and the renderer, which
+//! knows the panel's width, decides what fits (R3.1/R3.4).
 //!
-//! Two constraints shape every decision in this module:
+//! Two constraints shape every decision in it:
 //!
-//! * **The app is width-blind.** `OverlayModel` carries no width, `AppCtx` no
-//!   columns, and the `Overlay` trait has no resize hook — the renderer computes a
-//!   column budget at draw time and clips. So sections are **open-right** (a rule
-//!   that simply ends early when clipped) rather than closed boxes, whose missing
-//!   corner would be a conspicuous tell. Even a width channel would not fix it:
-//!   nothing recomposes the overlay on resize, so any learned width goes stale at
-//!   the first window drag.
-//! * **Pure.** [`compose`] takes a snapshot and an injected `now_ms` and reads no
-//!   clock, no filesystem, no globals — which is what makes the `insta` snapshots
-//!   byte-stable.
+//! * **No column count lives here any more.** The module used to assemble fixed
+//!   104-column strings — `RULE_COLS`, `fit_row`, a `rule*` family — because the old
+//!   full-width overlay carried no width, `AppCtx` no columns and the `Overlay` trait no
+//!   resize hook, so a section had to be *open-right* (a rule that simply ends when
+//!   clipped) rather than a closed box whose missing corner would be a conspicuous tell.
+//!   A **docked** panel has a known width, so the entire compensation is gone (R3.3). Do
+//!   not bring one back: a second width rule here and in `monitor_layout` would put the
+//!   run rectangles and the glyphs drawn into them permanently out of step.
+//! * **Pure.** [`model`] takes a snapshot and an injected [`Env`] and reads no clock, no
+//!   filesystem, no timezone and no globals — which is what makes the `insta` snapshots
+//!   byte-stable (R3.2). The **UTC offset is injected too** (D19), exactly like `now_ms`:
+//!   D7/D9 put a local wall clock on the panel, and resolving it here would render one
+//!   thing on the author's machine, another on a UTC CI runner, and a third across a DST
+//!   boundary. `overlay.rs` — impure by design, it already reads the config and the
+//!   process table — resolves it and passes it in.
 
-use ai_monitor::telemetry::{FileOp, TaskEntry, TelemetrySnapshot};
-
-/// Nominal rule length. At the default 900x540 logical window with `size_pt: 14.0`
-/// on a 2x display, `cw = round(14*2*0.6) = 17` and the full-width panel budgets
-/// `floor((1800 - 2*10)/17) = 104` columns — so a rule terminates almost exactly at
-/// the panel edge by default, runs short on a wider window, and is clipped mid-rule
-/// on a narrower one. That is the least conspicuous direction to be wrong in: a rule
-/// is self-similar, so a clipped one still reads as a rule.
-pub const RULE_COLS: usize = 104;
-
-/// Width of the left label gutter. A fixed *left* gutter needs no width knowledge,
-/// unlike a right-aligned column.
-const LABEL_COLS: usize = 8;
+use ai_monitor::telemetry::{FileOp, Subagent, TaskEntry, TelemetrySnapshot};
+use renderer::monitor_model::{
+    Bar, Card, ColorRole, MonitorModel, PanelStatus, Row, RowLabel, Section, SectionBody,
+    SessionRow, StatTile,
+};
 
 /// The placeholder for every unknown value (U+2014).
 pub const DASH: &str = "—";
 
-// ---- section policy (B1/B2) ---------------------------------------------------
-//
-// Row caps deliberately EXCEED the default window's ~14-line budget. Sizing to 14
-// would show one row per section on the large windows where this dashboard is
-// actually read, and the app cannot size adaptively — it is height-blind for the
-// same freshness reason it is width-blind. What makes the overflow safe is the
-// order: the renderer keeps the LAST `max_lines` (`overlay_layer.rs:268`), so the
-// least disposable content is composed last. Tasks clip first, the summary never.
-//
-// Populated: 5 rules + 19 rows + the 4-line summary = 28 lines. Empty: 5 inline
-// rules + 4 = 9 (B3 puts the empty state ON the rule rather than spending a row).
-const TASKS_ROWS: usize = 4;
-const SKILLS_ROWS: usize = 3;
-const TOOLS_ROWS: usize = 4;
-const FILES_ROWS: usize = 4;
-const AGENTS_ROWS: usize = 4;
+/// Upper bound, in columns, on any variable-length string that enters the model.
+///
+/// **Not a layout budget.** The renderer knows the panel's width and truncates to it
+/// (`monitor_layout::Painter::text`); this bounds what crosses the seam. A task's
+/// `status`, an agent's `subagent_type`/`model` and a tool's `name` are raw strings the
+/// crate passes through verbatim, so a hostile 4000-char one would otherwise be cloned
+/// into the model and compared field by field on every frame by the R7.3 shaping cache —
+/// for a row that can never show more than ~90 columns (the panel's 760px maximum, less
+/// padding, at the widest cell the app draws). Deliberately above that, so it clips
+/// nothing a panel could have shown.
+const TEXT_CAP: usize = 96;
 
 /// Outcome, for finished tool and file rows. Two-valued: the pending-tool map is
 /// excluded from the snapshot, so no in-flight tool reaches this layer (B4).
-const OK: &str = "✓";
-const FAIL: &str = "✗";
+const OK: char = '✓';
+const FAIL: char = '✗';
 
-/// Liveness, for agent rows — a *different axis* from outcome. The fold records no
+/// Liveness, for agent cards — a *different axis* from outcome. The fold records no
 /// `is_error` for agents, so `✓`/`✗` would assert a result the data does not carry;
 /// an agent enters the ring the moment its call is folded and is completed later.
 ///
 /// All four glyphs sit outside the procedurally-drawn `U+2500..=U+259F` range and so
 /// depend on font coverage — which is why each pair is one constant, replaceable
 /// with `+`/`-` in a line if the configured font disappoints.
-const LIVE: &str = "●";
-const DONE: &str = "◯";
-
-/// Column budget for a file row's path (B7), derived term by term against
-/// `RULE_COLS = 104`: `2 indent, 5 operation label, 1, 1 glyph, 1, 8 duration, 1
-/// separator` is 19 of chrome, leaving 85. Pinned by
-/// `the_path_budget_equals_its_own_derivation`, so the number cannot drift away from
-/// the row it describes — two revisions of the spec stated a budget that disagreed
-/// with its own subtraction.
-const PATH_COLS: usize = 85;
+const LIVE: char = '●';
+const DONE: char = '◯';
 
 /// Per-model context windows (SD4 — app-side, so a new model needs no `ai-monitor`
 /// change). Seeded from the model ids that actually appear in the logs, measured
@@ -83,7 +68,15 @@ const PATH_COLS: usize = 85;
 ///
 /// Longest-prefix, then default — one rule, no second mechanism. Note there is no
 /// suffix parsing: model ids carry no bracketed context-window marker in any of the
-/// 28,925 logged values, so a `[1m]`-style rule would be unreachable code.
+/// 28,925 logged values, so a `[1m]`-style rule would be unreachable code. (Re-verified
+/// since: every `[1m]` occurrence in a real log is prose inside a message, never a
+/// field — the window genuinely cannot be READ.)
+///
+/// These are therefore the window a session is **assumed** to have, and the assumption
+/// is the small one: the same bare id is logged whether the session opened a 200k or a
+/// 1M window, so guessing large would over-report headroom on every ordinary session.
+/// What cannot be read can still be DEDUCED — see [`WINDOW_TIERS`] and
+/// [`promoted_window`], which correct the assumption from observed usage.
 const MODEL_WINDOWS: &[(&str, u64)] = &[
     ("claude-opus-", 200_000),
     ("claude-sonnet-", 200_000),
@@ -91,8 +84,15 @@ const MODEL_WINDOWS: &[(&str, u64)] = &[
     ("claude-fable-", 200_000),
 ];
 
+/// The context-window sizes a Claude session can actually have, smallest first.
+///
+/// Two, because two exist: the standard window and the 1M tier. Ascending order is
+/// load-bearing — [`promoted_window`] takes the first that fits, which is the smallest,
+/// and a mis-sorted table would over-state the window and under-report occupancy.
+const WINDOW_TIERS: &[u64] = &[200_000, 1_000_000];
+
 /// Everything the composer needs that the snapshot does not carry. Injected rather
-/// than read, which is what keeps [`compose`] pure and the snapshots byte-stable.
+/// than read, which is what keeps [`model`] pure and the snapshots byte-stable.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Env {
     /// Wall clock, epoch millis.
@@ -106,18 +106,35 @@ pub struct Env {
     pub context_window: Option<u64>,
     /// Whether the tab this panel belongs to is running a `claude` process at all —
     /// answered by walking the tab's process tree in `overlay.rs`, which is why it is
-    /// injected rather than derived: [`compose`] reads no process table, and a
+    /// injected rather than derived: [`model`] reads no process table, and a
     /// snapshot that does not exist carries nothing to derive it from. It selects
     /// which of the two [`Detached::NoLog`] wordings the session row shows.
     pub tab_has_claude: bool,
+    /// Seconds to add to a UTC epoch to get local wall-clock time (D19), resolved by
+    /// `overlay.rs` from the platform timezone each time the model is rebuilt.
+    ///
+    /// Injected, never read here, for the reason the module header gives: a timezone
+    /// lookup inside a pure composer makes its output machine- and season-dependent, and
+    /// the `insta` snapshots that pin composition policy would flake on a UTC runner.
+    ///
+    /// It is the offset **now**, applied to every timestamp on the frame — a session
+    /// spanning a DST transition renders its pre-transition rows an hour off. Accepted
+    /// rather than solved: a per-timestamp historical offset needs a full tz database,
+    /// which this project does not carry, and the error is bounded at one hour twice a
+    /// year against values whose purpose is ordering.
+    pub utc_offset_secs: i32,
 }
 
-/// The window for `model`, or `None` when no prefix matches.
+/// The **assumed** window for `model`, or `None` when no prefix matches.
 ///
 /// `None` is load-bearing: the caller omits the percentage entirely rather than
 /// assuming a denominator. A confident percentage against a guessed window is a
 /// false statement about how much room the session has left, and `<synthetic>`
 /// matches nothing.
+///
+/// `Some` is an assumption, not a reading — the id records no window. Callers that
+/// have observed usage should correct it through [`promoted_window`] rather than
+/// treat this number as measured.
 pub fn context_window(model: &str) -> Option<u64> {
     MODEL_WINDOWS
         .iter()
@@ -126,22 +143,63 @@ pub fn context_window(model: &str) -> Option<u64> {
         .map(|(_, w)| *w)
 }
 
-/// Compose the dashboard for a snapshot at `now_ms`.
+/// Correct an assumed window against what the session has demonstrably used.
 ///
-/// Pure: the clock is a parameter, not a call.
+/// The log records no window, so [`context_window`]'s answer is a guess — and it
+/// guesses small (see `MODEL_WINDOWS`). But `used` is a **measurement**: the tokens the
+/// API actually accepted in one turn. A turn of 514,930 tokens is proof the window was
+/// never 200k, whatever the id says, and against the assumed 200k it renders as a
+/// useless `>100%` on a session that is barely half full.
 ///
-/// `None` — no log resolved for this tab — renders the *same* frame as a snapshot
-/// with nothing folded into it yet (F3a's empty example). The two are the same
-/// statement to a reader ("nothing known"), and rendering nothing at all would flash
-/// the panel empty on every open.
+/// So: promote to the smallest known tier that fits the measurement. Three properties
+/// make this a deduction rather than a second guess, and each is pinned by a test —
 ///
-/// Section order is Tasks → Skills → Other Tools → File Activity → Agents →
-/// summary, and it is a degradation order, not a reading order: the panel keeps the
-/// tail, so what is composed last is what survives a short window. File Activity
-/// sits below Other Tools deliberately — on the file-heavy session that motivates
-/// the "Other Tools" name, the reverse order would spend a guaranteed-visible slot
-/// on an empty section while decapitating the populated one above it.
-pub fn compose(snap: Option<&TelemetrySnapshot>, env: &Env) -> Vec<String> {
+/// * **Evidence only.** `used <= assumed` returns `assumed` untouched, so a session
+///   that never exceeds its assumed window is bit-for-bit unaffected. The model NAME is
+///   never consulted here; naming a model that *can* run 1M would be exactly the hunch
+///   this must not make.
+/// * **Smallest fit.** The first tier that fits, not the largest — 514,930 proves the
+///   window is >200k and nothing more, so claiming more headroom than proven would be
+///   the original bug pointed the other way.
+/// * **No fit, no promotion.** Usage past the largest tier promotes to nothing and
+///   keeps `assumed`, so the caller's `>100%` still fires. That state is reachable and
+///   still means the right thing — "the window is wrong, and this table cannot say what
+///   it is" — which is what `[ai_monitor] context_window` exists to resolve.
+fn promoted_window(assumed: u64, used: u64) -> u64 {
+    if used <= assumed {
+        return assumed;
+    }
+    WINDOW_TIERS
+        .iter()
+        .copied()
+        .find(|&tier| tier > assumed && tier >= used)
+        .unwrap_or(assumed)
+}
+
+/// How long a session may go quiet before the pill reads IDLE rather than CONNECTED
+/// (D5/R5.2).
+///
+/// Five minutes, not five seconds: a `tool_use` line is written when a call starts and
+/// its result when the call ends, so a long `cargo build` or a deep subagent run leaves
+/// a genuinely working session silent for minutes. A threshold shorter than the longest
+/// routine gap would blink a live session to IDLE mid-call, and under D2 nothing
+/// repaints on a timer to blink it back.
+const IDLE_AFTER_MS: u64 = 300_000;
+
+/// Compose the **panel model** for a snapshot at `env.now_ms` (D11/R3.1).
+///
+/// Structure, never pre-formatted width-bound strings: the renderer knows the panel's
+/// width and this module does not. Pure, and by the same means as before — every input
+/// is in `env`.
+///
+/// `None` — no log resolved for this tab — builds the *same* model as a snapshot with
+/// nothing folded into it yet. The two are the same statement to a reader ("nothing
+/// known"), and rendering nothing at all would flash the panel empty on every open.
+///
+/// `visible` is left at its default: whether the user is looking is `overlay.rs`'s fact,
+/// not the snapshot's, and folding it in here would make the model depend on something
+/// no telemetry can supply.
+pub fn model(snap: Option<&TelemetrySnapshot>, env: &Env) -> MonitorModel {
     let empty = TelemetrySnapshot::default();
     // Which log a tab owns is not knowable — a live `claude` holds no open fd on its
     // own log, so the resolver can only offer "whichever session here did something
@@ -156,18 +214,195 @@ pub fn compose(snap: Option<&TelemetrySnapshot>, env: &Env) -> Vec<String> {
         // "nothing here" should not be two different-looking blank frames.
         (None, false) => Some(Detached::NoLog),
     };
+    // Unattached renders the EMPTY snapshot, never the resolved one: a log this tab
+    // cannot prove is its own must not have its spend, model or uptime shown as this
+    // tab's. The wording below says why the panel is empty.
     let t = match snap {
         Some(t) if env.attached => t,
         _ => &empty,
     };
-    let mut lines = Vec::with_capacity(28);
-    lines.extend(tasks(t));
-    lines.extend(skills(t, env.now_ms));
-    lines.extend(other_tools(t));
-    lines.extend(file_activity(t));
-    lines.extend(agents(t, env.now_ms));
-    lines.extend(summary(t, env, detached));
-    lines
+    MonitorModel {
+        visible: false,
+        title: "ai-monitor".to_string(),
+        status: status(t, env, detached),
+        session: session_row(t, detached, env),
+        tiles: tiles(t, env),
+        sections: sections(t, env),
+        footer: footer(t, env),
+    }
+}
+
+/// The pill's three states (D5/R5.2).
+///
+/// Detached is `NO SESSION` whichever of the four detached cases it is — the pill is an
+/// at-a-glance badge and the four are diagnosed by the session row's note. Attached
+/// splits on liveness, and an attached log with **no** parseable event time reads IDLE
+/// rather than CONNECTED: absence of a clock is not evidence of liveness, the same rule
+/// `overlay.rs::proves_ownership` applies to attachment.
+fn status(t: &TelemetrySnapshot, env: &Env, detached: Option<Detached>) -> PanelStatus {
+    if detached.is_some() {
+        return PanelStatus::NoSession;
+    }
+    match t.last_event_ms {
+        Some(last) if env.now_ms.saturating_sub(last) <= IDLE_AFTER_MS => PanelStatus::Connected,
+        _ => PanelStatus::Idle,
+    }
+}
+
+/// The session identity row, with the detached wording underneath it (R5.3).
+///
+/// The panel's name is already in the header, so this row spends its columns on the
+/// session instead of repeating it. When detached it carries **only** the note: every
+/// identity field is left empty, because the fields would otherwise describe the log
+/// this tab declined to claim.
+fn session_row(t: &TelemetrySnapshot, detached: Option<Detached>, env: &Env) -> SessionRow {
+    if let Some(d) = detached {
+        return SessionRow {
+            name: "session".to_string(),
+            note: Some(detached_note(d, env)),
+            ..SessionRow::default()
+        };
+    }
+    SessionRow {
+        name: "session".to_string(),
+        short_id: t
+            .session_id
+            .as_deref()
+            .map(|s| s.chars().take(8).collect::<String>())
+            .unwrap_or_else(|| DASH.to_string()),
+        provider: "[Claude]".to_string(),
+        model: t
+            .model
+            .as_deref()
+            .map(clip)
+            .unwrap_or_else(|| DASH.to_string()),
+        note: None,
+    }
+}
+
+/// The four detached wordings (R5.3), in one place so the pill's compression cannot
+/// quietly become a compression of these too.
+///
+/// They are the entire diagnostic story for "why is this panel empty", which is the
+/// panel's most common confusing state — and "you have no Claude here" and "your Claude
+/// has not logged yet" are diagnosed completely differently.
+pub fn detached_note(d: Detached, env: &Env) -> String {
+    match d {
+        // Naming the gap is the point: "empty" alone would read as "nothing has
+        // happened", when in fact a log was found and deliberately not believed.
+        Detached::StaleSince(last) => format!(
+            "(no active session — newest log idle {})",
+            dur(env.now_ms.saturating_sub(last))
+        ),
+        Detached::Undated => "(no active session — newest log is undated)".to_string(),
+        // Nothing resolved — which under strict resolution is the ordinary empty state,
+        // so it has to say *which* nothing this is. The key is whether the tab runs a
+        // `claude` process, deliberately NOT whether its hint was usable: a live
+        // `claude` started without `--resume`, or whose start time could not be read,
+        // yields an empty hint, and telling the user there is no session in a tab where
+        // they can watch `claude` running reads as a bug.
+        Detached::NoLog if env.tab_has_claude => {
+            "(this tab's session has not written a log yet)".to_string()
+        }
+        Detached::NoLog => "(no Claude session in this tab)".to_string(),
+    }
+}
+
+/// The 3x2 stat grid, in the design's order.
+///
+/// Every value is a **reading**, not a counter (D20): the footer's absolute timestamp
+/// says when the whole frame was computed, and UPTIME/IDLE freeze between snapshots
+/// because under D2 nothing repaints on a timer.
+fn tiles(t: &TelemetrySnapshot, env: &Env) -> Vec<StatTile> {
+    let since = |ms: Option<u64>| match ms {
+        Some(ms) => dur(env.now_ms.saturating_sub(ms)),
+        None => DASH.to_string(),
+    };
+    // Cumulative and session-wide (D3) — NOT `parse_errors`, which counts parser faults.
+    // Showing one under the other's label would be a false statement about what failed.
+    let errors = t.failed_tool_calls;
+    vec![
+        StatTile::new("UPTIME", since(t.first_event_ms), ColorRole::TextPrimary),
+        StatTile::new("IDLE", since(t.last_event_ms), ColorRole::TextPrimary),
+        StatTile::new(
+            "ERRORS",
+            num(errors),
+            // Zero failures is a fact worth stating plainly; a rose zero would read as
+            // an alarm about nothing.
+            if errors > 0 {
+                ColorRole::Rose
+            } else {
+                ColorRole::TextMuted
+            },
+        ),
+        StatTile::new(
+            "IN·OUT",
+            format!("{}·{}", tok(t.total_input), tok(t.total_output)),
+            ColorRole::TextPrimary,
+        ),
+        StatTile::new(
+            "CACHE",
+            tok(t.total_cache_read.saturating_add(t.total_cache_creation)),
+            ColorRole::Teal,
+        ),
+        context_tile(t, env),
+    ]
+}
+
+/// The CONTEXT tile and its gauge (R5.4/R5.5).
+///
+/// `None` from [`context_pct`] emits **no percentage and no gauge** — not `0%`, and not
+/// an empty track. An empty track is a claim ("you have used none of your window") that
+/// a model matching no `MODEL_WINDOWS` prefix does not entitle the panel to make, and
+/// `StatTile::gauge` distinguishes the two precisely so this case can be drawn as
+/// nothing.
+fn context_tile(t: &TelemetrySnapshot, env: &Env) -> StatTile {
+    let Some(pct) = context_pct(t, env) else {
+        return StatTile::new("CONTEXT", DASH, ColorRole::TextMuted);
+    };
+    // `>100%` because a percentage over 100 is self-evidently impossible and reads as a
+    // broken dashboard, when what it means is that the assumed window is too small — a
+    // 1M-context session logs the same bare model id as a 200k one. The gauge clamps to
+    // full alongside it.
+    //
+    // Reachable only past the largest known tier — unobserved in the measured corpus (max 666,545), but retained because a larger window shipping is exactly when it matters, and still the right answer, now that `promoted_window` corrects
+    // the assumption: it only promotes to a window this table KNOWS about, so usage past
+    // the largest known tier fits nothing and lands here. The statement is narrower than
+    // it was — no longer "your window might be bigger than 200k" (deduced now) but "your
+    // window is bigger than any size this build knows" — and `[ai_monitor]
+    // context_window` remains how a user resolves it.
+    let value = if pct > 100 {
+        ">100%".to_string()
+    } else {
+        format!("{pct}%")
+    };
+    StatTile::new("CONTEXT", value, ColorRole::Teal).with_gauge(pct as f32 / 100.0)
+}
+
+/// The footer: an **absolute** last-update time (D9/D20/R5.10).
+///
+/// Never a relative age. Under D2 nothing repaints on a timer, so "updated 6s ago"
+/// freezes and becomes actively false while Claude spends five minutes composing a
+/// reply; `16:21:18` stays correct however long it sits on screen. It also qualifies
+/// every other value on the panel — UPTIME and IDLE are readings taken at that moment,
+/// and a duration has no absolute form to fix itself with.
+fn footer(t: &TelemetrySnapshot, env: &Env) -> String {
+    match t.last_event_ms {
+        Some(ms) => format!("Last update {}", clock(ms, env.utc_offset_secs)),
+        None => format!("Last update {DASH}"),
+    }
+}
+
+/// `16:21:18` — a UTC epoch in local wall-clock time, on the injected offset (D7/D19).
+///
+/// Deliberately no date: the panel shows one session, and a session that spans midnight
+/// is rarer than the row this would cost. `rem_euclid` rather than `%` so a negative
+/// offset west of Greenwich wraps into the previous day instead of producing a negative
+/// hour.
+pub fn clock(epoch_ms: u64, utc_offset_secs: i32) -> String {
+    let local = (epoch_ms / 1000) as i64 + utc_offset_secs as i64;
+    let sod = local.rem_euclid(86_400);
+    format!("{:02}:{:02}:{:02}", sod / 3600, (sod % 3600) / 60, sod % 60)
 }
 
 /// Why a resolved log is not being shown as this window's session.
@@ -198,7 +433,7 @@ impl Detached {
     /// Why the *not yet attached* state is showing. Reporting only — the decision
     /// itself was made in `overlay.rs`; this turns it into words.
     fn of(t: &TelemetrySnapshot) -> Detached {
-        // Read from the RESOLVED snapshot, before `compose` swaps in the empty one —
+        // Read from the RESOLVED snapshot, before `model` swaps in the empty one —
         // testing the emptied value here would make every case look like `NoLog`.
         if *t == TelemetrySnapshot::default() {
             return Detached::NoLog;
@@ -210,15 +445,62 @@ impl Detached {
     }
 }
 
-/// Tasks — newest-*updated* first (B6c).
+// ---- the content sections -----------------------------------------------------
+
+/// The content sections, in the design's order.
 ///
-/// The store is a keyed map, which has no order, so the sort is not a nicety: a
-/// `HashMap` iteration would make the pinned snapshots flaky run to run, Rust's
-/// hasher being randomly seeded per process. The key is `updated_ms` because it
+/// The order is a **priority** order now, not the degradation order the retiring overlay
+/// used. That layer kept the *last* `max_lines`, so the least disposable content had to
+/// be composed last; D18's allocator instead reserves headings from the top and drops
+/// them from the **bottom**, so what is listed last is what a short panel loses. TASKS
+/// and ACTIVE AGENTS lead because they answer "what is this session doing right now".
+///
+/// The five ring-backed sections are **not** capped here. The crate's rings are already
+/// bounded (`TOOLS_CAP = 32`, `SKILLS_CAP = 16`, …) and sized at "~3x the app's display
+/// counts, so the app can show more without a crate change"; an app-side cap on top of
+/// that would decide the panel's height in the one file that cannot see it, and a tall
+/// window would show four rows while the allocator had room for eight. TOOL USAGE is the
+/// exception, and for a different reason — see [`TOOL_BARS`].
+fn sections(t: &TelemetrySnapshot, env: &Env) -> Vec<Section> {
+    vec![
+        tasks(t, env),
+        agents(t, env),
+        skills(t, env),
+        file_activity(t),
+        recent_calls(t),
+        tool_usage(t),
+    ]
+}
+
+/// A populated section, or its empty state.
+///
+/// The wording rides the **heading** (the renderer draws it there), never a row: an empty
+/// state that occupied a row would compete for the single row D18 guarantees a populated
+/// neighbour. A missing section and an empty one are also different facts, so a section
+/// is never simply omitted — the layout would jump as sections appeared, and a reader
+/// could not tell "no data" from "not built".
+fn section(label: &str, empty_state: &str, total: usize, body: SectionBody) -> Section {
+    Section {
+        label: label.to_string(),
+        total,
+        body: if body.is_empty() {
+            SectionBody::Empty(empty_state.to_string())
+        } else {
+            body
+        },
+    }
+}
+
+/// TASKS — newest-*updated* first (B6c), one card each.
+///
+/// The crate hands the tasks over as a `Vec` already sorted by **id**
+/// (`telemetry.rs:358`, which is what makes the snapshots byte-stable), so the sort here
+/// is not deduplicating a `HashMap` order — it is what turns that arbitrary-but-stable id
+/// order into the display order. The key is `updated_ms` because it
 /// surfaces the task that just changed and because the crate already evicts by it —
 /// display order and eviction order agree instead of fighting. Ties fall through to
 /// `created_ms` then the id, so the order is total.
-fn tasks(t: &TelemetrySnapshot) -> Vec<String> {
+fn tasks(t: &TelemetrySnapshot, env: &Env) -> Section {
     let mut ordered: Vec<&(String, TaskEntry)> = t.tasks.iter().collect();
     ordered.sort_by(|a, b| {
         b.1.updated_ms
@@ -226,338 +508,352 @@ fn tasks(t: &TelemetrySnapshot) -> Vec<String> {
             .then_with(|| b.1.created_ms.cmp(&a.1.created_ms))
             .then_with(|| a.0.cmp(&b.0))
     });
-    let rows = ordered
+    let cards = ordered
         .iter()
-        .take(TASKS_ROWS)
-        .map(|(_, e)| fit_row("  ", &e.subject, &format!(" · {}{}", e.status, task_dur(e))))
+        .map(|(_, e)| Card {
+            accent: Some(task_role(&e.status)),
+            title: clip(&e.subject),
+            value: task_dur(e),
+            detail: Some(task_detail(e, env)),
+        })
         .collect();
-    section("Tasks", "(no tasks)", t.tasks.len(), rows)
+    section(
+        "TASKS",
+        "(no tasks)",
+        t.tasks.len(),
+        SectionBody::Cards(cards),
+    )
 }
 
-/// A task's duration, or nothing.
+/// A task's accent: amber while it is moving, green once it is done, faint otherwise.
 ///
 /// Only `completed` is treated as terminal — every other string, known or not. The
 /// measured vocabulary is exactly `completed` and `in_progress` (plus `active` at
 /// creation); `failed` does not occur. Closing the rule on one value rather than
-/// enumerating a set is what keeps an unknown status from being read as finished,
-/// and `updated_ms − created_ms` is only a duration when the last update *is* the
-/// completion — otherwise it measures time-since-last-change (B6a).
+/// enumerating a set is what keeps an unknown status from being read as finished.
+fn task_role(status: &str) -> ColorRole {
+    match status {
+        "completed" => ColorRole::AccentGreen,
+        "in_progress" | "active" => ColorRole::Amber,
+        _ => ColorRole::TextFaint,
+    }
+}
+
+/// A completed task's duration, or nothing.
+///
+/// `updated_ms − created_ms` is only a duration when the last update *is* the
+/// completion — otherwise it measures time-since-last-change (B6a), which the card's
+/// detail line reports instead and in those words.
 fn task_dur(e: &TaskEntry) -> String {
     if e.status != "completed" {
         return String::new();
     }
     match (e.created_ms, e.updated_ms) {
-        (Some(c), Some(u)) if u >= c => format!(" · {}", dur_short(u - c)),
+        (Some(c), Some(u)) if u >= c => dur_short(u - c),
         _ => String::new(),
     }
 }
 
-/// Skills — name and a relative age (B7a).
+/// `in_progress · updated 4m ago` — the raw status, then how long since it moved.
 ///
-/// No duration: a `Skill` tool_use→result pair measures ~50ms of instruction-load
-/// latency, not the skill's execution, so a duration column here would be a
-/// precisely-formatted irrelevance. The age is relative rather than a wall clock
-/// because the injected `now_ms` is a bare epoch value and `std` alone cannot
-/// resolve a local timezone — a UTC clock on a local-session dashboard is worse
-/// than no clock.
-fn skills(t: &TelemetrySnapshot, now_ms: u64) -> Vec<String> {
-    let rows = t
-        .skills
-        .iter()
-        .take(SKILLS_ROWS)
-        .map(|s| {
-            let when = match s.start_ms {
-                Some(ms) => format!(" · {} ago", age(now_ms.saturating_sub(ms))),
-                None => String::new(),
-            };
-            fit_row("  ", &s.name, &when)
-        })
-        .collect();
-    section("Skills", "(no skills yet)", t.skills.len(), rows)
+/// The status passes through verbatim; substituting a glyph or normalising the
+/// vocabulary would silently reinterpret a value the crate deliberately does not
+/// enumerate. The age answers what a status alone leaves open on a long session
+/// (`in_progress` *since when*), and it is a reading like every other duration on the
+/// panel — frozen between snapshots, qualified by the footer's absolute time (D20).
+fn task_detail(e: &TaskEntry, env: &Env) -> String {
+    let status = clip(&e.status);
+    match e.updated_ms {
+        Some(u) => format!(
+            "{status} · updated {} ago",
+            age(env.now_ms.saturating_sub(u))
+        ),
+        None => status,
+    }
 }
 
-/// Other Tools — named for what the store actually holds (B7b).
-///
-/// The ring receives only tools that classify as *plain*: `Read|Write|Edit|Grep|Glob`
-/// go to file activity, `Agent`/`Skill`/`Task*` to their own stores. "Recent Tools"
-/// over a section that structurally excludes the five most common tools would read
-/// as a bug on a file-heavy session — empty here, full below.
-fn other_tools(t: &TelemetrySnapshot) -> Vec<String> {
-    let rows = t
-        .tools
-        .iter()
-        .take(TOOLS_ROWS)
-        .map(|c| {
-            fit_row(
-                &format!("  {} ", mark(c.ok)),
-                &c.name,
-                &format!(" {}", opt_dur(c.duration_ms)),
-            )
-        })
-        .collect();
-    section("Other Tools", "(no other tool calls)", t.tools.len(), rows)
-}
-
-/// File Activity — operation, outcome, target, duration.
-///
-/// Spacing here is single-column and deliberate: it is the layout B7's path budget
-/// is derived against, so widening a separator silently invalidates `PATH_COLS`.
-fn file_activity(t: &TelemetrySnapshot) -> Vec<String> {
-    let rows = t
-        .files
-        .iter()
-        .take(FILES_ROWS)
-        .map(|f| {
-            // Through `fit_row` like every other section, so the path yields when the
-            // duration is wider than the 8 columns B7 reserves for it. `dur` can
-            // legitimately emit 9 (`70000h00m`) from a hostile timestamp pair, and a
-            // row that overruns its own rule is the one thing this layout must not do.
-            fit_row(
-                &format!("  {:<5} {} ", op_label(f.op), mark(f.ok)),
-                &file_target(f.op, &f.path),
-                &format!(" {}", opt_dur(f.duration_ms)),
-            )
-        })
-        .collect();
-    section("File Activity", "(no file activity)", t.files.len(), rows)
-}
-
-/// Agents — a flat list, because there is no tree.
+/// ACTIVE AGENTS — a flat list, because there is no tree.
 ///
 /// Real Claude Code JSONL carries no parent linkage (nested agents write to a
 /// `subagents/` sibling directory that is never read), so `├─`/`└─` connectors would
-/// draw a hierarchy that was never observed. The heading is "Agents" rather than
-/// "Active Agents" because completed entries persist: on an idle session nothing new
-/// pushes them out, and an "active" heading whose empty state becomes unreachable
-/// after the first agent ever runs is simply false (B5/B6).
-fn agents(t: &TelemetrySnapshot, now_ms: u64) -> Vec<String> {
-    let rows = t
+/// draw a hierarchy that was never observed.
+///
+/// Completed agents keep their cards under the design's ACTIVE heading: on an idle
+/// session nothing new pushes them out, and a section that emptied itself the moment its
+/// last agent finished would say "no agents ran" when it means "none are running". The
+/// `●`/`◯` mark and the accent are what separate the two.
+fn agents(t: &TelemetrySnapshot, env: &Env) -> Section {
+    let cards = t
         .subagents
         .iter()
-        .take(AGENTS_ROWS)
-        .map(|a| {
-            // Frozen on completion. A finished agent whose timer keeps climbing is
-            // the single most misleading thing a status dashboard can show.
-            let elapsed = match (a.start_ms, a.completed, a.end_ms) {
-                (Some(s), true, Some(e)) if e >= s => format!(" · {}", dur(e - s)),
-                (Some(s), false, _) => format!(" · {}", dur(now_ms.saturating_sub(s))),
-                _ => String::new(),
-            };
-            let head = format!(
-                "  {} {} · ",
+        .map(|a| Card {
+            accent: Some(if a.completed {
+                ColorRole::TextFaint
+            } else {
+                ColorRole::Amber
+            }),
+            title: format!(
+                "{} {}",
                 if a.completed { DONE } else { LIVE },
-                a.subagent_type.as_deref().unwrap_or(DASH)
-            );
-            let tail = format!(
-                "{}{elapsed}",
-                a.model
-                    .as_deref()
-                    .map(|m| format!(" · {m}"))
-                    .unwrap_or_default()
-            );
-            fit_row(&head, a.description.as_deref().unwrap_or(DASH), &tail)
+                clip(a.subagent_type.as_deref().unwrap_or(DASH))
+            ),
+            value: agent_elapsed(a, env),
+            detail: Some(agent_detail(a)),
         })
         .collect();
-    section("Agents", "(no agents yet)", t.subagents.len(), rows)
+    section(
+        "ACTIVE AGENTS",
+        "(no agents yet)",
+        t.subagents.len(),
+        SectionBody::Cards(cards),
+    )
 }
 
-/// A section: its rule, then its rows — or a single rule carrying the empty state.
-///
-/// An empty section is one line, not two: at a 14-line budget an all-empty dashboard
-/// must not spend ten of them saying nothing. A missing section and an empty one are
-/// different facts, so it is never simply omitted — the layout would jump as
-/// sections appeared, and a reader could not tell "no data" from "not built".
-fn section(label: &str, empty_state: &str, total: usize, rows: Vec<String>) -> Vec<String> {
-    if total == 0 || rows.is_empty() {
-        return vec![rule_empty(label, empty_state)];
+/// Frozen on completion. A finished agent whose timer keeps climbing is the single most
+/// misleading thing a status dashboard can show.
+fn agent_elapsed(a: &Subagent, env: &Env) -> String {
+    match (a.start_ms, a.completed, a.end_ms) {
+        (Some(s), true, Some(e)) if e >= s => dur(e - s),
+        (Some(s), false, _) => dur(env.now_ms.saturating_sub(s)),
+        _ => String::new(),
     }
-    let hidden = total.saturating_sub(rows.len());
-    let mut out = Vec::with_capacity(rows.len() + 1);
-    out.push(if hidden > 0 {
-        rule_with(label, Some(&format!("+{hidden} more")))
-    } else {
-        rule(label)
-    });
-    out.extend(rows);
-    out
 }
 
-/// The summary block: rule, session/model/context, spend, activity.
+fn agent_detail(a: &Subagent) -> String {
+    let desc = clip(a.description.as_deref().unwrap_or(DASH));
+    match a.model.as_deref() {
+        Some(m) => format!("{desc} · {}", clip(m)),
+        None => desc,
+    }
+}
+
+/// SKILLS — name and the local wall-clock time it started, `at 16:21:18` (D7/R5.9).
 ///
-/// `overlay-dashboard-boxes` composes this LAST, beneath its sections — the panel
-/// keeps the *tail* of the output, so a summary placed first is the first thing
-/// clipped on a short window.
-/// `detached` is set when no session has been attached, so the session row can say
-/// *why* it is showing nothing rather than looking merely empty. The decision itself
-/// is `overlay.rs`'s; this only puts it into words.
-pub fn summary(t: &TelemetrySnapshot, env: &Env, detached: Option<Detached>) -> Vec<String> {
-    let mut lines = Vec::with_capacity(4);
-    lines.push(rule("ai-monitor"));
-
-    // session id · model · context%
-    let session = match detached {
-        // Naming the gap is the point: "empty" alone would read as "nothing has
-        // happened", when in fact a log was found and deliberately not believed.
-        Some(Detached::StaleSince(last)) => format!(
-            "(no active session — newest log idle {})",
-            dur(env.now_ms.saturating_sub(last))
-        ),
-        Some(Detached::Undated) => "(no active session — newest log is undated)".to_string(),
-        // Nothing resolved — which under strict resolution is the ordinary empty
-        // state, so it has to say *which* nothing this is. The key is whether the tab
-        // runs a `claude` process, deliberately NOT whether its hint was usable: a
-        // live `claude` started without `--resume`, or whose start time could not be
-        // read, yields an empty hint, and telling the user there is no session in a
-        // tab where they can watch `claude` running reads as a bug. Being slightly
-        // optimistic when the real cause was an unreadable process is the cheaper
-        // error of the two.
-        Some(Detached::NoLog) if env.tab_has_claude => {
-            "(this tab's session has not written a log yet)".to_string()
-        }
-        Some(Detached::NoLog) => "(no Claude session in this tab)".to_string(),
-        None => {
-            let mut ident = vec![
-                t.session_id
-                    .as_deref()
-                    .map(|s| s.chars().take(8).collect::<String>())
-                    .unwrap_or_else(|| DASH.to_string()),
-                t.model.clone().unwrap_or_else(|| DASH.to_string()),
-            ];
-            // Omitted entirely — label and all — when the model is unmatched or the
-            // gauge is zero. A fresh session's occupancy is unknown, not 0%.
-            if let Some(pct) = context_label(t, env) {
-                ident.push(pct);
-            }
-            ident.join(" · ")
-        }
-    };
-    lines.push(row("session", &session, None));
-
-    // Cumulative COST counters, never presented as occupancy: cache-read is
-    // re-billed every turn, so these run ~16x the live context on a real session.
-    lines.push(row(
-        "spend",
-        &format!(
-            "in {} · out {} · cache {}",
-            tok(t.total_input),
-            tok(t.total_output),
-            tok(t.total_cache_read.saturating_add(t.total_cache_creation))
-        ),
-        Some("billed"),
-    ));
-
-    // Both values freeze between snapshots — nothing recomposes the overlay on a
-    // timer — so they are framed as a reading, not a live counter.
-    let activity = match (t.first_event_ms, t.last_event_ms) {
-        (Some(f), Some(l)) => format!(
-            "up {} · idle {}",
-            dur(env.now_ms.saturating_sub(f)),
-            dur(env.now_ms.saturating_sub(l))
-        ),
-        _ => DASH.to_string(),
-    };
-    lines.push(row("activity", &activity, Some("as of last update")));
-    lines
-}
-
-/// The rendered `context N%` field, or `None` when occupancy cannot be stated.
+/// No duration: a `Skill` tool_use→result pair measures ~50ms of instruction-load
+/// latency, not the skill's execution, so a duration column here would be a
+/// precisely-formatted irrelevance.
 ///
-/// Above 100% it reads `>100%` rather than the number. A percentage over 100 is
-/// self-evidently impossible and reads as a broken dashboard; what it actually means
-/// is that the *window* is wrong — a 1M-context session logs the same bare model id
-/// as a 200k one — so the clamp reports the one thing that is certain (the assumed
-/// window is too small) instead of a figure that cannot be true. `[ai_monitor]
-/// context_window` is how a user resolves it.
-pub fn context_label(t: &TelemetrySnapshot, env: &Env) -> Option<String> {
-    let pct = context_pct(t, env)?;
-    Some(if pct > 100 {
-        "context >100%".to_string()
-    } else {
-        format!("context {pct}%")
-    })
+/// **Absolute, not the relative age this section used to show.** The old form was chosen
+/// because `std` alone cannot resolve a local timezone and a UTC clock on a local-session
+/// dashboard is worse than no clock — but that reasoning assumed `std` was the only
+/// option, and D7/D19 removed the constraint by resolving the offset in `overlay.rs` and
+/// injecting it. An absolute time is also what makes a skill run correlatable against the
+/// terminal's own scrollback, which "12s ago" on a panel that does not repaint is not.
+fn skills(t: &TelemetrySnapshot, env: &Env) -> Section {
+    let rows = t
+        .skills
+        .iter()
+        .map(|s| Row {
+            text: clip(&s.name),
+            value: match s.start_ms {
+                Some(ms) => format!("at {}", clock(ms, env.utc_offset_secs)),
+                None => String::new(),
+            },
+            value_color: ColorRole::TextMuted,
+            ..Row::default()
+        })
+        .collect();
+    section(
+        "SKILLS",
+        "(no skills yet)",
+        t.skills.len(),
+        SectionBody::Rows(rows),
+    )
 }
+
+/// FILE ACTIVITY — verb, outcome, target, duration.
+///
+/// The verb is a [`RowLabel`], which the renderer draws in a fixed gutter rather than at
+/// its own width — that is what makes `READ`/`WRITE` scan as a column — and it carries
+/// the design's roles: magenta for a write, teal for a read (R5.6).
+fn file_activity(t: &TelemetrySnapshot) -> Section {
+    let rows = t
+        .files
+        .iter()
+        .map(|f| Row {
+            label: Some(RowLabel {
+                text: op_label(f.op).to_string(),
+                color: op_role(f.op),
+            }),
+            glyph: Some(mark(f.ok)),
+            text: file_target(f.op, &f.path),
+            value: opt_dur(f.duration_ms),
+            value_color: value_role(f.ok, f.duration_ms),
+        })
+        .collect();
+    section(
+        "FILE ACTIVITY",
+        "(no file activity)",
+        t.files.len(),
+        SectionBody::Rows(rows),
+    )
+}
+
+/// RECENT CALLS — the completed-tool ring, newest first.
+///
+/// The ring receives only tools that classify as *plain*: `Read|Write|Edit|Grep|Glob` go
+/// to FILE ACTIVITY directly above, `Agent`/`Skill`/`Task*` to their own sections. The
+/// design's heading is kept because FILE ACTIVITY sitting immediately above answers the
+/// "where are the reads" question the name would otherwise raise — but the **empty state
+/// still names the gap**, since an empty RECENT CALLS on a file-heavy session is
+/// otherwise indistinguishable from a broken section.
+fn recent_calls(t: &TelemetrySnapshot) -> Section {
+    let rows = t
+        .tools
+        .iter()
+        .map(|c| Row {
+            glyph: Some(mark(c.ok)),
+            text: clip(&c.name),
+            value: opt_dur(c.duration_ms),
+            value_color: value_role(c.ok, c.duration_ms),
+            ..Row::default()
+        })
+        .collect();
+    section(
+        "RECENT CALLS",
+        "(no other tool calls)",
+        t.tools.len(),
+        SectionBody::Rows(rows),
+    )
+}
+
+/// Distinct tools TOOL USAGE ranks (D12).
+///
+/// The one app-side cap on a section, and it is not a height decision the allocator could
+/// make instead: the tally holds up to 64 names, and a bar list long enough to include a
+/// tool called twice is a list in which the design's proportions — the point of the
+/// section — are unreadable. Nine matches the design.
+const TOOL_BARS: usize = 9;
+
+/// TOOL USAGE — the cumulative per-tool tally, ranked and normalised (D12/R5.8).
+///
+/// The ranking lives here because ranking *is* presentation: the crate emits `tool_calls`
+/// in name order and says so, precisely so this decision is not made where the numbers are
+/// accumulated. Count descending, then name ascending — a count-only sort would leave
+/// ties resolved by whatever order the vector happened to arrive in, and the pinned
+/// snapshots would flake the first time two tools drew level.
+///
+/// `tool_calls_other` is in **neither** the ranking nor the denominator: it accumulates
+/// monotonically and never drains, so ranking it would permanently occupy a slot with an
+/// aggregate that names nothing, and normalising against it would rescale every real
+/// tool's bar toward zero as the session aged.
+///
+/// The counts are cumulative and the display rings are not — `TOOLS_CAP = 32` means
+/// everything older than the last 32 calls is gone from RECENT CALLS above. A tool with a
+/// large bar and no recent row is therefore the expected reading, not a contradiction.
+fn tool_usage(t: &TelemetrySnapshot) -> Section {
+    let mut ranked: Vec<&(String, u64)> = t.tool_calls.iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(TOOL_BARS);
+    // The highest *named* count is the full-width bar. Zero only when the tally is empty,
+    // in which case there are no bars to normalise.
+    let top = ranked.first().map(|(_, n)| *n).unwrap_or(0);
+    let bars = ranked
+        .iter()
+        .map(|(name, n)| {
+            let fraction = if top > 0 { *n as f32 / top as f32 } else { 0.0 };
+            Bar::new(clip(name), *n, fraction)
+        })
+        .collect();
+    section(
+        "TOOL USAGE",
+        "(no tool calls yet)",
+        t.tool_calls.len(),
+        SectionBody::Bars(bars),
+    )
+}
+
+/// The colour a row's trailing value and its outcome mark share.
+///
+/// They share one role deliberately (`Row::value_color` drives both): a `✗` drawn in the
+/// duration's colour would announce a failure in the palette of a fast call. So a failure
+/// outranks the magnitude — the question "did this work" is answered before "was it
+/// quick" — and only a successful call is coloured by how long it took.
+fn value_role(ok: bool, duration_ms: Option<u64>) -> ColorRole {
+    if !ok {
+        return ColorRole::Rose;
+    }
+    match duration_ms {
+        Some(ms) => dur_role(ms),
+        // No derivable duration: the value is the `—` placeholder, and there is nothing
+        // to bucket. Colouring it green would read as "fast".
+        None => ColorRole::TextMuted,
+    }
+}
+
+/// A duration's colour, bucketed by magnitude (R5.7): amber from 30s, neutral from 1s,
+/// green below.
+///
+/// Buckets, not a gradient, because the question this column is read for is categorical —
+/// *was that slow* — and three steps answer it at a glance where a continuous ramp would
+/// have to be decoded against a scale the panel does not draw. The boundaries are the two
+/// places the answer changes: a second is where a call stops being instant, and thirty is
+/// where it stops being something you waited through and becomes something you noticed.
+fn dur_role(ms: u64) -> ColorRole {
+    if ms >= 30_000 {
+        ColorRole::Amber
+    } else if ms >= 1_000 {
+        ColorRole::TextMuted
+    } else {
+        ColorRole::AccentGreen
+    }
+}
+
+/// The verb's colour role (R5.6). `WRITE` magenta, `READ` teal; the rest stay muted —
+/// the design colours the two operations a reader scans for, and colouring all five
+/// would spend the distinction it is making.
+fn op_role(op: FileOp) -> ColorRole {
+    match op {
+        FileOp::Write => ColorRole::Magenta,
+        FileOp::Read => ColorRole::Teal,
+        _ => ColorRole::TextMuted,
+    }
+}
+
+// ---- formatting helpers -------------------------------------------------------
 
 /// Context occupancy as a whole percentage, or `None` when it cannot be stated.
 pub fn context_pct(t: &TelemetrySnapshot, env: &Env) -> Option<u64> {
     if t.context_used == 0 {
         return None;
     }
-    // The configured window wins over the table: the table can only guess from a
-    // model id that does not record the window.
+    // The configured window wins over the table AND over the deduction below: the
+    // table can only guess from a model id that does not record the window, and a
+    // deduction is still an inference. A user who has stated the window has knowledge
+    // neither of them has, so nothing may overrule it — which is why this returns
+    // before `promoted_window` is ever consulted.
     let window = match env.context_window {
         Some(w) => w,
-        None => context_window(t.model.as_deref()?)?,
+        // Assumed from the id, then corrected by measurement. The correction is inert
+        // unless the session has itself proved the assumption wrong.
+        //
+        // Measured against the session HIGH-WATER, never the current reading. The window
+        // is a property of the session; occupancy is a property of the newest turn, and
+        // occupancy falls — a `/compact` took a real session from 517,389 to 53,268. Read
+        // against `context_used` the deduction is amnesiac: it would re-derive a 200k
+        // window from the smaller number and report 27% of a window that session had
+        // already proven it was not on. Evidence of a window's size cannot expire with
+        // the reading that produced it, because a window does not shrink mid-session.
+        None => promoted_window(
+            context_window(t.model.as_deref()?)?,
+            t.context_high_water.max(t.context_used),
+        ),
     };
     if window == 0 {
         return None;
     }
     // Round-half-up without floats, then floor at 1: `0%` is reserved for "unknown"
-    // (F7/R6.2 omit the label entirely there), so a displayed percentage always
-    // means real, non-zero occupancy. Rounding a live gauge down to the one value
-    // that elsewhere means "no reading" is the one ambiguity worth spending a
-    // fraction of a percent to avoid.
+    // (the tile omits the value and the gauge entirely there), so a displayed
+    // percentage always means real, non-zero occupancy. Rounding a live gauge down to
+    // the one value that elsewhere means "no reading" is the one ambiguity worth
+    // spending a fraction of a percent to avoid.
     let pct = (t.context_used.saturating_mul(200) / window).div_ceil(2);
     Some(pct.max(1))
 }
 
-/// `── label ─────…` to `RULE_COLS`. Open on the right: no closing glyph to lose.
-pub fn rule(label: &str) -> String {
-    rule_with(label, None)
-}
-
-/// A rule carrying an optional marker next to its label (e.g. `+7 more`), which is
-/// where a marker must live: at the tail it would be clipped on exactly the narrow
-/// windows that make truncation likely.
-pub fn rule_with(label: &str, marker: Option<&str>) -> String {
-    let head = match marker {
-        Some(m) => format!("── {label} {m} "),
-        None => format!("── {label} "),
-    };
-    let used = head.chars().count();
-    format!("{head}{}", "─".repeat(RULE_COLS.saturating_sub(used)))
-}
-
-/// A rule carrying its section's empty state: `── Skills ── (no skills yet) ───…`.
-///
-/// The state sits **next to the label**, not at the rule's tail, for the reason B2a
-/// gives for `+N more`: at a 700-logical-px window the budget is 81 columns, so
-/// anything past column 81 is clipped away — and a clipped empty state leaves a bare
-/// rule, which says nothing at all. Adjacent to the label it survives any width.
-fn rule_empty(label: &str, state: &str) -> String {
-    let head = format!("── {label} ── {state} ");
-    format!(
-        "{head}{}",
-        "─".repeat(RULE_COLS.saturating_sub(head.chars().count()))
-    )
-}
-
-/// A labelled row with an optional right-hand qualifier, one space after the value.
-/// Never padded to a column — aligning would be the fixed-width assumption the
-/// open-right design rejects, and it would break the moment a value changed length.
-fn row(label: &str, value: &str, qualifier: Option<&str>) -> String {
-    let mut s = format!(" {:<w$} {value}", label, w = LABEL_COLS);
-    if let Some(q) = qualifier {
-        s.push_str(&format!(" ({q})"));
-    }
-    s
-}
-
-/// `prefix + variable + suffix`, truncating **only** the variable part so the row
-/// lands within `RULE_COLS`.
-///
-/// The budget is measured from the chrome actually composed, never from a stated
-/// per-row constant — a number written down beside a row is a number that drifts
-/// away from it. `PATH_COLS` is the one exception, and it is pinned by a test
-/// asserting it equals this same subtraction.
-/// The chrome itself is not always bounded — a task's `status` and an agent's
-/// `subagent_type`/`model` are raw strings the crate passes through verbatim — so the
-/// composed row is clipped once more at the end. Without that backstop a 150-column
-/// status would leave the variable part zero-width *and* still overrun the rule.
-fn fit_row(prefix: &str, variable: &str, suffix: &str) -> String {
-    let chrome = prefix.chars().count() + suffix.chars().count();
-    let budget = RULE_COLS.saturating_sub(chrome);
-    let row = format!("{prefix}{}{suffix}", truncate_right(variable, budget));
-    truncate_right(&row, RULE_COLS)
+/// Bound a passthrough string before it enters the model. See [`TEXT_CAP`].
+fn clip(s: &str) -> String {
+    truncate_right(s, TEXT_CAP)
 }
 
 /// Keep the head, mark the loss with `…` (U+2026).
@@ -587,7 +883,7 @@ fn truncate_left(s: &str, cols: usize) -> String {
 }
 
 /// Outcome glyph for a finished entry.
-fn mark(ok: bool) -> &'static str {
+fn mark(ok: bool) -> char {
     if ok {
         OK
     } else {
@@ -595,7 +891,8 @@ fn mark(ok: bool) -> &'static str {
     }
 }
 
-/// The 5-column operation label the path budget is derived against.
+/// The operation label. Fixed vocabulary, five values wide at most, because the renderer
+/// draws it in a fixed gutter.
 fn op_label(op: FileOp) -> &'static str {
     match op {
         FileOp::Read => "READ",
@@ -614,7 +911,7 @@ fn op_label(op: FileOp) -> &'static str {
 /// TS reference has this bug; it is deliberately not inherited.
 fn file_target(op: FileOp, s: &str) -> String {
     match op {
-        FileOp::Grep | FileOp::List => truncate_right(s, PATH_COLS),
+        FileOp::Grep | FileOp::List => truncate_right(s, TEXT_CAP),
         _ => short_path(s),
     }
 }
@@ -636,12 +933,12 @@ fn short_path(path: &str) -> String {
         2 if !root => format!("{}/{}", segs[0], base),
         n => format!("…/{}/{}", segs[n - 2], base),
     };
-    if candidate.chars().count() <= PATH_COLS {
+    if candidate.chars().count() <= TEXT_CAP {
         return candidate;
     }
     // Drop the parent before mangling the name; only then truncate the name itself,
     // from the left, so the extension survives.
-    truncate_left(base, PATH_COLS)
+    truncate_left(base, TEXT_CAP)
 }
 
 /// A duration, or `—` when the crate could not derive one (a missing timestamp or a
@@ -686,8 +983,8 @@ fn age(ms: u64) -> String {
 ///
 /// Zero and "not yet known" are indistinguishable in this data, and a real session
 /// never bills zero input or zero output tokens — so the placeholder is the honest
-/// reading (F7 rejects showing `0` for an unknown). The only case that reaches zero
-/// legitimately is a session with nothing folded, which is exactly the empty state.
+/// reading. The only case that reaches zero legitimately is a session with nothing
+/// folded, which is exactly the empty state.
 fn tok(n: u64) -> String {
     if n == 0 {
         DASH.to_string()
@@ -727,6 +1024,11 @@ pub fn dur(ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use ai_monitor::telemetry::{CompletedTool, FileActivity, SkillEntry};
+    use renderer::monitor_layout::{layout, PanelDraw};
+    use std::fmt::Write as _;
+
     /// A default environment at `now`: attached (so nothing is detached) and no
     /// configured window, so every pre-existing expectation keeps its meaning.
     /// `tab_has_claude` is irrelevant while attached — it only selects between the two
@@ -737,18 +1039,32 @@ mod tests {
             attached: true,
             context_window: None,
             tab_has_claude: false,
+            utc_offset_secs: 0,
         }
     }
 
-    use super::*;
-    use ai_monitor::telemetry::{CompletedTool, FileActivity, SkillEntry, Subagent};
+    /// The unattached environment, at `now`.
+    fn unattached(now: u64) -> Env {
+        Env {
+            attached: false,
+            ..env(now)
+        }
+    }
 
-    /// Every store filled **past** its cap, so each section shows both its rows and
-    /// its `+N more` marker, at a fixed `now_ms`. Hand-built: no live log, no clock.
+    /// The unattached, nothing-resolved environment the two `NoLog` wordings are keyed in.
+    fn no_session(now: u64, tab_has_claude: bool) -> Env {
+        Env {
+            tab_has_claude,
+            ..unattached(now)
+        }
+    }
+
+    /// Every store filled **past** the height any panel could draw, at a fixed `now_ms`.
+    /// Hand-built: no live log, no clock.
     fn full() -> (TelemetrySnapshot, u64) {
         let (mut t, now) = populated();
-        // 6 tasks against a cap of 4, deliberately out of order and with a tie on
-        // `updated_ms` so the tie-break is exercised rather than assumed.
+        // 6 tasks, deliberately out of order and with a tie on `updated_ms` so the
+        // tie-break is exercised rather than assumed.
         t.tasks = vec![
             task(
                 "t-3",
@@ -793,7 +1109,6 @@ mod tests {
                 now - 930_000,
             ),
         ];
-        // 4 skills against a cap of 3.
         t.skills = ["harness-ops:loop", "insta-review", "run-term", "specify"]
             .iter()
             .enumerate()
@@ -802,20 +1117,23 @@ mod tests {
                 start_ms: Some(now - (i as u64 + 1) * 240_000),
             })
             .collect();
-        // 11 plain tools against a cap of 4 — R2.2's exact "+7 more" case.
         t.tools = (0..11)
             .map(|i| CompletedTool {
                 name: ["Bash", "WebFetch", "TodoWrite", "Monitor"][i % 4].to_string(),
                 ok: i != 1,
                 duration_ms: match i {
                     2 => None,
+                    // One call over R5.7's 30s boundary, so the pinned form carries all
+                    // three duration colours and not only the two fast ones.
+                    5 => Some(45_000),
                     _ => Some(120 + i as u64 * 640),
                 },
                 start_ms: Some(now - (i as u64 + 1) * 30_000),
             })
             .collect();
-        // 5 file activities against a cap of 4, covering a path, a pattern and a
-        // failed write.
+        // A path, a pattern and a failed write — plus one of each **over** `TEXT_CAP`, so
+        // the pinned form carries the two truncation directions and a change to either
+        // is a snapshot diff rather than a silent re-render (R3.5).
         t.files = vec![
             file(
                 FileOp::Read,
@@ -825,6 +1143,13 @@ mod tests {
             ),
             file(FileOp::Grep, r"src/.*/mod\.rs", true, Some(1_240)),
             file(
+                FileOp::Read,
+                &format!("/Users/x/proj/crates/renderer/{}.rs", "glyph".repeat(24)),
+                true,
+                Some(88),
+            ),
+            file(FileOp::Grep, &"nested/dir/".repeat(12), true, Some(310)),
+            file(
                 FileOp::Write,
                 "/Users/x/proj/crates/app/src/dashboard.rs",
                 false,
@@ -833,7 +1158,7 @@ mod tests {
             file(FileOp::List, "**/*.toml", true, None),
             file(FileOp::Read, "Cargo.toml", true, Some(12)),
         ];
-        // 5 subagents against a cap of 4: one live, the rest finished.
+        // One live agent, the rest finished.
         t.subagents = vec![
             Subagent {
                 id: "a1".into(),
@@ -873,6 +1198,29 @@ mod tests {
                 now - 1_790_000,
             ),
         ];
+        // The cumulative tally, in the NAME order the crate emits (D3) and holding more
+        // names than TOOL USAGE ranks, with a tie astride the cut so the tie-break is
+        // exercised rather than assumed. `WebFetch`/`WebSearch` both hold 3 and both fall
+        // outside the top 9. The sum is honest: 247 named + 40 merged = 287 total.
+        t.tool_calls = [
+            ("Bash", 76),
+            ("Edit", 27),
+            ("Glob", 9),
+            ("Grep", 31),
+            ("Monitor", 4),
+            ("Read", 58),
+            ("Skill", 6),
+            ("TodoWrite", 12),
+            ("WebFetch", 3),
+            ("WebSearch", 3),
+            ("Write", 18),
+        ]
+        .iter()
+        .map(|(n, c)| ((*n).to_string(), *c))
+        .collect();
+        t.tool_calls_other = 40;
+        t.total_tool_calls = 287;
+        t.failed_tool_calls = 3;
         (t, now)
     }
 
@@ -935,62 +1283,921 @@ mod tests {
         (t, now)
     }
 
+    // ---- the projection the snapshots pin ------------------------------------
+
+    /// A deterministic text projection of the model — what the `insta` snapshots pin
+    /// (D11/R3.5).
+    ///
+    /// It renders exactly what this module *decides*: section order, what each section
+    /// holds and in which order, truncation, colour roles, placeholders and wordings. It
+    /// renders nothing the **renderer** decides — no pixel, no width, no allocator grant
+    /// — and that is the line the migration draws. The old snapshots pinned 104-column
+    /// geometry, which was only ever the app's business because the app could not see the
+    /// width; what is left is composition policy, so a diff here is a diff in a decision.
+    fn project(m: &MonitorModel) -> String {
+        let mut o = String::new();
+        let _ = writeln!(o, "{} [{}]", m.title, m.status.label());
+        let s = &m.session;
+        let _ = writeln!(
+            o,
+            "  session name={:?} id={:?} provider={:?} model={:?}",
+            s.name, s.short_id, s.provider, s.model
+        );
+        let _ = writeln!(o, "  note {}", opt(s.note.as_deref()));
+        for t in &m.tiles {
+            let _ = writeln!(
+                o,
+                "  tile {:<8} {:>7} {:?} gauge={}",
+                t.label,
+                t.value,
+                t.color,
+                match t.gauge {
+                    Some(g) => format!("{g:.2}"),
+                    None => "none".to_string(),
+                }
+            );
+        }
+        for section in &m.sections {
+            o.push_str(&project_section(section));
+        }
+        let _ = writeln!(o, "  footer {:?}", m.footer);
+        o
+    }
+
+    /// One section of [`project`], also snapshotted on its own so a change to one
+    /// section's policy is a one-section diff.
+    fn project_section(s: &Section) -> String {
+        let mut o = String::new();
+        let _ = writeln!(o, "  {} (total {})", s.label, s.total);
+        match &s.body {
+            SectionBody::Empty(state) => {
+                let _ = writeln!(o, "    empty {state:?}");
+            }
+            SectionBody::Cards(v) => {
+                for c in v {
+                    let _ = writeln!(
+                        o,
+                        "    card {:<12} {:?} value={:?} detail={}",
+                        role(c.accent),
+                        c.title,
+                        c.value,
+                        opt(c.detail.as_deref())
+                    );
+                }
+            }
+            SectionBody::Rows(v) => {
+                for r in v {
+                    let _ = writeln!(
+                        o,
+                        "    row  {:<19} {} {:?} value={:?} {:?}",
+                        match &r.label {
+                            Some(l) => format!("{} {:?}", l.text, l.color),
+                            None => "—".to_string(),
+                        },
+                        r.glyph.unwrap_or('—'),
+                        r.text,
+                        r.value,
+                        r.value_color
+                    );
+                }
+            }
+            SectionBody::Bars(v) => {
+                for b in v {
+                    let _ = writeln!(
+                        o,
+                        "    bar  {:<12} {:>5} {:.2}",
+                        b.name, b.count, b.fraction
+                    );
+                }
+            }
+        }
+        o
+    }
+
+    /// This module's production **code**, with its tests and every comment line removed.
+    ///
+    /// Two tests below assert that certain names do not appear in it. The comments are
+    /// stripped because this file's register is to explain what broke before — the header
+    /// names the deleted 104-column machinery precisely so nobody rebuilds it — and a
+    /// grep that could not tell an explanation from a call would force the prose to stop
+    /// naming what it is warning about.
+    fn production_code() -> String {
+        include_str!("dashboard.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn opt(s: Option<&str>) -> String {
+        match s {
+            Some(s) => format!("{s:?}"),
+            None => "—".to_string(),
+        }
+    }
+
+    fn role(r: Option<ColorRole>) -> String {
+        match r {
+            Some(r) => format!("{r:?}"),
+            None => "—".to_string(),
+        }
+    }
+
+    /// The named tile, or a failure naming what was actually built.
+    fn tile_of<'a>(m: &'a MonitorModel, label: &str) -> &'a StatTile {
+        m.tiles
+            .iter()
+            .find(|t| t.label == label)
+            .unwrap_or_else(|| {
+                let built: Vec<&str> = m.tiles.iter().map(|t| t.label.as_str()).collect();
+                panic!("no {label} tile among {built:?}")
+            })
+    }
+
+    /// The named section, or a failure naming what was actually built.
+    fn section_of<'a>(m: &'a MonitorModel, label: &str) -> &'a Section {
+        m.sections
+            .iter()
+            .find(|s| s.label == label)
+            .unwrap_or_else(|| {
+                let built: Vec<&str> = m.sections.iter().map(|s| s.label.as_str()).collect();
+                panic!("no {label} section among {built:?}")
+            })
+    }
+
+    // ---- the pinned forms (R3.5) ---------------------------------------------
+
     #[test]
-    fn populated_summary_matches_its_pinned_form() {
-        let (t, now) = populated();
-        insta::assert_snapshot!(summary(&t, &env(now), None).join("\n"));
+    fn the_populated_panel_matches_its_pinned_form() {
+        let (t, now) = full();
+        insta::assert_snapshot!(project(&model(Some(&t), &env(now))));
     }
 
     #[test]
-    fn empty_snapshot_renders_the_frame_with_placeholders() {
-        let t = TelemetrySnapshot::default();
-        insta::assert_snapshot!(summary(&t, &env(1_785_226_000_000), None).join("\n"));
+    fn the_empty_panel_matches_its_pinned_form() {
+        insta::assert_snapshot!(project(&model(None, &env(1_785_226_000_000))));
     }
 
     #[test]
-    fn an_absent_snapshot_renders_the_same_frame_as_an_empty_one() {
-        // R6.1 — "no log resolved" and "nothing folded yet" are one statement to a
-        // reader. Never a blank panel.
+    fn the_detached_panel_matches_its_pinned_form() {
+        // A resolved log this tab declined: every identity field empty, every section
+        // empty, and one line saying which nothing this is.
+        let (t, now) = full();
+        insta::assert_snapshot!(project(&model(Some(&t), &unattached(now))));
+    }
+
+    // One snapshot per section, each store holding more than a short panel can draw, so
+    // a change to a section's ordering, shape or wording shows up as a reviewable diff.
+    // One test per section rather than six assertions in one: `insta` stops a test at its
+    // first mismatch, so a single test would hide every section after the one that moved.
+
+    #[test]
+    fn tasks_at_their_truncation_boundary_are_pinned() {
+        let (t, now) = full();
+        insta::assert_snapshot!("boundary_tasks", project_section(&tasks(&t, &env(now))));
+    }
+
+    #[test]
+    fn agents_at_their_truncation_boundary_are_pinned() {
+        let (t, now) = full();
+        insta::assert_snapshot!("boundary_agents", project_section(&agents(&t, &env(now))));
+    }
+
+    #[test]
+    fn skills_at_their_truncation_boundary_are_pinned() {
+        let (t, now) = full();
+        insta::assert_snapshot!("boundary_skills", project_section(&skills(&t, &env(now))));
+    }
+
+    #[test]
+    fn file_activity_at_its_truncation_boundary_is_pinned() {
+        let (t, _) = full();
+        insta::assert_snapshot!(
+            "boundary_file_activity",
+            project_section(&file_activity(&t))
+        );
+    }
+
+    #[test]
+    fn recent_calls_at_their_truncation_boundary_are_pinned() {
+        let (t, _) = full();
+        insta::assert_snapshot!("boundary_recent_calls", project_section(&recent_calls(&t)));
+    }
+
+    #[test]
+    fn tool_usage_at_its_ranking_boundary_is_pinned() {
+        let (t, _) = full();
+        insta::assert_snapshot!("boundary_tool_usage", project_section(&tool_usage(&t)));
+    }
+
+    // ---- R3.2: purity --------------------------------------------------------
+
+    #[test]
+    fn r3_2_the_model_is_pure_and_reaches_for_no_clock_of_its_own() {
+        let (t, now) = full();
+        let m = model(Some(&t), &env(now));
+        assert_eq!(m, model(Some(&t), &env(now)), "same inputs, equal models");
+        // ... and not equal by accident: both injected values are genuinely read, so
+        // "stable" cannot be passing because the model ignores its `Env`.
+        assert_ne!(m, model(Some(&t), &env(now + 60_000)), "now_ms is read");
+        let shifted = Env {
+            utc_offset_secs: 32_400,
+            ..env(now)
+        };
+        assert_ne!(m, model(Some(&t), &shifted), "utc_offset_secs is read");
+
+        // The purity is structural, not incidental. A clock, a filesystem read or a
+        // timezone lookup added here would still pass every assertion above (the two
+        // calls are microseconds apart) and would flake the snapshots above on a UTC CI
+        // runner or across a DST boundary — the exact failure D19 exists to prevent. So
+        // the production half of this file is checked for the calls themselves.
+        let production = production_code();
+        for forbidden in [
+            "SystemTime",
+            "Instant::now",
+            "std::fs",
+            "std::env",
+            "unsafe ",
+            "static mut",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "`{forbidden}` in dashboard.rs — the composer must stay a function of its Env (D19)"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_snapshot_builds_the_same_model_as_an_empty_one() {
+        // "No log resolved" and "nothing folded yet" are one statement to a reader.
+        // Never a blank panel.
         let now = 1_785_226_000_000;
         assert_eq!(
-            compose(None, &env(now)),
-            compose(Some(&TelemetrySnapshot::default()), &env(now))
-        );
-        let lines = compose(None, &env(now));
-        assert_eq!(
-            lines.len(),
-            9,
-            "five inline empty rules + the summary block"
-        );
-        assert_eq!(
-            &lines[5..],
-            &summary(&TelemetrySnapshot::default(), &env(now), None)[..]
+            model(None, &env(now)),
+            model(Some(&TelemetrySnapshot::default()), &env(now))
         );
     }
 
+    // ---- R3.3: the fixed-width machinery is gone ------------------------------
+
     #[test]
-    fn every_rule_is_exactly_rule_cols_wide() {
-        let (t, now) = full();
-        for line in compose(Some(&t), &env(now))
-            .iter()
-            .chain(compose(None, &env(now)).iter())
-            .filter(|l| l.starts_with("──"))
-        {
-            assert_eq!(line.chars().count(), RULE_COLS, "{line}");
+    fn r3_3_no_column_geometry_survives_in_this_module() {
+        // The deleted mechanism, named: `RULE_COLS`, `fit_row` and the `rule*` family
+        // existed only to compensate for not knowing the panel's width, and a docked
+        // panel knows it. A helper that quietly reintroduced one would be invisible in a
+        // diff of 2,000 lines, so the names are pinned as absent.
+        let production = production_code();
+        for gone in ["RULE_COLS", "fit_row", "fn rule", "rule_with", "rule_empty"] {
+            assert!(
+                !production.contains(gone),
+                "`{gone}` is back in dashboard.rs"
+            );
         }
+    }
+
+    // ---- composition policy ---------------------------------------------------
+
+    #[test]
+    fn the_section_order_is_the_designs_order() {
+        // D18 drops headings from the BOTTOM, so this list is a priority order: what is
+        // last is what a short panel loses.
+        let (t, now) = full();
+        let m = model(Some(&t), &env(now));
+        let labels: Vec<&str> = m.sections.iter().map(|s| s.label.as_str()).collect();
         assert_eq!(
-            rule_with("Other Tools", Some("+7 more")).chars().count(),
-            RULE_COLS
+            labels,
+            vec![
+                "TASKS",
+                "ACTIVE AGENTS",
+                "SKILLS",
+                "FILE ACTIVITY",
+                "RECENT CALLS",
+                "TOOL USAGE"
+            ]
         );
     }
 
     #[test]
-    fn a_rule_never_carries_a_closing_glyph() {
-        // Open-right: clipping a rule must leave a valid rule, never an orphaned corner.
-        let r = rule("ai-monitor");
-        assert!(r.ends_with('─'));
-        assert!(!r.contains('╗') && !r.contains('┐') && !r.contains('│'));
+    fn every_section_is_present_however_empty_the_session_is() {
+        // D10 — a region that vanished with its data would make "not built" and "no data"
+        // indistinguishable, and the panel's shape would jump as a session warmed up.
+        let (t, now) = full();
+        let populated: Vec<String> = model(Some(&t), &env(now))
+            .sections
+            .iter()
+            .map(|s| s.label.clone())
+            .collect();
+        for e in [
+            model(None, &env(now)),
+            model(None, &no_session(now, true)),
+            model(Some(&t), &unattached(now)),
+        ] {
+            let labels: Vec<String> = e.sections.iter().map(|s| s.label.clone()).collect();
+            assert_eq!(labels, populated);
+        }
     }
+
+    #[test]
+    fn r8_a_real_model_reaches_the_allocator_with_the_entries_it_actually_holds() {
+        // The end-to-end half of R8: `monitor_layout` tests the allocator against
+        // synthetic metrics, but the metrics it divides are derived from *this* model's
+        // `body.len()`, so a section that sent a body it could not draw — or a `total`
+        // that did not exceed it — would satisfy every allocator test and still produce a
+        // panel with an empty grant or a `+N more` that counted nothing.
+        let (t, now) = full();
+        let mut m = model(Some(&t), &env(now));
+        m.visible = true;
+        let cell = [8.0, 16.0];
+
+        // A panel tall enough for every heading and a first row each (R8.1): each
+        // section's first entry is drawn, and every heading with it.
+        let tall = layout(&m, [0.0, 0.0, 430.0, 1600.0], 1.0, cell);
+        let drawn = |d: &PanelDraw, s: &str| d.runs.iter().any(|r| r.text == s);
+        for (label, first) in [
+            ("TASKS", "Fold usage per message id"),
+            ("ACTIVE AGENTS", "● general-purpose"),
+            ("SKILLS", "harness-ops:loop"),
+            ("FILE ACTIVITY", "READ"),
+            ("RECENT CALLS", "Bash"),
+            ("TOOL USAGE", "Bash"),
+        ] {
+            assert!(drawn(&tall, label), "{label} heading missing");
+            assert!(drawn(&tall, first), "{label} drew no row");
+        }
+
+        // R8.6 end to end: TOOL USAGE holds 11 names and sends 9, so the heading says so
+        // even on a panel with room for every row it was given.
+        assert!(drawn(&tall, "+2 more"), "TOOL USAGE lost its `+2 more`");
+
+        // R8.5 end to end: on a panel too short for six headings the survivors are a
+        // prefix of the design order, never a hole in the middle.
+        let short = layout(&m, [0.0, 0.0, 430.0, 260.0], 1.0, cell);
+        let headings: Vec<&str> = [
+            "TASKS",
+            "ACTIVE AGENTS",
+            "SKILLS",
+            "FILE ACTIVITY",
+            "RECENT CALLS",
+            "TOOL USAGE",
+        ]
+        .into_iter()
+        .filter(|l| drawn(&short, l))
+        .collect();
+        assert!(
+            !headings.is_empty(),
+            "the short panel drew no section at all"
+        );
+        assert!(
+            headings.len() < 6,
+            "the short panel must actually be short; drew {headings:?}"
+        );
+        assert_eq!(
+            headings,
+            ["TASKS", "ACTIVE AGENTS", "SKILLS", "FILE ACTIVITY"][..headings.len()],
+            "headings drop from the bottom of the design order"
+        );
+    }
+
+    #[test]
+    fn an_empty_section_states_itself_on_its_heading_and_never_as_a_row() {
+        // The wording rides the heading (the renderer draws it there): a row would
+        // compete for the single row D18 guarantees a populated neighbour.
+        let now = 1_785_226_000_000;
+        let m = model(None, &env(now));
+        for (label, wording) in [
+            ("TASKS", "(no tasks)"),
+            ("ACTIVE AGENTS", "(no agents yet)"),
+            ("SKILLS", "(no skills yet)"),
+            ("FILE ACTIVITY", "(no file activity)"),
+            ("RECENT CALLS", "(no other tool calls)"),
+            ("TOOL USAGE", "(no tool calls yet)"),
+        ] {
+            let s = section_of(&m, label);
+            assert_eq!(s.total, 0);
+            assert_eq!(
+                s.body,
+                SectionBody::Empty(wording.to_string()),
+                "{label} lost its empty state"
+            );
+        }
+    }
+
+    #[test]
+    fn a_section_reports_the_session_total_beside_what_it_sent() {
+        // `total` is what the heading counts and what `+N more` subtracts from (R8.6), and
+        // it is the field — not the vector's length — that the renderer reads. For the
+        // five ring-backed sections nothing is capped app-side, so the two agree.
+        let (t, now) = full();
+        let m = model(Some(&t), &env(now));
+        for (label, total) in [
+            ("TASKS", t.tasks.len()),
+            ("ACTIVE AGENTS", t.subagents.len()),
+            ("SKILLS", t.skills.len()),
+            ("FILE ACTIVITY", t.files.len()),
+            ("RECENT CALLS", t.tools.len()),
+        ] {
+            let s = section_of(&m, label);
+            assert_eq!(s.total, total, "{label}");
+            assert_eq!(s.body.len(), total, "{label} sends the whole store");
+        }
+        // TOOL USAGE is the one section that caps (D12), so the two deliberately differ —
+        // and `total` still counts every named tool, which is what makes `+2 more` on its
+        // heading the truth rather than a restatement of the cap.
+        let usage = section_of(&m, "TOOL USAGE");
+        assert_eq!(usage.total, t.tool_calls.len(), "11 names in the tally");
+        assert_eq!(usage.body.len(), TOOL_BARS);
+    }
+
+    #[test]
+    fn tasks_sort_by_updated_desc_deterministically() {
+        // The store is an unordered map; without a total order the pinned snapshots
+        // would be flaky run to run (the hasher is seeded per process).
+        let (t, now) = full();
+        let titles = |t: &TelemetrySnapshot| match tasks(t, &env(now)).body {
+            SectionBody::Cards(v) => v.iter().map(|c| c.title.clone()).collect::<Vec<_>>(),
+            body => panic!("tasks are cards, got {body:?}"),
+        };
+        // t-1 and t-2 tie on `updated_ms`; t-1 has the later `created_ms` and wins.
+        assert_eq!(
+            titles(&t),
+            vec![
+                "Fold usage per message id",
+                "Pin the worked examples",
+                "Audit the dedupe keying",
+                "Measure the model census",
+                "Wire the overlay seam",
+                "Draft the partition manifest",
+            ]
+        );
+        // Order does not depend on the input order of an unordered store.
+        let mut shuffled = t.clone();
+        shuffled.tasks.reverse();
+        assert_eq!(titles(&shuffled), titles(&t));
+    }
+
+    #[test]
+    fn task_status_is_the_raw_string_and_only_completed_shows_a_duration() {
+        // `blocked` is unobserved in the corpus and must still pass through intact
+        // rather than being glyph-substituted or treated as terminal.
+        let (t, now) = full();
+        let cards = cards_of(tasks(&t, &env(now)));
+        let detail = |i: usize| cards[i].detail.clone().unwrap_or_default();
+        assert!(
+            detail(0).starts_with("in_progress · updated 1m ago"),
+            "{:?}",
+            detail(0)
+        );
+        assert!(
+            detail(2).starts_with("blocked · updated 2m ago"),
+            "{:?}",
+            detail(2)
+        );
+        // Only a completed task carries a duration, and it is the completion interval.
+        assert_eq!(cards[0].value, "", "in_progress: no duration");
+        assert_eq!(cards[1].value, "10m40s", "completed: created → updated");
+        assert_eq!(cards[1].accent, Some(ColorRole::AccentGreen));
+        assert_eq!(cards[0].accent, Some(ColorRole::Amber));
+        assert_eq!(
+            cards[2].accent,
+            Some(ColorRole::TextFaint),
+            "unknown status"
+        );
+    }
+
+    #[test]
+    fn a_live_agent_elapsed_grows_and_a_completed_one_is_frozen() {
+        let (t, now) = full();
+        let values = |now: u64| match agents(&t, &env(now)).body {
+            SectionBody::Cards(v) => v.iter().map(|c| c.value.clone()).collect::<Vec<_>>(),
+            body => panic!("agents are cards, got {body:?}"),
+        };
+        assert_eq!(values(now)[0], "1m30s", "live, measured from now_ms");
+        assert_eq!(values(now)[1], "30s", "completed, measured from its end");
+        assert_eq!(values(now + 600_000)[0], "11m30s", "the live one grew");
+        assert_eq!(values(now + 600_000)[1], "30s", "the completed one did not");
+    }
+
+    #[test]
+    fn agent_cards_carry_type_description_and_model() {
+        let (t, now) = full();
+        let SectionBody::Cards(cards) = agents(&t, &env(now)).body else {
+            panic!("agents are cards");
+        };
+        assert_eq!(cards[0].title, "● general-purpose");
+        assert_eq!(cards[0].detail.as_deref(), Some("Gate 3 checker · opus"));
+        assert_eq!(cards[1].title, "◯ Explore");
+        // Flat: there is no parent linkage in the data, so a connector would draw a
+        // hierarchy that was never observed.
+        for c in &cards {
+            assert!(!c.title.contains('├') && !c.title.contains('└'), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn the_two_marker_pairs_are_never_conflated() {
+        // Outcome is ✓/✗; liveness is ●/◯. The fold records no agent outcome, so ✓ on an
+        // agent card would assert something the data lacks.
+        let (t, now) = full();
+        let m = model(Some(&t), &env(now));
+        let calls = project_section(section_of(&m, "RECENT CALLS"));
+        assert!(calls.contains(OK) && calls.contains(FAIL), "{calls}");
+        assert!(!calls.contains(LIVE) && !calls.contains(DONE), "{calls}");
+
+        let agents = project_section(section_of(&m, "ACTIVE AGENTS"));
+        assert!(agents.contains(LIVE) && agents.contains(DONE), "{agents}");
+        assert!(!agents.contains(OK) && !agents.contains(FAIL), "{agents}");
+    }
+
+    #[test]
+    fn skills_show_when_they_ran_and_never_a_duration() {
+        // A Skill pair measures dispatch latency, not execution.
+        let (t, now) = full();
+        let rows = rows_of(skills(&t, &env(now)));
+        assert_eq!(rows[0].text, "harness-ops:loop");
+        assert!(!rows[0].value.contains("ms"), "{:?}", rows[0].value);
+        assert!(rows.iter().all(|r| r.label.is_none() && r.glyph.is_none()));
+    }
+
+    #[test]
+    fn r5_9_skills_show_a_local_absolute_time() {
+        // D7/D19 — the epoch below is 07:21:18 UTC, so +32400 reads 16:21:18. The offset
+        // is injected, which is what lets an absolute time be pinned in a snapshot at all.
+        let t = TelemetrySnapshot {
+            skills: vec![SkillEntry {
+                name: "specify".into(),
+                start_ms: Some(1_785_223_278_000),
+            }],
+            ..TelemetrySnapshot::default()
+        };
+        let kst = Env {
+            utc_offset_secs: 32_400,
+            ..env(1_785_226_000_000)
+        };
+        assert_eq!(rows_of(skills(&t, &kst))[0].value, "at 16:21:18");
+        assert_eq!(
+            rows_of(skills(&t, &env(1_785_226_000_000)))[0].value,
+            "at 07:21:18",
+            "the same instant, a different zone"
+        );
+        // Never the relative form this section used to carry: under D2 nothing repaints,
+        // so an age freezes and starts lying while an absolute time stays correct.
+        assert!(!rows_of(skills(&t, &kst))[0].value.contains("ago"));
+        // A skill with no start time states nothing rather than inventing midnight UTC.
+        let undated = TelemetrySnapshot {
+            skills: vec![SkillEntry {
+                name: "specify".into(),
+                start_ms: None,
+            }],
+            ..TelemetrySnapshot::default()
+        };
+        assert_eq!(rows_of(skills(&undated, &kst))[0].value, "");
+    }
+
+    #[test]
+    fn r5_7_call_duration_colour_is_bucketed_by_magnitude() {
+        // The requirement's three worked values, plus both boundaries and the two cases
+        // that are not a magnitude at all.
+        let t = TelemetrySnapshot {
+            tools: vec![
+                tool("Bash", true, Some(32_800)),
+                tool("Grep", true, Some(1_800)),
+                tool("Read", true, Some(139)),
+                tool("Edit", false, Some(139)),
+                tool("Glob", true, None),
+            ],
+            ..TelemetrySnapshot::default()
+        };
+        let roles: Vec<ColorRole> = rows_of(recent_calls(&t))
+            .iter()
+            .map(|r| r.value_color)
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                ColorRole::Amber,       // 32.8s — you noticed this one
+                ColorRole::TextMuted,   // 1.8s  — ordinary
+                ColorRole::AccentGreen, // 139ms — instant
+                ColorRole::Rose,        // failed: the outcome outranks the magnitude
+                ColorRole::TextMuted,   // no duration: nothing to bucket, never "fast"
+            ]
+        );
+        // The boundaries themselves, since a `>` where a `>=` belongs is invisible in a
+        // colour.
+        assert_eq!(dur_role(30_000), ColorRole::Amber);
+        assert_eq!(dur_role(29_999), ColorRole::TextMuted);
+        assert_eq!(dur_role(1_000), ColorRole::TextMuted);
+        assert_eq!(dur_role(999), ColorRole::AccentGreen);
+        assert_eq!(dur_role(0), ColorRole::AccentGreen);
+    }
+
+    #[test]
+    fn r5_8_tool_usage_ranks_named_tools_and_normalises_to_the_top_one() {
+        // The requirement's worked case: `other` is in neither the list nor the
+        // denominator, or `bash` would be a sliver of a bucket that names nothing.
+        let t = TelemetrySnapshot {
+            tool_calls: vec![("bash".into(), 76), ("read".into(), 27)],
+            tool_calls_other: 900,
+            total_tool_calls: 1003,
+            ..TelemetrySnapshot::default()
+        };
+        let bars = bars_of(tool_usage(&t));
+        assert_eq!(
+            bars.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+            vec!["bash", "read"]
+        );
+        assert_eq!(bars[0].fraction, 1.0, "the top named tool is full width");
+        assert!(
+            (bars[1].fraction - 27.0 / 76.0).abs() < 1e-6,
+            "{}",
+            bars[1].fraction
+        );
+        assert_eq!(
+            bars[0].count, 76,
+            "the count is the tally's, not a proportion"
+        );
+    }
+
+    #[test]
+    fn tool_usage_draws_the_top_nine_named_tools_and_breaks_ties_by_name() {
+        let (t, _) = full();
+        let bars = bars_of(tool_usage(&t));
+        assert_eq!(
+            bars.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+            vec![
+                "Bash",      // 76
+                "Read",      // 58
+                "Grep",      // 31
+                "Edit",      // 27
+                "Write",     // 18
+                "TodoWrite", // 12
+                "Glob",      // 9
+                "Skill",     // 6
+                "Monitor",   // 4
+            ],
+            "count descending — the crate emits this list in NAME order"
+        );
+        // The two tied at 3 fall outside the cut, and `total` still counts them, so the
+        // heading can say `+2 more` rather than pretending the tally holds nine names.
+        assert_eq!(tool_usage(&t).total, 11);
+        // Ranking is stable under the tie: two tools level on count sort by name, so a
+        // fixture reordering cannot flip the snapshot.
+        let mut tied = t.clone();
+        tied.tool_calls = vec![("zeta".into(), 5), ("alpha".into(), 5), ("mid".into(), 5)];
+        assert_eq!(
+            bars_of(tool_usage(&tied))
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "mid", "zeta"]
+        );
+    }
+
+    #[test]
+    fn an_empty_tally_normalises_to_nothing_instead_of_dividing_by_zero() {
+        // The bucket alone is a real state: every name a short session used can have been
+        // merged away only after 64 of them, but a snapshot arriving mid-fold can carry
+        // the scalar with an empty map.
+        let t = TelemetrySnapshot {
+            tool_calls_other: 12,
+            total_tool_calls: 12,
+            ..TelemetrySnapshot::default()
+        };
+        let s = tool_usage(&t);
+        assert_eq!(s.total, 0);
+        assert_eq!(
+            s.body,
+            SectionBody::Empty("(no tool calls yet)".to_string())
+        );
+    }
+
+    /// The rows of a `Rows` section, or a failure naming what it actually held.
+    fn rows_of(s: Section) -> Vec<Row> {
+        match s.body {
+            SectionBody::Rows(v) => v,
+            body => panic!("{} is not a row section: {body:?}", s.label),
+        }
+    }
+
+    /// The cards of a `Cards` section, or a failure naming what it actually held.
+    fn cards_of(s: Section) -> Vec<Card> {
+        match s.body {
+            SectionBody::Cards(v) => v,
+            body => panic!("{} is not a card section: {body:?}", s.label),
+        }
+    }
+
+    /// The bars of a `Bars` section, or a failure naming what it actually held.
+    fn bars_of(s: Section) -> Vec<Bar> {
+        match s.body {
+            SectionBody::Bars(v) => v,
+            body => panic!("{} is not a bar section: {body:?}", s.label),
+        }
+    }
+
+    fn tool(name: &str, ok: bool, duration_ms: Option<u64>) -> CompletedTool {
+        CompletedTool {
+            name: name.to_string(),
+            ok,
+            duration_ms,
+            start_ms: None,
+        }
+    }
+
+    /// The first row whose verb reads `verb` — by label, never by index, so adding a
+    /// fixture row cannot silently re-point an assertion at a different operation.
+    fn row_with_verb(rows: &[Row], verb: &str) -> Row {
+        rows.iter()
+            .find(|r| r.label.as_ref().is_some_and(|l| l.text == verb))
+            .unwrap_or_else(|| panic!("no {verb} row"))
+            .clone()
+    }
+
+    #[test]
+    fn r5_6_the_file_verb_carries_the_designs_role() {
+        // WRITE magenta, READ teal; the operations a reader scans for are the ones
+        // coloured.
+        let (t, _) = full();
+        let rows = rows_of(file_activity(&t));
+        assert_eq!(
+            row_with_verb(&rows, "READ").label.expect("verb").color,
+            ColorRole::Teal
+        );
+        assert_eq!(
+            row_with_verb(&rows, "WRITE").label.expect("verb").color,
+            ColorRole::Magenta
+        );
+        assert_eq!(
+            row_with_verb(&rows, "GREP").label.expect("verb").color,
+            ColorRole::TextMuted,
+            "the design colours two operations, not five"
+        );
+        assert!(
+            rows.iter().all(|r| r.label.is_some()),
+            "every file row has a verb"
+        );
+    }
+
+    #[test]
+    fn a_failed_call_colours_its_mark_and_its_duration_together() {
+        // `Row::value_color` drives both, so a `✗` in the duration's colour would
+        // announce a failure in the palette of a fast call.
+        let (t, _) = full();
+        let rows = rows_of(file_activity(&t));
+        let failed = row_with_verb(&rows, "WRITE");
+        assert_eq!(failed.glyph, Some(FAIL));
+        assert_eq!(failed.value_color, ColorRole::Rose);
+        let ok = row_with_verb(&rows, "READ");
+        assert_eq!(ok.glyph, Some(OK));
+        assert_ne!(ok.value_color, ColorRole::Rose);
+    }
+
+    #[test]
+    fn a_missing_duration_renders_the_placeholder() {
+        let (t, _) = full();
+        for body in [file_activity(&t).body, recent_calls(&t).body] {
+            let SectionBody::Rows(rows) = body else {
+                panic!("rows expected");
+            };
+            assert!(
+                rows.iter().any(|r| r.value == DASH),
+                "a call with no derivable duration must not read 0ms"
+            );
+        }
+    }
+
+    #[test]
+    fn paths_keep_the_filename_and_one_parent() {
+        assert_eq!(
+            short_path("/Users/x/proj/crates/renderer/atlas.rs"),
+            "…/renderer/atlas.rs"
+        );
+        assert_eq!(short_path("crates/app/dashboard.rs"), "…/app/dashboard.rs");
+        assert_eq!(short_path("Cargo.toml"), "Cargo.toml");
+        assert_eq!(short_path("src/main.rs"), "src/main.rs");
+        // The root is an ancestor: without the marker these read as relative paths,
+        // which name different files.
+        assert_eq!(short_path("/etc/hosts"), "…/etc/hosts");
+        assert_eq!(short_path("/Cargo.toml"), "…/Cargo.toml");
+    }
+
+    #[test]
+    fn an_over_long_basename_truncates_from_the_left() {
+        // Left, so the extension survives; right-truncation would clip the one part of a
+        // path worth reading.
+        let long = format!("/a/b/{}.rs", "x".repeat(120));
+        let out = short_path(&long);
+        assert_eq!(out.chars().count(), TEXT_CAP);
+        assert!(out.starts_with('…') && out.ends_with(".rs"), "{out}");
+    }
+
+    #[test]
+    fn grep_and_glob_render_their_pattern_not_a_path() {
+        // Path-shortening a regex mangles one containing `/`.
+        assert_eq!(
+            file_target(FileOp::Grep, r"src/.*/mod\.rs"),
+            r"src/.*/mod\.rs"
+        );
+        assert_eq!(file_target(FileOp::List, "**/*.toml"), "**/*.toml");
+        // ... and the head is what survives truncation, since that is a pattern's
+        // discriminating part.
+        let long = "a/".repeat(80);
+        let out = file_target(FileOp::Grep, &long);
+        assert_eq!(out.chars().count(), TEXT_CAP);
+        assert!(out.starts_with("a/a/") && out.ends_with('…'), "{out}");
+    }
+
+    #[test]
+    fn no_model_string_is_unbounded_on_hostile_telemetry() {
+        // The passthrough fields — a task's subject and status, an agent's type,
+        // description and model, a tool's name, a file's path — are raw strings the crate
+        // never bounds. The renderer truncates for the panel's width, but an unbounded
+        // one would still be cloned into the model and compared field by field on every
+        // frame by the R7.3 shaping cache.
+        let now = 1_785_226_000_000;
+        let t = TelemetrySnapshot {
+            model: Some("m".repeat(400)),
+            tasks: vec![task("t", &"s".repeat(300), &"x".repeat(300), 0, 0)],
+            subagents: vec![Subagent {
+                id: "a".into(),
+                subagent_type: Some("y".repeat(300)),
+                description: Some("d".repeat(300)),
+                model: Some("m".repeat(300)),
+                start_ms: Some(0),
+                end_ms: None,
+                completed: false,
+            }],
+            files: vec![file(FileOp::Read, &"p".repeat(400), true, Some(u64::MAX))],
+            tools: vec![CompletedTool {
+                name: "n".repeat(300),
+                ok: true,
+                duration_ms: Some(u64::MAX),
+                start_ms: None,
+            }],
+            skills: vec![SkillEntry {
+                name: "k".repeat(300),
+                start_ms: Some(0),
+            }],
+            ..TelemetrySnapshot::default()
+        };
+        let m = model(Some(&t), &env(now));
+        // A generous bound on a *composed* string: the longest is a card detail, which is
+        // a clipped passthrough plus a short suffix.
+        let limit = TEXT_CAP * 2 + 32;
+        for (what, s) in strings(&m) {
+            assert!(
+                s.chars().count() <= limit,
+                "{what} carries {} chars: {s}",
+                s.chars().count()
+            );
+        }
+    }
+
+    /// Every variable-length string the model carries, with a label naming where it came
+    /// from — so a failure says which field grew, not merely that one did.
+    fn strings(m: &MonitorModel) -> Vec<(String, String)> {
+        let mut out = vec![
+            ("title".into(), m.title.clone()),
+            ("session.model".into(), m.session.model.clone()),
+            ("footer".into(), m.footer.clone()),
+        ];
+        out.extend(m.session.note.iter().map(|n| ("note".into(), n.clone())));
+        out.extend(
+            m.tiles
+                .iter()
+                .map(|t| (format!("tile {}", t.label), t.value.clone())),
+        );
+        for s in &m.sections {
+            let at = |what: &str| format!("{} {what}", s.label);
+            match &s.body {
+                SectionBody::Empty(state) => out.push((at("empty"), state.clone())),
+                SectionBody::Cards(v) => {
+                    for c in v {
+                        out.push((at("card.title"), c.title.clone()));
+                        out.push((at("card.value"), c.value.clone()));
+                        out.extend(c.detail.iter().map(|d| (at("card.detail"), d.clone())));
+                    }
+                }
+                SectionBody::Rows(v) => {
+                    for r in v {
+                        out.push((at("row.text"), r.text.clone()));
+                        out.push((at("row.value"), r.value.clone()));
+                        out.extend(r.label.iter().map(|l| (at("row.label"), l.text.clone())));
+                    }
+                }
+                SectionBody::Bars(v) => {
+                    for b in v {
+                        out.push((at("bar.name"), b.name.clone()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    // ---- formatting ----------------------------------------------------------
 
     #[test]
     fn context_window_is_longest_prefix_then_default() {
@@ -1001,22 +2208,6 @@ mod tests {
         // The one observed value matching nothing — and the reason `None` exists.
         assert_eq!(context_window("<synthetic>"), None);
         assert_eq!(context_window("opus"), None);
-    }
-
-    #[test]
-    fn an_unmatched_model_omits_the_percentage_entirely() {
-        let (mut t, now) = populated();
-        t.model = Some("<synthetic>".into());
-        let s = summary(&t, &env(now), None).join("\n");
-        assert!(!s.contains("context"), "no label, not 0% and not —%:\n{s}");
-        assert!(s.contains("<synthetic>"), "the model is still named");
-    }
-
-    #[test]
-    fn a_zero_gauge_omits_the_percentage() {
-        let (mut t, now) = populated();
-        t.context_used = 0;
-        assert!(!summary(&t, &env(now), None).join("\n").contains("context"));
     }
 
     #[test]
@@ -1031,43 +2222,6 @@ mod tests {
             Some(1),
             "a non-zero gauge never reads 0%"
         );
-    }
-
-    #[test]
-    fn spend_is_labelled_billed_and_is_never_a_percentage() {
-        let (t, now) = populated();
-        let s = summary(&t, &env(now), None).join("\n");
-        assert!(s.contains("(billed)"));
-        // cache = read + creation, summed because both are billed
-        assert!(s.contains("cache 1.9M"), "{s}");
-        // the ONLY percentage is the context gauge
-        assert_eq!(s.matches('%').count(), 1);
-    }
-
-    #[test]
-    fn activity_carries_the_staleness_qualifier() {
-        let (t, now) = populated();
-        let s = summary(&t, &env(now), None).join("\n");
-        assert!(s.contains("up 45m12s · idle 2m03s"));
-        assert!(s.contains("(as of last update)"), "not a live counter");
-    }
-
-    #[test]
-    fn missing_event_times_render_a_dash_not_an_epoch() {
-        let (mut t, now) = populated();
-        t.first_event_ms = None;
-        t.last_event_ms = None;
-        let s = summary(&t, &env(now), None).join("\n");
-        assert!(s.contains(&format!("activity {DASH}")) || s.contains(DASH));
-        assert!(!s.contains("up "), "no epoch-derived duration:\n{s}");
-    }
-
-    #[test]
-    fn the_composer_is_pure() {
-        // Same inputs -> byte-identical output. This is what makes the snapshots
-        // stable, and it only holds because the clock is a parameter.
-        let (t, now) = populated();
-        assert_eq!(summary(&t, &env(now), None), summary(&t, &env(now), None));
     }
 
     #[test]
@@ -1094,389 +2248,18 @@ mod tests {
         assert_eq!(age(7_200_000), "2h");
     }
 
-    // ---- sections ------------------------------------------------------------
-
-    #[test]
-    fn the_populated_dashboard_matches_its_pinned_form() {
-        let (t, now) = full();
-        insta::assert_snapshot!(compose(Some(&t), &env(now)).join("\n"));
-    }
-
-    #[test]
-    fn the_empty_dashboard_matches_its_pinned_form() {
-        insta::assert_snapshot!(compose(None, &env(1_785_226_000_000)).join("\n"));
-    }
-
-    // R8.1 — one snapshot per section, each store holding more than its cap, so a
-    // change to a cap or to a row's shape shows up as a reviewable diff. One test per
-    // section rather than five assertions in one: `insta` stops a test at its first
-    // mismatch, so a single test would hide every section after the one that moved.
-
-    #[test]
-    fn tasks_at_their_truncation_boundary_are_pinned() {
-        let (t, _) = full();
-        insta::assert_snapshot!("boundary_tasks", tasks(&t).join("\n"));
-    }
-
-    #[test]
-    fn skills_at_their_truncation_boundary_are_pinned() {
-        let (t, now) = full();
-        insta::assert_snapshot!("boundary_skills", skills(&t, now).join("\n"));
-    }
-
-    #[test]
-    fn other_tools_at_their_truncation_boundary_are_pinned() {
-        let (t, _) = full();
-        insta::assert_snapshot!("boundary_other_tools", other_tools(&t).join("\n"));
-    }
-
-    #[test]
-    fn file_activity_at_its_truncation_boundary_is_pinned() {
-        let (t, _) = full();
-        insta::assert_snapshot!("boundary_file_activity", file_activity(&t).join("\n"));
-    }
-
-    #[test]
-    fn agents_at_their_truncation_boundary_are_pinned() {
-        let (t, now) = full();
-        insta::assert_snapshot!("boundary_agents", agents(&t, now).join("\n"));
-    }
-
-    #[test]
-    fn the_composed_height_is_28_populated_and_9_empty() {
-        // B1/B2 — the two numbers the caps were chosen against. If a cap moves, this
-        // is the assertion that says so.
-        let (t, now) = full();
-        assert_eq!(compose(Some(&t), &env(now)).len(), 28);
-        assert_eq!(compose(None, &env(now)).len(), 9);
-    }
-
-    #[test]
-    fn the_summary_block_is_last_and_survives_a_14_line_panel() {
-        // R1.2 — the renderer keeps the LAST max_lines, so "composed last" is what
-        // makes the summary the content that never gets clipped.
-        let (t, now) = full();
-        let lines = compose(Some(&t), &env(now));
-        let tail: Vec<&String> = lines.iter().rev().take(14).collect();
-        for expected in ["ai-monitor", "session ", "spend ", "activity "] {
-            assert!(
-                tail.iter().any(|l| l.contains(expected)),
-                "{expected} clipped at 14 lines"
-            );
-        }
-        assert_eq!(&lines[lines.len() - 4..], &summary(&t, &env(now), None)[..]);
-    }
-
-    #[test]
-    fn the_section_order_is_fixed() {
-        let (t, now) = full();
-        let rules: Vec<&String> = compose(Some(&t), &env(now))
-            .iter()
-            .filter(|l| l.starts_with("──"))
-            .cloned()
-            .collect::<Vec<_>>()
-            .leak()
-            .iter()
-            .collect();
-        let labels: Vec<&str> = rules
-            .iter()
-            .map(|r| r.split(' ').nth(1).unwrap_or(""))
-            .collect();
-        assert_eq!(
-            labels,
-            vec!["Tasks", "Skills", "Other", "File", "Agents", "ai-monitor"]
-        );
-    }
-
-    #[test]
-    fn each_section_renders_at_most_its_cap() {
-        // R2.1 — every store in `full()` holds more than its cap.
-        let (t, now) = full();
-        assert_eq!(tasks(&t).len(), TASKS_ROWS + 1, "rows + rule");
-        assert_eq!(skills(&t, now).len(), SKILLS_ROWS + 1);
-        assert_eq!(other_tools(&t).len(), TOOLS_ROWS + 1);
-        assert_eq!(file_activity(&t).len(), FILES_ROWS + 1);
-        assert_eq!(agents(&t, now).len(), AGENTS_ROWS + 1);
-    }
-
-    #[test]
-    fn truncation_is_stated_next_to_the_label_and_never_lengthens_the_rule() {
-        // R2.2 — 11 tools against a cap of 4.
-        let (t, _) = full();
-        let r = &other_tools(&t)[0];
-        assert!(r.starts_with("── Other Tools +7 more ─"), "{r}");
-        assert_eq!(r.chars().count(), RULE_COLS);
-        // At a 700-logical-px window the budget is 81 columns; a tail marker would
-        // be clipped away on exactly the narrow windows where truncation is likely.
-        assert!(r.chars().take(81).collect::<String>().contains("+7 more"));
-    }
-
-    #[test]
-    fn a_section_at_exactly_its_cap_carries_no_marker() {
-        // R2.3
-        let (mut t, _) = full();
-        t.tools.truncate(TOOLS_ROWS);
-        assert!(!other_tools(&t)[0].contains("more"));
-        assert_eq!(other_tools(&t)[0].chars().count(), RULE_COLS);
-    }
-
-    #[test]
-    fn an_empty_section_is_one_line_with_its_own_wording() {
-        // R3.1/R3.2 — all five reachable, inline on the rule, one line each.
-        let now = 1_785_226_000_000;
-        let e = TelemetrySnapshot::default();
-        for (lines, wording) in [
-            (tasks(&e), "(no tasks)"),
-            (skills(&e, now), "(no skills yet)"),
-            (other_tools(&e), "(no other tool calls)"),
-            (file_activity(&e), "(no file activity)"),
-            (agents(&e, now), "(no agents yet)"),
-        ] {
-            assert_eq!(lines.len(), 1, "inline on the rule, never a second row");
-            assert!(lines[0].contains(wording), "{}", lines[0]);
-            assert_eq!(lines[0].chars().count(), RULE_COLS);
-            // Adjacent to the label, so a narrow panel cannot clip away the only
-            // thing the section had to say.
-            assert!(lines[0]
-                .chars()
-                .take(81)
-                .collect::<String>()
-                .contains(wording));
-        }
-    }
-
-    #[test]
-    fn the_two_marker_pairs_are_never_conflated() {
-        // R4.1/R4.2 — outcome is ✓/✗; liveness is ●/◯. The fold records no agent
-        // outcome, so ✓ on an agent row would assert something the data lacks.
-        let (t, now) = full();
-        let tool_rows = other_tools(&t)[1..].join("\n");
-        assert!(tool_rows.contains(OK) && tool_rows.contains(FAIL));
-        assert!(!tool_rows.contains(LIVE) && !tool_rows.contains(DONE));
-
-        let agent_rows = agents(&t, now)[1..].join("\n");
-        assert!(agent_rows.contains(LIVE) && agent_rows.contains(DONE));
-        assert!(!agent_rows.contains(OK) && !agent_rows.contains(FAIL));
-    }
-
-    #[test]
-    fn agents_are_flat_with_no_tree_connectors() {
-        // R5.1 — there is no parent linkage in the data, so a connector would draw a
-        // hierarchy that was never observed.
-        let (t, now) = full();
-        for row in &agents(&t, now)[1..] {
-            assert!(!row.contains('├') && !row.contains('└'), "{row}");
-            assert!(row.starts_with("  ●") || row.starts_with("  ◯"), "{row}");
-        }
-    }
-
-    #[test]
-    fn a_live_agent_elapsed_grows_and_a_completed_one_is_frozen() {
-        // R5.2
-        let (t, now) = full();
-        let rows = agents(&t, now);
-        assert!(rows[1].contains("1m30s"), "live, from now_ms: {}", rows[1]);
-        assert!(
-            rows[2].contains("30s"),
-            "completed, from its end: {}",
-            rows[2]
-        );
-        let later = agents(&t, now + 600_000);
-        assert!(later[1].contains("11m30s"), "live grew: {}", later[1]);
-        assert!(later[2].contains("30s"), "completed did NOT: {}", later[2]);
-    }
-
-    #[test]
-    fn agent_rows_carry_type_description_and_model() {
-        // R5.4
-        let (t, now) = full();
-        let row = &agents(&t, now)[1];
-        assert!(row.contains("general-purpose") && row.contains("Gate 3 checker"));
-        assert!(row.contains("opus"), "{row}");
-    }
-
-    #[test]
-    fn tasks_sort_by_updated_desc_deterministically() {
-        // R6.1 — the store is an unordered map; without a total order the pinned
-        // snapshots would be flaky run to run (the hasher is seeded per process).
-        let (t, _) = full();
-        let rows = tasks(&t);
-        let subjects: Vec<&str> = rows[1..]
-            .iter()
-            .map(|r| r.trim_start().split(" · ").next().unwrap_or(""))
-            .collect();
-        // t-1 and t-2 tie on `updated_ms`; t-1 has the later `created_ms` and wins.
-        assert_eq!(
-            subjects,
-            vec![
-                "Fold usage per message id",
-                "Pin the worked examples",
-                "Audit the dedupe keying",
-                "Measure the model census"
-            ]
-        );
-        // Order does not depend on the input order of an unordered store.
-        let mut shuffled = t.clone();
-        shuffled.tasks.reverse();
-        assert_eq!(tasks(&shuffled), rows);
-    }
-
-    #[test]
-    fn task_status_is_the_raw_string_and_only_completed_shows_a_duration() {
-        // R6.2/R6.3 — `blocked` is unobserved in the corpus and must still pass
-        // through intact rather than being glyph-substituted or treated as terminal.
-        let (t, _) = full();
-        let rows = tasks(&t).join("\n");
-        assert!(rows.contains("· in_progress"), "{rows}");
-        assert!(rows.contains("· blocked"), "{rows}");
-        assert!(rows.contains("· completed · 10m40s"), "{rows}");
-        // the in_progress row carries no duration after its status
-        let ip = tasks(&t)[1].clone();
-        assert!(ip.ends_with("in_progress"), "{ip}");
-    }
-
-    #[test]
-    fn skills_show_a_relative_age_and_no_duration() {
-        // R7.1 — a Skill pair measures dispatch latency, not execution.
-        let (t, now) = full();
-        let row = &skills(&t, now)[1];
-        assert!(
-            row.contains("harness-ops:loop") && row.contains("4m ago"),
-            "{row}"
-        );
-        assert!(!row.contains("ms") && !row.contains(".0s"), "{row}");
-    }
-
-    #[test]
-    fn a_missing_duration_renders_the_placeholder() {
-        // R7.2
-        let (t, _) = full();
-        assert!(other_tools(&t)[1..].iter().any(|r| r.ends_with(DASH)));
-        assert!(file_activity(&t)[1..].iter().any(|r| r.ends_with(DASH)));
-    }
-
-    #[test]
-    fn paths_keep_the_filename_and_one_parent() {
-        // R7.3
-        assert_eq!(
-            short_path("/Users/x/proj/crates/renderer/atlas.rs"),
-            "…/renderer/atlas.rs"
-        );
-        assert_eq!(short_path("crates/app/dashboard.rs"), "…/app/dashboard.rs");
-        assert_eq!(short_path("Cargo.toml"), "Cargo.toml");
-        assert_eq!(short_path("src/main.rs"), "src/main.rs");
-        // The root is an ancestor: without the marker these read as relative paths,
-        // which name different files.
-        assert_eq!(short_path("/etc/hosts"), "…/etc/hosts");
-        assert_eq!(short_path("/Cargo.toml"), "…/Cargo.toml");
-    }
-
-    #[test]
-    fn no_row_overruns_the_rule_on_hostile_telemetry() {
-        // The chrome around the variable field is raw passthrough data — a task's
-        // status, an agent's type and model — so it is not bounded by construction.
-        let now = 1_785_226_000_000;
-        let mut t = TelemetrySnapshot {
-            tasks: vec![task("t", &"s".repeat(300), &"x".repeat(300), 0, 0)],
-            subagents: vec![Subagent {
-                id: "a".into(),
-                subagent_type: Some("y".repeat(300)),
-                description: Some("d".repeat(300)),
-                model: Some("m".repeat(300)),
-                start_ms: Some(0),
-                end_ms: None,
-                completed: false,
-            }],
-            ..TelemetrySnapshot::default()
-        };
-        // A timestamp pair spanning the whole epoch: `dur` emits 9 columns here,
-        // one more than the file row's derivation reserves.
-        t.files = vec![file(FileOp::Read, &"p".repeat(400), true, Some(u64::MAX))];
-        t.tools = vec![CompletedTool {
-            name: "n".repeat(300),
-            ok: true,
-            duration_ms: Some(u64::MAX),
-            start_ms: None,
-        }];
-        t.skills = vec![SkillEntry {
-            name: "k".repeat(300),
-            start_ms: Some(0),
-        }];
-        for line in compose(Some(&t), &env(now)) {
-            assert!(line.chars().count() <= RULE_COLS, "{line}");
-        }
-    }
-
-    #[test]
-    fn an_over_long_basename_truncates_from_the_left() {
-        // R7.4 — left, so the extension survives; right-truncation would clip the
-        // one part of a path worth reading.
-        let long = format!("/a/b/{}.rs", "x".repeat(120));
-        let out = short_path(&long);
-        assert_eq!(out.chars().count(), PATH_COLS);
-        assert!(out.starts_with('…') && out.ends_with(".rs"), "{out}");
-    }
-
-    #[test]
-    fn grep_and_glob_render_their_pattern_not_a_path() {
-        // R7.5 — path-shortening a regex mangles one containing `/`.
-        assert_eq!(
-            file_target(FileOp::Grep, r"src/.*/mod\.rs"),
-            r"src/.*/mod\.rs"
-        );
-        assert_eq!(file_target(FileOp::List, "**/*.toml"), "**/*.toml");
-        // ... and the head is what survives truncation, since that is a pattern's
-        // discriminating part.
-        let long = "a/".repeat(80);
-        let out = file_target(FileOp::Grep, &long);
-        assert_eq!(out.chars().count(), PATH_COLS);
-        assert!(out.starts_with("a/a/") && out.ends_with('…'), "{out}");
-    }
-
-    #[test]
-    fn the_path_budget_equals_its_own_derivation() {
-        // B7 term by term: 2 indent + 5 op + 1 + 1 glyph + 1 + 8 duration + 1 = 19.
-        // A stated number that disagrees with the row it describes is the defect this
-        // pins; two earlier revisions of the spec got it wrong in exactly that way.
-        const CHROME: usize = 2 + 5 + 1 + 1 + 1 + 8 + 1;
-        assert_eq!(PATH_COLS, RULE_COLS - CHROME);
-        // and the composed row honours it: op label is 5 wide, indent is 2
-        let (t, _) = full();
-        for row in &file_activity(&t)[1..] {
-            assert!(row.starts_with("  "), "{row}");
-            assert!(row.chars().count() <= RULE_COLS, "{row}");
-        }
-    }
-
-    #[test]
-    fn no_row_overruns_the_rule() {
-        let (t, now) = full();
-        for line in compose(Some(&t), &env(now)) {
-            assert!(line.chars().count() <= RULE_COLS, "{line}");
-        }
-    }
-
     // ---- attachment rendering ------------------------------------------------
 
     #[test]
     fn an_unattached_snapshot_shows_none_of_its_data() {
-        // Before attaching, whatever the resolver happened to find must not be
-        // presented as this tab's session.
+        // Before attaching, whatever the resolver happened to find must not be presented
+        // as this tab's session.
         let (t, now) = full();
-        let out = compose(
-            Some(&t),
-            &Env {
-                now_ms: now,
-                attached: false,
-                context_window: None,
-                tab_has_claude: false,
-            },
-        )
-        .join("\n");
+        let out = project(&model(Some(&t), &unattached(now)));
         assert!(out.contains("(no active session"), "{out}");
         assert!(!out.contains("claude-opus-5"), "no model leak:\n{out}");
         assert!(!out.contains("19.3K"), "no spend leak:\n{out}");
-        assert!(!out.contains("up "), "no uptime leak:\n{out}");
+        assert!(!out.contains("45m12s"), "no uptime leak:\n{out}");
         assert!(out.contains("(no tasks)") && out.contains("(no agents yet)"));
     }
 
@@ -1490,16 +2273,7 @@ mod tests {
         for last in [Some(0), None] {
             t.last_event_ms = last;
             t.first_event_ms = last;
-            let out = compose(
-                Some(&t),
-                &Env {
-                    now_ms: now,
-                    attached: true,
-                    context_window: None,
-                    tab_has_claude: false,
-                },
-            )
-            .join("\n");
+            let out = project(&model(Some(&t), &env(now)));
             assert!(!out.contains("no active session"), "{out}");
             assert!(out.contains("claude-opus-5"), "data intact:\n{out}");
             assert!(out.contains("Fold usage per message id"), "tasks intact");
@@ -1511,80 +2285,40 @@ mod tests {
     #[test]
     fn the_unattached_row_reports_which_case_it_is() {
         let (mut t, now) = populated();
-        let unattached = |t: &TelemetrySnapshot| {
-            compose(
-                Some(t),
-                &Env {
-                    now_ms: now,
-                    attached: false,
-                    context_window: None,
-                    tab_has_claude: false,
-                },
-            )
-            .join("\n")
+        let note = |t: &TelemetrySnapshot| {
+            model(Some(t), &unattached(now))
+                .session
+                .note
+                .expect("a detached session row states which nothing this is")
         };
         // A log that went quiet: say how long ago.
         t.last_event_ms = Some(now - 110 * 60 * 1000);
-        assert!(
-            unattached(&t).contains("newest log idle 1h50m"),
-            "{}",
-            unattached(&t)
-        );
+        assert_eq!(note(&t), "(no active session — newest log idle 1h50m)");
         // A log with content but no clock: say that instead of inventing an age.
         t.last_event_ms = None;
-        assert!(unattached(&t).contains("newest log is undated"));
-        // No log at all: claim nothing about a log. `tab_has_claude: false` above, so
-        // this is the no-process wording.
-        let none = unattached(&TelemetrySnapshot::default());
-        assert!(none.contains("(no Claude session in this tab)"), "{none}");
-        assert!(
-            !none.contains("undated") && !none.contains("idle"),
-            "{none}"
+        assert_eq!(note(&t), "(no active session — newest log is undated)");
+        // No log at all: claim nothing about a log.
+        assert_eq!(
+            note(&TelemetrySnapshot::default()),
+            "(no Claude session in this tab)"
         );
-    }
-
-    #[test]
-    fn no_log_at_all_while_unattached_renders_the_frame() {
-        // Reachable whenever a cwd resolves no project directory. Must be a frame
-        // with a reason, never a blank panel.
-        let out = compose(
-            None,
-            &Env {
-                now_ms: 1_785_226_000_000,
-                attached: false,
-                context_window: None,
-                tab_has_claude: false,
-            },
-        );
-        assert_eq!(out.len(), 9, "five empty sections + the summary block");
-        assert!(out.join("\n").contains("(no Claude session in this tab)"));
-    }
-
-    /// The unattached, nothing-resolved environment the two wordings are keyed in.
-    fn no_session(now: u64, tab_has_claude: bool) -> Env {
-        Env {
-            now_ms: now,
-            attached: false,
-            context_window: None,
-            tab_has_claude,
-        }
     }
 
     #[test]
     fn a_tab_with_no_claude_process_is_told_exactly_that() {
-        // R7.5 — the everyday case: a tab that simply is not running Claude Code.
-        let out = compose(None, &no_session(1_785_226_000_000, false)).join("\n");
+        // The everyday case: a tab that simply is not running Claude Code.
+        let out = project(&model(None, &no_session(1_785_226_000_000, false)));
         assert!(out.contains("(no Claude session in this tab)"), "{out}");
         assert!(!out.contains("has not written a log"), "{out}");
     }
 
     #[test]
     fn a_tab_running_claude_with_nothing_confirmed_is_told_the_other_thing() {
-        // R7.6 — the reported case: `claude` is running in this tab and the user can
-        // watch it, but no log in the project directory can be confirmed as its own.
-        // "(no Claude session in this tab)" here would read as a bug, which is why the
-        // wording is keyed on process presence rather than on the hint's usability.
-        let out = compose(None, &no_session(1_785_226_000_000, true)).join("\n");
+        // The reported case: `claude` is running in this tab and the user can watch it,
+        // but no log in the project directory can be confirmed as its own. "(no Claude
+        // session in this tab)" here would read as a bug, which is why the wording is
+        // keyed on process presence rather than on the hint's usability.
+        let out = project(&model(None, &no_session(1_785_226_000_000, true)));
         assert!(
             out.contains("(this tab's session has not written a log yet)"),
             "{out}"
@@ -1594,28 +2328,27 @@ mod tests {
 
     #[test]
     fn nothing_resolved_leaks_nothing_from_the_session_that_was_declined() {
-        // R0.1 — the goal-level assertion, and the whole reason this feature exists.
-        // The foreign values are taken from a REAL snapshot rather than written out as
-        // literals, so the test cannot pass by asserting the absence of strings this
-        // dashboard never emits: every one of these does appear when that snapshot is
-        // composed attached (asserted below), and none may appear when strict
-        // resolution answered `None`.
+        // The goal-level assertion, and the whole reason this feature exists. The foreign
+        // values are taken from a REAL snapshot rather than written out as literals, so
+        // the test cannot pass by asserting the absence of strings this module never
+        // emits: every one of these appears when that snapshot is composed attached
+        // (asserted below), and none may appear when strict resolution answered `None`.
         let (foreign, now) = populated();
-        let leaked = compose(Some(&foreign), &env(now)).join("\n");
+        let leaked = project(&model(Some(&foreign), &env(now)));
         let markers = [
             "5e59b629",      // session id, as the row truncates it
             "claude-opus-5", // model
             "19.3K",         // spend (output)
             "1.9M",          // spend (cache)
-            "context 59%",   // occupancy
-            "up 45m12s",     // uptime
+            "59%",           // occupancy
+            "45m12s",        // uptime
         ];
         for m in markers {
             assert!(leaked.contains(m), "fixture no longer emits {m}:\n{leaked}");
         }
 
         for tab_has_claude in [false, true] {
-            let out = compose(None, &no_session(now, tab_has_claude)).join("\n");
+            let out = project(&model(None, &no_session(now, tab_has_claude)));
             for m in markers {
                 assert!(
                     !out.contains(m),
@@ -1634,74 +2367,313 @@ mod tests {
         }
     }
 
+    // ---- the docked panel's chrome (R5.1–R5.5, R5.10) ------------------------
+
     #[test]
-    fn an_unattached_row_stays_within_the_rule() {
-        let (mut t, now) = populated();
-        t.last_event_ms = Some(0);
-        for line in compose(
-            Some(&t),
-            &Env {
-                now_ms: now,
-                attached: false,
-                context_window: None,
-                tab_has_claude: false,
-            },
-        ) {
-            assert!(line.chars().count() <= RULE_COLS, "{line}");
+    fn r5_1_every_pinned_region_is_present_whatever_the_input() {
+        // The chrome is the panel's identity, so it is built for a populated session, a
+        // detached tab and an empty snapshot alike — a layout that appeared and
+        // disappeared with the data would look broken rather than empty.
+        let (t, now) = populated();
+        for m in [
+            model(Some(&t), &env(now)),
+            model(None, &no_session(now, false)),
+            model(Some(&TelemetrySnapshot::default()), &env(now)),
+        ] {
+            assert_eq!(m.title, "ai-monitor");
+            assert!(
+                !m.session.name.is_empty(),
+                "the session row is always drawn"
+            );
+            let labels: Vec<&str> = m.tiles.iter().map(|t| t.label.as_str()).collect();
+            assert_eq!(
+                labels,
+                vec!["UPTIME", "IDLE", "ERRORS", "IN·OUT", "CACHE", "CONTEXT"],
+                "the design's 3x2 grid, in its order"
+            );
+            assert!(m.footer.starts_with("Last update"), "{}", m.footer);
+            // Visibility is `overlay.rs`'s fact, stamped after this returns.
+            assert!(!m.visible);
         }
     }
 
-    // ---- context window ------------------------------------------------------
+    #[test]
+    fn r5_2_the_status_pill_has_exactly_three_states() {
+        let (mut t, now) = populated();
+        // Attached and writing.
+        t.last_event_ms = Some(now - 2_000);
+        assert_eq!(model(Some(&t), &env(now)).status, PanelStatus::Connected);
+        // Attached but quiet past the threshold: the same session, a different reading.
+        t.last_event_ms = Some(now - IDLE_AFTER_MS - 1);
+        assert_eq!(model(Some(&t), &env(now)).status, PanelStatus::Idle);
+        // An attached log with no parseable time is IDLE, never CONNECTED: absence of a
+        // clock is not evidence of liveness.
+        t.last_event_ms = None;
+        assert_eq!(model(Some(&t), &env(now)).status, PanelStatus::Idle);
+        // A tab with no Claude session at all.
+        assert_eq!(
+            model(None, &no_session(now, false)).status,
+            PanelStatus::NoSession
+        );
+        // All four detached cases compress to the one badge — the wordings live on the
+        // row below (R5.3), which is the point of D5.
+        assert_eq!(
+            model(Some(&t), &unattached(now)).status,
+            PanelStatus::NoSession
+        );
+    }
 
     #[test]
-    fn an_occupancy_over_the_window_reads_greater_than_100_not_a_number() {
-        // The measured case: 256,551 tokens against an assumed 200k window rendered
-        // `context 128%`. A percentage over 100 is impossible on its face; what it
-        // really means is the window is wrong.
+    fn r5_3_the_session_row_keeps_all_four_detached_wordings_verbatim() {
         let (mut t, now) = populated();
-        t.context_used = 256_551;
-        let out = compose(Some(&t), &env(now)).join("\n");
-        assert!(out.contains("context >100%"), "{out}");
-        assert!(!out.contains("128"), "never the impossible number:\n{out}");
+        let note = |snap: Option<&TelemetrySnapshot>, e: &Env| {
+            model(snap, e)
+                .session
+                .note
+                .expect("a detached session row states which nothing this is")
+        };
+        t.last_event_ms = Some(now - 110 * 60 * 1000);
+        assert_eq!(
+            note(Some(&t), &unattached(now)),
+            "(no active session — newest log idle 1h50m)"
+        );
+        t.last_event_ms = None;
+        assert_eq!(
+            note(Some(&t), &unattached(now)),
+            "(no active session — newest log is undated)"
+        );
+        assert_eq!(
+            note(None, &no_session(now, true)),
+            "(this tab's session has not written a log yet)"
+        );
+        assert_eq!(
+            note(None, &no_session(now, false)),
+            "(no Claude session in this tab)"
+        );
+        // An attached row carries no note...
+        assert!(model(Some(&t), &env(now)).session.note.is_none());
+        // ... and a detached one carries nothing BUT the note: the identity fields would
+        // otherwise describe the log this tab declined to claim.
+        let detached = model(Some(&t), &unattached(now)).session;
+        assert!(detached.short_id.is_empty() && detached.model.is_empty());
+        assert!(detached.provider.is_empty());
+    }
+
+    #[test]
+    fn an_attached_session_row_names_the_session_and_the_model() {
+        let (t, now) = populated();
+        let row = model(Some(&t), &env(now)).session;
+        assert_eq!(row.short_id, "5e59b629", "8 chars of the session id");
+        assert_eq!(row.model, "claude-opus-5");
+        assert_eq!(row.provider, "[Claude]");
+    }
+
+    #[test]
+    fn r5_4_the_context_tile_carries_a_proportional_gauge() {
+        let (mut t, now) = populated();
+        t.context_used = 90_000; // 45% of the 200k window claude-opus-* maps to
+        let m = model(Some(&t), &env(now));
+        let tile = tile_of(&m, "CONTEXT");
+        assert_eq!(tile.value, "45%");
+        assert_eq!(tile.gauge, Some(0.45));
+        // Over the assumed window the *number* is refused, not the gauge: the reading is
+        // real, the denominator is what is wrong.
+        //
+        // The INPUT moved (256,551 -> 1,256,551) when window promotion landed; the two
+        // assertions below are untouched. 256,551 is no longer a `>100%` case at all —
+        // it is evidence of a 1M window and now reads 26% — so leaving it here would
+        // have pinned the promotion OFF and silently re-frozen the bug. Past every tier
+        // `WINDOW_TIERS` knows, nothing fits, so the clamp is still what fires.
+        t.context_used = 1_256_551;
+        let m = model(Some(&t), &env(now));
+        assert_eq!(tile_of(&m, "CONTEXT").value, ">100%");
+        assert_eq!(tile_of(&m, "CONTEXT").gauge, Some(1.0));
+    }
+
+    #[test]
+    fn r5_5_an_unknown_context_window_emits_no_percentage_and_no_gauge() {
+        let (mut t, now) = populated();
+        t.model = Some("<synthetic>".into()); // matches no prefix in MODEL_WINDOWS
+        let m = model(Some(&t), &env(now));
+        let tile = tile_of(&m, "CONTEXT");
+        assert_eq!(
+            tile.gauge, None,
+            "None, never Some(0.0): an empty track claims 0% used, which is not known"
+        );
+        assert_eq!(tile.value, DASH, "no percentage at all — and not `0%`");
+        assert!(!tile.value.contains('%'));
+        assert_eq!(m.session.model, "<synthetic>", "the model is still named");
+        // A fresh session's occupancy is unknown too, not zero.
+        t.model = Some("claude-opus-5".into());
+        t.context_used = 0;
+        assert_eq!(tile_of(&model(Some(&t), &env(now)), "CONTEXT").gauge, None);
     }
 
     #[test]
     fn the_configured_window_overrides_the_model_table() {
-        // Which is the fix for the case above: the same 256,551 tokens against the
-        // 1M window the session actually had.
+        // The fix for a session whose real window the log does not record: the same
+        // 256,551 tokens against the 1M window the session actually had.
         let (mut t, now) = populated();
         t.context_used = 256_551;
-        let out = compose(
-            Some(&t),
-            &Env {
-                now_ms: now,
-                attached: true,
-                context_window: Some(1_000_000),
-                tab_has_claude: false,
-            },
-        )
-        .join("\n");
-        assert!(out.contains("context 26%"), "{out}");
+        let e = Env {
+            context_window: Some(1_000_000),
+            ..env(now)
+        };
+        assert_eq!(tile_of(&model(Some(&t), &e), "CONTEXT").value, "26%");
+        // ... and without it, the honest refusal rather than an impossible number.
+        //
+        // This half needed a bigger reading once promotion landed: at 256,551 the
+        // deduction now reaches the same 1M window the config states, so the contrast
+        // the assertion below is drawing no longer exists at that size. Past every known
+        // tier it does. What the config uniquely buys is pinned separately, by
+        // `a_configured_window_outranks_the_deduced_one`.
+        t.context_used = 1_256_551;
+        assert_eq!(
+            tile_of(&model(Some(&t), &env(now)), "CONTEXT").value,
+            ">100%"
+        );
+    }
+
+    #[test]
+    fn the_1m_repro_a_session_bigger_than_200k_is_measured_against_the_tier_that_fits() {
+        // Measured on a real 1M-context session: one turn reached 514,930 tokens of
+        // context. Against the assumed 200k that is 257% — clamped to a useless
+        // `>100%` on a session that is barely half full. The number is not a guess: the
+        // API accepted those tokens, so the window was never 200k.
+        let (mut t, now) = populated();
+        t.context_used = 514_930;
+        let m = model(Some(&t), &env(now));
+        let tile = tile_of(&m, "CONTEXT");
+        assert_eq!(tile.value, "51%", "514,930 of the 1M window that fits it");
+        assert_eq!(
+            tile.gauge,
+            Some(0.51),
+            "and a gauge that is half full, not full"
+        );
+    }
+
+    #[test]
+    fn the_deduced_window_survives_a_compact_that_drops_occupancy() {
+        // The amnesia case, from real logs: a `/compact` took one session from 517,389
+        // tokens of context to 53,268 between two adjacent turns. Read against the
+        // CURRENT occupancy the deduction forgets — 53,268 fits 200k, so the window
+        // silently reverts and the panel reports 27% of a window the session has already
+        // proved it is not on. The high-water is what makes the deduction a property of
+        // the session rather than of the newest line.
+        let (mut t, now) = populated();
+        t.context_used = 517_389;
+        t.context_high_water = 517_389;
+        assert_eq!(tile_of(&model(Some(&t), &env(now)), "CONTEXT").value, "52%");
+
+        // ... then the compact lands. Occupancy really did fall — the gauge must follow
+        // it down — but the DENOMINATOR must not.
+        t.context_used = 53_268;
+        assert_eq!(
+            tile_of(&model(Some(&t), &env(now)), "CONTEXT").value,
+            "5%",
+            "5% of the proven 1M window, not 27% of a window it outgrew"
+        );
+
+        // And the evidence is the high-water alone: a session that never exceeded 200k
+        // is untouched by any of this.
+        let (mut u, _) = populated();
+        u.context_used = 53_268;
+        u.context_high_water = 53_268;
+        assert_eq!(
+            tile_of(&model(Some(&u), &env(now)), "CONTEXT").value,
+            "27%",
+            "no evidence of a bigger window, so the table's 200k stands"
+        );
+    }
+
+    #[test]
+    fn promotion_fires_on_evidence_only_never_on_the_model_name() {
+        // The whole safety property: `claude-opus-5` CAN run a 1M window, and that fact
+        // is never consulted. Only the session's own usage moves the denominator, so a
+        // session inside its assumed window is bit-for-bit what it was before.
+        let (mut t, now) = populated();
+        for (used, pct) in [(90_000u64, "45%"), (150_000, "75%"), (200_000, "100%")] {
+            t.context_used = used;
+            assert_eq!(
+                tile_of(&model(Some(&t), &env(now)), "CONTEXT").value,
+                pct,
+                "{used} is within the assumed 200k — measured against 200k"
+            );
+        }
+        // One token past it is evidence, and the smallest tier that fits takes over.
+        t.context_used = 200_001;
+        assert_eq!(tile_of(&model(Some(&t), &env(now)), "CONTEXT").value, "20%");
+        // The unit rule behind both, including the exact boundaries.
+        assert_eq!(promoted_window(200_000, 199_999), 200_000);
+        assert_eq!(
+            promoted_window(200_000, 200_000),
+            200_000,
+            "fits: no promotion"
+        );
+        assert_eq!(promoted_window(200_000, 200_001), 1_000_000);
+        assert_eq!(promoted_window(200_000, 1_000_000), 1_000_000, "exact fit");
+        // `promoted_window` takes the FIRST tier that fits, so "first" has to mean
+        // "smallest". Only one tier sits above 200k today, so a mis-sorted table would
+        // change no output and no behavioural test could catch it — pinned here before a
+        // third tier makes the ordering silently load-bearing.
+        assert!(
+            WINDOW_TIERS.windows(2).all(|w| w[0] < w[1]),
+            "WINDOW_TIERS must be strictly ascending"
+        );
+    }
+
+    #[test]
+    fn usage_past_every_known_tier_still_refuses_the_number() {
+        // The `>100%` clamp is not dead code after promotion — it is what remains when
+        // the deduction has nothing to deduce. A session past 1M fits no tier this build
+        // knows, so the panel says so instead of inventing a denominator.
+        let (mut t, now) = populated();
+        t.context_used = 1_000_001;
+        let m = model(Some(&t), &env(now));
+        let tile = tile_of(&m, "CONTEXT");
+        assert_eq!(tile.value, ">100%");
+        assert_eq!(tile.gauge, Some(1.0));
+        assert_eq!(
+            promoted_window(200_000, 1_000_001),
+            200_000,
+            "no tier fits, so the assumption stands and the caller clamps"
+        );
+    }
+
+    #[test]
+    fn a_configured_window_outranks_the_deduced_one() {
+        // `[ai_monitor] context_window` is knowledge; promotion is inference. The one
+        // case that separates them is a config NARROWER than what the usage would
+        // deduce — if the deduction could overrule it, this reads 51%.
+        let (mut t, now) = populated();
+        t.context_used = 514_930;
+        let e = Env {
+            context_window: Some(200_000),
+            ..env(now)
+        };
+        assert_eq!(
+            tile_of(&model(Some(&t), &e), "CONTEXT").value,
+            ">100%",
+            "the user said 200k; the panel does not argue"
+        );
+        assert_eq!(
+            tile_of(&model(Some(&t), &env(now)), "CONTEXT").value,
+            "51%",
+            "and without the config, the deduction does its job"
+        );
     }
 
     #[test]
     fn the_configured_window_applies_to_an_unmatched_model_too() {
-        // `<synthetic>` matches no prefix, so the table yields nothing — but an
-        // explicit window is knowledge, not a guess, and does apply.
+        // `<synthetic>` matches no prefix, so the table yields nothing — but an explicit
+        // window is knowledge, not a guess, and does apply.
         let (mut t, now) = populated();
         t.model = Some("<synthetic>".into());
-        assert_eq!(
-            context_pct(
-                &t,
-                &Env {
-                    now_ms: now,
-                    attached: true,
-                    context_window: Some(200_000),
-                    tab_has_claude: false,
-                }
-            ),
-            Some(59)
-        );
+        let e = Env {
+            context_window: Some(200_000),
+            ..env(now)
+        };
+        assert_eq!(context_pct(&t, &e), Some(59));
         assert_eq!(
             context_pct(&t, &env(now)),
             None,
@@ -1710,9 +2682,145 @@ mod tests {
     }
 
     #[test]
-    fn the_whole_dashboard_is_pure() {
-        // R8.2 — same inputs, byte-identical output, twice.
+    fn the_errors_tile_counts_failed_calls_not_parser_faults() {
+        // D3/R2.3 — `parse_errors` counts PARSER faults. Showing it under an ERRORS
+        // label would be a false statement about what failed.
+        let (mut t, now) = populated();
+        t.failed_tool_calls = 3;
+        t.parse_errors = 99;
+        let m = model(Some(&t), &env(now));
+        assert_eq!(tile_of(&m, "ERRORS").value, "3");
+        assert_eq!(tile_of(&m, "ERRORS").color, ColorRole::Rose);
+        t.failed_tool_calls = 0;
+        let m = model(Some(&t), &env(now));
+        assert_eq!(
+            tile_of(&m, "ERRORS").value,
+            "0",
+            "zero failures is a fact worth stating, not an unknown"
+        );
+        assert_ne!(
+            tile_of(&m, "ERRORS").color,
+            ColorRole::Rose,
+            "a rose zero would read as an alarm about nothing"
+        );
+    }
+
+    #[test]
+    fn the_spend_tiles_sum_cache_and_only_context_is_a_percentage() {
+        // The cumulative COST counters, never presented as occupancy: cache-read is
+        // re-billed every turn, so these run ~16x the live context on a real session.
+        let (t, now) = populated();
+        let m = model(Some(&t), &env(now));
+        assert_eq!(tile_of(&m, "IN·OUT").value, "45·19.3K");
+        assert_eq!(
+            tile_of(&m, "CACHE").value,
+            "1.9M",
+            "read + creation, summed because both are billed"
+        );
+        assert_eq!(
+            project(&m).matches('%').count(),
+            1,
+            "the context gauge is the only percentage on the panel"
+        );
+    }
+
+    #[test]
+    fn the_activity_tiles_are_readings_taken_at_the_footer_s_timestamp() {
+        // D20 — UPTIME and IDLE are `now - first/last`, frozen between snapshots, which
+        // the footer's absolute time is what qualifies.
+        let (mut t, now) = populated();
+        let m = model(Some(&t), &env(now));
+        assert_eq!(tile_of(&m, "UPTIME").value, "45m12s");
+        assert_eq!(tile_of(&m, "IDLE").value, "2m03s");
+        // Missing event times render the placeholder, never an epoch-derived duration.
+        t.first_event_ms = None;
+        t.last_event_ms = None;
+        let m = model(Some(&t), &env(now));
+        assert_eq!(tile_of(&m, "UPTIME").value, DASH);
+        assert_eq!(tile_of(&m, "IDLE").value, DASH);
+    }
+
+    #[test]
+    fn r5_10_the_footer_is_an_absolute_local_time_with_no_relative_age() {
+        // D9 — a relative age freezes and starts lying the moment nothing repaints, which
+        // under D2 is most of the time. The epoch below is 07:21:18 UTC.
+        let (mut t, now) = populated();
+        t.last_event_ms = Some(1_785_223_278_000);
+        let kst = Env {
+            utc_offset_secs: 32_400,
+            ..env(now)
+        };
+        assert_eq!(model(Some(&t), &kst).footer, "Last update 16:21:18");
+        // The offset is injected, so the same snapshot reads differently by zone — and
+        // identically on every machine in one zone, which is what keeps the snapshots
+        // byte-stable (D19).
+        assert_eq!(
+            model(Some(&t), &env(now)).footer,
+            "Last update 07:21:18",
+            "utc_offset_secs = 0"
+        );
+        for footer in [
+            model(Some(&t), &kst).footer,
+            model(None, &no_session(now, false)).footer,
+        ] {
+            assert!(!footer.contains("ago"), "{footer}");
+            assert!(!footer.contains("idle"), "{footer}");
+        }
+        // Nothing folded yet: the placeholder, not an epoch rendered as midnight UTC.
+        t.last_event_ms = None;
+        assert_eq!(model(Some(&t), &kst).footer, format!("Last update {DASH}"));
+    }
+
+    #[test]
+    fn r1_4_the_footer_draws_no_q_keycap() {
+        // D1 dropped the design's `q` keycap rather than draw a promise the panel does not
+        // keep. The design's footer reads "Streaming live · updated 6s ago" with a boxed
+        // `q` beside it, and that keycap is a *claim*: it says pressing `q` closes the
+        // panel. It does not — `q` goes to the shell, where it quits `less` (R1.3). A
+        // keycap for a key nothing handles is worse than no keycap, because the user
+        // presses it, `less` exits, and the panel stays open.
+        //
+        // Asserted on the model rather than on pixels because the model is the only thing
+        // the app composes: `monitor_layout::footer` draws `model.footer` and one hairline
+        // and nothing else, so a keycap could only enter here (the layout half is pinned
+        // in `monitor_layout.rs`).
         let (t, now) = full();
-        assert_eq!(compose(Some(&t), &env(now)), compose(Some(&t), &env(now)));
+        let kst = Env {
+            utc_offset_secs: 32_400,
+            ..env(now)
+        };
+        // Every state the footer has: attached, detached, and no session at all. A close
+        // affordance drawn in only one of them is the easiest version of this to ship.
+        for footer in [
+            model(Some(&t), &kst).footer,
+            model(Some(&t), &unattached(now)).footer,
+            model(None, &no_session(now, true)).footer,
+            model(None, &no_session(now, false)).footer,
+        ] {
+            assert!(
+                footer.starts_with("Last update "),
+                "the footer is the last-update time and nothing else: {footer:?}"
+            );
+            // The design's keycap and the two other close affordances it draws (the header
+            // `✕`, the `Esc` hint). None of them is a key the panel answers to.
+            for affordance in ["q", "Q", "esc", "Esc", "ESC", "✕", "×", "close", "quit"] {
+                assert!(
+                    !footer.contains(affordance),
+                    "{affordance:?} in the footer {footer:?} — the panel closes on \
+                     Cmd+Shift+M only (D1), so any other close affordance is a lie"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_clock_wraps_west_of_greenwich_instead_of_going_negative() {
+        // A naive `%` on a pre-dawn UTC time with a negative offset yields a negative
+        // hour, which formats as `-1:59:59`.
+        assert_eq!(clock(1_785_223_278_000, 32_400), "16:21:18");
+        assert_eq!(clock(1_785_223_278_000, 0), "07:21:18");
+        assert_eq!(clock(1_785_223_278_000, -8 * 3_600), "23:21:18");
+        assert_eq!(clock(0, -3_600), "23:00:00");
+        assert_eq!(clock(0, 0), "00:00:00");
     }
 }

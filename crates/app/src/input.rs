@@ -104,7 +104,69 @@ pub fn sidebar_press(
     })
 }
 
-/// An in-flight drag-to-resize of the sidebar's right edge (tab-resize D9/D17).
+/// Which of the three things a left press can land on claims it (D17/R9.5).
+///
+/// The variants are the app's three press consumers in priority order, and the order is
+/// the whole content of this type — see [`press_route`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PressRoute {
+    /// The sidebar claimed it; do this action.
+    Sidebar(SidebarAction),
+    /// The sidebar declined and the pointer is in the ai-monitor panel's grab band: arm a
+    /// [`ResizeEdge::Monitor`] resize.
+    MonitorEdge,
+    /// Neither piece of chrome claimed it — the terminal grid gets the press.
+    Grid,
+}
+
+/// Resolve a left press between the sidebar, the panel's grab band, and the grid —
+/// **the ordering rule of D17/R9.5, as a function rather than as the order two `else if`
+/// arms happen to sit in.**
+///
+/// D17 calls an unordered hit test "a coin flip at the overlap", and until this existed
+/// the rule *was* source order: swapping the two arms in `terminal_app`'s press handler
+/// changed which edge a shared pointer armed, and nothing anywhere would have failed.
+/// That is the specific thing this function exists to make impossible.
+///
+/// **The sidebar wins**, because it is the older and more frequently used affordance, and
+/// it wins with *any* action — not only `BeginResize`. A tab card that overlaps the panel's
+/// band is still a tab switch; the panel's edge is reachable only where the sidebar
+/// declined the press outright, which is also why `Inert` (sidebar dead space) beats the
+/// panel rather than falling through to it.
+///
+/// Note what does *not* justify leaving this implicit: D4 currently keeps the two edges at
+/// least `MIN_TERMINAL_COLS` apart, so a live window is not supposed to be able to put one
+/// pointer in both 6px bands. But the two hit tests read their geometry from two different
+/// places (`left_inset` via `SidebarLayoutInput`, `right_inset` via
+/// [`in_monitor_grab_band`]), and a rule that is only correct because *another* decision's
+/// arithmetic happens to hold is the kind that breaks silently when that arithmetic moves.
+pub fn press_route(sidebar: Option<SidebarAction>, in_monitor_band: bool) -> PressRoute {
+    match (sidebar, in_monitor_band) {
+        (Some(action), _) => PressRoute::Sidebar(action),
+        (None, true) => PressRoute::MonitorEdge,
+        (None, false) => PressRoute::Grid,
+    }
+}
+
+/// Which draggable edge a resize grabbed (ai-monitor-right-panel D17).
+///
+/// The two edges face opposite ways, so the pointer means opposite things to them — this
+/// is what [`drive_resize`] dispatches on. It rides *inside* [`ResizeDrag`] rather than
+/// beside it in a second `Option<ResizeDrag>` field deliberately: only one edge can be
+/// under the pointer at press time, and a second slot would turn "a resize and a selection
+/// are never both armed" from a bool invariant into a 2×2 matrix.
+///
+/// [`drive_resize`]: crate::terminal_app
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResizeEdge {
+    /// The tab sidebar's right edge. Grows **rightward** with the pointer.
+    Sidebar,
+    /// The docked ai-monitor panel's left edge. Grows **leftward** — see
+    /// [`resize_raw_monitor_width`].
+    Monitor,
+}
+
+/// An in-flight drag-to-resize of a chrome edge (tab-resize D9/D17; panel edge D17).
 ///
 /// The `grab_offset` is captured at press and **never re-derived** — that is what lets the
 /// gesture survive D12's mid-drag collapse, where there is no edge left to measure against.
@@ -113,6 +175,38 @@ pub struct ResizeDrag {
     /// `pointer_x − edge_x` at the moment of the press, **physical** px. Fixed for the
     /// whole gesture, so the edge stays welded to the point the user grabbed.
     pub grab_offset: f32,
+    /// Which edge this gesture owns. Recorded at press because the two edges' arithmetic
+    /// is mirrored, not shared, and a drag must keep applying the pointer to the edge the
+    /// user actually grabbed even after the other one has moved underneath it.
+    pub edge: ResizeEdge,
+}
+
+/// Which `config.toml` table a released resize writes (R6.1/D6/D8).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PersistTarget {
+    /// `[sidebar]`, via `common::config::save_sidebar`.
+    Sidebar,
+    /// `[ai_monitor]`, via `common::config::save_ai_monitor`.
+    AiMonitor,
+}
+
+/// What a left-release persists, decided by the **edge the gesture recorded** — never by
+/// "whichever value looks like it changed" (R6.1/D8).
+///
+/// D17 gives the two drags one `Option<ResizeDrag>` slot between them, so this is the one
+/// line where a panel drag could rewrite `[sidebar]`. Reading the edge off the gesture is
+/// what keeps a release from persisting a field the user never touched — and lifting the
+/// decision out of `TerminalApp::finish_resize` is what makes it assertable, since that
+/// method needs a live window, a renderer and a config path.
+///
+/// `None` (nothing armed) writes nothing: `finish_resize` clears the slot before
+/// dispatching, so a `Released` arriving after a focus-loss commit finds the slot empty and
+/// does not write a second time.
+pub fn persist_target(drag: Option<ResizeDrag>) -> Option<PersistTarget> {
+    match drag?.edge {
+        ResizeEdge::Sidebar => Some(PersistTarget::Sidebar),
+        ResizeEdge::Monitor => Some(PersistTarget::AiMonitor),
+    }
 }
 
 /// Is this the **Cmd+Shift+S** sidebar toggle chord (tab-resize D17a)?
@@ -202,6 +296,31 @@ pub fn remember_write(recent: &mut Vec<(f32, bool)>, pair: (f32, bool)) {
     }
 }
 
+/// Whether a persist has anything to write (tab-resize D15; right-panel D8/R6.6).
+///
+/// `current` is what the renderer would save — the *intent*, config plus any runtime
+/// override — and `on_disk` is the pair from the last config we applied. Equal means the
+/// file already says this, and touching it would be pure damage: a bare click on a grab band
+/// (press + release, no motion) would rewrite `config.toml` for a value already in it, which
+/// on a fresh install CREATES the file out of nothing and on an existing one rewrites `340`
+/// as `340.0`. It is also what makes a **launch restore** silent — the pair it would write is
+/// the pair it just read (R6.6), so an app that starts with the panel open does not rewrite
+/// its own config on every start.
+///
+/// `override_authoritative` forces a write through: after a *failed* save the file and the
+/// override are knowingly out of step, so equality proves nothing and the next chance to
+/// reconcile must be taken.
+///
+/// Compared against the applied config rather than the write history so the guard also
+/// covers the FIRST gesture of a session, when nothing has been written yet.
+pub fn needs_persist(
+    current: (f32, bool),
+    on_disk: (f32, bool),
+    override_authoritative: bool,
+) -> bool {
+    current != on_disk || override_authoritative
+}
+
 /// Whether a human edit should clear the runtime sidebar override (tab-resize D15a/D14).
 ///
 /// Normally yes — that is what keeps `config.toml` genuinely hand-editable after the first
@@ -269,6 +388,57 @@ pub fn resize_raw_width(pointer_x: f64, drag: ResizeDrag, scale: f64) -> f32 {
     let physical = pointer_x as f32 - drag.grab_offset;
     // Logical px, because `SIDEBAR_WIDTH_MIN`/`MAX` and `SidebarConfig::width_px` are
     // logical (D7) — persisting physical px would make the file display-dependent.
+    let scale = if scale > 0.0 { scale as f32 } else { 1.0 };
+    physical / scale
+}
+
+/// The x of the ai-monitor panel's left edge, in **physical** px — what a press grabs
+/// (D17). `viewport_w` and `right_inset` are both physical, and `right_inset` is the band
+/// the renderer actually reserved, so this is the same edge `grid_size` stops at.
+pub fn monitor_edge_x(viewport_w: f32, right_inset: f32) -> f32 {
+    viewport_w - right_inset
+}
+
+/// Is this pointer x inside the panel's grab band (D16/D17/R9.4)?
+///
+/// The band is `[edge, edge + GRAB_BAND_PX·scale)` — **inside** the panel, mirroring the
+/// sidebar's, whose band is likewise inside its own edge (`sidebar_layout::GRAB_BAND_PX`)
+/// rather than straddling it. The design draws its 8px handle *between* the two columns;
+/// putting it inside is what keeps the terminal's last column selectable, which straddling
+/// would take away — and it needs no change to `pixel_to_cell`'s bound, since the band is
+/// already inside the region that function rejects.
+///
+/// Always `false` when the panel is closed (`right_inset == 0.0`): a zero-width band must
+/// not become a 6px strip of dead terminal at the window's right edge.
+pub fn in_monitor_grab_band(pointer_x: f64, viewport_w: f32, right_inset: f32, scale: f64) -> bool {
+    if right_inset <= 0.0 {
+        return false;
+    }
+    let edge = monitor_edge_x(viewport_w, right_inset);
+    let w = (sidebar_layout::GRAB_BAND_PX * scale as f32)
+        .min(right_inset)
+        .max(0.0);
+    let px = pointer_x as f32;
+    px >= edge && px < edge + w
+}
+
+/// The panel drag's **raw**, unclamped width in *logical* px (D17/R9.6).
+///
+/// The **mirror** of [`resize_raw_width`], written out rather than reused: the sidebar
+/// grows rightward, so its width *is* the edge's x; the panel grows leftward, so its width
+/// is what the edge leaves behind — `viewport_w − edge_x`. Bending the sidebar's expression
+/// into serving both (a sign flag, an "anchor" parameter) would put the one line that
+/// differs behind a branch, in the function whose whole content is that line.
+pub fn resize_raw_monitor_width(
+    pointer_x: f64,
+    drag: ResizeDrag,
+    viewport_w: f32,
+    scale: f64,
+) -> f32 {
+    let edge = pointer_x as f32 - drag.grab_offset;
+    let physical = viewport_w - edge;
+    // Logical px, because `MONITOR_WIDTH_MIN`/`MAX` and `AiMonitorConfig::width_px` are
+    // logical — persisting physical px would make the file display-dependent.
     let scale = if scale > 0.0 { scale as f32 } else { 1.0 };
     physical / scale
 }
@@ -659,21 +829,36 @@ pub fn suppress_key(composing: bool, key: &Key) -> bool {
 /// Map a physical-px cursor point to a viewport cell `(col, row)`, inverting the
 /// renderer's cursor mapping (`x = left_inset + col*cw`, `y = top_inset + row*ch`).
 ///
-/// Returns `None` when the point is left of the grid (over the sidebar band) or
-/// above it (the top inset) — the dead band a grid press must ignore. A point past
-/// the right/bottom edge clamps to the last cell, so a drag off the edge selects the
-/// edge cell rather than going out of bounds. Pure (no winit) → unit-tested.
+/// Returns `None` when the point is left of the grid (over the sidebar band), above it
+/// (the top inset), or **inside the docked ai-monitor panel's band** — the dead bands a
+/// grid press must ignore (ai-monitor-right-panel D16). A point past the bottom edge, or
+/// past the right edge with no panel open, clamps to the last cell, so a drag off the edge
+/// selects the edge cell rather than going out of bounds. Pure (no winit) → unit-tested.
+///
+/// The panel bound is conditional on `right_inset > 0.0`, and that guard is load-bearing
+/// rather than defensive: `viewport_w` is the window, not the grid, so an unconditional
+/// bound would reject every point past the last column **with the panel closed** too —
+/// turning a selection drag that overshoots the window's right edge from "clamp to the last
+/// column" into "stop extending", a regression in a different feature (R9.3).
+#[allow(clippy::too_many_arguments)]
 pub fn pixel_to_cell(
     cursor: (f64, f64),
     cell: (f32, f32),
     left_inset: f32,
     top_inset: f32,
+    viewport_w: f32,
+    right_inset: f32,
     cols: u16,
     rows: u16,
 ) -> Option<(u16, u16)> {
     let (px, py) = (cursor.0 as f32, cursor.1 as f32);
     let (cw, ch) = cell;
     if px < left_inset || py < top_inset || cw <= 0.0 || ch <= 0.0 || cols == 0 || rows == 0 {
+        return None;
+    }
+    // The panel swallows its own band (R9.1/R9.2): a press here arms no selection and
+    // ⌘-clicks no link, because there is no cell under the pointer to anchor either on.
+    if right_inset > 0.0 && px >= viewport_w - right_inset {
         return None;
     }
     // `px - left_inset >= 0` and `cw > 0` → non-negative quotient; `as u16` floors
@@ -687,41 +872,54 @@ pub fn pixel_to_cell(
 mod tests {
     use super::*;
 
+    /// `pixel_to_cell` with no panel open — the shape every pre-panel test used.
+    fn cell_at(cursor: (f64, f64), cols: u16, rows: u16) -> Option<(u16, u16)> {
+        pixel_to_cell(cursor, (8.0, 16.0), 40.0, 24.0, 1000.0, 0.0, cols, rows)
+    }
+
     #[test]
     fn pixel_to_cell_maps_a_point_inside_the_grid() {
         // R1.1 — cell (8,16), insets (40,24), cursor (64,40) → (3,1).
-        assert_eq!(
-            pixel_to_cell((64.0, 40.0), (8.0, 16.0), 40.0, 24.0, 100, 40),
-            Some((3, 1))
-        );
+        assert_eq!(cell_at((64.0, 40.0), 100, 40), Some((3, 1)));
         // Exact top-left corner of the grid (px == insets) → cell (0,0) (strict `<`).
-        assert_eq!(
-            pixel_to_cell((40.0, 24.0), (8.0, 16.0), 40.0, 24.0, 100, 40),
-            Some((0, 0))
-        );
+        assert_eq!(cell_at((40.0, 24.0), 100, 40), Some((0, 0)));
     }
 
     #[test]
     fn pixel_to_cell_rejects_the_sidebar_and_top_band() {
         // R1.2 — left of left_inset and above top_inset → None.
-        assert_eq!(
-            pixel_to_cell((20.0, 10.0), (8.0, 16.0), 40.0, 24.0, 100, 40),
-            None
-        );
+        assert_eq!(cell_at((20.0, 10.0), 100, 40), None);
         // Left band alone (above the grid horizontally) is also None.
-        assert_eq!(
-            pixel_to_cell((10.0, 100.0), (8.0, 16.0), 40.0, 24.0, 100, 40),
-            None
-        );
+        assert_eq!(cell_at((10.0, 100.0), 100, 40), None);
     }
 
+    /// D16/R9.1/R9.2/R9.3 — the far-edge rule, both halves. Rewritten from
+    /// `pixel_to_cell_clamps_past_the_far_edge`, which asserted the clamp *unconditionally*
+    /// and so asserted the bug: with the panel open, that clamp anchored a terminal
+    /// selection at the last column for a click anywhere in the panel, painted an invisible
+    /// selection down that column on a drag, and let a ⌘-click follow whatever URL happened
+    /// to sit there.
     #[test]
-    fn pixel_to_cell_clamps_past_the_far_edge() {
-        // R1.3 — far bottom-right clamps to the last cell (9,4), never out of range.
+    fn the_panel_band_is_inert_but_the_far_edge_still_clamps_without_it() {
+        // Panel CLOSED (right_inset == 0.0): the far bottom-right still clamps to the last
+        // cell (9,4) — a drag past the window edge keeps extending the selection (R9.3).
+        assert_eq!(cell_at((9_999.0, 9_999.0), 10, 5), Some((9, 4)));
+        // …including a point past the last column but still inside the window.
+        assert_eq!(cell_at((500.0, 40.0), 10, 5), Some((9, 1)));
+
+        // Panel OPEN over the right 430px of a 1000px window: the band starts at 570.
+        let panel =
+            |x: f64| pixel_to_cell((x, 40.0), (8.0, 16.0), 40.0, 24.0, 1000.0, 430.0, 100, 40);
         assert_eq!(
-            pixel_to_cell((9_999.0, 9_999.0), (8.0, 16.0), 40.0, 24.0, 10, 5),
-            Some((9, 4))
+            panel(569.0),
+            Some((66, 1)),
+            "one px short of the band is grid"
         );
+        assert_eq!(panel(570.0), None, "the band's first px is already inert");
+        assert_eq!(panel(999.0), None);
+        // And a drag that runs off the window entirely stays inert rather than snapping
+        // back to the last terminal column.
+        assert_eq!(panel(9_999.0), None);
     }
 
     fn ch(c: &str) -> Key {
@@ -1297,7 +1495,7 @@ mod tests {
             "hit_test routes the top band to the grid"
         );
         assert_eq!(
-            pixel_to_cell(p, (8.0, 16.0), inp.sidebar_w, 24.0, 100, 40),
+            pixel_to_cell(p, (8.0, 16.0), inp.sidebar_w, 24.0, 1000.0, 0.0, 100, 40),
             None,
             "…but there is no cell there — cursor_cell would make the strip inert"
         );
@@ -1582,7 +1780,10 @@ mod tests {
         // R4.4 — the regression test for the contradiction the L2 review caught. Feeding
         // the CLAMPED width in would make collapse unreachable, because clamping floors
         // the value at 260 — well above the 240 threshold.
-        let drag = ResizeDrag { grab_offset: 0.0 };
+        let drag = ResizeDrag {
+            grab_offset: 0.0,
+            edge: ResizeEdge::Sidebar,
+        };
         let raw = resize_raw_width(200.0, drag, 1.0);
         assert!(next_collapsed(raw, false), "raw 200 collapses");
         assert!(
@@ -1595,7 +1796,10 @@ mod tests {
     fn a_collapse_survives_the_pointer_running_far_past_it() {
         // The width-0 case D9's fixed grab offset exists for: `raw` keeps advancing while
         // the sidebar is shut, so the return trip is still measured from the same origin.
-        let drag = ResizeDrag { grab_offset: 0.0 };
+        let drag = ResizeDrag {
+            grab_offset: 0.0,
+            edge: ResizeEdge::Sidebar,
+        };
         assert!(next_collapsed(resize_raw_width(50.0, drag, 1.0), false));
         assert!(next_collapsed(resize_raw_width(-200.0, drag, 1.0), true));
         assert!(!next_collapsed(resize_raw_width(300.0, drag, 1.0), true));
@@ -1788,6 +1992,86 @@ mod tests {
         );
     }
 
+    /// R6.4/R6.5 — the panel reuses this exact machinery, so what has to be pinned is that
+    /// it reuses it with its **own** ring. The two tables are written by different gestures
+    /// at different times: one shared history would classify a sidebar drag's echo as a
+    /// panel *human edit*, clearing an override the user's gesture never touched.
+    #[test]
+    fn the_panel_and_the_sidebar_classify_deliveries_independently() {
+        let mut sidebar = Vec::new();
+        let mut monitor = Vec::new();
+        remember_write(&mut sidebar, (400.0, false)); // a sidebar drag released
+        remember_write(&mut monitor, (520.0, true)); // a panel drag released
+
+        // R6.4 — each recognises its own write coming back, so the override is retained.
+        assert_eq!(
+            classify_delivery((520.0, true), &monitor),
+            ConfigDelivery::Echo
+        );
+        assert!(!should_clear_override(
+            classify_delivery((520.0, true), &monitor),
+            false
+        ));
+        // The sidebar's write is NOT the panel's echo — it is a delivery the panel never
+        // made, and vice versa. Under one shared ring both of these would read `Echo`.
+        assert_eq!(
+            classify_delivery((400.0, false), &monitor),
+            ConfigDelivery::HumanEdit
+        );
+        assert_eq!(
+            classify_delivery((520.0, true), &sidebar),
+            ConfigDelivery::HumanEdit
+        );
+
+        // R6.5 — a width the app never wrote is a hand edit, and it clears the override so
+        // the file wins. This is what keeps `[ai_monitor].width_px` hand-editable after the
+        // first drag.
+        let hand_edited = (610.0, true);
+        assert_eq!(
+            classify_delivery(hand_edited, &monitor),
+            ConfigDelivery::HumanEdit
+        );
+        assert!(should_clear_override(
+            classify_delivery(hand_edited, &monitor),
+            false
+        ));
+        // …unless our last write FAILED, in which case the file and the override are
+        // knowingly out of step and clearing would snap the panel back mid-session.
+        assert!(!should_clear_override(
+            classify_delivery(hand_edited, &monitor),
+            true
+        ));
+    }
+
+    /// R6.6 x D8 — the guard that makes a **launch restore** silent, driven with the exact
+    /// values a restore hands it.
+    ///
+    /// Reopening the panel at startup sets no runtime override, so the width the app would
+    /// save is `[ai_monitor].width_px` read straight back, and the open flag is the one just
+    /// loaded: the pair is identical to what is on disk, by construction. The restore does
+    /// not call `persist_monitor` at all — it goes through `apply_monitor_open`, which has no
+    /// persistence path — and this is the second line of defence behind that, because
+    /// "persisted state the app rewrites on every start" is indistinguishable from working
+    /// until the file's mtime or a VCS diff gives it away.
+    #[test]
+    fn a_launch_restore_has_nothing_to_persist_but_a_chord_does() {
+        let on_disk = (520.0_f32, true); // `[ai_monitor]` as the last session left it
+        assert!(
+            !needs_persist(on_disk, on_disk, false),
+            "a restore replays the file's own pair — writing it back would be pure churn"
+        );
+
+        // The chord, closing the panel: a real change, and the one gesture D8 lets record it
+        // (R6.3). A drag to a new width is the other.
+        assert!(needs_persist((520.0, false), on_disk, false));
+        assert!(needs_persist((610.0, true), on_disk, false));
+
+        // The exception, in both directions: after a FAILED save the file and the override
+        // are knowingly out of step, so equality no longer proves the file is current and the
+        // next chance to reconcile must be taken.
+        assert!(needs_persist(on_disk, on_disk, true));
+    }
+
     #[test]
     fn the_write_history_is_bounded_and_deduplicated() {
         let mut recent = Vec::new();
@@ -1900,6 +2184,7 @@ mod tests {
         // offset is 5; at pointer 405 the width is 400.
         let drag = ResizeDrag {
             grab_offset: resize_grab_offset(345.0, 340.0),
+            edge: ResizeEdge::Sidebar,
         };
         assert_eq!(drag.grab_offset, 5.0);
         assert_eq!(resize_raw_width(405.0, drag, 1.0), 400.0);
@@ -1916,6 +2201,7 @@ mod tests {
         for grab_x in [334.0_f64, 337.0, 339.9] {
             let drag = ResizeDrag {
                 grab_offset: resize_grab_offset(grab_x, 340.0),
+                edge: ResizeEdge::Sidebar,
             };
             // Moving the pointer by +50 moves the width by exactly +50, whatever the grab.
             let before = resize_raw_width(grab_x, drag, 1.0);
@@ -1925,10 +2211,185 @@ mod tests {
         }
     }
 
+    /// R9.6 — the panel grows **leftward**, the exact mirror of the sidebar. Both edges are
+    /// driven from the same pointer through the same fixed grab offset; only the direction
+    /// differs, and this pins that it really is a mirror rather than a copy with a sign bug.
+    #[test]
+    fn the_panel_drag_grows_leftward_while_the_sidebar_grows_rightward() {
+        // A 1000px window with the panel at 430: its edge sits at 570. Grab 3px inside it.
+        let grab_x = 573.0_f64;
+        let drag = ResizeDrag {
+            grab_offset: resize_grab_offset(grab_x, monitor_edge_x(1000.0, 430.0)),
+            edge: ResizeEdge::Monitor,
+        };
+        assert_eq!(drag.grab_offset, 3.0);
+        assert_eq!(
+            resize_raw_monitor_width(grab_x, drag, 1000.0, 1.0),
+            430.0,
+            "starts at the current width, no jump"
+        );
+        // Dragging LEFT by 90 widens the panel by 90 (R9.6's worked example).
+        assert_eq!(
+            resize_raw_monitor_width(grab_x - 90.0, drag, 1000.0, 1.0),
+            520.0
+        );
+        // …and dragging right narrows it, by the same absolute mapping.
+        assert_eq!(
+            resize_raw_monitor_width(grab_x + 130.0, drag, 1000.0, 1.0),
+            300.0
+        );
+
+        // The sidebar's expression is untouched and still runs the other way: the same
+        // -90 pointer move NARROWS it.
+        let side = ResizeDrag {
+            grab_offset: resize_grab_offset(343.0, 340.0),
+            edge: ResizeEdge::Sidebar,
+        };
+        assert_eq!(resize_raw_width(343.0 - 90.0, side, 1.0), 250.0);
+
+        // Logical px on a Retina display: the physical travel is halved, and it is the
+        // *logical* number that reaches `config.toml`.
+        assert_eq!(
+            resize_raw_monitor_width(grab_x - 90.0, drag, 1000.0, 2.0),
+            260.0
+        );
+    }
+
+    /// R9.4 — the grab band sits INSIDE the panel, so the terminal's last column stays
+    /// selectable, and it does not exist at all while the panel is closed.
+    #[test]
+    fn the_panel_grab_band_is_inside_its_own_edge() {
+        let band = |x: f64| in_monitor_grab_band(x, 1000.0, 430.0, 1.0);
+        assert!(!band(569.0), "one px outside is terminal, not band");
+        assert!(band(570.0), "the edge itself is the band's first px");
+        assert!(band(575.0), "…through 6 logical px");
+        assert!(!band(576.0), "…and no further");
+
+        // The band scales with the display, like every other logical metric.
+        assert!(in_monitor_grab_band(581.0, 1000.0, 430.0, 2.0));
+        assert!(!in_monitor_grab_band(583.0, 1000.0, 430.0, 2.0));
+
+        // Closed panel → no band anywhere, so the window's right edge does not grow a 6px
+        // strip of dead terminal (R9.3's sibling).
+        for x in [0.0, 570.0, 994.0, 999.0] {
+            assert!(!in_monitor_grab_band(x, 1000.0, 0.0, 1.0), "closed at {x}");
+        }
+        // A panel narrower than the grab width shrinks the band to its own width rather
+        // than spilling 4px past the window's right edge: [998, 1000), not [998, 1004).
+        assert!(!in_monitor_grab_band(997.9, 1000.0, 2.0, 1.0));
+        assert!(in_monitor_grab_band(998.0, 1000.0, 2.0, 1.0));
+        assert!(in_monitor_grab_band(999.9, 1000.0, 2.0, 1.0));
+        assert!(!in_monitor_grab_band(1000.0, 1000.0, 2.0, 1.0));
+    }
+
+    /// R6.1/D8 — a released panel drag writes `[ai_monitor]`, a released sidebar drag
+    /// writes `[sidebar]`, and the edge the gesture recorded is the only thing that decides.
+    ///
+    /// The two drags share one `Option<ResizeDrag>` slot (D17), so this is the single line
+    /// where they could cross-write. `TerminalApp::finish_resize` needs a live window, a
+    /// renderer and a config path, so what is assertable is the decision it dispatches on;
+    /// the file half — that `save_ai_monitor` leaves `[sidebar]` byte-identical — is
+    /// `common::config`'s `the_two_writers_do_not_touch_each_others_tables`.
+    #[test]
+    fn r6_1_a_released_drag_persists_its_own_edges_table() {
+        let drag = |edge| {
+            Some(ResizeDrag {
+                grab_offset: 7.0,
+                edge,
+            })
+        };
+        assert_eq!(
+            persist_target(drag(ResizeEdge::Monitor)),
+            Some(PersistTarget::AiMonitor),
+            "a panel drag must not rewrite [sidebar]"
+        );
+        assert_eq!(
+            persist_target(drag(ResizeEdge::Sidebar)),
+            Some(PersistTarget::Sidebar),
+            "…and a sidebar drag must not rewrite [ai_monitor]"
+        );
+
+        // The grab offset is not part of the decision: no drag distance on either edge
+        // makes it write the other one's table.
+        for grab_offset in [-6.0_f32, 0.0, 6.0, 900.0] {
+            assert_eq!(
+                persist_target(Some(ResizeDrag {
+                    grab_offset,
+                    edge: ResizeEdge::Monitor,
+                })),
+                Some(PersistTarget::AiMonitor),
+                "offset {grab_offset} changed the target"
+            );
+        }
+
+        // Nothing armed → nothing written. This arm is what makes `finish_resize`
+        // idempotent: a `Released` after a focus-loss commit must not write a second time.
+        assert_eq!(persist_target(None), None);
+    }
+
+    /// R9.5/D17 — with the pointer genuinely inside **both** grab bands, the sidebar's
+    /// edge is the one that arms.
+    ///
+    /// Driven through both real hit tests, not through hand-written booleans: the point of
+    /// the requirement is the *overlap*, so the test builds a geometry where both functions
+    /// independently say yes about the same pixel, and asserts what `press_route` does with
+    /// that. Before `press_route` existed the answer was the order of two `else if` arms in
+    /// `terminal_app`, which no test could reach.
+    #[test]
+    fn r9_5_the_sidebars_edge_wins_an_overlap() {
+        // A 740px window with a 444px sidebar and a 300px panel: the sidebar's band is
+        // [438, 444) and the panel's is [440, 446), so x = 442 is inside both.
+        let (viewport_w, sidebar_w, right_inset, x) = (740.0_f32, 444.0_f32, 300.0_f32, 442.0_f64);
+        let inp = SidebarLayoutInput {
+            sidebar_w,
+            viewport: [viewport_w, 900.0],
+            ..layout_input(sidebar_w, 3)
+        };
+        let sidebar = sidebar_press((x, 400.0), &inp, 0.0, false);
+        let panel = in_monitor_grab_band(x, viewport_w, right_inset, 1.0);
+        assert_eq!(
+            sidebar,
+            Some(SidebarAction::BeginResize),
+            "premise: the sidebar's own grab band must claim this pixel"
+        );
+        assert!(panel, "premise: the panel's grab band must claim it too");
+
+        assert_eq!(
+            press_route(sidebar, panel),
+            PressRoute::Sidebar(SidebarAction::BeginResize),
+            "both edges under one pointer: the sidebar's wins (D17)"
+        );
+
+        // The panel's edge is still reachable — the rule is an ordering, not a veto.
+        assert_eq!(press_route(None, panel), PressRoute::MonitorEdge);
+        // …and with neither claiming it, the grid keeps the press.
+        assert_eq!(press_route(None, false), PressRoute::Grid);
+
+        // The sidebar wins with ANY action, not only its own edge: a card, the new-tab
+        // button, even sidebar dead space beats the panel's band. Otherwise a press that
+        // overlapped both would switch tabs *and* start resizing the panel, or worse,
+        // resize the panel instead of switching.
+        for action in [
+            SidebarAction::Switch(0),
+            SidebarAction::NewTab,
+            SidebarAction::Collapse,
+            SidebarAction::Inert,
+        ] {
+            assert_eq!(
+                press_route(Some(action), true),
+                PressRoute::Sidebar(action),
+                "{action:?} lost to the panel's grab band"
+            );
+        }
+    }
+
     #[test]
     fn the_applied_width_is_clamped_at_both_ends() {
         // R3.2
-        let drag = ResizeDrag { grab_offset: 0.0 };
+        let drag = ResizeDrag {
+            grab_offset: 0.0,
+            edge: ResizeEdge::Sidebar,
+        };
         assert_eq!(
             clamp_sidebar_width(resize_raw_width(700.0, drag, 1.0)),
             440.0
@@ -1947,7 +2408,10 @@ mod tests {
         // R3.3 — pushing 260px past the maximum then coming back 200px must NOT move the
         // edge: the pointer has to return to where the edge actually is. This is the
         // absolute-mapping property; a delta-accumulating model would have moved it.
-        let drag = ResizeDrag { grab_offset: 0.0 };
+        let drag = ResizeDrag {
+            grab_offset: 0.0,
+            edge: ResizeEdge::Sidebar,
+        };
         assert_eq!(
             clamp_sidebar_width(resize_raw_width(700.0, drag, 1.0)),
             440.0
@@ -1969,7 +2433,10 @@ mod tests {
         // R4.4 / D9a — the regression test for an outright contradiction the L2 review
         // caught: if `resize_raw_width` clamped, `raw` could never be below 260 and D12's
         // 240 collapse threshold would be unreachable dead code.
-        let drag = ResizeDrag { grab_offset: 0.0 };
+        let drag = ResizeDrag {
+            grab_offset: 0.0,
+            edge: ResizeEdge::Sidebar,
+        };
         let raw = resize_raw_width(200.0, drag, 1.0);
         assert_eq!(raw, 200.0, "raw must stay BELOW the 260 minimum");
         assert!(raw < common::config::SIDEBAR_WIDTH_MIN);
@@ -1984,7 +2451,10 @@ mod tests {
     fn the_mapping_is_in_logical_px_across_scales() {
         // D7 — the band and the persisted value are logical, so a 2x display must not
         // halve the usable range. At scale 2, physical 800 is logical 400.
-        let drag = ResizeDrag { grab_offset: 0.0 };
+        let drag = ResizeDrag {
+            grab_offset: 0.0,
+            edge: ResizeEdge::Sidebar,
+        };
         assert_eq!(resize_raw_width(800.0, drag, 2.0), 400.0);
         assert_eq!(resize_raw_width(400.0, drag, 1.0), 400.0);
     }
@@ -1992,7 +2462,10 @@ mod tests {
     #[test]
     fn a_degenerate_scale_does_not_poison_the_width() {
         // Defensive: a zero/negative scale must not divide by zero into the uniforms.
-        let drag = ResizeDrag { grab_offset: 0.0 };
+        let drag = ResizeDrag {
+            grab_offset: 0.0,
+            edge: ResizeEdge::Sidebar,
+        };
         assert_eq!(resize_raw_width(400.0, drag, 0.0), 400.0);
         assert!(clamp_sidebar_width(f32::NAN).is_finite());
         assert!(clamp_sidebar_width(f32::INFINITY).is_finite());

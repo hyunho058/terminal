@@ -2080,6 +2080,7 @@ mod tests {
                 top_inset: 0.0,
                 // R5.3: a positive band width, or `record` returns before drawing anything.
                 left_inset: 340.0,
+                right_inset: 0.0,
                 format: wgpu::TextureFormat::Rgba8Unorm,
                 sidebar: &fx.sidebar,
                 scale_factor: 1.0,

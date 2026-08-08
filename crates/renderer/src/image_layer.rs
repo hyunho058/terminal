@@ -387,10 +387,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn z_order_between_tab_bar_and_overlay() {
+    fn z_order_between_tab_bar_and_the_monitor_panel() {
         let l = ImageLayer::new();
         assert!(l.z_order() > super::super::tab_bar::TAB_BAR_Z);
-        assert!(l.z_order() < super::super::overlay_layer::OVERLAY_Z);
+        assert!(l.z_order() < super::super::monitor_panel::MONITOR_PANEL_Z);
     }
 
     #[test]

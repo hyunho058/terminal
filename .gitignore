@@ -10,3 +10,4 @@
 
 # insta pending snapshots
 **/*.snap.new
+specs/*/progress.md

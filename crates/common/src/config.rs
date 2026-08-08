@@ -26,8 +26,8 @@ pub struct Config {
     pub ai_monitor: AiMonitorConfig,
 }
 
-/// ai-monitor overlay settings.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// ai-monitor panel settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AiMonitorConfig {
     /// Context window in tokens, overriding the overlay's per-model table.
@@ -37,6 +37,38 @@ pub struct AiMonitorConfig {
     /// occupancy percentage against the assumed 200k reads up to 5x high — the
     /// measured case showed `context 128%`. `None` keeps the per-model table.
     pub context_window: Option<u64>,
+    /// The docked panel's width in *logical* px (ai-monitor-right-panel D6), clamped to
+    /// `[MONITOR_WIDTH_MIN, MONITOR_WIDTH_MAX]` in [`Config::load_from`]. Logical, like
+    /// [`SidebarConfig::width_px`], so the file does not become display-dependent.
+    ///
+    /// This is the user's **intent**, never the width actually drawn (D8): a narrow window
+    /// squeezes the band below it at layout time, and persisting that squeeze would destroy
+    /// a width chosen on a large display the first afternoon spent on a laptop.
+    pub width_px: f32,
+    /// Whether the panel was open when the user last pressed `Cmd+Shift+M` (D6/D8).
+    ///
+    /// Written by that chord and by nothing else — a window too narrow to fit the panel
+    /// force-closes it as a *display clamp*, which must leave this flag alone so re-widening
+    /// can restore the panel with no keystroke (R4.5/R6.3).
+    pub open: bool,
+}
+
+/// Minimum ai-monitor panel `width_px` — the design's drag lower bound. Below this the
+/// section cards and the two-column stat grid cannot hold their labels.
+pub const MONITOR_WIDTH_MIN: f32 = 300.0;
+/// Maximum ai-monitor panel `width_px` — the design's drag upper bound. Above this the
+/// panel starves the terminal of columns before D4's 20-column floor even engages.
+pub const MONITOR_WIDTH_MAX: f32 = 760.0;
+
+impl Default for AiMonitorConfig {
+    fn default() -> Self {
+        Self {
+            context_window: None,
+            // The design's `width:430px`.
+            width_px: 430.0,
+            open: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -185,26 +217,50 @@ impl Config {
     /// never keep the terminal from starting. A non-finite width falls back to the
     /// default. Emitted here (load/reload only), never per frame.
     fn normalize(&mut self) {
-        let requested = self.sidebar.width_px;
-        let effective = if requested.is_finite() {
-            requested.clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX)
-        } else {
-            SidebarConfig::default().width_px
-        };
-        if effective != requested {
-            tracing::warn!(
-                requested,
-                effective,
-                "sidebar.width_px {requested} out of range [{SIDEBAR_WIDTH_MIN}, {SIDEBAR_WIDTH_MAX}]; clamped to {effective}"
-            );
-            self.sidebar.width_px = effective;
-        }
+        self.sidebar.width_px = clamp_width(
+            "sidebar.width_px",
+            self.sidebar.width_px,
+            SIDEBAR_WIDTH_MIN,
+            SIDEBAR_WIDTH_MAX,
+            SidebarConfig::default().width_px,
+        );
+        // The panel's width gets the same treatment as the sidebar's, and for the same
+        // reason: it is a cosmetic value the user hand-edits, so an out-of-band number
+        // must clamp with a warning rather than keep the terminal from starting (D2).
+        self.ai_monitor.width_px = clamp_width(
+            "ai_monitor.width_px",
+            self.ai_monitor.width_px,
+            MONITOR_WIDTH_MIN,
+            MONITOR_WIDTH_MAX,
+            AiMonitorConfig::default().width_px,
+        );
     }
 }
 
+/// One cosmetic width clamped into its supported band, warning once when it moved (D2).
+/// A non-finite value falls back to `fallback` rather than propagating a `NaN` into the
+/// renderer's inset arithmetic, where it would silently poison every comparison.
+fn clamp_width(field: &str, requested: f32, min: f32, max: f32, fallback: f32) -> f32 {
+    let effective = if requested.is_finite() {
+        requested.clamp(min, max)
+    } else {
+        fallback
+    };
+    if effective != requested {
+        tracing::warn!(
+            field,
+            requested,
+            effective,
+            "{field} {requested} out of range [{min}, {max}]; clamped to {effective}"
+        );
+    }
+    effective
+}
+
 // ---------------------------------------------------------------------------
-// Sidebar write-back (tab-resize D8) — the FIRST thing in this workspace that
-// writes `config.toml` rather than only reading it.
+// Chrome write-back (tab-resize D8) — the FIRST thing in this workspace that
+// writes `config.toml` rather than only reading it. Two callers now: the sidebar's
+// drag/collapse, and the ai-monitor panel's drag/toggle (right-panel D6).
 // ---------------------------------------------------------------------------
 
 /// The temp file a [`save_sidebar`] writes before renaming it over the target (D8).
@@ -235,19 +291,47 @@ fn fmt_f32(v: f32) -> String {
 
 /// Persist ONLY the sidebar's `width_px` and `collapsed` to `path`, preserving everything
 /// else in the file byte-for-byte (tab-resize D2/D8/D16).
+pub fn save_sidebar(path: &Path, width_px: f32, collapsed: bool) -> Result<()> {
+    save_table(
+        path,
+        "sidebar",
+        &[
+            ("width_px", fmt_f32(width_px)),
+            ("collapsed", collapsed.to_string()),
+        ],
+    )
+}
+
+/// Persist ONLY the ai-monitor panel's `width_px` and `open` to `path` (right-panel D6/D8),
+/// under exactly the sidebar's rules — same surgical editing, same atomic rename.
+///
+/// `width_px` is the user's **intent**: a released drag's width, never the width a narrow
+/// window squeezed the band down to (D8/R6.2). `open` is written only by the `Cmd+Shift+M`
+/// chord, so a force-close leaves it reading `true` and re-widening restores the panel with
+/// no keystroke (R6.3).
+pub fn save_ai_monitor(path: &Path, width_px: f32, open: bool) -> Result<()> {
+    save_table(
+        path,
+        "ai_monitor",
+        &[("width_px", fmt_f32(width_px)), ("open", open.to_string())],
+    )
+}
+
+/// Write `entries` into `[table]` of the TOML file at `path`, leaving every other byte
+/// alone (tab-resize D2/D8/D16).
 ///
 /// **Surgical, not a serde round-trip.** `toml::to_string(&Config)` would be three lines
 /// and would silently delete every comment and reorder every key — turning a file the user
-/// hand-edits into one only the machine can maintain. So this rewrites the two target
-/// lines in place, inserts a `[sidebar]` table when absent, and leaves comments, blank
-/// lines, key order, and keys we do not model exactly where they were.
+/// hand-edits into one only the machine can maintain. So this rewrites the target lines in
+/// place, inserts the table when absent, and leaves comments, blank lines, key order, and
+/// keys we do not model exactly where they were.
 ///
 /// **Atomic.** Writes [`TMP_FILE`] beside the target and renames over it, so the watcher
 /// (and any concurrent reader) can never observe a half-written file.
 ///
 /// Creates the parent directory and the file itself when missing — a fresh install has no
 /// `config.toml` at all, because [`Config::load`] returns defaults without creating one.
-pub fn save_sidebar(path: &Path, width_px: f32, collapsed: bool) -> Result<()> {
+fn save_table(path: &Path, table: &str, entries: &[(&str, String)]) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|source| CommonError::ConfigWrite {
             path: path.to_path_buf(),
@@ -255,7 +339,7 @@ pub fn save_sidebar(path: &Path, width_px: f32, collapsed: bool) -> Result<()> {
         })?;
     }
     // A missing file is not an error — it is a fresh install. Treat it as empty and let
-    // the editor below synthesize the `[sidebar]` table.
+    // the editor below synthesize the table.
     let original = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -267,22 +351,24 @@ pub fn save_sidebar(path: &Path, width_px: f32, collapsed: bool) -> Result<()> {
         }
     };
 
-    // Refuse to touch a file whose `sidebar` is an inline table or a dotted key
+    // Refuse to touch a file whose table is an inline table or a dotted key
     // (`sidebar = { .. }` / `sidebar.width_px = ..`). Both are valid TOML that
     // `load_from` accepts today, but the line-oriented editor below cannot see them as a
     // table and would append a second `[sidebar]` — defining the key twice, which makes
     // the file unparseable and silently drops the user back to full defaults at next
     // launch. Warning and keeping the session value is exactly what D14 prescribes.
-    if has_non_table_sidebar(&original) {
+    if has_non_table_key(&original, table) {
         return Err(CommonError::ConfigWrite {
             path: path.to_path_buf(),
             source: std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "[sidebar] is written as an inline table or dotted key; refusing to rewrite it",
+                format!(
+                    "[{table}] is written as an inline table or dotted key; refusing to rewrite it"
+                ),
             ),
         });
     }
-    let updated = edit_sidebar_toml(&original, width_px, collapsed);
+    let updated = edit_table_toml(&original, table, entries);
 
     let tmp = path.with_file_name(TMP_FILE);
     std::fs::write(&tmp, updated).map_err(|source| CommonError::ConfigWrite {
@@ -295,19 +381,25 @@ pub fn save_sidebar(path: &Path, width_px: f32, collapsed: bool) -> Result<()> {
     })
 }
 
-/// The pure text transform behind [`save_sidebar`] — separated so every fidelity rule is
+/// The pure text transform behind [`save_table`] — separated so every fidelity rule is
 /// unit-testable without touching a filesystem.
 ///
 /// Rules, in the order they matter:
-/// 1. Inside the `[sidebar]` table, replace the *value* of an existing `width_px` /
-///    `collapsed` line, preserving its indentation and re-attaching any trailing comment.
-/// 2. Keys absent from an existing `[sidebar]` table are appended to the end of that
+/// 1. Inside the `[table]` table, replace the *value* of an existing line for each entry
+///    key, preserving its indentation and re-attaching any trailing comment.
+/// 2. Keys absent from an existing `[table]` table are appended to the end of that
 ///    table (before the next `[header]`), never to the file's end — which would place them
 ///    under a different table and change their meaning.
-/// 3. No `[sidebar]` table at all → append a fresh one.
-fn edit_sidebar_toml(original: &str, width_px: f32, collapsed: bool) -> String {
-    let width_line = format!("width_px = {}", fmt_f32(width_px));
-    let collapsed_line = format!("collapsed = {collapsed}");
+/// 3. No `[table]` table at all → append a fresh one.
+///
+/// Parameterised over the table and its keys rather than duplicated per caller: every rule
+/// above is a fidelity promise about a user's hand-edited file, and a second copy is a
+/// second place for one of them to rot. `[ai_monitor]` inherits all three for free.
+fn edit_table_toml(original: &str, table: &str, entries: &[(&str, String)]) -> String {
+    let key_lines: Vec<String> = entries
+        .iter()
+        .map(|(key, value)| format!("{key} = {value}"))
+        .collect();
     // `str::lines()` strips the `\r` of a `\r\n`, so rejoining with `\n` alone would
     // silently rewrite every line ending in a CRLF file — a change to every byte of every
     // line, which R8.2's "byte-identical" promise forbids.
@@ -320,62 +412,60 @@ fn edit_sidebar_toml(original: &str, width_px: f32, collapsed: bool) -> String {
     };
 
     let mut out: Vec<String> = Vec::new();
-    let mut in_sidebar = false;
-    let mut seen_sidebar = false;
-    let mut wrote_width = false;
-    let mut wrote_collapsed = false;
-    // Where the `[sidebar]` table ended, so missing keys land inside it (rule 2).
-    let mut sidebar_end: Option<usize> = None;
+    let mut in_table = false;
+    let mut seen_table = false;
+    let mut written = vec![false; entries.len()];
+    // Where the table ended, so missing keys land inside it (rule 2).
+    let mut table_end: Option<usize> = None;
 
     for line in original.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with('[') {
-            // Leaving the sidebar table: remember where to append any missing key.
-            if in_sidebar {
-                sidebar_end = Some(out.len());
-                in_sidebar = false;
+            // Leaving the table: remember where to append any missing key.
+            if in_table {
+                table_end = Some(out.len());
+                in_table = false;
             }
-            if is_table_header(trimmed, "sidebar") {
-                in_sidebar = true;
-                seen_sidebar = true;
+            if is_table_header(trimmed, table) {
+                in_table = true;
+                seen_table = true;
             }
             out.push(line.to_string());
             continue;
         }
-        if in_sidebar {
-            // Keep any trailing comment the user wrote beside the value — replacing the
-            // whole line would delete `# I like it narrow`, which R8.2 promises not to do.
-            if let Some(indent) = key_indent(line, "width_px") {
-                let (before, comment) = split_trailing_comment(line);
-                out.push(join_comment(indent, &width_line, before, comment));
-                wrote_width = true;
-                continue;
-            }
-            if let Some(indent) = key_indent(line, "collapsed") {
-                let (before, comment) = split_trailing_comment(line);
-                out.push(join_comment(indent, &collapsed_line, before, comment));
-                wrote_collapsed = true;
-                continue;
-            }
+        // Keep any trailing comment the user wrote beside the value — replacing the
+        // whole line would delete `# I like it narrow`, which R8.2 promises not to do.
+        let hit = in_table
+            .then(|| {
+                entries
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, (key, _))| key_indent(line, key).map(|indent| (i, indent)))
+            })
+            .flatten();
+        if let Some((i, indent)) = hit {
+            let (before, comment) = split_trailing_comment(line);
+            out.push(join_comment(indent, &key_lines[i], before, comment));
+            written[i] = true;
+            continue;
         }
         out.push(line.to_string());
     }
-    if in_sidebar {
-        sidebar_end = Some(out.len());
+    if in_table {
+        table_end = Some(out.len());
     }
 
-    let missing: Vec<String> = [
-        (!wrote_width).then(|| width_line.clone()),
-        (!wrote_collapsed).then(|| collapsed_line.clone()),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let missing: Vec<String> = key_lines
+        .iter()
+        .zip(&written)
+        .filter(|(_, done)| !**done)
+        .map(|(line, _)| line.clone())
+        .collect();
 
     if !missing.is_empty() {
-        if seen_sidebar {
+        if seen_table {
             // Rule 2: append inside the existing table, at its end.
-            let at = sidebar_end.unwrap_or(out.len());
+            let at = table_end.unwrap_or(out.len());
             // Skip back over trailing blank lines so the keys hug the table's content.
             let at = trim_back_blanks(&out, at);
             for (i, line) in missing.iter().enumerate() {
@@ -386,7 +476,7 @@ fn edit_sidebar_toml(original: &str, width_px: f32, collapsed: bool) -> String {
             if !out.is_empty() && !out.last().is_some_and(|l| l.trim().is_empty()) {
                 out.push(String::new());
             }
-            out.push("[sidebar]".to_string());
+            out.push(format!("[{table}]"));
             out.extend(missing);
         }
     }
@@ -411,12 +501,14 @@ fn join_comment(indent: &str, key_line: &str, before: &str, comment: &str) -> St
     format!("{indent}{key_line}{gap}{comment}")
 }
 
-/// Whether the file declares `sidebar` as a **top-level inline table or dotted key**
-/// rather than a `[sidebar]` section — a shape [`edit_sidebar_toml`] cannot edit safely.
+/// Whether the file declares `name` as a **top-level inline table or dotted key**
+/// rather than a `[name]` section — a shape [`edit_table_toml`] cannot edit safely.
 ///
 /// Only top-level assignments count: a `sidebar = ...` line *inside* some other table is
 /// a different key entirely and is none of our business.
-fn has_non_table_sidebar(original: &str) -> bool {
+fn has_non_table_key(original: &str, name: &str) -> bool {
+    let quoted_d = format!("\"{name}\"");
+    let quoted_s = format!("'{name}'");
     let mut at_top_level = true;
     for line in original.lines() {
         let t = line.trim_start();
@@ -426,8 +518,8 @@ fn has_non_table_sidebar(original: &str) -> bool {
             // corruption, since `is_table_header` does not match it and the editor would
             // append a plain `[sidebar]` alongside it. Refuse rather than corrupt.
             if t.starts_with("[[") {
-                let name = t.trim_start_matches('[');
-                if unquote(name.split(']').next().unwrap_or("").trim()) == "sidebar" {
+                let head = t.trim_start_matches('[');
+                if unquote(head.split(']').next().unwrap_or("").trim()) == name {
                     return true;
                 }
             }
@@ -440,9 +532,9 @@ fn has_non_table_sidebar(original: &str) -> bool {
         // and missing it produces the same duplicate-table corruption this guard exists
         // to prevent.
         let key = t
-            .strip_prefix("sidebar")
-            .or_else(|| t.strip_prefix("\"sidebar\""))
-            .or_else(|| t.strip_prefix("'sidebar'"));
+            .strip_prefix(name)
+            .or_else(|| t.strip_prefix(quoted_d.as_str()))
+            .or_else(|| t.strip_prefix(quoted_s.as_str()));
         if let Some(rest) = key {
             let rest = rest.trim_start();
             // `sidebar = {..}` (inline table) or `sidebar.width_px = ..` (dotted key).
@@ -452,6 +544,30 @@ fn has_non_table_sidebar(original: &str) -> bool {
         }
     }
     false
+}
+
+/// [`edit_table_toml`] bound to the sidebar's two keys — the shape the fidelity tests were
+/// written against, kept so they keep asserting the rules rather than the generalisation.
+#[cfg(test)]
+fn edit_sidebar_toml(original: &str, width_px: f32, collapsed: bool) -> String {
+    edit_table_toml(
+        original,
+        "sidebar",
+        &[
+            ("width_px", fmt_f32(width_px)),
+            ("collapsed", collapsed.to_string()),
+        ],
+    )
+}
+
+/// The same, bound to the panel's two keys (D6).
+#[cfg(test)]
+fn edit_ai_monitor_toml(original: &str, width_px: f32, open: bool) -> String {
+    edit_table_toml(
+        original,
+        "ai_monitor",
+        &[("width_px", fmt_f32(width_px)), ("open", open.to_string())],
+    )
 }
 
 /// Split a line into `(before_comment, comment_including_hash)` so a rewrite can keep a
@@ -544,6 +660,124 @@ mod tests {
         // A config with no [ai_monitor] table at all still loads.
         let c: Config = toml::from_str("[font]\nsize_pt = 13.0\n").unwrap();
         assert_eq!(c.ai_monitor.context_window, None);
+    }
+
+    /// D6/R6.1 — the panel's two persisted keys parse, default to the design's values, and
+    /// survive a table that names only one of them.
+    #[test]
+    fn ai_monitor_width_and_open_default_and_parse() {
+        assert_eq!(Config::default().ai_monitor.width_px, 430.0);
+        assert!(!Config::default().ai_monitor.open);
+
+        let c: Config = toml::from_str("[ai_monitor]\nwidth_px = 520.0\nopen = true\n").unwrap();
+        assert_eq!(c.ai_monitor.width_px, 520.0);
+        assert!(c.ai_monitor.open);
+
+        // The pre-existing key keeps working beside them, and the absent ones default —
+        // an old config.toml written before this feature must still load unchanged.
+        let c: Config = toml::from_str("[ai_monitor]\ncontext_window = 1000000\n").unwrap();
+        assert_eq!(c.ai_monitor.width_px, 430.0);
+        assert!(!c.ai_monitor.open);
+        // …and a file with no [ai_monitor] table at all is still a valid config.
+        let c: Config = toml::from_str("[grid]\ncolumns = 80\n").unwrap();
+        assert_eq!(c.ai_monitor.width_px, 430.0);
+    }
+
+    /// D2 — the panel's width is clamped at load like the sidebar's, so a hand-typed 5000
+    /// cannot reach the inset arithmetic.
+    #[test]
+    fn ai_monitor_width_is_clamped_at_load() {
+        let p = write_tmp_config("mon-clamp-up", "[ai_monitor]\nwidth_px = 10.0\n");
+        assert_eq!(
+            Config::load_from(&p).expect("loads").ai_monitor.width_px,
+            MONITOR_WIDTH_MIN
+        );
+        let p = write_tmp_config("mon-clamp-down", "[ai_monitor]\nwidth_px = 5000.0\n");
+        assert_eq!(
+            Config::load_from(&p).expect("loads").ai_monitor.width_px,
+            MONITOR_WIDTH_MAX
+        );
+        let p = write_tmp_config("mon-in-band", "[ai_monitor]\nwidth_px = 520.0\n");
+        assert_eq!(
+            Config::load_from(&p).expect("loads").ai_monitor.width_px,
+            520.0
+        );
+        // A non-finite value falls back to the default rather than poisoning the inset.
+        let p = write_tmp_config("mon-nan", "[ai_monitor]\nwidth_px = nan\n");
+        assert_eq!(
+            Config::load_from(&p).expect("loads").ai_monitor.width_px,
+            AiMonitorConfig::default().width_px
+        );
+    }
+
+    /// R6.1 — a released drag's width reaches the file, and everything else in it survives
+    /// byte-for-byte: the panel inherits the sidebar's whole fidelity contract because it
+    /// goes through the same editor, not a second one.
+    #[test]
+    fn save_ai_monitor_writes_both_keys_and_preserves_the_rest() {
+        let original = "\
+# my config
+[font]
+size_pt = 13.0
+
+[ai_monitor]
+context_window = 1000000  # 1M session
+width_px = 430.0
+open = false
+";
+        let updated = edit_ai_monitor_toml(original, 520.0, true);
+        assert!(updated.contains("width_px = 520.0"));
+        assert!(updated.contains("open = true"));
+        assert!(updated.starts_with("# my config\n"), "comments survive");
+        assert!(
+            updated.contains("context_window = 1000000  # 1M session"),
+            "an unrelated key and its comment are untouched: {updated:?}"
+        );
+        let c: Config = toml::from_str(&updated).expect("still parses");
+        assert_eq!(c.ai_monitor.width_px, 520.0);
+        assert!(c.ai_monitor.open);
+        assert_eq!(c.font.size_pt, 13.0);
+
+        // No [ai_monitor] table yet → one is appended, not merged into [sidebar].
+        let updated = edit_ai_monitor_toml("[sidebar]\nwidth_px = 340.0\n", 300.0, true);
+        let c: Config = toml::from_str(&updated).expect("parses");
+        assert_eq!(
+            c.sidebar.width_px, 340.0,
+            "the sidebar's width is not stolen"
+        );
+        assert_eq!(c.ai_monitor.width_px, 300.0);
+        assert!(c.ai_monitor.open);
+
+        // And through a real file, atomically.
+        let path = write_tmp_config("mon-save", "[grid]\ncolumns = 80\n");
+        save_ai_monitor(&path, 520.0, true).expect("saved");
+        let c = Config::load_from(&path).expect("reloads");
+        assert_eq!(c.ai_monitor.width_px, 520.0);
+        assert!(c.ai_monitor.open);
+        assert_eq!(c.grid.columns, 80);
+
+        // The same refusal the sidebar gets: an inline table is not corrupted.
+        let path = write_tmp_config("mon-inline", "ai_monitor = { width_px = 430.0 }\n");
+        assert!(save_ai_monitor(&path, 520.0, true).is_err());
+    }
+
+    /// The two writers touch different tables — a panel drag must never rewrite
+    /// `[sidebar]`, which is the failure the generalisation could most easily introduce.
+    #[test]
+    fn the_two_writers_do_not_touch_each_others_tables() {
+        let original = "[sidebar]\nwidth_px = 340.0\ncollapsed = false\n\n[ai_monitor]\nwidth_px = 430.0\nopen = false\n";
+        let after_panel = edit_ai_monitor_toml(original, 520.0, true);
+        let c: Config = toml::from_str(&after_panel).expect("parses");
+        assert_eq!(c.sidebar.width_px, 340.0);
+        assert!(!c.sidebar.collapsed);
+        assert_eq!(c.ai_monitor.width_px, 520.0);
+
+        let after_sidebar = edit_sidebar_toml(&after_panel, 400.0, true);
+        let c: Config = toml::from_str(&after_sidebar).expect("parses");
+        assert_eq!(c.sidebar.width_px, 400.0);
+        assert!(c.sidebar.collapsed);
+        assert_eq!(c.ai_monitor.width_px, 520.0, "the panel's write survives");
+        assert!(c.ai_monitor.open);
     }
 
     #[test]
@@ -895,14 +1129,18 @@ columns = 120
         let c: Config = toml::from_str(&updated).expect("still parses");
         assert_eq!(c.sidebar.width_px, 400.0);
         // A quoted top-level inline table is likewise refused rather than corrupted.
-        assert!(has_non_table_sidebar(
-            "\"sidebar\" = { width_px = 340.0 }\n"
+        assert!(has_non_table_key(
+            "\"sidebar\" = { width_px = 340.0 }\n",
+            "sidebar"
         ));
         // …and so is an array-of-tables — the third door into the same duplicate-key bug.
-        assert!(has_non_table_sidebar("[[sidebar]]\nwidth_px = 340.0\n"));
-        assert!(has_non_table_sidebar("[[ \"sidebar\" ]]\n"));
+        assert!(has_non_table_key(
+            "[[sidebar]]\nwidth_px = 340.0\n",
+            "sidebar"
+        ));
+        assert!(has_non_table_key("[[ \"sidebar\" ]]\n", "sidebar"));
         // A DIFFERENT array-of-tables is none of our business.
-        assert!(!has_non_table_sidebar("[[other]]\nx = 1\n"));
+        assert!(!has_non_table_key("[[other]]\nx = 1\n", "sidebar"));
     }
 
     #[test]
@@ -948,14 +1186,18 @@ columns = 120
         // file that already defines `sidebar` as an inline table makes the file
         // UNPARSEABLE, and a config that fails to parse silently drops the user back to
         // full defaults. Refusing (D14: warn and keep the session value) is the safe path.
-        assert!(has_non_table_sidebar(
-            "sidebar = { width_px = 340.0, collapsed = false }\n"
+        assert!(has_non_table_key(
+            "sidebar = { width_px = 340.0, collapsed = false }\n",
+            "sidebar"
         ));
-        assert!(has_non_table_sidebar("sidebar.width_px = 340.0\n"));
+        assert!(has_non_table_key("sidebar.width_px = 340.0\n", "sidebar"));
         // A `[sidebar]` section is fine, and so is a `sidebar = ...` key inside ANOTHER
         // table — that is a different key entirely.
-        assert!(!has_non_table_sidebar("[sidebar]\nwidth_px = 340.0\n"));
-        assert!(!has_non_table_sidebar("[other]\nsidebar = 1\n"));
+        assert!(!has_non_table_key(
+            "[sidebar]\nwidth_px = 340.0\n",
+            "sidebar"
+        ));
+        assert!(!has_non_table_key("[other]\nsidebar = 1\n", "sidebar"));
 
         let path = write_tmp_config("inline", "sidebar = { width_px = 340.0 }\n");
         assert!(

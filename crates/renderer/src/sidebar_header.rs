@@ -23,15 +23,15 @@ use crate::{DrawLayer, FrameCtx};
 
 /// z-order: above the cards (`TAB_BAR_Z = 10`, so the opaque band clips scrolled cards)
 /// and inline images (`IMAGE_Z = 20`, so the restore button is never buried), below the
-/// ai-monitor overlay (`OVERLAY_Z = 100`) (D4).
+/// ai-monitor panel (`MONITOR_PANEL_Z = 100`) (D4).
 pub const SIDEBAR_CHROME_Z: i32 = 30;
 
 // R3.7 / D4 — a compile-time invariant, not a comment: the chrome must sit above the
-// cards and inline images and below the ai-monitor overlay. A card layer registered
+// cards and inline images and below the ai-monitor panel. A card layer registered
 // above 30 (or this constant moved) would silently invert D5's clip-by-overdraw.
 const _: () = assert!(SIDEBAR_CHROME_Z > crate::sidebar_row::TAB_BAR_Z);
 const _: () = assert!(SIDEBAR_CHROME_Z > crate::image_layer::IMAGE_Z);
-const _: () = assert!(SIDEBAR_CHROME_Z < crate::overlay_layer::OVERLAY_Z);
+const _: () = assert!(SIDEBAR_CHROME_Z < crate::monitor_panel::MONITOR_PANEL_Z);
 
 /// The one field the app writes (D10/D11): the raw cursor in physical px, `None` when the
 /// pointer leaves the window. Resolved to a hover region by the layer, never the app.

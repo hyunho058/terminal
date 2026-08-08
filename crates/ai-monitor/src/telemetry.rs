@@ -50,6 +50,20 @@ const DEDUPE_CAP: usize = 64;
 /// bounds each key's value, so neither dimension of that structure can grow without
 /// limit. 8 is ~2x the widest observed content-block split.
 const RETRY_IDS_CAP: usize = 8;
+/// Distinct names the cumulative tool tally keeps (D12). The key is a string the
+/// LOG supplies and MCP tool names are effectively unbounded, so an uncapped map is
+/// a slow leak on a long session. 64 mirrors `DEDUPE_CAP` rather than inventing a
+/// new magnitude.
+///
+/// On overflow the smallest **incumbents** are merged into `tool_calls_other` —
+/// never the arriving name. Evicting (or merging) the smallest entry overall is the
+/// obvious implementation and is wrong: once 64 names sit at count >= 2, every
+/// genuinely new tool enters at 1, is instantly the smallest, and is dropped
+/// forever no matter how heavily it is later used.
+const TALLY_CAP: usize = 64;
+/// Merging runs in ONE batch down to this watermark, so the O(n log n) scan is
+/// amortised over the next 16 new names instead of running on every one.
+const TALLY_WATERMARK: usize = 48;
 
 // ---- value types --------------------------------------------------------------
 
@@ -152,6 +166,10 @@ pub struct TaskEntry {
 pub struct TelemetrySnapshot {
     // identity
     pub session_id: Option<String>,
+    /// The model the session is running **now** — the last real `message.model` folded,
+    /// not the first. The two differ whenever the user ran `/model`, and the field's
+    /// whole purpose is to answer "what is running", so first-wins would be a lie about
+    /// the live session. Sentinel values (`<synthetic>`) are never folded here.
     pub model: Option<String>,
     // tokens: four cumulative COST counters (D2) ...
     pub total_input: u64,
@@ -160,6 +178,13 @@ pub struct TelemetrySnapshot {
     pub total_cache_creation: u64,
     // ... and a latest-value occupancy gauge, which is a different quantity
     pub context_used: u64,
+    /// The largest `context_used` this session has ever reported — monotone, never reset.
+    ///
+    /// The gauge above answers "how full is the window now"; this answers "how big has the
+    /// window been PROVEN to be". They diverge whenever occupancy falls (a `/compact`), and
+    /// the app needs the second to pick a denominator: a window cannot shrink mid-session,
+    /// so evidence of its size must not expire with the reading that produced it.
+    pub context_high_water: u64,
     // time (D3) — the app derives uptime/idle from these
     pub first_event_ms: Option<u64>,
     pub last_event_ms: Option<u64>,
@@ -170,6 +195,27 @@ pub struct TelemetrySnapshot {
     pub subagents: Vec<Subagent>,
     /// `(taskId, entry)`, in a deterministic id order. Display order is the app's.
     pub tasks: Vec<(String, TaskEntry)>,
+    // cumulative call counters (D3) — a DIFFERENT quantity from the rings above.
+    // Those are bounded display windows: on a 3-hour session everything older than
+    // the last `TOOLS_CAP` calls is gone, so counting a ring would print a number
+    // that LOOKS cumulative and is not.
+    /// `(tool name, calls)` over the whole session, in a deterministic NAME order.
+    /// Ordering by count would be a ranking, and ranking is presentation (SD4).
+    /// Bounded at `TALLY_CAP` names; the overflow lands in `tool_calls_other`.
+    pub tool_calls: Vec<(String, u64)>,
+    /// Calls merged out of `tool_calls` when it overflowed its name cap. It names
+    /// nothing and never drains, so it belongs in no ranking and in no bar
+    /// denominator (D12) — but it is what keeps the tally's sum honest.
+    pub tool_calls_other: u64,
+    /// Every call folded, as its OWN scalar — deliberately not a sum over
+    /// `tool_calls`, which is bounded, so the headline number is immune to the map's
+    /// cap. It equals `tool_calls`'s sum plus `tool_calls_other` by construction.
+    pub total_tool_calls: u64,
+    /// Calls whose `tool_result` carried `is_error: true`, folded at the one place
+    /// `ok` is derived. Kept apart from the `parse_errors` family below: those count
+    /// PARSER faults, which is a different fact — displaying one under the other's
+    /// label would be a lie about what failed.
+    pub failed_tool_calls: u64,
     // diagnostics — kept apart so a mis-sized tail window (benign) is never
     // conflated with a changed result format (a real regression)
     pub parse_errors: u64,
@@ -210,6 +256,7 @@ pub struct SessionTelemetry {
     total_cache_read: u64,
     total_cache_creation: u64,
     context_used: u64,
+    context_high_water: u64,
     first_event_ms: Option<u64>,
     last_event_ms: Option<u64>,
 
@@ -218,6 +265,12 @@ pub struct SessionTelemetry {
     files: VecDeque<FileActivity>,
     subagents: VecDeque<Subagent>,
     tasks: HashMap<String, TaskEntry>,
+
+    // cumulative counters (D3/D12) — independent of the rings above
+    tool_calls: HashMap<String, u64>,
+    tool_calls_other: u64,
+    total_tool_calls: u64,
+    failed_tool_calls: u64,
 
     pending: HashMap<String, Pending>,
     pending_order: VecDeque<String>,
@@ -265,12 +318,24 @@ impl SessionTelemetry {
                 .or_else(|| str_at(&v, "session_id"))
                 .map(str::to_string);
         }
-        if self.model.is_none() {
-            self.model = v
-                .pointer("/message/model")
-                .and_then(Value::as_str)
-                .or_else(|| v.get("model").and_then(Value::as_str))
-                .map(str::to_string);
+        // Identity, but NOT the rule the `session_id` fold above uses. A session id is
+        // fixed for the life of a file, so first-wins is correct there. A model is not:
+        // `/model` switches it mid-session and every later assistant line carries the
+        // new id, so the panel must show the LAST one — first-wins pins the panel to
+        // whatever the session happened to start with (measured: a real log ran
+        // `claude-fable-5`, switched, then logged two further `claude-opus-5` turns, and the
+        // panel still read `claude-fable-5`).
+        //
+        // Skipping sentinels is what makes last-wins safe. Only a real id may
+        // overwrite; a sentinel neither overwrites nor blocks, so the first real fold
+        // still populates the field and a trailing `<synthetic>` cannot blank it.
+        if let Some(m) = v
+            .pointer("/message/model")
+            .and_then(Value::as_str)
+            .or_else(|| v.get("model").and_then(Value::as_str))
+            .filter(|m| is_real_model(m))
+        {
+            self.model = Some(m.to_string());
         }
 
         self.fold_usage(&v);
@@ -316,6 +381,16 @@ impl SessionTelemetry {
         // stable. WHICH order to display is the app's policy, not ours.
         tasks.sort_by_key(|t| task_id_key(&t.0));
 
+        // Same reason, same rule: a HashMap has no order, so emit one. By NAME,
+        // not by count — sorting by count is a ranking, and which tools to rank
+        // and show is the app's policy (SD4).
+        let mut tool_calls: Vec<(String, u64)> = self
+            .tool_calls
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        tool_calls.sort_by(|a, b| a.0.cmp(&b.0));
+
         TelemetrySnapshot {
             session_id: self.session_id.clone(),
             model: self.model.clone(),
@@ -324,6 +399,7 @@ impl SessionTelemetry {
             total_cache_read: self.total_cache_read,
             total_cache_creation: self.total_cache_creation,
             context_used: self.context_used,
+            context_high_water: self.context_high_water,
             first_event_ms: self.first_event_ms,
             last_event_ms: self.last_event_ms,
             tools: self.tools.iter().cloned().collect(),
@@ -331,6 +407,10 @@ impl SessionTelemetry {
             files: self.files.iter().cloned().collect(),
             subagents: self.subagents.iter().cloned().collect(),
             tasks,
+            tool_calls,
+            tool_calls_other: self.tool_calls_other,
+            total_tool_calls: self.total_tool_calls,
+            failed_tool_calls: self.failed_tool_calls,
             parse_errors: self.parse_errors,
             usage_conflicts: self.usage_conflicts,
             orphan_tool_results: self.orphan_tool_results,
@@ -437,7 +517,20 @@ impl SessionTelemetry {
         // because cache-read is re-billed in full every turn. Set unconditionally —
         // a guard on `> 0` would leave a stale gauge standing when the newest usage
         // genuinely reports zero context.
-        self.context_used = inp.saturating_add(cr).saturating_add(cc);
+        let used = inp.saturating_add(cr).saturating_add(cc);
+        self.context_used = used;
+        // ... but the HIGH-WATER is a monotone session fact, and it is a different
+        // question from the gauge. `context_used` answers "how full is the window now";
+        // this answers "how big has the window been proven to be". A context window does
+        // not shrink mid-session, so evidence of its size cannot expire — whereas the
+        // gauge legitimately falls (a `/compact` drops it by an order of magnitude).
+        //
+        // Without this the app's window deduction is amnesiac: measured on real logs, a
+        // `/compact` took one session from 517,389 to 53,268, and the panel re-derived a
+        // 200k window from the smaller number — reporting 27% of a window the session had
+        // already proven it was not on. Keeping the maximum is what makes the deduction a
+        // property of the session rather than of the newest line.
+        self.context_high_water = self.context_high_water.max(used);
     }
 
     // ---- tool correlation (D5, D7, D8, D9) ------------------------------------
@@ -529,6 +622,13 @@ impl SessionTelemetry {
 
         // Only an explicit `true` is a failure — successes routinely omit the field.
         let ok = !it.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+        // The cumulative counters (D3) fold HERE: at the single point `ok` is
+        // derived and BEFORE the per-kind branch below. Every completed call is
+        // therefore counted exactly once whatever ring it lands in (or none, as an
+        // `Agent` does), and the failure count can never disagree with the `ok` the
+        // rings carry — a second `is_error` read elsewhere would be a second source
+        // of truth for one fact.
+        self.tally_call(&p.name, ok);
         let duration_ms = match (p.start_ms, ts) {
             // Clamp a negative interval to None, not zero: zero would render as a
             // real measurement.
@@ -651,6 +751,56 @@ impl SessionTelemetry {
         }
     }
 
+    // ---- cumulative counters (D3, D12) ----------------------------------------
+
+    /// Fold one completed call into the counters the rings cannot answer for: how
+    /// many calls this session made, how many of them failed, and how they split by
+    /// name. Saturating throughout, like every other accumulator here — no input
+    /// may panic the fold.
+    fn tally_call(&mut self, name: &str, ok: bool) {
+        self.total_tool_calls = self.total_tool_calls.saturating_add(1);
+        if !ok {
+            self.failed_tool_calls = self.failed_tool_calls.saturating_add(1);
+        }
+        if let Some(c) = self.tool_calls.get_mut(name) {
+            *c = c.saturating_add(1);
+            return;
+        }
+        // A name the map does not hold. Merge FIRST and insert AFTER, so the
+        // arriving name is never among the merge candidates: it would enter at 1
+        // and be the smallest entry the instant it existed. That ordering is the
+        // whole of D12's anti-starvation rule — swapping the two lines reproduces
+        // exactly the bug the rule exists to avoid.
+        if self.tool_calls.len() >= TALLY_CAP {
+            self.merge_smallest_incumbents();
+        }
+        self.tool_calls.insert(name.to_string(), 1);
+    }
+
+    /// Merge the smallest incumbents into the `other` bucket, in one batch down to
+    /// `TALLY_WATERMARK`. The sum is conserved — what leaves the map is added to the
+    /// bucket — so the map's sum plus `other` still equals `total_tool_calls`, which
+    /// is what lets the app show a per-name breakdown and a total that agree.
+    fn merge_smallest_incumbents(&mut self) {
+        let excess = self.tool_calls.len().saturating_sub(TALLY_WATERMARK);
+        if excess == 0 {
+            return;
+        }
+        // `(count, name)` so the sort is smallest-first with the NAME as the
+        // tie-break: a HashMap has no order, so equal counts would otherwise merge
+        // a different set on every run of the same input.
+        let mut ranked: Vec<(u64, String)> = self
+            .tool_calls
+            .iter()
+            .map(|(k, v)| (*v, k.clone()))
+            .collect();
+        ranked.sort();
+        for (count, name) in ranked.into_iter().take(excess) {
+            self.tool_calls.remove(&name);
+            self.tool_calls_other = self.tool_calls_other.saturating_add(count);
+        }
+    }
+
     /// A `<command-name>/foo</command-name>` wrapper is a slash-command invocation.
     /// No dedupe window against the `Skill` tool_use: the two signals come from
     /// different actors (a human typing `/foo` vs the model invoking a skill), so
@@ -675,6 +825,28 @@ impl SessionTelemetry {
 }
 
 // ---- helpers ------------------------------------------------------------------
+
+/// Whether a `message.model` value names a model that actually ran.
+///
+/// `<synthetic>` is a REAL value of that field, not a hypothetical: Claude Code writes
+/// it on records it fabricates locally — API-error and session-limit notices, which is
+/// why they land at the TAIL of a log (52 across the measured corpus, against 37,450
+/// genuine ids). It is a sentinel, not a model, and under the last-wins rule it
+/// would blank the panel's model the moment one landed at the tail of a log.
+///
+/// Matched by SHAPE, not by the one literal: `<...>` is how this log marks "not a real
+/// value", so a future `<none>`/`<unknown>` must be refused on the same grounds. A
+/// genuine id is a bare slug (`claude-opus-5`) and can never take this form, so the
+/// shape test cannot reject one. Empty is refused for the same reason — it names
+/// nothing, and `Some("")` on the panel is indistinguishable from a bug.
+///
+/// This is a mechanism, not presentation (SD4): the crate must decide what to fold, and
+/// "is this a model id" is a property of the datum. Which of the folded ids to SHOW,
+/// and how, stays the app's.
+fn is_real_model(m: &str) -> bool {
+    let sentinel = m.is_empty() || (m.starts_with('<') && m.ends_with('>'));
+    !sentinel
+}
 
 /// Record a `requestId` against a message key, bounded (D6): the dedupe map caps the
 /// number of KEYS, this caps each key's value, so neither dimension grows without limit.
