@@ -23,6 +23,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// What the tab's live `claude` process says about which session it is running.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct SessionHint {
+    /// The `claude` process this hint describes.
+    ///
+    /// Carried so a caller can ask that *same* process the same question again later
+    /// without re-running [`hint_for`] — which forks `/bin/ps`. `/clear` rotates the
+    /// session inside one process, so re-reading `~/.claude/sessions/<pid>.json` for this
+    /// pid is the whole rotation signal, and it costs one small file read rather than a
+    /// process listing (`ai-monitor-session-rotation`).
+    ///
+    /// `None` only from [`Default`] — a real hint always names the process it came from.
+    /// It is **not** an identity on its own: pids are recycled, so it must always be
+    /// paired with `started_ms` and put through [`ai_monitor::validated_session_id`].
+    pub pid: Option<u32>,
     /// Named exactly, from `--resume <id>`. When present nothing else is needed.
     pub session_id: Option<String>,
     /// When the process started, epoch millis. A session started by this process has
@@ -83,6 +95,7 @@ pub fn hint_for(shell_pid: u32) -> Option<SessionHint> {
     let (rivals, rivals_known) =
         table.rival_starts_checked(claude, mine.as_deref(), cwd_of_pid, start_ms);
     Some(SessionHint {
+        pid: Some(claude),
         // Ask the process what session it is running, before trying to infer it.
         // `--resume` is only the argv spelling of the same question and stays as the
         // fallback for a `claude` old enough not to write the registry file.
