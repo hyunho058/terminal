@@ -19,7 +19,6 @@
 //! rather than capped rings — so a re-point must rebuild them from the new tab's log
 //! instead of continuing the old tab's. [`Session`] is the value that makes that one act.
 
-use std::cell::RefCell;
 use std::path::PathBuf;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -99,9 +98,7 @@ pub struct AiMonitorOverlay {
     /// `None` only when the tab has no `claude` at all; a `claude` that has not yet named a
     /// session is `Some` with a `None` id, which the first valid record ARMS.
     ///
-    /// `RefCell` for exactly that arming: it happens inside `session_rotated`, which is
-    /// `&self` because the call site reads `self.visible` in the same expression.
-    opened_on: RefCell<Option<OpenedOn>>,
+    opened_on: Option<OpenedOn>,
 }
 
 impl AiMonitorOverlay {
@@ -131,7 +128,7 @@ impl AiMonitorOverlay {
             started_ms: now_ms(),
             context_window: None,
             tab_has_claude: false,
-            opened_on: RefCell::new(None),
+            opened_on: None,
             rivals: Arc::new(Mutex::new(ai_monitor::RivalSet::default())),
             refreshing: Arc::new(AtomicBool::new(false)),
         }
@@ -205,7 +202,7 @@ impl AiMonitorOverlay {
         // Requiring all three parts is what makes the check evidence-based rather than a
         // hunch, and it is also what makes it self-limiting: no id at open means no
         // rotation can be detected for this open, which is honest, cheap, and cannot storm.
-        *self.opened_on.get_mut() = match (hint.pid, hint.started_ms) {
+        self.opened_on = match (hint.pid, hint.started_ms) {
             (Some(pid), Some(process_start_ms)) => Some(OpenedOn {
                 pid,
                 process_start_ms,
@@ -338,25 +335,9 @@ impl AiMonitorOverlay {
     /// **Cost, stated plainly:** one 14 µs read per wake, only while the panel is open and
     /// only while the tab has a `claude` to ask. A closed panel and a tab with no `claude`
     /// add nothing at all — no read, no fork, no clock.
-    fn session_rotated(&self) -> bool {
-        // Scoped so the shared borrow is released before the `Arm` arm takes a mutable one.
-        let outcome = {
-            let baseline = self.opened_on.borrow();
-            session_rotated_with(ai_monitor::registered_session, baseline.as_ref())
-        };
-        match outcome {
-            Rotation::Rotated => true,
-            // Learning an id we never had is an arrival, not a rotation: record it and let
-            // this wake fall through to the rival refresh. The NEXT `/clear` then has a
-            // baseline to be measured against, which is the whole point of arming.
-            Rotation::Arm(id) => {
-                if let Some(prev) = self.opened_on.borrow_mut().as_mut() {
-                    prev.session_id = Some(id);
-                }
-                false
-            }
-            Rotation::None => false,
-        }
+    fn session_rotated(&mut self) -> bool {
+        let outcome = session_rotated_with(ai_monitor::registered_session, self.opened_on.as_ref());
+        apply_rotation(outcome, &mut self.opened_on)
     }
 
     /// Re-enumerate the live rivals into the shared handle (D11/R6.2).
@@ -954,6 +935,31 @@ fn session_rotated_with(
     }
 }
 
+/// Apply a [`Rotation`] to the baseline, and answer whether the panel must re-point.
+///
+/// **The one stateful transition this feature adds, split out so a test can drive it.** The
+/// rule ([`session_rotated_with`]) is pure and was already covered; the *state change* was
+/// not, and a checker proved the gap by mutating this arm to `Rotation::Arm(_) => false` —
+/// with all 1133 tests still green, while a panel opened during `claude`'s first ~1.5 s went
+/// permanently blind to `/clear`. That is precisely the regression the arming path exists to
+/// fix, so the transition gets the same treatment every other decision in this file gets.
+fn apply_rotation(outcome: Rotation, baseline: &mut Option<OpenedOn>) -> bool {
+    match outcome {
+        Rotation::Rotated => true,
+        // Learning an id we never had is an ARRIVAL, not a rotation: record it and answer
+        // "no re-point", so this wake falls through to the rival refresh. Re-opening here
+        // would drop a live watcher and re-run a full backfill to learn nothing. The next
+        // `/clear` then has a baseline to be measured against, which is the whole point.
+        Rotation::Arm(id) => {
+            if let Some(prev) = baseline.as_mut() {
+                prev.session_id = Some(id);
+            }
+            false
+        }
+        Rotation::None => false,
+    }
+}
+
 /// Has this log written since the window opened?
 ///
 /// **The single site of this question**, and the only writer of the shared
@@ -1077,11 +1083,14 @@ impl Overlay for AiMonitorOverlay {
     }
 
     fn on_active_changed(&mut self, cwd: Option<PathBuf>, shell_pid: Option<u32>) {
-        let tab_changed = self
-            .repoint
-            .changed(self.visible, cwd.as_deref(), shell_pid);
-        // The order, and the laziness, live in `tick_action` — one author for both.
-        match tick_action(tab_changed, self.visible, || self.session_rotated()) {
+        let visible = self.visible;
+        let tab_changed = self.repoint.changed(visible, cwd.as_deref(), shell_pid);
+        // The order, and the laziness, live in `tick_action` — one author for both. Bound to
+        // a local rather than matched inline: the thunk borrows `self` mutably (arming writes
+        // the baseline), and a temporary in a `match` scrutinee lives until the end of the
+        // match, which would hold that borrow across the arms that call `open`.
+        let action = tick_action(tab_changed, visible, || self.session_rotated());
+        match action {
             // A tab change and a rotation take the SAME action, and deliberately so.
             // `open()` is the whole re-point in both cases: `Session::repoint` drops the
             // old attachment and its flag, the accumulator is rebuilt from scratch
@@ -1117,7 +1126,7 @@ impl Overlay for AiMonitorOverlay {
 #[cfg(test)]
 mod tests {
     use super::{
-        backfill_from_scratch, drain_to_newest, pane_cwd_with, proves_ownership,
+        apply_rotation, backfill_from_scratch, drain_to_newest, pane_cwd_with, proves_ownership,
         session_rotated_with, tick_action, AiMonitorOverlay, Attachment, OpenedOn, Repoint,
         Rotation, Session, Tick,
     };
@@ -2152,11 +2161,24 @@ mod tests {
     //
     // The values below come from a real chain measured in
     // `~/.claude/projects/-Users-hyunhokim-IdeaProjects-terminal/`: one `claude` process,
-    // pid 88187, whose registry record kept `startedAt: 1786169000374` (its process start)
-    // while `sessionId` moved three times — `a3dc815b` -> `fc326d50` -> `3150bf9c` ->
-    // `d554e3c6`, each previous log's LAST record being the `/clear`. `d554e3c6-...` and the
-    // two numbers are verbatim from `~/.claude/sessions/88187.json`; the earlier ids are the
-    // real 8-char prefixes with synthetic tails, because only the *difference* is load-bearing.
+    // pid 88187, whose registry record kept `startedAt: 1786169000374` while `sessionId`
+    // moved three times — `a3dc815b` -> `fc326d50` -> `3150bf9c` -> `d554e3c6`.
+    //
+    // Two corrections to what an earlier draft of this header said, both verified against the
+    // logs, because both mislead a reader into the wrong model:
+    //
+    //   * The `/clear` marker is at **index 3 of each SUCCESSOR**, not the last record of the
+    //     predecessor. `a3dc815b` — the first predecessor — contains no `/clear` record at
+    //     all, and its last record is at 06:31:47.313 while the marker sits in `fc326d50` at
+    //     06:31:54.828. Reasoning about the predecessor's tail is what produced the first
+    //     draft's design.
+    //   * `startedAt` is NOT the process start. `ai_monitor::Registered` documents it as
+    //     "slightly after its real start" (measured 1.3-2.2s), which is exactly why
+    //     `validated_session_id` is a windowed check and not an equality.
+    //
+    // `d554e3c6-...` and the two numbers are verbatim from `~/.claude/sessions/88187.json`;
+    // the earlier ids are the real 8-char prefixes with synthetic tails, because only the
+    // *difference* between them is load-bearing.
 
     const PID: u32 = 88_187;
     const PROC_START: u64 = 1_786_169_000_374;
@@ -2367,6 +2389,148 @@ mod tests {
                 "a closed panel must not read anything"
             )),
             Tick::Idle
+        );
+    }
+
+    // ---- the state transition: arming, and what it does to the baseline ----
+
+    #[test]
+    fn arming_writes_the_id_into_the_baseline_and_does_not_re_point() {
+        // REGRESSION, and the checker's mutation is the reason it exists: replacing this arm
+        // with `Rotation::Arm(_) => false` left all 1133 tests green while a panel opened
+        // during `claude`'s first ~1.5 s stayed permanently blind to `/clear`. Asserting the
+        // *return* alone cannot see that — the write-back is the whole fix, so the write-back
+        // is what this asserts.
+        let mut baseline = Some(opened_unnamed());
+        let re_point = apply_rotation(Rotation::Arm(BEFORE.to_string()), &mut baseline);
+        assert!(!re_point, "an arrival must not drop a live watcher");
+        assert_eq!(
+            baseline.as_ref().and_then(|b| b.session_id.as_deref()),
+            Some(BEFORE),
+            "the id must be RECORDED, or the next /clear has nothing to be measured against"
+        );
+    }
+
+    #[test]
+    fn an_armed_baseline_then_detects_the_next_clear() {
+        // The whole sequence, in the order it happens in production: open before the session
+        // is named -> arm from the first believable record -> `/clear` -> rotate. Each step
+        // feeds the next, so a break anywhere in the chain fails here even if every step
+        // passes in isolation.
+        let mut baseline = Some(opened_unnamed());
+
+        let armed = session_rotated_with(|_| Some(record(BEFORE, 1_500)), baseline.as_ref());
+        assert!(!apply_rotation(armed, &mut baseline));
+
+        let after_clear = session_rotated_with(|_| Some(record(AFTER, 1_500)), baseline.as_ref());
+        assert_eq!(after_clear, Rotation::Rotated);
+        assert!(
+            apply_rotation(after_clear, &mut baseline),
+            "a panel that opened before its session was named must still follow the /clear"
+        );
+    }
+
+    #[test]
+    fn a_rotation_leaves_the_baseline_alone_because_open_rewrites_it() {
+        // Deliberate, and worth pinning: `apply_rotation` does NOT write the new id. The
+        // re-point runs `open()`, which rebuilds the baseline from a fresh `hint_for` — the
+        // authoritative source, including the pid, which may itself have changed. Writing a
+        // half-baseline here would leave `pid`/`process_start_ms` describing one process and
+        // `session_id` another, and every later comparison would be against a mixture.
+        let mut baseline = Some(opened_on(BEFORE));
+        assert!(apply_rotation(Rotation::Rotated, &mut baseline));
+        assert_eq!(
+            baseline.as_ref().and_then(|b| b.session_id.as_deref()),
+            Some(BEFORE),
+            "open() is the only writer of a post-rotation baseline"
+        );
+    }
+
+    #[test]
+    fn nothing_is_written_when_there_is_no_baseline_to_write_to() {
+        let mut baseline: Option<OpenedOn> = None;
+        assert!(!apply_rotation(
+            Rotation::Arm(BEFORE.to_string()),
+            &mut baseline
+        ));
+        assert!(baseline.is_none());
+    }
+
+    /// A rotation re-points through `open()` — the same call a tab switch makes — so the new
+    /// session's counters replace the old session's rather than continuing them (R10.3).
+    ///
+    /// Driven at the units the re-point actually uses (`Session::repoint` +
+    /// `backfill_from_scratch`), because `open()` itself needs a live process tree and a real
+    /// `~/.claude`. This is the contract's "totals rebuilt, not continued" row.
+    #[test]
+    fn a_rotation_rebuilds_the_totals_from_the_new_log_and_never_continues_the_old() {
+        let dir = temp_dir("rotation-totals");
+        let old = dir.join("before.jsonl");
+        let new = dir.join("after.jsonl");
+        std::fs::write(&old, bash_calls(0, 7)).unwrap();
+        std::fs::write(&new, bash_calls(100, 2)).unwrap();
+
+        let mut session = Session::default();
+        let (pre, _) = backfill_from_scratch(Some(&old));
+        session.note(Arc::new(pre.snapshot()), 0, true);
+        assert_eq!(
+            session.latest.as_ref().unwrap().total_tool_calls,
+            7,
+            "premise: the pre-rotation session's own tally"
+        );
+
+        // The rotation. `open()` does exactly these two things, in this order.
+        session.repoint();
+        let (post, offset) = backfill_from_scratch(Some(&new));
+        session.note(Arc::new(post.snapshot()), 0, true);
+
+        assert_eq!(
+            session.latest.as_ref().unwrap().total_tool_calls,
+            2,
+            "the new session's tally ALONE — 9 would mean the accumulator was continued"
+        );
+        assert_eq!(
+            offset,
+            std::fs::metadata(&new).unwrap().len(),
+            "the tail resumes past what was folded, or the watcher re-folds every line"
+        );
+    }
+
+    #[test]
+    fn a_rotation_re_points_rather_than_refreshing_rivals() {
+        // The `Tick::Reopen -> open()` mapping is one line and no unit can reach it: `open()`
+        // needs a live process tree, a real `~/.claude` and an `EventLoopProxy`. So it is
+        // pinned the way this crate already pins unreachable wiring (see
+        // `r7_4_the_loop_still_waits_and_the_panel_schedules_no_wake`, which scans this same
+        // production half for scheduler names): by asserting the source.
+        //
+        // Crude, and it earns its place — a checker mutated this arm to `refresh_rivals` and
+        // every one of the 1133 tests stayed green while the panel never re-pointed at all.
+        let src = include_str!("overlay.rs");
+        // Split on the FULL `mod tests` marker, not on `#[cfg(test)]` — this file has a
+        // test-only constructor at the top, so the bare attribute appears ~1000 lines above
+        // the real boundary and the first draft of this test cut there and failed on correct
+        // code. Comment lines are stripped for the same reason the sibling helper strips
+        // them: a comment quoting the arm must not be able to satisfy the assertion.
+        let (production, tests) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("no `mod tests` marker to split on");
+        assert!(
+            !tests.is_empty() && production.len() > src.len() / 4,
+            "the split found the marker in an implausible place"
+        );
+        let production = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            production.contains("Tick::Reopen => self.open(cwd, shell_pid)"),
+            "a rotation must re-point through open(), which is the whole re-point"
+        );
+        assert!(
+            production.contains("Tick::RefreshRivals => self.refresh_rivals(shell_pid)"),
+            "and the inert case must still republish rival membership (D11)"
         );
     }
 }
