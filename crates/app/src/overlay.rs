@@ -99,6 +99,13 @@ pub struct AiMonitorOverlay {
     /// session is `Some` with a `None` id, which the first valid record ARMS.
     ///
     opened_on: Option<OpenedOn>,
+    /// Set by the rival worker when it finds a `claude` under a tab whose panel opened
+    /// WITHOUT one — the state `opened_on: None` describes (D-rot2).
+    ///
+    /// Cross-thread because the only cheap-enough place to look is the thread that already
+    /// forks `/bin/ps`: asking on the event loop would put a fork on every wake. The event
+    /// loop consumes the flag and answers with a full re-point.
+    claude_appeared: Arc<AtomicBool>,
 }
 
 impl AiMonitorOverlay {
@@ -129,6 +136,7 @@ impl AiMonitorOverlay {
             context_window: None,
             tab_has_claude: false,
             opened_on: None,
+            claude_appeared: Arc::new(AtomicBool::new(false)),
             rivals: Arc::new(Mutex::new(ai_monitor::RivalSet::default())),
             refreshing: Arc::new(AtomicBool::new(false)),
         }
@@ -199,6 +207,9 @@ impl AiMonitorOverlay {
         // stale baseline would compare the new tab's process against the old tab's session id
         // and re-point on every wake.
         self.opened_on = baseline_from(&hint);
+        // Whatever a worker observed before this open is now answered by this open itself.
+        // Leaving it set would re-point once more, immediately, for nothing.
+        self.claude_appeared.store(false, Ordering::Relaxed);
         // The previous tab's session goes as ONE value, and it goes here — *above* the
         // `project_dir` branch, so a tab that resolves no log still clears it. That
         // placement is what makes the worst case survivable: re-pointing to a tab with no
@@ -321,6 +332,20 @@ impl AiMonitorOverlay {
     /// only while the tab has a `claude` to ask. A closed panel and a tab with no `claude`
     /// add nothing at all — no read, no fork, no clock.
     fn session_rotated(&mut self) -> bool {
+        // UNARMED — this open found no `claude` in the tab, so there is no process to ask and
+        // no baseline to compare against. Reported by a user: open the window, press
+        // Cmd+Shift+M, *then* start `claude`. The unattached watcher still finds the session
+        // and fills the panel, so it looks healthy — while being blind to `/clear` for the
+        // rest of the open, because `open()` is the only writer of the baseline and nothing
+        // re-opens a tab that never changed.
+        //
+        // The answer is a full re-point rather than an arming, and the difference matters:
+        // this open resolved with an EMPTY `Wanted` (there was no process to name a session),
+        // so it is not merely missing an id — it is running the weakest resolution tier.
+        // `open()` redoes the whole thing against a process that now exists.
+        if self.opened_on.is_none() {
+            return self.claude_appeared.swap(false, Ordering::AcqRel);
+        }
         let outcome = session_rotated_with(ai_monitor::registered_session, self.opened_on.as_ref());
         apply_rotation(outcome, &mut self.opened_on)
     }
@@ -350,20 +375,32 @@ impl AiMonitorOverlay {
     ///   overlap and land out of order — a stale set overwriting a fresher one.
     fn refresh_rivals(&self, shell_pid: Option<u32>) {
         let Some(pid) = shell_pid else { return };
-        if self.session.attached_flag.load(Ordering::Relaxed) {
-            return; // R6.3 — attached: the watcher no longer re-resolves
+        if !rival_refresh_needed(
+            self.session.attached_flag.load(Ordering::Relaxed),
+            self.opened_on.is_some(),
+        ) {
+            return;
         }
         if self.refreshing.swap(true, Ordering::AcqRel) {
             return; // one outstanding refresh is enough
         }
         let handle = self.rivals.clone();
+        // Only meaningful while unarmed; harmless otherwise, since `session_rotated` reads it
+        // only on that branch and `open()` clears it.
+        let appeared = self.claude_appeared.clone();
         // Cleared by `Drop`, not by a statement at the end of the closure. A panic anywhere
         // in `hint_for` would skip a manual `store(false)` and latch this `true` for the
         // life of the process — rival refresh silently dead forever, with nothing to
         // indicate it. Low probability, unbounded consequence, four lines to remove.
         let inflight = InFlight(self.refreshing.clone());
         std::thread::spawn(move || {
-            let set = match tabsession::hint_for(pid) {
+            let hint = tabsession::hint_for(pid);
+            // A `claude` exists under this tab now. Reported unconditionally — the event loop
+            // decides whether it cares, and it only cares while unarmed.
+            if hint.is_some() {
+                appeared.store(true, Ordering::Release);
+            }
+            let set = match hint {
                 Some(h) => ai_monitor::RivalSet {
                     list: h.rival_starts,
                     known: h.rivals_known,
@@ -928,6 +965,22 @@ fn session_rotated_with(
     }
 }
 
+/// Is a rival refresh still worth its `/bin/ps` fork?
+///
+/// **Two conditions, and the second is the one this feature added.** R6.3 stops the refresh
+/// once attached, because re-resolution has stopped and membership can no longer change the
+/// answer. That reasoning holds only for a panel that HAS a baseline. A panel that opened
+/// before its tab had a `claude` is attached-but-unarmed: it can be showing the right session
+/// (the unattached watcher found it by dating) while having no process recorded to ask about
+/// rotations — and the only thing that can arm it is the very lookup R6.3 switched off.
+///
+/// So the refresh continues while unarmed. It is rare, self-terminating (one re-point arms
+/// the baseline and the guard closes again), and no worse than what an unattached panel
+/// already did on every wake.
+fn rival_refresh_needed(attached: bool, armed: bool) -> bool {
+    !attached || !armed
+}
+
 /// The rotation baseline this hint supports, if any.
 ///
 /// **Which parts are required, and why they differ.** `pid` and `process_start_ms` are
@@ -1149,8 +1202,8 @@ impl Overlay for AiMonitorOverlay {
 mod tests {
     use super::{
         apply_rotation, backfill_from_scratch, baseline_from, drain_to_newest, pane_cwd_with,
-        proves_ownership, session_rotated_with, tick_action, AiMonitorOverlay, Attachment,
-        OpenedOn, Repoint, Rotation, Session, Tick,
+        proves_ownership, rival_refresh_needed, session_rotated_with, tick_action,
+        AiMonitorOverlay, Attachment, OpenedOn, Repoint, Rotation, Session, Tick,
     };
     use crate::seam::{AppCtx, AppRequest, Handled, KeyInput, Overlay, WriteProbe};
     use crate::tabsession;
@@ -2616,5 +2669,87 @@ mod tests {
         ] {
             assert_eq!(baseline_from(&hint), None);
         }
+    }
+
+    // ---- opened before the tab had a `claude` (user-reported, 2026-08-08) ----
+
+    #[test]
+    fn an_unarmed_panel_re_points_when_a_claude_finally_appears() {
+        // The reported sequence: open the window, press Cmd+Shift+M, THEN start `claude`.
+        // `hint_for` found nothing at open, so there is no baseline and no process to ask.
+        // Without this the panel fills in (the unattached watcher finds the log by dating)
+        // and is then blind to `/clear` for the rest of the open.
+        let mut o = AiMonitorOverlay::detached();
+        o.visible = true;
+        assert!(
+            o.opened_on.is_none(),
+            "premise: opened with no claude in the tab"
+        );
+
+        assert!(
+            !o.session_rotated(),
+            "nothing has appeared yet — a bare unarmed panel must not re-point"
+        );
+
+        o.claude_appeared.store(true, Ordering::Release);
+        assert!(
+            o.session_rotated(),
+            "a claude appeared: re-point, so the whole resolution is redone against it"
+        );
+    }
+
+    #[test]
+    fn one_appearance_causes_exactly_one_re_point() {
+        // The flag is CONSUMED. Left set, every later wake would re-open — each one a
+        // /bin/ps fork, two 250 ms-budgeted tmux waits on the event-loop thread, a watcher
+        // respawn and a full backfill. That is the storm `Repoint` exists to prevent.
+        let mut o = AiMonitorOverlay::detached();
+        o.visible = true;
+        o.claude_appeared.store(true, Ordering::Release);
+
+        assert!(o.session_rotated());
+        assert!(!o.session_rotated(), "the appearance must not fire twice");
+    }
+
+    #[test]
+    fn an_armed_panel_never_consumes_the_appearance_flag() {
+        // Once a baseline exists the question is "did MY session rotate", answered from the
+        // registry — the appearance flag belongs to the unarmed branch and must not be read
+        // or consumed on this one.
+        //
+        // Asserted on the flag rather than on the return value ON PURPOSE: `session_rotated`
+        // reads the real `~/.claude/sessions/` on the armed path, so asserting its answer
+        // would make this test depend on which sessions happen to exist on the machine
+        // running it. The first draft did exactly that and failed here — pid 88187 still has
+        // a live record, the very one these constants were taken from, so the rule correctly
+        // reported a rotation and the test was wrong, not the code. Flag-consumption is the
+        // property that actually belongs to this branch, and it is machine-independent.
+        let mut o = AiMonitorOverlay::detached();
+        o.visible = true;
+        o.opened_on = Some(opened_on(BEFORE));
+        o.claude_appeared.store(true, Ordering::Release);
+
+        let _ = o.session_rotated();
+        assert!(
+            o.claude_appeared.load(Ordering::Acquire),
+            "armed: the appearance flag is not this branch's business"
+        );
+    }
+
+    #[test]
+    fn the_rival_refresh_keeps_running_while_unarmed_even_once_attached() {
+        // R6.3 turns the refresh off once attached — but that reasoning assumes a baseline
+        // exists. Attached-and-unarmed is exactly the reported state, and the lookup R6.3
+        // switched off is the only thing that can arm it.
+        assert!(
+            rival_refresh_needed(true, false),
+            "attached but unarmed: keep looking, or nothing ever arms the baseline"
+        );
+        assert!(
+            !rival_refresh_needed(true, true),
+            "attached and armed: R6.3 — stop, the reads can no longer change anything"
+        );
+        assert!(rival_refresh_needed(false, true));
+        assert!(rival_refresh_needed(false, false));
     }
 }
