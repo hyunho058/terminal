@@ -193,27 +193,12 @@ impl AiMonitorOverlay {
         // re-pointing to a tab with no `claude` clears it.
         self.tab_has_claude = h.is_some();
         let hint = h.unwrap_or_default();
-        // The rotation baseline, taken from the SAME hint the resolution below uses, so the
-        // two can never disagree about which session this open is for. Unconditional, like
-        // `tab_has_claude` above: re-pointing to a tab with no `claude`, or to one that has
-        // not named a session yet, must CLEAR it — a stale baseline would compare the new
-        // tab's process against the old tab's session id and re-point every tick.
-        //
-        // Requiring all three parts is what makes the check evidence-based rather than a
-        // hunch, and it is also what makes it self-limiting: no id at open means no
-        // rotation can be detected for this open, which is honest, cheap, and cannot storm.
-        self.opened_on = match (hint.pid, hint.started_ms) {
-            (Some(pid), Some(process_start_ms)) => Some(OpenedOn {
-                pid,
-                process_start_ms,
-                // May be `None` — a `claude` younger than its first registry record, with no
-                // `--resume` in argv, names nothing yet. That is armable, not terminal.
-                session_id: hint.session_id.clone(),
-            }),
-            // No `claude` under this tab, or no measurable start for one: there is no
-            // process to re-ask, so the check disables itself for this open.
-            _ => None,
-        };
+        // The rotation baseline, from the SAME hint the resolution below uses, so the two can
+        // never disagree about which session this open is for. Unconditional, like
+        // `tab_has_claude` above: re-pointing to a tab with no `claude` must CLEAR it — a
+        // stale baseline would compare the new tab's process against the old tab's session id
+        // and re-point on every wake.
+        self.opened_on = baseline_from(&hint);
         // The previous tab's session goes as ONE value, and it goes here — *above* the
         // `project_dir` branch, so a tab that resolves no log still clears it. That
         // placement is what makes the worst case survivable: re-pointing to a tab with no
@@ -935,6 +920,31 @@ fn session_rotated_with(
     }
 }
 
+/// The rotation baseline this hint supports, if any.
+///
+/// **Which parts are required, and why they differ.** `pid` and `process_start_ms` are
+/// mandatory: together they are the *identity* of the process to re-ask, and neither is
+/// usable alone — `~/.claude/sessions/` files outlive their processes, so a pid without a
+/// start cannot be told from a stranger's record. `session_id` is optional, because a
+/// `claude` younger than its first registry record (measured 1.1-2.2s) with no `--resume` in
+/// argv genuinely names nothing yet; that baseline is ARMED later by [`Rotation::Arm`]
+/// rather than abandoned.
+///
+/// Split out of `open()` because a checker mutated that assignment to `None` and all 1133
+/// tests stayed green, with rotation detection entirely dead.
+fn baseline_from(hint: &tabsession::SessionHint) -> Option<OpenedOn> {
+    match (hint.pid, hint.started_ms) {
+        (Some(pid), Some(process_start_ms)) => Some(OpenedOn {
+            pid,
+            process_start_ms,
+            session_id: hint.session_id.clone(),
+        }),
+        // No `claude` under this tab, or no measurable start for one: there is no process to
+        // re-ask, so the check disables itself for this open rather than guessing.
+        _ => None,
+    }
+}
+
 /// Apply a [`Rotation`] to the baseline, and answer whether the panel must re-point.
 ///
 /// **The one stateful transition this feature adds, split out so a test can drive it.** The
@@ -1126,9 +1136,9 @@ impl Overlay for AiMonitorOverlay {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_rotation, backfill_from_scratch, drain_to_newest, pane_cwd_with, proves_ownership,
-        session_rotated_with, tick_action, AiMonitorOverlay, Attachment, OpenedOn, Repoint,
-        Rotation, Session, Tick,
+        apply_rotation, backfill_from_scratch, baseline_from, drain_to_newest, pane_cwd_with,
+        proves_ownership, session_rotated_with, tick_action, AiMonitorOverlay, Attachment,
+        OpenedOn, Repoint, Rotation, Session, Tick,
     };
     use crate::seam::{AppCtx, AppRequest, Handled, KeyInput, Overlay, WriteProbe};
     use crate::tabsession;
@@ -2532,5 +2542,53 @@ mod tests {
             production.contains("Tick::RefreshRivals => self.refresh_rivals(shell_pid)"),
             "and the inert case must still republish rival membership (D11)"
         );
+        // Same class, same reason: a checker mutated the one line that arms the whole
+        // feature to `self.opened_on = None` — rotation detection entirely dead, 1133 green.
+        assert!(
+            production.contains("self.opened_on = baseline_from(&hint);"),
+            "open() must record the baseline, or nothing is compared against anything"
+        );
+    }
+
+    fn hint_of(
+        pid: Option<u32>,
+        started: Option<u64>,
+        sid: Option<&str>,
+    ) -> tabsession::SessionHint {
+        tabsession::SessionHint {
+            pid,
+            session_id: sid.map(str::to_string),
+            started_ms: started,
+            rival_starts: vec![],
+            rivals_known: true,
+        }
+    }
+
+    #[test]
+    fn a_hint_naming_a_process_and_a_session_becomes_the_baseline() {
+        let hint = hint_of(Some(PID), Some(PROC_START), Some(BEFORE));
+        assert_eq!(baseline_from(&hint), Some(opened_on(BEFORE)));
+    }
+
+    #[test]
+    fn a_hint_with_no_session_yet_still_becomes_an_armable_baseline() {
+        // The case the first draft dropped on the floor. `claude` takes 1.1-2.2s to write its
+        // registry record; a hint taken inside that window names a process but no session,
+        // and that is a baseline worth keeping — `Rotation::Arm` fills the id in later.
+        let hint = hint_of(Some(PID), Some(PROC_START), None);
+        assert_eq!(baseline_from(&hint), Some(opened_unnamed()));
+    }
+
+    #[test]
+    fn half_an_identity_is_no_baseline_at_all() {
+        // A pid with no start, or a start with no pid, is not an identity: registry files
+        // outlive their processes, so half an identity cannot be told from a stranger's.
+        for hint in [
+            hint_of(None, Some(PROC_START), Some(BEFORE)),
+            hint_of(Some(PID), None, Some(BEFORE)),
+            tabsession::SessionHint::default(),
+        ] {
+            assert_eq!(baseline_from(&hint), None);
+        }
     }
 }
