@@ -880,6 +880,14 @@ enum Rotation {
 /// being pulled to a *sibling's* session by mere file activity, and nothing here restores
 /// that. `refresh_rivals` keeps its attached early-return untouched.
 ///
+/// **What this DOES narrow, stated rather than left implicit.** R6.3 is written as "no
+/// registry reads and no membership reads occur" once attached. The *anti-yank* half is
+/// intact; the *cost* half is now literally false on the app side, because an attached panel
+/// performs one registry read per wake (see [`AiMonitorOverlay::session_rotated`] for the
+/// measured 14 µs). The watcher's reads still stop dead. That narrowing was pre-authorised by
+/// this feature's contract, and it is recorded here so the next reader of R6.3 finds the
+/// exception where the exception lives.
+///
 /// **Failure means "no rotation".** A record that cannot be read, or that fails
 /// [`ai_monitor::validated_session_id`] against the process start recorded at open, answers
 /// [`Rotation::None`] — the panel keeps what it has. The cost of being wrong this way is the
@@ -960,6 +968,12 @@ fn apply_rotation(outcome: Rotation, baseline: &mut Option<OpenedOn>) -> bool {
         // "no re-point", so this wake falls through to the rival refresh. Re-opening here
         // would drop a live watcher and re-run a full backfill to learn nothing. The next
         // `/clear` then has a baseline to be measured against, which is the whole point.
+        // One consequence to be explicit about, since it follows from the decision rather
+        // than from an oversight: arming updates the BASELINE only, never the live
+        // `Watch.want.session_id`. A panel that opened before its session was named therefore
+        // keeps resolving on the weaker tier-2 dating path for the rest of that open. Pushing
+        // the id into the watcher would mean re-opening, which is exactly what arming exists
+        // not to do; the next `/clear` re-opens anyway and repairs it.
         Rotation::Arm(id) => {
             if let Some(prev) = baseline.as_mut() {
                 prev.session_id = Some(id);
@@ -1114,9 +1128,11 @@ impl Overlay for AiMonitorOverlay {
             // the START of the successor, not the end of the predecessor. So by the time
             // this fires the new file almost always exists, strict resolution finds it, and
             // the panel re-points straight onto it. When it does not, resolution answers
-            // `None`, nothing is backfilled and `latest` is cleared, so the panel shows the
-            // "has not written a log yet" empty state rather than a dead session's numbers,
-            // and the freshly-spawned watcher (now unattached) adopts the log when it lands.
+            // `None` and nothing is folded, so what the panel holds is an EMPTY snapshot
+            // (not the absence of one) — `Detached::of` reads that as `NoLog` and, with
+            // `tab_has_claude`, shows "this tab's session has not written a log yet" rather
+            // than a dead session's numbers. The freshly-spawned watcher, now unattached,
+            // adopts the log when it lands.
             //
             // WHEN this fires is a separate question and is NOT established — see
             // `session_rotated`. It depends on when `claude` rewrites its registry record

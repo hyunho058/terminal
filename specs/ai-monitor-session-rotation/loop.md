@@ -154,13 +154,29 @@ Recorded so later work argues with numbers rather than with adjectives.
 ## Known gaps (accurate, not exhaustive-by-assumption)
 
 1. **`claude` restarted in the same tab** — different pid, and `Repoint::changed` keys on
-   (cwd, shell_pid), which a restart leaves untouched. A cached-pid check cannot see it.
+   (cwd, shell_pid), which a restart leaves untouched. Worse than merely undetected: the
+   *dead* pid's registry file survives, still validates against the old process start, and
+   still names the old session — so the check answers "no rotation" with apparent confidence.
 2. **Two `claude` under one tab** — `tabsession::find_claude` BFS-picks one; a `/clear` in
    the other is invisible.
 3. **When the re-point fires is not established.** The signal is correct; its promptness is
    not measured. See the table above.
-4. Covered, and worth naming because it was not designed for: an in-session `/resume` rotates
+4. **Arming does not update `Watch.want`.** A panel opened before its session was named arms
+   its baseline but keeps resolving on the weaker tier-2 dating path for the rest of that
+   open. This follows from "arming must not re-point" rather than from an oversight; the next
+   `/clear` re-opens and repairs it.
+5. Covered, and worth naming because it was not designed for: an in-session `/resume` rotates
    the session id **within one pid**, so it is followed by the same mechanism.
+
+## Decisions this narrows
+
+`ai-monitor-rival-assignment` **R6.3** is written as "no registry reads and no membership
+reads occur" once attached. Its **anti-yank half is intact** — nothing here lets an unnamed
+or merely-newer log be adopted, and both latches (`refresh_rivals`' early return, the
+watcher's `if !attached`) are byte-identical. Its **cost half is now false on the app side**:
+an attached, visible panel performs one 14 µs registry read per wake. That was pre-authorised
+by this contract's Gate 2 and is recorded in `session_rotated_with`'s doc so a reader of R6.3
+finds the exception. The watcher's reads still stop dead.
 
 ## Lessons
 
