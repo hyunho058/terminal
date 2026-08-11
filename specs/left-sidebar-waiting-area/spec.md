@@ -132,6 +132,15 @@ pinned로 둔다. 세 신호 소스(에이전트 멈춤 = `~/.claude/projects/**
 ### D18: ZDOTDIR 주입은 사용자 설정을 clobber하지 않고 chain
 - **Status**: resolved (reviewer #3b)
 - **Rationale**: 주입 zshrc는 원래 `$ZDOTDIR`(없으면 `$HOME`)를 먼저 캡처→우리 디렉터리로 `ZDOTDIR` 설정→우리 `.zshrc`가 사용자의 `.zshenv`/`.zshrc`/`.zlogin`을 명시적으로 source한 뒤 그 이후에 OSC 133 훅(preexec/precmd)만 추가. oh-my-zsh·starship 등 기존 프롬프트와 공존(우리 훅은 add-only, 프롬프트 문자열 미변경). 실패 시 D13(우아한 저하).
+  > **Amended by `specs/pty-session-env-isolation` (D9/D19) — 축소가 아니라 정제(strict refinement).**
+  > 위 2단계 캡처(`$ZDOTDIR` → `$HOME`)가 3단계가 된다: ① 상속된 `MAC_TERMINAL_USER_ZDOTDIR`
+  > → ② 상속된 `ZDOTDIR`(단, *우리 것*으로 인식되지 않은 경우) → ③ `$HOME`. 새 1순위는
+  > **상속된 `ZDOTDIR`가 우리 생성 디렉터리일 때만** 발동한다 — 즉 mac-terminal 탭 안에서 앱을
+  > 다시 띄운 중첩(nesting) 상황이며, 이 스펙이 작성될 당시에는 존재하지 않던 경우다. 이 스펙이
+  > 상정한 모든 경우(Finder 실행, 다른 터미널에서 실행, 커스텀 `ZDOTDIR` 유무)에서는 1순위가
+  > 비어 있어 동작이 D18과 완전히 동일하다. R4.2("원래 rc를 먼저 source")는 오히려 더 잘
+  > 충족된다: 중첩 상황에서 우리 생성 `.zshrc`를 다시 source하는 대신 사용자의 진짜 rc를 찾는다.
+  > 의무사항: R4.1/R4.2를 인코딩한 기존 `inject_*` 테스트는 **수정 없이** 그대로 통과해야 한다.
 
 ### D19: 명령 실행시간은 셸이 측정해 OSC로 emit (앱 시계 비의존)
 - **Status**: resolved (reviewer #3c)
