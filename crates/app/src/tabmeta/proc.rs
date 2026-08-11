@@ -132,6 +132,73 @@ pub(crate) fn tty_dev_of_pid(pid: u32) -> Option<u32> {
     (dev != NODEV && dev != 0).then_some(dev)
 }
 
+/// When `pid` started, epoch millis, via `proc_pidinfo(PROC_PIDTBSDINFO)`. `None` on any
+/// failure, and for a start time in the future — not a usable date to match against.
+///
+/// **The one implementation in the tree.** This lived in `tabsession.rs`, module-private,
+/// where the ai-monitor panel used it to validate `~/.claude/sessions/<pid>.json` against the
+/// process actually holding that pid. The sidebar's metadata worker now needs the same value
+/// for the same purpose, and `~/.claude/sessions/` files outlive their processes (5 files for
+/// 4 live processes, when measured), so a *second* copy of the input to that validation is
+/// precisely the shape `ai_monitor::validated_session_id`'s doc names as having already
+/// produced two defects. `tabsession::start_ms` now delegates here.
+///
+/// Lives beside [`tty_dev_of_pid`], which already reads the same `PROC_PIDTBSDINFO` struct —
+/// so this adds a field read, not a new syscall surface.
+///
+/// The panel calls [`start_ms_uncounted`] instead — same body, no cost probe; see there.
+pub(crate) fn start_ms_of_pid(pid: u32) -> Option<u64> {
+    #[cfg(test)]
+    super::probe::PROC_START.bump(1);
+    start_ms_uncounted(pid)
+}
+
+/// [`start_ms_of_pid`]'s body, **without** the cost probe.
+///
+/// The split exists so `tabsession::start_ms` — the ai-monitor panel's path — can share this
+/// implementation without firing `tabmeta`'s cost counter. Both halves of that matter:
+///
+/// - **D6 is satisfied**: there is still exactly one implementation of the rule, which is what
+///   stops the panel and the sidebar disagreeing about a process's start time and therefore
+///   about whether a `~/.claude/sessions/` record is stale.
+/// - **The counter stays sound**: `PROC_START` is `tabmeta`'s instrumentation of `tabmeta`'s
+///   own per-refresh budget, and the panel's tests do not hold `probe::serial()`. While they
+///   bumped it, any absolute assertion on it was a latent flake — reproduced at
+///   `--test-threads=2`: a worker test asserting `PROC_START == 0` saw `2`, because a
+///   `tabsession` test called `start_ms` twice in the same instant.
+///
+/// The alternative fixes were both worse. Forcing `probe::serial()` into the panel's tests
+/// modifies pre-existing tests to protect a sidebar counter, which R7.5 forbids. Making every
+/// assertion a floor gives up the ability to say "this tab performs NO start-time read",
+/// which is exactly what Confirmed Goal 4 needs to state.
+pub(crate) fn start_ms_uncounted(pid: u32) -> Option<u64> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut c_void,
+            size,
+        )
+    };
+    if n != size {
+        return None; // error or short read
+    }
+    let ms = info
+        .pbi_start_tvsec
+        .saturating_mul(1_000)
+        .saturating_add(info.pbi_start_tvusec / 1_000);
+    // A start time in the future is not a usable date to match against — better no
+    // hint than a wrong one.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    (ms > 0 && ms <= now).then_some(ms)
+}
+
 /// The device number a path refers to (`stat`'s `st_rdev`), as `u32`. `None` on any failure.
 /// The tmux side of the tty join: `tmux list-clients` reports `#{client_tty}` as a path, and
 /// this resolves it to the number [`tty_dev_of_pid`] returns for the tab's shell.
@@ -212,16 +279,29 @@ fn kern_argmax() -> usize {
 /// `returned` is the **count of child pids** — `proc_listchildpids` reports pids, not
 /// bytes (its libproc wrapper already divides the kernel's byte count by `sizeof(int)`).
 /// `<= 0` → empty; the count is capped at the buffer length; non-positive pids are dropped.
+///
+/// **Sorted ascending**, and that is load-bearing rather than tidiness. Every child listing
+/// in this crate passes through here, so both consumers inherit it: `agent::walk`, which
+/// returns its *first* match, and `tmux::tmux_client_of_with`, which does the same. The
+/// kernel's order is unspecified, and once the walk started answering "which session does
+/// this tab show" — not merely "is an agent present" — an unspecified order meant a tab with
+/// two same-depth `claude` processes (one suspended with `Ctrl+Z`, one in the foreground)
+/// could show a different label from run to run. Sorting fixes the answer without changing
+/// which answers are reachable; depth still decides across levels, and only ties within a
+/// level are affected. Which of two same-depth siblings *ought* to win is a separate
+/// question — see the spec's Known Gaps.
 pub(crate) fn parse_childpids(buf: &[i32], returned: c_int) -> Vec<u32> {
     if returned <= 0 {
         return Vec::new();
     }
     let count = (returned as usize).min(buf.len());
-    buf[..count]
+    let mut pids: Vec<u32> = buf[..count]
         .iter()
         .filter(|&&p| p > 0)
         .map(|&p| p as u32)
-        .collect()
+        .collect();
+    pids.sort_unstable();
+    pids
 }
 
 /// Pure: parse a `KERN_PROCARGS2` buffer into argv (R11.4). Layout: `argc` (i32,
@@ -421,6 +501,68 @@ mod tests {
         // an over-large `returned` is capped at the buffer length (no OOB).
         let capped = parse_childpids(&buf, 10_000);
         assert!(capped.len() <= MAX_CHILDREN);
+    }
+
+    #[test]
+    fn parse_childpids_is_sorted_ascending() {
+        // R1.2 — the kernel's order is unspecified; ours is not. Every child listing in this
+        // crate passes through here, so `agent::walk` and `tmux::tmux_client_of_with` — both
+        // of which return their FIRST match — inherit a deterministic answer (R1.6).
+        let mut buf = [0i32; MAX_CHILDREN];
+        buf[0] = 7;
+        buf[1] = 3;
+        buf[2] = 9;
+        assert_eq!(
+            parse_childpids(&buf, 3),
+            vec![3, 7, 9],
+            "children must come back in ascending pid order"
+        );
+        // Stable across calls — the property a walk's first-match depends on.
+        assert_eq!(parse_childpids(&buf, 3), parse_childpids(&buf, 3));
+        // Sorting composes with the existing filter: the dropped zero does not reappear.
+        let mut with_zero = [0i32; MAX_CHILDREN];
+        with_zero[0] = 22;
+        with_zero[1] = 0;
+        with_zero[2] = 11;
+        assert_eq!(parse_childpids(&with_zero, 3), vec![11, 22]);
+    }
+
+    #[test]
+    fn start_ms_of_self_is_in_the_past_and_dead_pids_are_none() {
+        let _g = super::super::probe::serial();
+        // R1.4 — the live case resolves to a real, non-future timestamp...
+        let ms = start_ms_of_pid(std::process::id()).expect("own start time");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .expect("clock");
+        assert!(ms > 0 && ms <= now, "start {ms} must not be in the future");
+        // ...and the two failure shapes yield None rather than a panic or a bogus number.
+        assert_eq!(start_ms_of_pid(0), None, "pid 0 yields nothing");
+        assert_eq!(start_ms_of_pid(u32::MAX), None, "a dead pid yields nothing");
+    }
+
+    #[test]
+    fn start_ms_counts_itself_on_success_and_failure() {
+        let _g = super::super::probe::serial();
+        // The counter counts CALLS, not successes, so a budget assertion over it stays
+        // meaningful on the failure path (same contract as PROC_TTY's).
+        //
+        // **Deltas, not absolutes** (D6(2)). `PROC_START` is a process-global counter and
+        // `tabsession::start_ms` delegates to this same function, so a test elsewhere in the
+        // binary can bump it concurrently. An earlier version asserted `== 1` / `== 2`, which
+        // was only safe because it had forced `probe::serial()` guards into two pre-existing
+        // `tabsession` tests — modifying panel tests to protect a sidebar counter, which is
+        // exactly what R7.5 forbids. Measuring the delta needs no such cooperation.
+        let before = super::super::probe::PROC_START.get();
+        let _ = start_ms_of_pid(std::process::id());
+        let after_ok = super::super::probe::PROC_START.get();
+        assert!(after_ok > before, "a successful read must count itself");
+        let _ = start_ms_of_pid(u32::MAX); // fails
+        assert!(
+            super::super::probe::PROC_START.get() > after_ok,
+            "a failed read still counts"
+        );
     }
 
     #[test]

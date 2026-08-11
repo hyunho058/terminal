@@ -17,7 +17,10 @@
 mod activity;
 mod agent;
 mod git;
-mod proc;
+// `pub(crate)` unlike its private siblings: the crate-root `tabsession` module consumes
+// `start_ms_of_pid` from here (tabmeta-session-keying D6), so that the process start time
+// feeding `ai_monitor::validated_session_id` has exactly one implementation.
+pub(crate) mod proc;
 // `pub(crate)` unlike its private siblings: the crate-root `tabsession` module consumes
 // `effective_root_uncached` from here, and `super::` from there is the crate root
 // (tmux-root-resolution R8.3).
@@ -72,6 +75,25 @@ pub struct TabMeta {
 pub struct Agent {
     pub kind: AgentKind,
     pub state: AgentState,
+}
+
+/// The identity of *this tab's* `claude` process — the input that lets the card resolve its
+/// own session instead of ranking the project directory (tabmeta-session-keying).
+///
+/// Lives here rather than in `agent` or `activity` because it is the interface *between*
+/// them: `agent::agent_of_pid` supplies the pid, `worker` pairs it with the start time, and
+/// `activity::resolve_log` consumes both.
+///
+/// `start_ms` is deliberately `Option`. `proc::start_ms_of_pid` returns `None` for a dead pid
+/// or a start time in the future, and the two resolution tiers need it differently: the
+/// registry tier cannot run without it (validating a record against an unknown start is not
+/// validation), while the argv tier needs only the pid. So a missing start time must
+/// *downgrade* the tier rather than discard the identity.
+// Constructed by `worker::Deriver::tab`, consumed by `activity::resolve_log`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ClaudeId {
+    pub(crate) pid: u32,
+    pub(crate) start_ms: Option<u64>,
 }
 
 /// Agent activity. **No `Done`** — a finished agent is a process that exited, i.e.
@@ -365,6 +387,23 @@ pub(crate) mod probe {
     pub(crate) static PROC_CHILDREN: Counter = Counter::new();
     pub(crate) static PROC_EXE: Counter = Counter::new();
     pub(crate) static PROC_ARGS: Counter = Counter::new();
+    /// proc.rs (tabmeta-session-keying) — `start_ms_of_pid`, the process-start read that
+    /// `ai_monitor::validated_session_id` needs.
+    ///
+    /// **Assert a FLOOR or a DELTA on this, never an absolute equality.**
+    /// `tabsession::start_ms` delegates to the same function, and `tabsession`'s tests do not
+    /// hold [`serial()`] — deliberately: they are pre-existing ai-monitor panel tests, and
+    /// making them cooperate with a sidebar counter would be this feature reaching into the
+    /// panel's suite to protect its own assertions. So the counter can be bumped by a test
+    /// that is not coordinating with the lock, and only a floor is sound.
+    ///
+    /// (The `PROC_EXE` note in `worker.rs` reaches the same remedy from a different cause —
+    /// there the nondeterminism is a varying live *child count*, not an uncoordinated caller.)
+    pub(crate) static PROC_START: Counter = Counter::new();
+    /// activity.rs (tabmeta-session-keying) — one `~/.claude/sessions/<pid>.json` read.
+    /// Counted because it is per-Claude-tab-per-refresh and uncounted I/O is exactly what
+    /// lets a cost test keep passing while the real cost grows.
+    pub(crate) static SESSION_REG: Counter = Counter::new();
     // git.rs (T4) — the .git filesystem entry points (D13(6)).
     pub(crate) static GIT_STAT: Counter = Counter::new();
     pub(crate) static GIT_READ: Counter = Counter::new();
@@ -389,6 +428,8 @@ pub(crate) mod probe {
             &PROC_CHILDREN,
             &PROC_EXE,
             &PROC_ARGS,
+            &PROC_START,
+            &SESSION_REG,
             &PROC_TTY,
             &TTY_STAT,
             &TMUX_LIST,
