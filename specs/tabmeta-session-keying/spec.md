@@ -199,11 +199,38 @@ rather than on its cwd, using the session registry `claude` already writes about
 | 8573 | `71c62a68…` | yes | `harness-ops-fix-antigravity-cli-skills` |
 | 11395 | `064c3591…` | **no** | `terminal-fix-ai-monitor-no-session` |
 
-Two things this pins down. (1) The pid → session id → log path chain resolves directly, with
-no ranking. (2) The 4th row is the "**named but not yet written**" state, observed live at
-**95 s** after process start with the project directory not yet created — so it is not a
-sub-second window that can be waved away. It is exactly the state in which cwd-ranking
-returns a *sibling's* log, which is the reported bug.
+What this pins down: **the pid → session id → log path chain resolves directly, with no
+ranking.** Three of four records name a log that exists, at the path this feature computes.
+
+The 4th row is the "**named but not yet written**" state — a validating record whose log did
+not exist, 95 s after that process started.
+
+> **Correction (2026-08-11, after #28).** This row was originally read as evidence that the
+> unwritten window is *long* — "not a sub-second window that can be waved away" — and D1's
+> rationale leant on the 95 s figure. That reading is now superseded and the figure is
+> **withdrawn**.
+>
+> `#28 fix(pty): give each tab its own agent session identity, not the launcher's` found the
+> real cause: `CommandBuilder::new` seeds from `std::env::vars_os()`, so an app launched from
+> inside a Claude session leaked `CLAUDE_CODE_CHILD_SESSION=1` / `CLAUDE_PID` into every tab.
+> The tab's `claude` read the inherited marker, called itself a nested child session, and
+> **suppressed its transcript entirely**. Pid 11395 was in that state: it was never going to
+> write a log, at 95 s or at any later time. So the row measures the env-leak bug, not the
+> latency of a healthy session.
+>
+> **What survives, and why the tier is unchanged.** The window itself is real and is not in
+> dispute — a session cannot have a log before it writes its first event, and the registry
+> record appears 1.1–2.2 s after process start (measured independently, `lib.rs:329-336`).
+> What is no longer evidenced is any claim about *how long* the window lasts. Tier 2's rule
+> never depended on the duration: it turns on the *authority* of the name, not on how long the
+> file has been missing. A one-second window and a ninety-second one take the same answer,
+> because ranking during either returns a sibling's log.
+>
+> Two consequences worth stating rather than leaving implicit. Post-#28 the window should be
+> short in the ordinary case, so tier 2 will be **rarer** than this section originally implied.
+> And a tab whose `claude` genuinely never writes — one the user starts and never types into —
+> still sits in tier 2 indefinitely; that case is unaffected by #28 and remains the reason the
+> tier must be terminal-safe rather than time-bounded.
 
 ### Precedent for what to do when the named log is absent
 
@@ -279,8 +306,14 @@ let a tab with a perfectly known session id adopt a sibling's log."
   guess is not. Same reasoning and nearly the same shape as `ai-monitor`'s tier 1
   (`crates/ai-monitor/src/lib.rs:313-327`), whose comment records that the fall-through this
   avoids "is what let a tab with a perfectly known session id adopt a sibling's log".
-  Measured live 2026-08-10: a session **95 s** old had a valid registry record and no project
-  directory at all, next to a project directory holding 56 competing logs.
+
+  **The rule turns on authority, not on duration** — worth stating precisely, because an
+  earlier draft argued it from a measured 95 s unwritten window that #28 has since re-explained
+  as an env-leak artefact (see the correction under Research → Live verification). Nothing here
+  rests on that figure. Ranking during the window returns a neighbour's log whether the window
+  is one second or ninety, and the standing measurement that *does* matter is the directory:
+  56 competing logs in one project. A shorter window makes tier 2 rarer; it does not make
+  ranking inside it any less wrong.
 
   **Tier 1b is not decoration.** Without it the card and the panel disagree *permanently* on
   `claude --resume <id>` whose registry record is absent: the panel names the session from
@@ -289,12 +322,14 @@ let a tab with a perfectly known session id adopt a sibling's log."
   `proc::proc_args` reads argv by `sysctl` and `agent.rs:191` already calls it. Gated on a
   tier-1 miss, so it costs nothing in the common case.
 
-  **Tier 2's exits, stated because the evidence only measured its onset.** It ends when the
-  log appears (→ tier 1, within one refresh, D3), when the session rotates (`/clear` → a new
-  id, also tier 1), or when the process exits (→ `agent: None`, no label). It does **not**
-  end for a `claude` the user never types into — that session genuinely never writes a log,
-  and tier 2 is then *terminal and correct*: agent-present mark, cwd title, no task. That is
-  strictly better than today, where such a tab displays a neighbour's task.
+  **Tier 2's exits, stated because nothing measures its duration.** It ends when the log
+  appears (→ tier 1, within one refresh, D3), when the session rotates (`/clear` → a new id,
+  also tier 1), or when the process exits (→ `agent: None`, no label). It does **not** end for
+  a `claude` the user never types into — that session genuinely never writes a log, and tier 2
+  is then *terminal and correct*: agent-present mark, cwd title, no task. That is strictly
+  better than today, where such a tab displays a neighbour's task. This "never writes" case is
+  the one that survives #28 untouched, and it is why the tier is designed to be safe when
+  terminal rather than bounded by a timeout.
 
   **Rejected — "never rank"** (drop tier 3): strictest isolation, but a card goes blank on any
   registry hiccup, and the registry is another program's undocumented on-disk detail that
