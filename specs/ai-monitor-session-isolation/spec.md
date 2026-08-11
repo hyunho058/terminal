@@ -17,6 +17,12 @@ that says why there is nothing to show.
 - Fixing `CLAUDE_CODE_CHILD_SESSION` inheritance (why the reporter's tab wrote no
   transcript). Environmental, not a code defect — `HANDOFF.md:22-24` says so explicitly.
   It stays the cheapest reproduction of the real gap.
+  > **Superseded by `specs/pty-session-env-isolation` (D17).** That spec reclassifies this
+  > inheritance as a **code defect in `Pty::spawn`** and fixes it: the app is not a bystander
+  > to the inheritance, it is the *propagator* — a line in this repository copies the parent's
+  > session identity into every tab. "Environmental" described the marker's origin, not its
+  > transmission. This non-goal's other half still holds: that spec changes no panel code, so
+  > the strict per-tab isolation decided here is untouched.
 - The two rejected alternatives: labelling the guess on screen, and a multi-session
   list view. The human chose strict isolation over both.
 - `crates/renderer/**`, `crates/common/**`, `crates/term-core/**` — no change needed.
@@ -612,6 +618,14 @@ is untouched by the split.
   unguarded would name a parent's session and reproduce this feature's entire bug class.
   A guarded tier — trust it only when the log it names exists in this tab's own project
   directory — is the shape of the follow-up, and needs its own L2 round.
+
+  > **Premise updated by `specs/pty-session-env-isolation` (D1, Known Gaps).** The rejection
+  > above rests on `CLAUDE_CODE_SESSION_ID` being *inherited*. That spec puts it on an
+  > eleven-name denylist stripped in `Pty::spawn`, so once the fix lands a tab no longer
+  > inherits it and a read inside a tab names **that tab's own** session exactly. The gap
+  > stands as written for tabs spawned before the fix; afterwards the guarded tier described
+  > here becomes viable — and stronger than the timing heuristics `tabsession.rs` uses today.
+  > Building it is explicitly out of scope there too: it needs its own `/specify` round.
 
 ## Requirements
 
