@@ -283,6 +283,38 @@ pub(crate) fn effective_root_uncached(pid: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_client_scan_inherits_the_deterministic_child_order() {
+        // R1.6 — `tmux_client_of_with` returns its FIRST matching child, so its answer is only
+        // as deterministic as the child list it is handed. In production that list comes from
+        // `proc::children_of` → `parse_childpids`, which sorts ascending
+        // (tabmeta-session-keying D11).
+        //
+        // The provider is fed the **raw, unsorted** order a kernel might return and the list
+        // is put through the production path (`parse_childpids`) rather than sorted inline by
+        // the test. An earlier version sorted its own input before feeding it in, which made
+        // the assertion a tautology about `sort_unstable`: deleting the sort from
+        // `parse_childpids` left this test green.
+        let mut raw = [0i32; 128];
+        raw[0] = 7;
+        raw[1] = 3;
+        raw[2] = 9;
+        let children = super::super::proc::parse_childpids(&raw, 3);
+
+        let exe_of = |pid: u32| -> Option<PathBuf> {
+            match pid {
+                1 => Some(PathBuf::from("/bin/zsh")), // the root is not a client
+                _ => Some(PathBuf::from("/opt/homebrew/bin/tmux")),
+            }
+        };
+        let got = tmux_client_of_with(1, exe_of, move |_| children.clone());
+        assert_eq!(
+            got.map(|c| c.pid),
+            Some(3),
+            "the lowest pid wins — if `parse_childpids` stops sorting, this returns 7"
+        );
+    }
     use std::cell::RefCell;
     use std::collections::HashMap;
 

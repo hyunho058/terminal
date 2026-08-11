@@ -18,7 +18,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+// `SystemTime`/`UNIX_EPOCH` moved to the test module with `start_ms`'s body
+// (tabmeta-session-keying D6) — only the tests still need a wall clock here.
+use std::time::Duration;
 
 /// What the tab's live `claude` process says about which session it is running.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -432,47 +434,34 @@ impl ProcTable {
 /// Taken from the kernel rather than parsed out of `ps`, whose `lstart` column is a
 /// locale-formatted local time — exactly the sort of thing that reads correctly on the
 /// machine it was written on and shifts by hours elsewhere.
+///
+/// **A delegation, and deliberately so** (tabmeta-session-keying D6). The body moved to
+/// `tabmeta::proc` when the sidebar's metadata worker began needing the same
+/// value: this number is the input to `ai_monitor::validated_session_id`, which exists solely
+/// to reject a stale `~/.claude/sessions/` record left behind on a recycled pid. Two copies
+/// of that input, drifting apart, is the failure mode `validated_session_id`'s own doc
+/// describes as having already produced two defects in this feature. One rule, one function.
 fn start_ms(pid: u32) -> Option<u64> {
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    let n = unsafe {
-        libc::proc_pidinfo(
-            pid as libc::c_int,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            &mut info as *mut _ as *mut libc::c_void,
-            size,
-        )
-    };
-    if n != size {
-        return None;
-    }
-    let ms = info
-        .pbi_start_tvsec
-        .saturating_mul(1_000)
-        .saturating_add(info.pbi_start_tvusec / 1_000);
-    // A start time in the future is not a usable date to match against — better no
-    // hint than a wrong one.
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
-    (ms > 0 && ms <= now).then_some(ms)
+    // The **uncounted** body: same implementation (D6's whole point — one rule, one
+    // function), but without `tabmeta`'s `PROC_START` cost probe. The panel has no business
+    // firing the sidebar's instrumentation, and while it did, `tabmeta`'s absolute
+    // assertions on that counter were a latent flake — these tests hold no probe lock.
+    crate::tabmeta::proc::start_ms_uncounted(pid)
 }
 
 /// A session id is a UUID, and it becomes a filename — so anything that is not one is
 /// rejected rather than joined onto a path.
+/// A delegation (tabmeta-session-keying): the rule moved to `ai_monitor`, which owns the
+/// session-id vocabulary, so the panel's `--resume` parser here and the sidebar card's argv
+/// tier apply one guard rather than two copies that can drift apart.
 fn looks_like_session_id(s: &str) -> bool {
-    s.len() == 36
-        && s.as_bytes().iter().enumerate().all(|(i, &b)| match i {
-            8 | 13 | 18 | 23 => b == b'-',
-            _ => b.is_ascii_hexdigit(),
-        })
+    ai_monitor::looks_like_session_id(s)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// A process table shaped like the measured one: two mac-terminal tabs each with
     /// their own `claude`, and Warp running a resumed session in the same project.
@@ -731,6 +720,24 @@ mod tests {
         assert!(started <= now, "not in the future");
         assert!(now - started < 24 * 3_600_000, "not a day old");
         assert_eq!(start_ms(u32::MAX), None, "a dead pid yields nothing");
+    }
+
+    #[test]
+    fn start_ms_is_the_same_function_the_sidebar_uses() {
+        // R1.4 / R7.5 — the panel and the sidebar card must validate registry records
+        // against the SAME process-start number. This asserts the delegation is real: if
+        // someone re-inlines a second `proc_pidinfo` here, the two could drift and a stale
+        // record would be accepted by one path and rejected by the other.
+        let pid = std::process::id();
+        assert_eq!(
+            start_ms(pid),
+            crate::tabmeta::proc::start_ms_uncounted(pid),
+            "tabsession::start_ms must delegate to tabmeta::proc's shared body"
+        );
+        assert_eq!(
+            start_ms(u32::MAX),
+            crate::tabmeta::proc::start_ms_uncounted(u32::MAX)
+        );
     }
 
     #[test]

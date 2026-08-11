@@ -146,14 +146,36 @@ pub(crate) fn classify_with(
     None
 }
 
+/// The agent a walk found: which one, **and which process it is**.
+///
+/// The pid used to be discarded — the walk visited it, classified it, and returned only the
+/// kind. That was sufficient while the only question was "is an agent running here". It is
+/// not sufficient for "which session is this tab showing": answering that means asking the
+/// process itself (`~/.claude/sessions/<pid>.json`), which needs the pid the walk already
+/// had in hand (tabmeta-session-keying D5). Returning it is what lets the card resolve its
+/// own session **without** `tabsession::hint_for`, which forks `/bin/ps` and is far too
+/// expensive for a per-tick worker.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Detected {
+    pub(crate) kind: AgentKind,
+    pub(crate) pid: u32,
+}
+
 /// Breadth-first, bounded, early-exit walk (D6). Generic over `children` and `classify`
 /// so R5.1–R5.4 test every bound against a fake tree. The root (the tab's zsh) is not
-/// itself classified — only its descendants, from depth 1. Returns the first match.
+/// itself classified — only its descendants, from depth 1. Returns the first match, as
+/// [`Detected`] — the kind *and* the pid that produced it.
+///
+/// **Order is now load-bearing.** Depth ordering is this loop's own (breadth-first, so a
+/// `claude` the user launched at depth 1–2 is always classified before one a tool call
+/// spawned at depth 3). Order *within* a level comes from the `children` provider, and the
+/// production provider (`proc::children_of` → `parse_childpids`) sorts ascending precisely
+/// so that this first-match is reproducible.
 pub(crate) fn walk(
     root: u32,
     children: impl Fn(u32) -> Vec<u32>,
     classify: impl Fn(u32) -> Option<AgentKind>,
-) -> Option<AgentKind> {
+) -> Option<Detected> {
     let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
     for child in children(root) {
         queue.push_back((child, 1));
@@ -165,7 +187,7 @@ pub(crate) fn walk(
         }
         visited += 1;
         if let Some(kind) = classify(pid) {
-            return Some(kind); // first match short-circuits (R5.3)
+            return Some(Detected { kind, pid }); // first match short-circuits (R5.3)
         }
         // A dead pid's `children` is empty; the queue simply carries on (R5.4).
         if depth < MAX_DEPTH {
@@ -179,7 +201,7 @@ pub(crate) fn walk(
 
 /// Production entry point: classify the descendants of `pid` using T2's real syscalls.
 /// A dead root pid yields `None` (its child list is empty), never a panic (R5.6).
-pub(crate) fn agent_of_pid(pid: u32) -> Option<AgentKind> {
+pub(crate) fn agent_of_pid(pid: u32) -> Option<Detected> {
     walk(pid, super::proc::children_of, classify_pid)
 }
 
@@ -372,7 +394,13 @@ mod tests {
             visited.borrow_mut().push(pid);
             matches.get(&pid).copied()
         });
-        assert_eq!(got, Some(AgentKind::Claude));
+        assert_eq!(
+            got,
+            Some(Detected {
+                kind: AgentKind::Claude,
+                pid: 2
+            })
+        );
         assert!(
             !visited.borrow().contains(&100),
             "second subtree must not be visited"
@@ -386,7 +414,53 @@ mod tests {
         // pid 3 intentionally absent from the tree → empty child list.
         let matches: HashMap<u32, AgentKind> = [(4, AgentKind::Codex)].into_iter().collect();
         let got = walk(1, children_of(&tree), |pid| matches.get(&pid).copied());
-        assert_eq!(got, Some(AgentKind::Codex));
+        assert_eq!(
+            got,
+            Some(Detected {
+                kind: AgentKind::Codex,
+                pid: 4
+            })
+        );
+    }
+
+    // ---- the walk reports an identity, not just a kind (R1.1, R1.3) ----
+
+    #[test]
+    fn walk_reports_the_pid_that_matched() {
+        // R1.1 — the pid is the whole point: it is what `~/.claude/sessions/<pid>.json` is
+        // keyed on, so discarding it is what forced the old cwd-ranking.
+        let tree: HashMap<u32, Vec<u32>> = [(1, vec![2])].into_iter().collect();
+        let matches: HashMap<u32, AgentKind> = [(2, AgentKind::Claude)].into_iter().collect();
+        let got = walk(1, children_of(&tree), |pid| matches.get(&pid).copied());
+        assert_eq!(
+            got,
+            Some(Detected {
+                kind: AgentKind::Claude,
+                pid: 2
+            }),
+            "the walk must report WHICH process it classified"
+        );
+    }
+
+    #[test]
+    fn depth_outranks_pid_order() {
+        // R1.3 — `parse_childpids` sorts *within* a level; it must never reorder *across*
+        // levels. A depth-1 `claude` with a high pid still beats a depth-2 one with a low
+        // pid, because the shallower process is the one the user launched in this tab.
+        //
+        // Note this test injects its own children provider, so it deliberately bypasses the
+        // production sort — which is exactly why the sort lives in `parse_childpids` and is
+        // tested there: the two properties are independent and are pinned independently.
+        let tree: HashMap<u32, Vec<u32>> = [(1, vec![50]), (50, vec![2])].into_iter().collect();
+        let matches: HashMap<u32, AgentKind> = [(2, AgentKind::Claude), (50, AgentKind::Claude)]
+            .into_iter()
+            .collect();
+        let got = walk(1, children_of(&tree), |pid| matches.get(&pid).copied());
+        assert_eq!(
+            got.map(|f| f.pid),
+            Some(50),
+            "depth 1 wins over depth 2 regardless of pid value"
+        );
     }
 
     #[test]

@@ -48,9 +48,28 @@ struct Deriver {
     /// the worker's and it needs no plumbing through `pass()` or `run()`.
     tmux_memo: TmuxMemo,
     projects_root: Option<PathBuf>,
+    /// `~/.claude/sessions` — where `claude` records which session each pid is running.
+    /// Held beside `projects_root` and threaded into resolution rather than read from
+    /// `$HOME` at the point of use, so every tier stays testable against a temp directory.
+    sessions_root: Option<PathBuf>,
     debug_seen: HashMap<TabId, AgentKind>,
     enabled_git: bool,
     enabled_agent: bool,
+    /// The three kernel reads a full derivation makes, injected as plain function pointers so
+    /// [`Deriver::pass`] is drivable over a **fake process tree**.
+    ///
+    /// Not gold-plating, and not only a testing nicety: without this seam the identity chain
+    /// `walk → pid → start_ms → ClaudeId` has no test at the layer that assembles it, and a
+    /// mutation test proved that concretely — hardcoding `start_ms: None` here left the whole
+    /// suite green while making tier 1 unreachable for every tab in production, i.e. silently
+    /// restoring the very defect this feature exists to fix. `agent::walk` was already generic
+    /// over its children/classify closures for the same reason; this extends that one level up.
+    ///
+    /// Function pointers, not generics, so `Deriver` stays a concrete type and `run()` is
+    /// unchanged.
+    agent_of: fn(u32) -> Option<super::agent::Detected>,
+    cwd_of: fn(u32) -> Option<PathBuf>,
+    start_ms_of: fn(u32) -> Option<u64>,
 }
 
 impl Deriver {
@@ -60,9 +79,13 @@ impl Deriver {
             act_memo: ActivityMemo::new(),
             tmux_memo: TmuxMemo::new(),
             projects_root: ai_monitor::claude_projects_dir(),
+            sessions_root: ai_monitor::claude_sessions_dir(),
             debug_seen: HashMap::new(),
             enabled_git: true,
             enabled_agent: true,
+            agent_of: super::agent::agent_of_pid,
+            cwd_of: super::proc::cwd_of_pid,
+            start_ms_of: super::proc::start_ms_of_pid,
         }
     }
 
@@ -82,13 +105,13 @@ impl Deriver {
         // with nothing on screen connecting cause to effect. The toggles still skip the
         // expensive work (`.git` I/O, the agent walk); they no longer skip a `proc_pidinfo`.
         let root = super::tmux::effective_root(&mut self.tmux_memo, tp.pid, tick);
-        let (root, cwd) = match super::proc::cwd_of_pid(root) {
+        let (root, cwd) = match (self.cwd_of)(root) {
             Some(c) => (root, Some(c)),
             // The pane died between `effective_root`'s liveness check and here: retry from
             // the tab's own shell so the card degrades to today's metadata rather than
             // going blank. The rebound `root` also redirects `agent_of_pid` below, so
             // branch and agent never describe different processes.
-            None if root != tp.pid => (tp.pid, super::proc::cwd_of_pid(tp.pid)),
+            None if root != tp.pid => (tp.pid, (self.cwd_of)(tp.pid)),
             None => (tp.pid, None),
         };
 
@@ -100,19 +123,25 @@ impl Deriver {
         };
 
         let (agent, task) = if self.enabled_agent {
-            match super::agent::agent_of_pid(root) {
-                Some(kind) => {
-                    let state = self.activity(kind, cwd.as_deref(), tick, now);
-                    // The "current task" label (tab-identity): only Claude has a log source
-                    // (D7), and `self.activity` just warmed the role memo for this cwd, so
-                    // this is a pure memo read — no extra I/O (R4.2). A non-Claude agent or an
-                    // unresolved log yields `None`, so the card falls back to the cwd title.
-                    let task = if kind == AgentKind::Claude {
-                        cwd.as_deref()
-                            .and_then(|c| super::activity::label_of_cwd(&self.act_memo, c))
-                    } else {
-                        None
-                    };
+            match (self.agent_of)(root) {
+                Some(super::agent::Detected { kind, pid }) => {
+                    // The tab's own agent process, paired with its start time — the identity
+                    // that lets resolution name this tab's session instead of ranking the
+                    // project directory. One `proc_pidinfo` on a pid the walk just touched; it
+                    // is `Option` because a dead or freshly-recycled pid has none, and
+                    // resolution downgrades the tier rather than discarding the identity.
+                    //
+                    // **Behind the Claude gate on purpose.** Only Claude has a session registry
+                    // to validate against (D7), so reading a start time for a Codex or Gemini
+                    // tab buys nothing and would tax every agent tab on the machine to serve
+                    // the Claude ones — which Confirmed Goal 4 ("tabs with no Claude agent pay
+                    // nothing new") forbids. The gate used to sit one frame lower, inside
+                    // `activity`, which read the start time first and discarded it.
+                    let claude = (kind == AgentKind::Claude).then(|| super::ClaudeId {
+                        pid,
+                        start_ms: (self.start_ms_of)(pid),
+                    });
+                    let (state, task) = self.activity(kind, cwd.as_deref(), claude, tick, now);
                     (Some(Agent { kind, state }), task)
                 }
                 None => (None, None),
@@ -129,21 +158,54 @@ impl Deriver {
         }
     }
 
-    /// The activity state for a detected agent. Only Claude has a log source (D7); every
-    /// other agent — and a Claude whose log cannot be resolved — is `Unknown` (R6.5).
+    /// The activity state **and** the tab-identity label for a detected agent. Only Claude
+    /// has a log source (D7); every other agent — and a Claude whose log cannot be resolved —
+    /// is `Unknown` with no label (R6.5).
+    ///
+    /// Resolution runs once and both readings come from the same `Found`, replacing the old
+    /// arrangement where the caller re-derived the label from a shared cwd map key and a
+    /// comment promised the two would agree.
     fn activity(
         &mut self,
         kind: AgentKind,
         cwd: Option<&Path>,
+        claude: Option<super::ClaudeId>,
         tick: u64,
         now: SystemTime,
-    ) -> AgentState {
-        if kind == AgentKind::Claude {
-            if let (Some(root), Some(cwd)) = (self.projects_root.clone(), cwd) {
-                return super::activity::state_of_cwd(&mut self.act_memo, &root, cwd, tick, now);
+    ) -> (AgentState, Option<String>) {
+        if kind != AgentKind::Claude {
+            return (AgentState::Unknown, None);
+        }
+        // Destructured once, rather than `self.projects_root.clone()` twice inside the
+        // pattern: the clones existed only to end the `&self` borrow before `&mut
+        // self.act_memo` below, and two `PathBuf` allocations per Claude tab per refresh is
+        // not a cost a requirement titled "honestly counted" should be paying invisibly.
+        let Deriver {
+            projects_root: Some(projects),
+            sessions_root: Some(sessions),
+            act_memo,
+            ..
+        } = self
+        else {
+            return (AgentState::Unknown, None);
+        };
+        let Some(cwd) = cwd else {
+            return (AgentState::Unknown, None);
+        };
+        match super::activity::resolve_log(act_memo, projects, sessions, cwd, claude, tick) {
+            super::activity::Resolution::Found(found) => {
+                let state = super::activity::state_of_found(act_memo, &found, tick, now);
+                // A pure memo read: `state_of_found` just warmed the entry for this exact
+                // log, so the label costs no further I/O (R4.2).
+                let label = super::activity::label_of_log(act_memo, &found.log);
+                (state, label)
+            }
+            // The session is named and has written nothing yet: an agent is here, but there
+            // is no task to show. Never a neighbour's log.
+            super::activity::Resolution::NamedButUnwritten | super::activity::Resolution::None => {
+                (AgentState::Unknown, None)
             }
         }
-        AgentState::Unknown
     }
 
     /// A full derivation pass: refresh the tabs due this tick (D4), reuse `prev` for the
@@ -382,6 +444,8 @@ mod tests {
             &super::super::probe::PROC_CHILDREN,
             &super::super::probe::PROC_EXE,
             &super::super::probe::PROC_ARGS,
+            &super::super::probe::PROC_START,
+            &super::super::probe::SESSION_REG,
             &super::super::probe::GIT_STAT,
             &super::super::probe::GIT_READ,
             &super::super::probe::LOG_RESOLVE,
@@ -390,6 +454,496 @@ mod tests {
         ] {
             assert_eq!(c.get(), 0, "empty roster must not touch any source");
         }
+    }
+
+    // ---- the identity path's cost is gated on actually having a Claude (R5.5, R5.6) ----
+
+    #[test]
+    fn a_tab_with_no_claude_agent_pays_nothing_for_identity() {
+        // R5.5 — `start_ms_of_pid` and the registry read hang off a *found* Claude, so a tab
+        // running a plain shell (like this test binary) must not pay either. Without this
+        // gate the feature would tax every tab on the machine to serve the ones with agents.
+        let _g = super::super::probe::serial();
+        let mut d = Deriver::new();
+        let tp = TabPid {
+            id: TabId(0),
+            pid: std::process::id(),
+        };
+        super::super::probe::reset_all();
+        let meta = d.tab(&tp, 0, SystemTime::now());
+        assert!(meta.agent.is_none(), "the test binary runs no agent");
+        assert_eq!(
+            super::super::probe::PROC_START.get(),
+            0,
+            "no agent → no start-time read"
+        );
+        assert_eq!(
+            super::super::probe::SESSION_REG.get(),
+            0,
+            "no agent → no registry read"
+        );
+        assert_eq!(meta.task, None, "no agent → no task label");
+    }
+
+    // ---- the wiring: resolve once, read state AND label from the same log ----
+    //
+    // These drive a full `pass()` over a **fake process tree**, via the `agent_of` / `cwd_of` /
+    // `start_ms_of` function pointers on `Deriver`. An earlier revision drove `Deriver::activity`
+    // directly, on the reasoning that a unit test cannot manufacture a live `claude` descendant.
+    // That reasoning was wrong in an important way: it is true of `agent_of_pid`, but the walk
+    // is not the only thing `pass()` adds. It also assembles the identity chain
+    // `walk → pid → start_ms → ClaudeId`, and a mutation test showed that chain had NO coverage
+    // — hardcoding `start_ms: None` in `tab()` left all 565 tests green while making tier 1
+    // unreachable for every tab in production, silently restoring the reported defect.
+    //
+    // So the seam moved up one level, exactly as `agent::walk` already is generic over its
+    // children/classify closures. `tab()` is now driven end to end.
+
+    fn fixture_roots(tag: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("tabmeta-wk-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let projects = base.join("projects");
+        let sessions = base.join("sessions");
+        std::fs::create_dir_all(&projects).expect("mkdir projects");
+        std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+        (projects, sessions)
+    }
+
+    fn write_log(projects: &Path, cwd: &Path, session_id: &str, body: &str) -> PathBuf {
+        let dir = projects.join(ai_monitor::encode_cwd(cwd));
+        std::fs::create_dir_all(&dir).expect("mkdir project");
+        let p = dir.join(format!("{session_id}.jsonl"));
+        std::fs::write(&p, body).expect("write log");
+        p
+    }
+
+    fn write_registry(sessions: &Path, pid: u32, session_id: &str, cwd: &Path, started: u64) {
+        let body = format!(
+            r#"{{"pid":{pid},"sessionId":"{session_id}","cwd":"{}","startedAt":{started}}}"#,
+            cwd.display()
+        );
+        std::fs::write(sessions.join(format!("{pid}.json")), body).expect("write registry");
+    }
+
+    fn prompt_line(text: &str) -> String {
+        format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        ) + "\n"
+    }
+
+    const SID_A: &str = "02a3919c-58e8-446b-babc-d3dc616543c5";
+    const SID_B: &str = "26fa908b-3225-428e-9ca2-de04e31c115d";
+
+    fn deriver_at(projects: PathBuf, sessions: PathBuf) -> Deriver {
+        let mut d = Deriver::new();
+        d.projects_root = Some(projects);
+        d.sessions_root = Some(sessions);
+        // Isolate: the fake cwds are not git repos, so leaving git on would add a `.git`
+        // probe per tab and nothing else. The cost is that no `pass()` test here covers
+        // `tab()`'s git half — deliberate, since `steady_state_repo_derivation_does_no_git_read`
+        // already owns that against a real repo.
+        d.enabled_git = false;
+        d
+    }
+
+    /// The fake tree the `pass()` tests run over. Every tab reports `THE_CWD`, every process
+    /// started at 1_000, and the tab's shell at pid N runs a `claude` at **pid N + `AGENT_PID_OFFSET`**.
+    ///
+    /// **The offset is load-bearing, not decoration.** An earlier version used the identity
+    /// (`|pid| Detected { pid }`) with the comment "deliberately not pid+1 … an identity
+    /// transform is what a mutation would break". That reasoning was backwards, and a mutation
+    /// proved it: with the identity fake, `tab_pid == root == walk_pid` are one number, so
+    /// rebuilding `ClaudeId` from `root` instead of the walk's `pid` failed **zero** tests.
+    /// A transform is what separates the three candidate sources; the identity collapses them.
+    const THE_CWD: &str = "/proj/shared";
+    const AGENT_PID_OFFSET: u32 = 1_000;
+
+    fn with_fake_tree(d: &mut Deriver) {
+        d.cwd_of = |_| Some(PathBuf::from(THE_CWD));
+        d.agent_of = |pid| {
+            Some(super::super::agent::Detected {
+                kind: AgentKind::Claude,
+                pid: pid + AGENT_PID_OFFSET,
+            })
+        };
+        d.start_ms_of = |_| Some(1_000);
+    }
+
+    /// The `claude` pid the fake tree reports for a tab whose shell is at `n` — i.e. the pid a
+    /// registry fixture must be keyed on.
+    fn agent_pid(n: u32) -> u32 {
+        n + AGENT_PID_OFFSET
+    }
+
+    /// A tab whose id and shell pid are the same number, so a failure message names the tab
+    /// and the process at once.
+    ///
+    /// The numbers callers pass are deliberately far above any live pid (`900_1xx`): `tab()`
+    /// still calls the real `tmux::effective_root`, which is not injected, so a pid that
+    /// happened to be alive and running a tmux client would re-root the derivation and make
+    /// these fixtures machine-dependent. An unallocatable pid fails the presence gate
+    /// deterministically, which is exactly why `root == tp.pid` holds here.
+    fn tp(n: u32) -> TabPid {
+        TabPid {
+            id: TabId(n as u64),
+            pid: n,
+        }
+    }
+
+    /// Run a full **stripe** of real `pass()` calls and return the final `(TabId, TabMeta)`.
+    ///
+    /// One `pass()` is not enough: `should_refresh` staggers background tabs across
+    /// `BG_INTERVAL` ticks (D4), so a single call derives only the tabs whose slot matches
+    /// this tick's phase and reuses `prev` for the rest. Running the whole stripe — threading
+    /// `prev` exactly as `run()` does — is what guarantees every tab in the roster has been
+    /// derived at least once, and it exercises the `prev`-reuse path into the bargain.
+    ///
+    /// **Ticks replay across calls**: `pass_over(.., 0)` runs ticks 0–3 and `pass_over(.., 1)`
+    /// then runs 1–4, so a test that calls it twice sees a non-monotonic tick sequence. Benign
+    /// for every current consumer — the memos compare with `saturating_sub`, so a tick going
+    /// backwards reads as "fresh" — but a future test that needs `RESOLVE_TTL_TICKS` or
+    /// `MEMO_TTL_TICKS` to *expire* must space its base ticks by at least `BG_INTERVAL`, or the
+    /// expiry it is testing will silently not happen.
+    fn pass_over(d: &mut Deriver, roster: &[TabPid], base_tick: u64) -> Vec<(TabId, TabMeta)> {
+        let mut out: Vec<(TabId, TabMeta)> = Vec::new();
+        for k in 0..BG_INTERVAL {
+            out = d.pass(roster, None, base_tick + k, SystemTime::now(), &out);
+        }
+        out
+    }
+
+    fn meta_of(out: &[(TabId, TabMeta)], n: u32) -> TabMeta {
+        out.iter()
+            .find(|(t, _)| *t == TabId(n as u64))
+            .map(|(_, m)| m.clone())
+            .expect("tab in pass output")
+    }
+
+    #[test]
+    fn two_tabs_in_one_project_derive_independent_label_and_state() {
+        // R0.1 + R0.2 — the reported bug, driven through a real two-tab `pass()`. Same cwd,
+        // two sessions: two labels, two states. Before this feature both tabs read one ranked
+        // log and were guaranteed to agree.
+        let _g = super::super::probe::serial();
+        let (projects, sessions) = fixture_roots("two-tabs");
+        let cwd = Path::new(THE_CWD);
+        // A: a substantive prompt, then the agent hands back → Waiting.
+        write_log(
+            &projects,
+            cwd,
+            SID_A,
+            &(prompt_line("refactor the auth module")
+                + r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn"}}"#
+                + "\n"),
+        );
+        // B: a substantive prompt, then mid-tool-call → Busy.
+        write_log(
+            &projects,
+            cwd,
+            SID_B,
+            &(prompt_line("fix the flaky test")
+                + r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use"}}"#
+                + "\n"),
+        );
+        write_registry(&sessions, agent_pid(900_101), SID_A, cwd, 1_000);
+        write_registry(&sessions, agent_pid(900_202), SID_B, cwd, 1_000);
+
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        let out = pass_over(&mut d, &[tp(900_101), tp(900_202)], 0);
+
+        let a = meta_of(&out, 900_101);
+        let b = meta_of(&out, 900_202);
+        assert_eq!(a.task.as_deref(), Some("refactor the auth module"));
+        assert_eq!(b.task.as_deref(), Some("fix the flaky test"));
+        assert_ne!(a.task, b.task, "two sessions must not share one label");
+        assert_eq!(a.agent.map(|x| x.state), Some(AgentState::Waiting));
+        assert_eq!(b.agent.map(|x| x.state), Some(AgentState::Busy));
+        assert_ne!(a.agent, b.agent, "two sessions must not share one badge");
+    }
+
+    #[test]
+    fn a_fresh_session_does_not_inherit_its_neighbours_label() {
+        // R0.3 — the exact reported symptom, through `pass()`. Session B is NEWER by mtime (so
+        // the old ranking preferred it) but has no substantive prompt yet. The old cwd-keyed
+        // carry-forward then supplied A's label and both cards showed A's prompt. Now B shows
+        // nothing and its card falls back to the cwd title.
+        let _g = super::super::probe::serial();
+        let (projects, sessions) = fixture_roots("fresh-session");
+        let cwd = Path::new(THE_CWD);
+        write_log(
+            &projects,
+            cwd,
+            SID_A,
+            &prompt_line("How to start no permission mode claude code"),
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        write_log(
+            &projects,
+            cwd,
+            SID_B,
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\"}}\n",
+        );
+        write_registry(&sessions, agent_pid(900_101), SID_A, cwd, 1_000);
+        write_registry(&sessions, agent_pid(900_202), SID_B, cwd, 1_000);
+
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        // Tab 101 is derived first in roster order — this is what used to poison the shared
+        // cwd entry that tab 202 then read.
+        let out = pass_over(&mut d, &[tp(900_101), tp(900_202)], 0);
+        assert_eq!(
+            meta_of(&out, 900_101).task.as_deref(),
+            Some("How to start no permission mode claude code")
+        );
+        assert_eq!(
+            meta_of(&out, 900_202).task,
+            None,
+            "the fresh session has no task of its own yet, and must not borrow one"
+        );
+    }
+
+    #[test]
+    fn a_named_but_unwritten_session_is_unknown_with_no_task() {
+        // D10 claim 1 — the tier-2 render. The directory holds another session's log and not
+        // one line of it reaches this tab.
+        let _g = super::super::probe::serial();
+        let (projects, sessions) = fixture_roots("unwritten");
+        let cwd = Path::new(THE_CWD);
+        write_log(&projects, cwd, SID_B, &prompt_line("someone else's task"));
+        write_registry(&sessions, agent_pid(900_101), SID_A, cwd, 1_000); // SID_A.jsonl absent
+
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        let m = meta_of(&pass_over(&mut d, &[tp(900_101)], 0), 900_101);
+        assert_eq!(m.agent.map(|x| x.state), Some(AgentState::Unknown));
+        assert_eq!(m.task, None, "never a neighbour's label");
+    }
+
+    #[test]
+    fn the_first_write_promotes_a_tab_out_of_tier_two() {
+        // R4.2 — tier 2 is not a trap: the moment the session writes, the next refresh picks
+        // it up. No TTL to wait out, because identity is re-derived every refresh.
+        let _g = super::super::probe::serial();
+        let (projects, sessions) = fixture_roots("promote");
+        let cwd = Path::new(THE_CWD);
+        write_registry(&sessions, agent_pid(900_101), SID_A, cwd, 1_000);
+
+        let mut d = deriver_at(projects.clone(), sessions);
+        with_fake_tree(&mut d);
+        let m = meta_of(&pass_over(&mut d, &[tp(900_101)], 0), 900_101);
+        assert_eq!(m.agent.map(|x| x.state), Some(AgentState::Unknown));
+        assert_eq!(m.task, None);
+
+        write_log(&projects, cwd, SID_A, &prompt_line("the first real task"));
+        let m = meta_of(&pass_over(&mut d, &[tp(900_101)], 1), 900_101);
+        assert_eq!(
+            m.task.as_deref(),
+            Some("the first real task"),
+            "picked up on the very next refresh"
+        );
+    }
+
+    #[test]
+    fn the_walks_pid_is_what_reaches_resolution() {
+        // The identity chain `walk → pid → start_ms → ClaudeId`, pinned end to end.
+        //
+        // This exists because a mutation test found the chain had no coverage at all:
+        // hardcoding `start_ms: None` in `tab()` left the entire suite green while making
+        // tier 1 unreachable in production. Here the two tabs' registry records are keyed on
+        // DIFFERENT pids, so a `tab()` that passed the wrong pid — or dropped the start time
+        // and fell to ranking — resolves the wrong session and this fails on the label.
+        let _g = super::super::probe::serial();
+        let (projects, sessions) = fixture_roots("identity-chain");
+        let cwd = Path::new(THE_CWD);
+        write_log(&projects, cwd, SID_A, &prompt_line("the tab-101 task"));
+        write_log(&projects, cwd, SID_B, &prompt_line("the tab-202 task"));
+        // Only these exact pids have records. Any other pid → no tier 1.
+        write_registry(&sessions, agent_pid(900_101), SID_A, cwd, 1_000);
+        write_registry(&sessions, agent_pid(900_202), SID_B, cwd, 1_000);
+
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        let out = pass_over(&mut d, &[tp(900_101), tp(900_202)], 0);
+        assert_eq!(
+            meta_of(&out, 900_101).task.as_deref(),
+            Some("the tab-101 task")
+        );
+        assert_eq!(
+            meta_of(&out, 900_202).task.as_deref(),
+            Some("the tab-202 task")
+        );
+
+        // And the start time is load-bearing: drop it and tier 1 cannot validate, so both
+        // tabs fall to mtime ranking and collapse onto ONE label — the original defect.
+        d.start_ms_of = |_| None;
+        let out = pass_over(&mut d, &[tp(900_101), tp(900_202)], 1);
+        assert_eq!(
+            meta_of(&out, 900_101).task,
+            meta_of(&out, 900_202).task,
+            "without a start time both tabs rank the directory and agree — which is exactly \
+             the defect, and is why `start_ms_of_pid` must not be dropped from `tab()`"
+        );
+    }
+
+    #[test]
+    fn a_warm_claude_tab_pays_one_start_time_read_per_refresh() {
+        // R5.4 — asserted as a FLOOR, never an equality: `PROC_START` is a process-global
+        // counter and `tabsession` calls the same function from tests this one does not
+        // coordinate with. The floor is what the requirement actually bounds — that the read
+        // happens once per refresh rather than being memoised away.
+        let _g = super::super::probe::serial();
+        let (projects, sessions) = fixture_roots("start-floor");
+        let cwd = Path::new(THE_CWD);
+        write_log(&projects, cwd, SID_A, &prompt_line("a task"));
+        write_registry(&sessions, agent_pid(900_101), SID_A, cwd, 1_000);
+
+        let mut d = deriver_at(projects, sessions);
+        // The fake tree supplies the walk and the cwd, but `start_ms_of` stays the REAL
+        // reader — it is the counter under test.
+        d.cwd_of = |_| Some(PathBuf::from(THE_CWD));
+        d.agent_of = |pid| {
+            Some(super::super::agent::Detected {
+                kind: AgentKind::Claude,
+                pid,
+            })
+        };
+        let _ = pass_over(&mut d, &[tp(900_101)], 0);
+        super::super::probe::reset_all();
+        let _ = pass_over(&mut d, &[tp(900_101)], 1);
+        assert!(
+            super::super::probe::PROC_START.get() >= 1,
+            "a Claude tab must re-read its process start time every refresh"
+        );
+    }
+
+    #[test]
+    fn a_non_claude_agent_tab_pays_no_start_time_read() {
+        // Confirmed Goal 4 / D3 — "tabs with no Claude agent pay nothing new". Only Claude
+        // has a session registry to validate against, so reading a start time for a Codex tab
+        // buys nothing. The gate used to sit one frame lower, which taxed every agent tab on
+        // the machine to serve the Claude ones.
+        let _g = super::super::probe::serial();
+        let (projects, sessions) = fixture_roots("non-claude");
+        let mut d = deriver_at(projects, sessions);
+        d.cwd_of = |_| Some(PathBuf::from(THE_CWD));
+        d.agent_of = |pid| {
+            Some(super::super::agent::Detected {
+                kind: AgentKind::Codex,
+                pid,
+            })
+        };
+        super::super::probe::reset_all();
+        let m = meta_of(&pass_over(&mut d, &[tp(900_101)], 0), 900_101);
+        assert_eq!(m.agent.map(|x| x.kind), Some(AgentKind::Codex));
+        assert_eq!(m.agent.map(|x| x.state), Some(AgentState::Unknown));
+        assert_eq!(
+            super::super::probe::PROC_START.get(),
+            0,
+            "a non-Claude agent must not trigger the start-time read"
+        );
+        assert_eq!(
+            super::super::probe::SESSION_REG.get(),
+            0,
+            "…nor the registry read"
+        );
+    }
+
+    #[test]
+    fn re_deriving_identity_does_not_perturb_the_derived_value() {
+        // R6.4 / D10 claim 2 — the property that keeps the G1 idle-CPU guarantee alive. It is
+        // NOT "the machine is quiet": it is that nothing the per-refresh registry read
+        // produces reaches `TabMeta`. Only the resolved log's derived (state, label) does, so
+        // an unchanged session yields a byte-identical result however often we re-ask.
+        let _g = super::super::probe::serial();
+        let (projects, sessions) = fixture_roots("stable");
+        let cwd = Path::new("/proj/stable");
+        write_log(
+            &projects,
+            cwd,
+            SID_A,
+            &(prompt_line("a steady task")
+                + r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn"}}"#
+                + "\n"),
+        );
+        write_registry(&sessions, agent_pid(900_101), SID_A, cwd, 1_000);
+
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        let first = meta_of(&pass_over(&mut d, &[tp(900_101)], 0), 900_101);
+        // Pin the CONTENT before pinning its stability. Without this the test passes under a
+        // uniformly-degraded derivation — a mutation forcing `activity()` to always return
+        // `(Unknown, None)` satisfied "ten passes agree" perfectly. Stability is only worth
+        // asserting about a value that is also correct. (`branch` is not covered: `deriver_at`
+        // disables git, so this pins agent/task/cwd.)
+        assert_eq!(first.task.as_deref(), Some("a steady task"));
+        assert_eq!(first.agent.map(|a| a.state), Some(AgentState::Waiting));
+        for tick in 1..10 {
+            let again = meta_of(&pass_over(&mut d, &[tp(900_101)], tick), 900_101);
+            assert_eq!(
+                again, first,
+                "pass {tick} differed — a re-derivation leaked into the published value"
+            );
+        }
+        // ...and the differ therefore stays silent, which is the consequence that matters.
+        let s = shared();
+        let woke = Arc::new(AtomicU64::new(0));
+        let w = woke.clone();
+        let wake = move || {
+            w.fetch_add(1, Ordering::Relaxed);
+        };
+        let mut published = Vec::new();
+        for _ in 0..10 {
+            let next = vec![(TabId(900_101), first.clone())];
+            publish_if_changed(&s, &mut published, next, &wake);
+        }
+        assert_eq!(
+            woke.load(Ordering::Relaxed),
+            1,
+            "ten identical passes must wake exactly once"
+        );
+    }
+
+    #[test]
+    fn a_missing_start_time_downgrades_the_tier_instead_of_discarding_the_pid() {
+        // R1.5 at the worker seam — a `None` start time must not throw the identity away. It
+        // only rules out the registry tier (there is nothing to validate the record against);
+        // resolution continues, and with no argv id either it lands on ranking.
+        let _g = super::super::probe::serial();
+        let (projects, sessions) = fixture_roots("no-start");
+        // THE_CWD, because `with_fake_tree` is what tells the deriver where this tab is.
+        let cwd = Path::new(THE_CWD);
+        write_log(&projects, cwd, SID_A, &prompt_line("the ranked task"));
+        write_registry(&sessions, agent_pid(900_101), SID_A, cwd, 1_000);
+
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        d.start_ms_of = |_| None; // the process start time cannot be read
+        super::super::probe::reset_all();
+        let task = meta_of(&pass_over(&mut d, &[tp(900_101)], 0), 900_101).task;
+        assert_eq!(
+            super::super::probe::SESSION_REG.get(),
+            0,
+            "no start time → the record cannot be validated, so it is not even read"
+        );
+        assert_eq!(
+            task.as_deref(),
+            Some("the ranked task"),
+            "the tab still gets today's answer rather than going blank"
+        );
+    }
+
+    #[test]
+    fn tabmeta_still_has_exactly_its_four_published_fields() {
+        // R6.5 — a compile-time assertion. If a field is added, removed or retyped this stops
+        // building, which is the point: the renderer and the snapshot contract are downstream
+        // and this feature promised not to move them.
+        let TabMeta {
+            branch: _,
+            agent: _,
+            cwd: _,
+            task: _,
+        } = TabMeta::default();
     }
 
     #[test]
@@ -432,7 +986,7 @@ mod tests {
         // side-effect free. Pinned explicitly so a future memo cannot break it invisibly.
         let _g = super::super::probe::serial();
         super::super::probe::reset_all();
-        let _d = Deriver::new();
+        let d = Deriver::new();
         for c in [
             &super::super::probe::PROC_CWD,
             &super::super::probe::PROC_CHILDREN,
@@ -440,8 +994,21 @@ mod tests {
             &super::super::probe::PROC_TTY,
             &super::super::probe::TTY_STAT,
             &super::super::probe::TMUX_LIST,
+            &super::super::probe::PROC_START,
+            &super::super::probe::SESSION_REG,
         ] {
             assert_eq!(c.get(), 0, "Deriver::new() must perform no I/O");
+        }
+        // R7.3 — both Claude roots are resolved once, here, rather than from `$HOME` at each
+        // point of use. Resolving a path is string work, not I/O, so the assertion above and
+        // this one are not in tension. (Both are `None` only when `$HOME` is unset.)
+        assert_eq!(
+            d.projects_root.is_some(),
+            d.sessions_root.is_some(),
+            "the two roots must appear and disappear together"
+        );
+        if let Some(sessions) = &d.sessions_root {
+            assert!(sessions.ends_with(".claude/sessions"));
         }
     }
 

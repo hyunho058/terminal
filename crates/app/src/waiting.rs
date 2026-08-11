@@ -329,6 +329,87 @@ mod tests {
         assert_eq!(items[0].since, t(base, 30));
     }
 
+    // ---- per-session attribution (tabmeta-session-keying R6.1-R6.3) ----
+    //
+    // No production change was needed in this module, and that is the finding worth stating
+    // rather than leaving implicit: `WaitingState` was always keyed on `TabId`. The band's
+    // "one session's question raises every tab in the project" behaviour was never a defect
+    // here — it was `tabmeta` handing this module the *same* `AgentState` for every tab
+    // sharing a cwd. These tests pin the consequence of that fix at this layer, so a
+    // regression upstream fails loudly at the surface the user actually sees.
+
+    #[test]
+    fn only_the_waiting_session_raises_a_band_item() {
+        // R6.1 — two tabs in one project, one session Waiting and one Busy. Before the fix
+        // both tabs received `Waiting` (one cwd-ranked log served both) and the band showed
+        // two items for one question.
+        let base = Instant::now();
+        let mut w = WaitingState::new();
+        let (tab_a, tab_b, active) = (TabId(1), TabId(2), TabId(9));
+        assert!(w.on_agent_states(
+            &[(tab_a, AgentState::Waiting), (tab_b, AgentState::Busy)],
+            active,
+            t(base, 10),
+        ));
+        let items = w.items();
+        assert_eq!(items.len(), 1, "exactly one tab is waiting");
+        assert_eq!(items[0].tab_id, tab_a);
+        assert_eq!(items[0].kind, WaitingKind::Waiting);
+    }
+
+    #[test]
+    fn answering_one_session_does_not_clear_the_other() {
+        // R6.2 — both sessions waiting, then A is answered (its log advances to a
+        // tool_result → Busy). B's item must survive: under the shared state both cleared
+        // together, so answering one question silently dismissed the other.
+        let base = Instant::now();
+        let mut w = WaitingState::new();
+        let (tab_a, tab_b, active) = (TabId(1), TabId(2), TabId(9));
+        w.on_agent_states(
+            &[(tab_a, AgentState::Waiting), (tab_b, AgentState::Waiting)],
+            active,
+            t(base, 10),
+        );
+        assert_eq!(w.items().len(), 2, "both waiting");
+
+        w.on_agent_states(
+            &[(tab_a, AgentState::Busy), (tab_b, AgentState::Waiting)],
+            active,
+            t(base, 20),
+        );
+        let items = w.items();
+        assert_eq!(items.len(), 1, "only the answered tab clears");
+        assert_eq!(items[0].tab_id, tab_b, "B's question is still outstanding");
+    }
+
+    #[test]
+    fn entering_unknown_clears_that_tabs_pending_item() {
+        // R6.3 / D10 claim 3 — pinned deliberately, because it is the one consequence of the
+        // new tier-2 state that reaches a user-visible surface.
+        //
+        // `Unknown` reads as a falling edge out of `Waiting`. That is established intent, not
+        // collateral: `terminal_app.rs` already maps "no live agent" to `Unknown` precisely so
+        // a finished agent drops its band item. The two transitions THIS feature adds are a
+        // `/clear` (the awaited turn is over — clearing is right) and a fresh session start
+        // (nothing was pending). An externally deleted transcript is a third, is not created
+        // here, and is recorded in the spec's Known Gaps.
+        let base = Instant::now();
+        let mut w = WaitingState::new();
+        let (tab, active) = (TabId(1), TabId(9));
+        w.on_agent_states(&[(tab, AgentState::Waiting)], active, t(base, 10));
+        assert_eq!(w.items().len(), 1);
+
+        w.on_agent_states(&[(tab, AgentState::Unknown)], active, t(base, 20));
+        assert!(
+            w.items().is_empty(),
+            "Unknown is a falling edge out of Waiting"
+        );
+
+        // ...and it is a real edge, not a latch: the tab can be raised again afterwards.
+        w.on_agent_states(&[(tab, AgentState::Waiting)], active, t(base, 30));
+        assert_eq!(w.items().len(), 1, "a later rising edge still raises");
+    }
+
     #[test]
     fn active_tab_is_excluded() {
         // R2.3 / D15 — neither source creates an item for the active tab.

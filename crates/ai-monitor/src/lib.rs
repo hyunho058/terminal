@@ -96,8 +96,26 @@ pub fn registered_session_in(sessions_root: &Path, pid: u32) -> Option<Registere
 
 /// `~/.claude/sessions/<pid>.json`, if `$HOME` is set and the file parses.
 pub fn registered_session(pid: u32) -> Option<Registered> {
-    let home = std::env::var_os("HOME")?;
-    registered_session_in(&PathBuf::from(home).join(".claude").join("sessions"), pid)
+    registered_session_in(&claude_sessions_dir()?, pid)
+}
+
+/// Whether `s` has the shape of a Claude session id (a lowercase-hex UUID).
+///
+/// **A path guard, not a formatting nicety.** A session id becomes a filename —
+/// `<project_dir>/<id>.jsonl` — and the ids this crate's callers handle come from places we
+/// do not control: another program's on-disk JSON, and a process's argv. `../../etc/passwd`
+/// is a perfectly good string and a very bad path component, so anything that is not
+/// UUID-shaped is rejected before it is ever joined onto a path.
+///
+/// Lives here because the session id is *this* crate's vocabulary, and because both
+/// consumers in `app` — the ai-monitor panel's `--resume` parser and the sidebar card's
+/// argv tier — must apply the identical rule. It was previously private to `app::tabsession`.
+pub fn looks_like_session_id(s: &str) -> bool {
+    s.len() == 36
+        && s.as_bytes().iter().enumerate().all(|(i, &b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
 }
 
 /// How far after a process's true start `claude` may record itself before we stop believing
@@ -129,6 +147,19 @@ pub fn validated_session_id(reg: &Registered, process_start_ms: u64) -> Option<&
 pub fn claude_projects_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".claude").join("projects"))
+}
+
+/// `~/.claude/sessions` (or `None` if `$HOME` is unset) — the twin of
+/// [`claude_projects_dir`], for the per-pid records [`registered_session_in`] reads.
+///
+/// The path used to be built inline inside [`registered_session`], which was fine while
+/// that was the only caller. It no longer is: the sidebar's metadata worker resolves each
+/// tab's session against this root and needs it as a value it can hold (and, in tests,
+/// substitute). Deriving `$HOME/.claude/sessions` in two places is the duplication this
+/// crate already refuses for the *validation* rule; the same reasoning applies to the path.
+pub fn claude_sessions_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".claude").join("sessions"))
 }
 
 /// Resolve the active session log for `cwd` under a given projects root: the
@@ -1511,6 +1542,32 @@ mod tests {
         assert_eq!(resolve_log_in(&root, cwd), Some(newest));
         // Unknown cwd → no dir → None (graceful, C4).
         assert_eq!(resolve_log_in(&root, Path::new("/nope")), None);
+    }
+
+    #[test]
+    fn the_two_claude_roots_are_derived_from_one_place() {
+        // R7.2 — `claude_sessions_dir` is the twin of `claude_projects_dir`, so the
+        // `$HOME/.claude` prefix has exactly one derivation and the app can hold the
+        // sessions root as a value instead of rebuilding it.
+        //
+        // Deliberately NOT written by setting `HOME`: these tests run in parallel threads of
+        // one process, so mutating a process-global env var here would make unrelated tests
+        // flaky in a way that is very hard to trace. The invariant that matters — one root,
+        // two leaves — is fully observable without it.
+        match (claude_sessions_dir(), claude_projects_dir()) {
+            (Some(sessions), Some(projects)) => {
+                assert_eq!(
+                    sessions.parent(),
+                    projects.parent(),
+                    "both must hang off the same ~/.claude"
+                );
+                assert_eq!(sessions.file_name().unwrap(), "sessions");
+                assert_eq!(projects.file_name().unwrap(), "projects");
+                assert!(sessions.ends_with(".claude/sessions"));
+            }
+            (None, None) => { /* no $HOME — both absent together, which is the contract */ }
+            (s, p) => panic!("the two roots must agree on whether $HOME exists: {s:?} {p:?}"),
+        }
     }
 
     #[test]
