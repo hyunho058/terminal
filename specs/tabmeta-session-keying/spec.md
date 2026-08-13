@@ -680,6 +680,34 @@ let a tab with a perfectly known session id adopt a sibling's log."
 - **`TabMeta.cwd` and `TabMeta.task` can describe different projects** after a shell `cd`
   that outlives its `claude` (D4). Accepted there; recorded here so it is not rediscovered
   as a bug.
+- **`pick_label` accepts synthetic user turns, so a correctly-resolved card can still show
+  noise.** Observed during the live two-tab check (2026-08-12), across real logs in
+  `~/.claude/projects/-Users-hyunhokim-IdeaProjects-terminal`:
+
+  | rendered label | what it actually is |
+  |---|---|
+  | `<task-notification> <task-id>bowlp2tyj</task-id>…` | a background-task notification |
+  | `<local-command-stdout>Set model to Opus 5 (1M context)…` | the output of `/model` |
+  | ``Read `/Users/…/SKILL.md` and follow its instructions exactly`` | a slash-command expansion |
+
+  All three are `type: "user"` records with no `toolUseResult`, so `classify_user` counts them
+  as human prompts, and all three clear `is_substantive` — ≥ `MIN_LABEL_CHARS` and not in the
+  continuation dictionary. Two tabs that ran the *same* slash command therefore render the
+  same label even though each resolved to its own distinct log (verified by inode: 41838341
+  vs 41838328), which reads on screen exactly like the defect this feature fixed and is not.
+
+  **Out of scope by construction, not by oversight**: the Non-goals section states that
+  `pick_label` / `is_substantive` / `is_continuation` stay exactly as they are, and this
+  feature changed *which log* is read, never *what is picked from it*. The gap predates it —
+  every one of these labels would have appeared before, just on every tab at once instead of
+  on the one that owns the session.
+
+  **The identified follow-up** is a synthetic-turn filter in the prompt scan: reject records
+  whose text opens with `<command-message>`, `<local-command-stdout>`, `<task-notification>`,
+  or the ``Read `…/SKILL.md` and follow its instructions`` skill-expansion preamble. It is a
+  change to app policy in `activity.rs::pick_label` alone — no resolution, memo or cadence
+  surface is involved — so it is its own small feature rather than a rider here.
+
 - **A tab whose `cwd_of_pid` fails renders `Unknown` with no task, even when tier 1 could
   have named its log.** D4 made tier 1 independent of the tab's live cwd — both halves of the
   path come from the registry record — but `worker.rs`'s `Deriver::activity` still gates the
@@ -1073,10 +1101,31 @@ direction is a review check. They are not listed per-task below.
   every API used is already public or made so in T1.
 
 ### Post-work
-- **`/run-term` two-tab visual check**: open two tabs in one project, start a separate Claude
-  session in each, and confirm the cards show two different labels and two independent
-  activity marks. This is the one acceptance criterion the hermetic tests structurally cannot
-  cover — they use temp roots and fake trees, so the real `proc_pidinfo` → real
-  `~/.claude/sessions` → real log chain is only exercised by running it.
+- **[DONE 2026-08-12] `/run-term` multi-tab visual check** — the one acceptance criterion the
+  hermetic tests structurally cannot cover, since they use temp roots and fake trees and so
+  never exercise the real `proc_pidinfo` → `~/.claude/sessions` → log chain.
+
+  Result: **three** tabs in `~/IdeaProjects/terminal`, a directory holding **62** competing
+  `.jsonl` files, resolved to three distinct sessions and three correct card states —
+
+  | tab shell | session | tier | card |
+  |---|---|---|---|
+  | 45176 | `77de50ce` | 2 — named, no log yet | cwd title `terminal` |
+  | 58561 | `41575852` | 1 — named | its own log |
+  | 68443 | `c653ae27` | 1 — named | its own log |
+
+  The load-bearing observation is the **first row**: that tab rendered the plain cwd title
+  while two *other* sessions in the same directory held live, freshly-written logs. Under cwd
+  ranking that outcome is unreachable — the tab would have been handed one of them. Tier 2
+  declining to guess is visible on screen, not merely in a unit test.
+
+  Two caveats recorded honestly. Rows 2 and 3 rendered *identical text*, because the same
+  slash command had been run in both tabs; they resolved to genuinely different files
+  (inodes 41838341 and 41838328, 34 vs 53 lines), so this is the `pick_label` gap above, not
+  a resolution failure. And two earlier attempts at this check were **inconclusive** — the
+  first had the tabs in different directories with no logs written, the second was run in
+  Warp rather than in mac-terminal — which is itself worth recording: the check only means
+  anything when all three conditions hold (same cwd, distinct sessions, a substantive prompt
+  typed in each).
 - **`/insta-review` is not needed**: no `term-core` grid or `GridSnapshot` behaviour changes,
   so no insta snapshots move.
