@@ -280,6 +280,16 @@ impl TabMetaSnapshot {
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
     }
+
+    /// The publication generation this snapshot was filled at (card-live-cwd D5/R3.4).
+    ///
+    /// Exposed so a consumer can tell "the metadata moved" **level-triggered**, by comparing
+    /// against a generation it stored, rather than edge-triggered on [`TabMetaHandle::sync`]'s
+    /// `bool` — which another caller's `sync` can consume first (`tmux-pane-cwd` D6 records
+    /// that trap: `displayed_label` syncs this same snapshot on a keystroke).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 // ---------------------------------------------------------------------------
