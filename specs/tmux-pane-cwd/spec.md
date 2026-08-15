@@ -516,10 +516,28 @@ collide with D2's own parts (a)/(b)/(c), which C7 cites as D2c.)*
 - **The worker cadence is inherited, not chosen** (D10). 500 ms / 2 s come from
   `worker.rs:27-30` and are unmeasured for this use, consistent with `docs/architecture.md`
   G1, where performance budgets are goals rather than gates.
-- **A briefly-wrong tab *title* survives outside the overlay** (D12). During the
+- ~~**A briefly-wrong tab *title* survives outside the overlay** (D12). During the
   not-yet-published window the sidebar row and rename prefill still show the tmux client's
   directory basename, self-correcting on the next tick. Judged cosmetic and not worth a spawn
-  on the sidebar path — but it is the residue of the hole D12 closes for the overlay only.
+  on the sidebar path — but it is the residue of the hole D12 closes for the overlay only.~~
+  **Corrected and closed by `specs/card-live-cwd/spec.md`.** Two things above were wrong, and
+  the wording is what let the defect survive a year of reading:
+  1. **"self-correcting on the next tick" was false for the sidebar row.** Nothing re-runs
+     `Tabs::titles()` on a tick — it runs on tab actions only (open/close/switch, a user
+     rename, `ResetToAuto`, or a program's OSC 0/2). So the row title froze at the directory
+     the tab was opened in, for the life of the tab. Only the rename prefill self-corrected,
+     because `displayed_label` syncs the snapshot itself. **Not one tick wide — permanent.**
+  2. **"briefly" and "outside the overlay" understated the scope.** The gap needed no tmux at
+     all: a plain `cd` in any tab reproduced it. And because `branch` *was* pulled live from
+     the same `TabMeta` the title ignored, one card could show the old folder beside the new
+     branch — which also breaks D5's claim that title, branch, badge, task, log directory and
+     prefill "all describe the same directory at the same instant". D5's *value* was single-
+     owned as claimed; its **reads** were not.
+
+  `card-live-cwd` closes both by moving the folder name onto the per-frame `MetaSource` pull
+  (D1) beside the task label, demoting `SidebarRow::title` to a documented pre-publish
+  fallback (D2), and giving the waiting band a generation-gated rebuild (D5). What remains
+  genuinely brief is only the not-yet-published window on a newly-opened tab.
 - **If the tabmeta worker never installed, the feature silently no-ops.** `spawn` returns
   `Option` and `global()` is `None` when `install` never ran (`mod.rs:160-172`, `:311-313`);
   `Session::cwd()` then falls back for the whole session and tmux tabs behave as they do

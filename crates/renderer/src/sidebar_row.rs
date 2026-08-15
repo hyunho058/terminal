@@ -50,8 +50,13 @@ const REPO_LINE2_WIDTH_SHARE: f32 = 0.55;
 pub struct SidebarRow {
     /// The app's `session::TabId` as a plain `u64` — the renderer must not know app types.
     pub tab_id: u64,
-    /// The cwd basename — the bottom of the label chain, and line 2's repo/folder name
-    /// when line 1 is custom.
+    /// The cwd basename **as the app assembled the rows** — the card's pre-publish
+    /// fallback, not its live folder name (card-live-cwd D2).
+    ///
+    /// The rows are rebuilt on tab actions, so this string does not follow a `cd`. The live
+    /// folder name arrives on the metadata pull as [`RowMeta::cwd_title`], and both the
+    /// label chain's cwd tier and line 2's repo name read that. This field is what a card
+    /// shows only while its tab is still unpolled, or when no [`MetaSource`] is installed.
     pub title: String,
     /// The **user's** sticky title for this tab, if any (sticky-tab-title R1.1). Set only
     /// by an explicit user action — never by the PTY — and outranks every other source on
@@ -126,6 +131,17 @@ pub struct RowMeta {
     /// is custom, the cwd/repo name moves down beside the branch (tab-identity R2.2).
     /// Decided by the app alongside `line1` so the two can never disagree.
     pub line1_is_custom: bool,
+    /// The tab's folder name — the basename of its **live** working directory, resolved by
+    /// the app on this same pull (card-live-cwd D1/D6).
+    ///
+    /// It travels here rather than on [`SidebarRow`] for the reason `line1` does: the rows
+    /// are assembled on tab actions, while the cwd is republished whenever the shell moves,
+    /// so reading the row's copy left a card naming the directory its tab opened in. The app
+    /// feeds this same string to the label chain's cwd tier, so line 1 and line 2 can never
+    /// name two different folders.
+    ///
+    /// Empty for a `default()` row; the layer falls back to the row's title then.
+    pub cwd_title: String,
 }
 
 impl Default for RowMeta {
@@ -136,6 +152,7 @@ impl Default for RowMeta {
             skin: AgentSkin::Generic,
             line1: String::new(),
             line1_is_custom: false,
+            cwd_title: String::new(),
         }
     }
 }
@@ -375,11 +392,33 @@ pub fn truncate_to_width(s: &str, advance: f32, max_w: f32, ellipsis: char) -> S
 /// in `sidebar_model::resolve_line1`, the one place that sees all four sources with the
 /// task label fresh. What remains here is the empty-means-no-metadata fallback, so a card
 /// drawn before the first `MetaSource::fill` shows its folder rather than a blank line.
-pub(crate) fn card_line1_text<'a>(resolved: &'a str, cwd_title: &'a str) -> &'a str {
+/// The second argument is the **row's** title (`SidebarRow::title`), deliberately NOT
+/// [`RowMeta::cwd_title`]. They differ: this fallback fires exactly when `RowMeta` is
+/// `default()`, so the live name is empty and the row's assembly-time copy is all there is.
+/// Named `row_title` rather than `cwd_title` because passing the live field here — the
+/// "obvious" consistency edit once both names exist — would blank line 1 on that very row.
+pub(crate) fn card_line1_text<'a>(resolved: &'a str, row_title: &'a str) -> &'a str {
     if resolved.is_empty() {
-        cwd_title
+        row_title
     } else {
         resolved
+    }
+}
+
+/// Line 2's folder name: the **live** cwd title the app pulled with the metadata
+/// (card-live-cwd D1), falling back to the row's assembly-time title.
+///
+/// Same empty-means-no-metadata shape as [`card_line1_text`], but note the direction:
+/// `RowMeta::cwd_title` follows the shell while `SidebarRow::title` was frozen when the rows
+/// were assembled, so live wins whenever it exists.
+///
+/// The fallback is unreachable from the one call site — see the comment there — and is kept
+/// as defence-in-depth. Only the live-wins branch is asserted in tests (R1.4/R1.5).
+pub(crate) fn card_cwd_title<'a>(live: &'a str, row_title: &'a str) -> &'a str {
+    if live.is_empty() {
+        row_title
+    } else {
+        live
     }
 }
 
@@ -1470,7 +1509,14 @@ impl DrawLayer for TabBar {
                 let line1_is_custom = meta.line1_is_custom;
                 if line1_is_custom {
                     let repo_budget = repo_line2_budget(right_edge - x, advance, branch.is_some());
-                    let repo = truncate_to_width(&rows[i].title, advance, repo_budget, ellipsis);
+                    // The LIVE folder name (card-live-cwd D1). The `rows[i].title` fallback is
+                    // unreachable HERE by construction and kept only as defence-in-depth: an
+                    // empty `cwd_title` means a `RowMeta::default()` row (the app's fill
+                    // always resolves one, D2), and `default()` sets `line1_is_custom: false`,
+                    // which this branch already excludes. Deliberately unasserted — a test
+                    // would have to manufacture a state the types cannot produce.
+                    let repo_text = card_cwd_title(&meta.cwd_title, rows[i].title.as_str());
+                    let repo = truncate_to_width(repo_text, advance, repo_budget, ellipsis);
                     push_glyphs(
                         &mut text,
                         ctx,
@@ -1915,6 +1961,17 @@ mod tests {
         // A row drawn before the app's first `MetaSource::fill` has `RowMeta::default()`,
         // whose `line1` is empty. That must show the folder, never a blank line.
         assert_eq!(card_line1_text("", "terminal"), "terminal");
+    }
+
+    #[test]
+    fn line2_draws_the_pulled_folder_name_not_the_assembled_row_title() {
+        // card-live-cwd R1.4 — the live name the app pulled wins over the row's copy, which
+        // was frozen when the rows were assembled and does not follow a `cd`. This is the
+        // renderer half of the fix; the app half is `sidebar_model::row_meta`.
+        assert_eq!(card_cwd_title("web", "api"), "web");
+        // Only the live-wins branch is asserted, deliberately (R1.5). The empty branch is
+        // unreachable at the one call site — it needs a `RowMeta::default()` row, whose
+        // `line1_is_custom: false` means line 2 never draws a folder name at all.
     }
 
     #[test]

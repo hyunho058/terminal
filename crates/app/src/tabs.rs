@@ -165,11 +165,22 @@ impl Tabs {
     }
 
     /// Rows for the sidebar model (D2) — each carries the tab's stable `TabId` (as a
-    /// plain `u64`, so async metadata joins by id, D10) plus its title: the live cwd
-    /// basename, or a `Tab N` fallback. Called on tab actions, not per frame, so its
-    /// per-tab `proc_pidinfo` is not on the render path (SD4). The field/method keep the
-    /// name `titles` although they now carry rows — a documented cost of the frozen
-    /// `terminal_app` struct literal (D2).
+    /// plain `u64`, so async metadata joins by id, D10) plus its title: the cwd basename
+    /// **as of this call**, or a `Tab N` fallback.
+    ///
+    /// That title is the card's *pre-publish fallback*, not its live folder name
+    /// (card-live-cwd D2). This runs on tab actions, so a `cd` never reaches it; the card
+    /// resolves the live cwd off the metadata pull instead (`sidebar_model::fill`) and falls
+    /// back to this only while a tab is still unpolled. Reading it as "the live cwd
+    /// basename" — as this doc did — is what left cards naming the directory they opened in.
+    ///
+    /// The old SD4 justification for this cadence ("its per-tab `proc_pidinfo` is not on the
+    /// render path") is **spent**: since `tmux-pane-cwd`, `Session::cwd` returns the
+    /// published value through `published_or` and costs no syscall at all when one exists.
+    /// The cadence is now merely where the rows happen to be assembled.
+    ///
+    /// The field/method keep the name `titles` although they now carry rows — a documented
+    /// cost of the frozen `terminal_app` struct literal (D2).
     pub fn titles(&self, meta: &crate::tabmeta::TabMetaSnapshot) -> Vec<SidebarRow> {
         // Push the live roster + active tab to the metadata worker (the tab-metadata
         // seam's natural site — called on tab actions, not per frame), so it derives each
@@ -192,11 +203,9 @@ impl Tabs {
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                let title = s
-                    .cwd(meta.get(s.id))
-                    .as_deref()
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().into_owned())
+                // The folder name AT ASSEMBLY TIME, through the one shared derivation (D7).
+                // `Tab {n}` is this caller's own fallback — the helper deliberately has none.
+                let title = crate::sidebar_model::folder_name(s.cwd(meta.get(s.id)).as_deref())
                     .unwrap_or_else(|| format!("Tab {}", i + 1));
                 // The two title sources travel separately (sticky-tab-title D9/R1.1): the
                 // user's sticky title, which outranks everything, and the last title a

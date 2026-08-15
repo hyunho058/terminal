@@ -81,6 +81,31 @@ pub enum UserEvent {
     OverlayPending,
 }
 
+/// One waiting-band row's folder name: the tab's **live** published cwd, falling back to the
+/// title the rows were assembled with (card-live-cwd D5/R3.1/R3.3).
+///
+/// The same degrade rule the card uses (D2), so the two zones can never name one tab's
+/// directory differently. Pure, so the rule is unit-tested without a window.
+fn band_row_title(meta: Option<&crate::tabmeta::TabMeta>, row_title: &str) -> String {
+    crate::sidebar_model::folder_name(meta.and_then(|m| m.cwd.as_deref()))
+        .unwrap_or_else(|| row_title.to_string())
+}
+
+/// Whether the waiting band must be rebuilt on this wake (card-live-cwd D5/R3.2).
+///
+/// **A disjunction, and both arms are load-bearing.** `waiting_changed` is the pre-existing
+/// trigger, derived by `push_agent_states` from the snapshot *and each tab's screen*, so it
+/// fires on transitions the metadata never sees. The generation arm is what this feature
+/// adds: the band names each tab by its folder, and a `cd` republishes the cwd without moving
+/// any waiting item. Drop either arm and a real repaint stops happening silently.
+///
+/// Level-triggered against a stored generation rather than edge-triggered on
+/// [`TabMetaHandle::sync`]'s `bool` — `displayed_label` syncs the same snapshot on a
+/// keystroke and would consume the edge first (`tmux-pane-cwd` D6).
+fn band_needs_rebuild(waiting_changed: bool, band_gen: u64, snapshot_gen: u64) -> bool {
+    waiting_changed || band_gen != snapshot_gen
+}
+
 /// Translate T3's `WaitingKind` to the renderer's `WaitingSignal` (D6). The app owns this
 /// mapping so the renderer never names the app's kind enum (dependency direction).
 fn waiting_signal(kind: WaitingKind) -> WaitingSignal {
@@ -303,6 +328,15 @@ struct Running {
     /// rising-edge Waiting detection. Kept across polls so `sync` reuses its
     /// allocation (mirrors `SidebarMetaSource`'s snapshot).
     tabmeta_snapshot: TabMetaSnapshot,
+    /// The metadata generation the waiting band was last built from (card-live-cwd D5).
+    ///
+    /// The band names each tab by its folder, and that name comes from the snapshot — but the
+    /// band is rebuilt only when the waiting *set* changes, and a `cd` moves no waiting item.
+    /// Comparing this against `tabmeta_snapshot.generation()` is what makes a publish a
+    /// rebuild. Level-triggered on purpose: `displayed_label` syncs the same snapshot on a
+    /// keystroke, so an edge (`TabMetaHandle::sync`'s `bool`) can be consumed before the
+    /// `OverlayPending` handler ever sees it (`tmux-pane-cwd` D6).
+    band_gen: u64,
 }
 
 impl App {
@@ -443,6 +477,7 @@ impl App {
             preedit_handle,
             waiting: WaitingState::new(),
             tabmeta_snapshot: TabMetaSnapshot::default(),
+            band_gen: 0,
         };
         running.sync_tab_model();
         // The first point at which both halves of a restore are available: the config has
@@ -849,12 +884,12 @@ impl Running {
         let session = self.tabs.by_id(id)?;
         // The sync just above makes this the freshest published cwd (tmux-pane-cwd D2), so the
         // prefill names the same directory the card shows.
-        let cwd = session
-            .cwd(self.tabmeta_snapshot.get(id))
-            .as_deref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        // Through the shared derivation (card-live-cwd D7); an empty prefill is this
+        // caller's own fallback, since there is nothing sensible to type into the field.
+        let cwd = crate::sidebar_model::folder_name(
+            session.cwd(self.tabmeta_snapshot.get(id)).as_deref(),
+        )
+        .unwrap_or_default();
         let task = self
             .tabmeta_snapshot
             .get(id)
@@ -962,17 +997,27 @@ impl Running {
     /// renderer must not name the app's kind), and drops any item whose session has no
     /// matching title (a tab closed between assembly and draw). Order is preserved — T3
     /// already sorted oldest-wait-first (R1.5) — and the ≤5 + "+N more" visual cap is the
-    /// renderer's (R1.6), so the FULL list is handed over. `titles` is passed in (rather
-    /// than recomputed) so the frequent-event refresh path avoids `titles()`'
-    /// per-tab `proc_pidinfo`.
+    /// renderer's (R1.6), so the FULL list is handed over.
+    ///
+    /// `titles` is passed in rather than recomputed. That used to be justified by
+    /// `titles()`' per-tab `proc_pidinfo` — a cost `published_or` has since removed
+    /// (`tabs.rs`) — but the reason that matters now is stronger: `Tabs::titles()` sends
+    /// `set_roster` + `set_active` to the metadata worker, and this function runs on the
+    /// worker's own publish path. Recomputing here would make a publish trigger a
+    /// derivation, which is the feedback cycle card-live-cwd D1 rejects and R5.2 forbids.
+    /// Each row's *folder name* is still resolved live, from the snapshot, by
+    /// [`band_row_title`].
     fn build_waiting_rows(&self, titles: &[sidebar_row::SidebarRow]) -> Vec<WaitingRow> {
         self.waiting_items()
             .into_iter()
             .filter_map(|item| {
-                let title = titles
-                    .iter()
-                    .find(|r| r.tab_id == item.tab_id.0)
-                    .map(|r| r.title.clone())?;
+                let row = titles.iter().find(|r| r.tab_id == item.tab_id.0)?;
+                // The LIVE folder name (card-live-cwd D5), from the snapshot the caller has
+                // just synced. `titles` was assembled on the last tab action, so a band row
+                // that outlives a `cd` would keep naming a directory its tab has left — and
+                // would then disagree with the card for the same tab. The row's own title is
+                // the fallback, the same degrade rule the card uses (D2).
+                let title = band_row_title(self.tabmeta_snapshot.get(item.tab_id), &row.title);
                 Some(WaitingRow {
                     tab_id: item.tab_id.0,
                     title,
@@ -2177,6 +2222,14 @@ impl ApplicationHandler<UserEvent> for App {
                     band_changed = true;
                 }
                 // Republish the band (rows + shifted list_top) before the redraw (T4).
+                //
+                // Does NOT advance `band_gen` (card-live-cwd D5): the R3.2 gate lives on the
+                // `OverlayPending` arm, and this rebuild is screen-driven. Advancing it here
+                // would also be *accurate* — `build_waiting_rows` reads this same snapshot,
+                // and `sync` writes a snapshot's generation only alongside its data, so the
+                // two can never disagree — but leaving it costs at most one redundant,
+                // idempotent rebuild on the next publish. `sync_tab_model` makes the same
+                // choice, so this is the convention here rather than a special case.
                 if band_changed {
                     inner.refresh_waiting_band();
                 }
@@ -2263,7 +2316,23 @@ impl ApplicationHandler<UserEvent> for App {
                 // detection, T3) and redraw if the waiting band changed.
                 let waiting_changed = inner.feed_agent_states();
                 // Republish the band (rows + shifted list_top) before the redraw (T4).
-                if waiting_changed {
+                //
+                // The generation arm is ADDITIVE, never a replacement (card-live-cwd R3.2).
+                // The band names each tab by its folder, which a `cd` changes without moving
+                // any waiting item — so `waiting_changed` alone left band and card naming
+                // different directories for one tab. But `waiting_changed` comes from
+                // `push_agent_states`, which reads each tab's SCREEN as well as the snapshot,
+                // so it can fire on a wake where the generation did not move (a timing-driven
+                // Waiting edge). Dropping either arm silently stops a real repaint.
+                //
+                // One condition, not two `if`s: a publish that also flips a tab to Waiting
+                // must rebuild the band once, not twice.
+                if band_needs_rebuild(
+                    waiting_changed,
+                    inner.band_gen,
+                    inner.tabmeta_snapshot.generation(),
+                ) {
+                    inner.band_gen = inner.tabmeta_snapshot.generation();
                     inner.refresh_waiting_band();
                 }
                 if overlay_changed || waiting_changed {
@@ -2829,6 +2898,136 @@ fn next_composition_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- card-live-cwd R3 + R5.2: the waiting band follows the shell, and its rebuild
+    //      path sends the metadata worker nothing ----
+
+    fn meta_at(cwd: &str) -> crate::tabmeta::TabMeta {
+        crate::tabmeta::TabMeta {
+            branch: None,
+            agent: None,
+            cwd: Some(std::path::PathBuf::from(cwd)),
+            task: None,
+        }
+    }
+
+    #[test]
+    fn a_band_row_names_the_live_directory_not_the_assembled_one() {
+        // R3.1 — the rows were assembled while the tab sat in `api`; the shell has moved.
+        // A band row that kept the old name would disagree with that tab's own card.
+        assert_eq!(band_row_title(Some(&meta_at("/Users/x/web")), "api"), "web");
+    }
+
+    #[test]
+    fn a_band_row_for_an_unpolled_tab_keeps_the_assembled_title() {
+        // R3.3 — the same degrade rule the card uses: the row's own title is the only answer
+        // during the not-yet-published window, and for a tab whose cwd cannot be resolved.
+        assert_eq!(band_row_title(None, "api"), "api");
+        assert_eq!(
+            band_row_title(Some(&crate::tabmeta::TabMeta::default()), "Tab 3"),
+            "Tab 3",
+            "a published `cwd: None` (dead pid) is not a name"
+        );
+    }
+
+    #[test]
+    fn the_band_rebuild_gate_keeps_both_arms() {
+        // R3.2 — the feature's arm: a `cd` republishes the cwd and moves no waiting item, so
+        // the generation is the only signal that the band's folder names went stale.
+        assert!(
+            band_needs_rebuild(false, 4, 5),
+            "a metadata publish must rebuild the band"
+        );
+        // …and the PRE-EXISTING arm, which this feature must not displace. `waiting_changed`
+        // is derived from each tab's screen as well as the snapshot, so it fires on
+        // transitions the generation never sees — a permission dialog appearing writes
+        // nothing to the session log. Replacing the guard rather than joining it would stop
+        // those repaints silently, which is the regression this test exists to catch.
+        assert!(
+            band_needs_rebuild(true, 5, 5),
+            "a waiting-set change with no metadata move must still rebuild"
+        );
+        // Neither signal → no rebuild, so the idle-CPU property survives (G1).
+        assert!(!band_needs_rebuild(false, 5, 5), "a quiet wake stays quiet");
+    }
+
+    #[test]
+    fn the_band_rebuild_path_sends_no_worker_command() {
+        // R5.2 — the constraint that keeps D1's rejected feedback cycle closed: the band now
+        // rebuilds on the worker's own publish, so if that path reached `Tabs::titles()` — the
+        // sole sender of `set_roster` / `set_active` — a publish would trigger a derivation,
+        // which would publish, which would rebuild. `publish_if_changed` is the only brake,
+        // and it is exactly what a flapping derivation defeats.
+        //
+        // A source scan, in the same style as the repaint-timer scan below, because the real
+        // property is *reachability* and the alternative — instantiating `Running` — needs a
+        // window, a GPU surface and a live PTY. Comment lines are stripped first, so a comment
+        // that merely mentions `titles(` cannot fail this.
+        let src = include_str!("terminal_app.rs");
+        let production = production_half("terminal_app.rs", src);
+        let body = production
+            .split_once("fn refresh_waiting_band(&mut self)")
+            .expect("refresh_waiting_band must exist")
+            .1
+            .split_once("\n    }\n")
+            .expect("its body must be delimited")
+            .0;
+        // Anchor the scan on something the body definitely contains, so a rename or a
+        // reshaped delimiter cannot leave this test scanning an empty string and passing
+        // vacuously — the failure mode that makes a source scan worse than no test at all.
+        assert!(
+            body.contains("build_waiting_rows"),
+            "the scan captured no recognisable body: {body:?}"
+        );
+        for forbidden in ["titles(", "set_roster", "set_active"] {
+            assert!(
+                !body.contains(forbidden),
+                "refresh_waiting_band reached `{forbidden}` — that closes the \
+                 publish -> rebuild -> derive -> publish cycle card-live-cwd D1 rejects"
+            );
+        }
+        // The scan above is one level deep — it reads `refresh_waiting_band`'s own body, not
+        // its callees. So pin the other end too: `Tabs::titles()` (the sender) must keep
+        // exactly one caller, and that caller is `sync_tab_model`, which runs on tab actions
+        // rather than on a publish. A new caller anywhere in this file's production half is
+        // what would smuggle the sender back onto the publish path without tripping the body
+        // scan, so it fails here instead.
+        assert_eq!(
+            production.matches("self.tabs.titles(").count(),
+            1,
+            "`Tabs::titles()` must keep exactly one caller (sync_tab_model); a second one \
+             risks putting the worker's `set_roster`/`set_active` back on the publish path"
+        );
+        // …and that the sender is where we think it is. Scanned against tabs.rs's production
+        // half for the same reason as above: a mention inside a comment or a test must not
+        // satisfy — or trip — a structural claim.
+        let tabs = production_half("tabs.rs", include_str!("tabs.rs"));
+        assert_eq!(
+            tabs.matches("handle.set_active(").count(),
+            1,
+            "`handle.set_active(` must appear exactly once in tabs.rs (inside Tabs::titles)"
+        );
+    }
+
+    #[test]
+    fn the_band_gate_is_level_triggered_not_edge_triggered() {
+        // R3.2 / D5 — the reason the gate compares a stored generation instead of consuming
+        // `TabMetaHandle::sync`'s `bool`. `displayed_label` syncs the same snapshot on a
+        // Cmd+Shift+R, so an edge can be eaten before `OverlayPending` ever runs. A stored
+        // value cannot be eaten: it still differs on the next wake, however many other
+        // callers synced in between.
+        let (mut band_gen, published) = (7_u64, 9_u64);
+        // Another caller already synced the snapshot to `published` — the edge is gone.
+        assert!(
+            band_needs_rebuild(false, band_gen, published),
+            "the rebuild must survive another caller consuming the sync edge"
+        );
+        band_gen = published;
+        assert!(
+            !band_needs_rebuild(false, band_gen, published),
+            "and must not repeat once the band is caught up"
+        );
+    }
 
     // ---- ai-monitor-right-panel R7.4 / D2: the panel introduced no repaint timer ----
 
