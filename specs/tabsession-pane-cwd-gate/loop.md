@@ -6,7 +6,8 @@
 > built. The loop starts by **verifying**, not by re-doing the work — iteration 1's WORK phase
 > is a no-op.
 >
-> Base commit for every diff-based check: **`7b7c0a2`**.
+> Base commit for every diff-based check: **`0b64fdd`** (was `7b7c0a2` before the rebase
+> onto `main`, which picked up #31 `card-live-cwd`).
 
 ## Goal
 Prove the shipped implementation satisfies the spec's `## Requirements` (R0–R10, 49 GWT
@@ -16,7 +17,7 @@ that Confirmed Goal 3 still holds **by a stated argument**: no path may confirm 
 application's log with `owned: true`.
 
 ## Scope & non-goals
-- **In:** the six files in the spec's `## Declared Surface` plus the two recorded deviations
+- **In:** the six files in the spec's `## Declared Surface` plus the three recorded deviations
   below; test additions for behaviour already in scope; comment/doc corrections; lint/format
   fixes.
 - **Out:** new features beyond R0–R10; changing the approved decisions D1–D12; any edit under
@@ -30,6 +31,16 @@ application's log with `owned: true`.
   2. `docs/architecture.md` — a `G5` known-gap entry for D11's card/panel directory divergence
      plus assumptions A1/A2. This is R9.1's "documented in Known Gaps"; the spec did not name a
      file for it.
+  3. `crates/app/src/sidebar_model.rs` — **forced by a rebase, not chosen.** `card-live-cwd`
+     landed on `main` first as #31 (the spec's Declared Surface predicted the opposite order),
+     adding a `meta_at()` test helper that constructs a `TabMeta` literal. That literal cannot
+     compile against the widened struct without the new field, so the rebase requires
+     `agent_pid: None` there. One line plus its comment, in a test helper, no production
+     behaviour. The alternative — giving `TabMeta` a `..Default::default()` escape at that site —
+     was rejected as the larger change: it would make future field additions *stop* being visible
+     edits at that call site, which is the property `tabmeta_still_has_exactly_its_five_published_fields`
+     exists to protect. The base commit for every diff-based check therefore moves from `7b7c0a2`
+     to `0b64fdd`.
 - **Recorded judgement calls** — same treatment; each is a candidate spec conflict (🛑) if the
   checker finds it exceeds the approved design:
   1. **Known Gap closed rather than left to L4.** The spec records "how `open()` reaches the
@@ -68,24 +79,24 @@ application's log with `owned: true`.
 | tests | `cargo test --workspace` |
 | format | `cargo fmt --all -- --check` |
 | typecheck | N/A — `cargo build` is the type check for Rust (no separate command) |
-| **R10.2** `crates/ai-monitor` unmodified | `test -z "$(git diff --name-only 7b7c0a2 -- 'crates/ai-monitor/')"` — the spec forbids touching the resolver crate at all; D3's tier-2 suppression is expressed purely by leaving `Wanted::since_ms` as `None`. Validated in both directions (fires when any file under that path is staged) |
+| **R10.2** `crates/ai-monitor` unmodified | `test -z "$(git diff --name-only 0b64fdd -- 'crates/ai-monitor/')"` — the spec forbids touching the resolver crate at all; D3's tier-2 suppression is expressed purely by leaving `Wanted::since_ms` as `None`. Validated in both directions (fires when any file under that path is staged) |
 | **R2.4** `choose_claude` is reader-free | `grep -q 'fn choose_claude(root: u32, shell_pid: u32, find: impl Fn(u32) -> Option<u32>) -> Option<u32>' crates/app/src/tabsession.rs` — the cwd reader must be **gone from the signature**, not merely unused. A left-behind parameter is how a gate gets quietly re-introduced |
-| **Declared surface** respected | `test -z "$(git diff --name-only 7b7c0a2 -- '*.rs' \| grep -vE 'crates/app/src/(tabsession\|overlay\|seam\|terminal_app\|tabs)\.rs\|crates/app/src/tabmeta/(mod\|worker)\.rs')"` — the six declared files plus deviation 1. **Validated in both directions**: dropping `tabs` from the alternation makes it report `crates/app/src/tabs.rs`, so it can genuinely fail |
+| **Declared surface** respected | `test -z "$(git diff --name-only 0b64fdd -- '*.rs' \| grep -vE 'crates/app/src/(tabsession\|overlay\|seam\|terminal_app\|tabs\|sidebar_model)\.rs\|crates/app/src/tabmeta/(mod\|worker)\.rs')"` — the six declared files plus deviations 1 and 3. **Validated in both directions**: dropping `tabs` from the alternation makes it report `crates/app/src/tabs.rs`, so it can genuinely fail. `sidebar_model` was added to the allow-list **only** after the rebase forced the edit (deviation 3); it was not in the originally approved list |
 | **D6 trigger is live** | `awk '/fn feed_agent_states/,/^    }$/' crates/app/src/terminal_app.rs \| grep -vE '^[[:space:]]*(//\|///\|\*)' \| grep -q 'active_agent_pid'` — the published pid must actually reach the seam. `agent_pid_moved` can be perfectly correct and the feature still dead if nothing feeds it; **a sibling feature in this repo shipped exactly that bug**. The comment filter is load-bearing: without it a commented-out call still matches. Validated: correctly silent over `push_agent_states` |
 | **R9.1** the divergence is recorded where a reader will find it | `grep -q 'G5' docs/architecture.md && grep -qi 'card' docs/architecture.md` — D11's card-vs-panel directory divergence must be documented as a known gap, not left only in the spec |
-| **`macos-only`** no new `#[cfg(target_os)]` | `test "$(git diff 7b7c0a2 -- '*.rs' \| grep -c '^+.*cfg(target_os')" = 0` |
+| **`macos-only`** no new `#[cfg(target_os)]` | `test "$(git diff 0b64fdd -- '*.rs' \| grep -c '^+.*cfg(target_os')" = 0` |
 
 ## Gate 2 — Quantitative  (measured vs threshold)
 
 | Metric | Threshold | How measured |
 |--------|-----------|--------------|
-| tests passing | `≥ 1230`, `0 failed` | `cargo test --workspace` — sum the `test result:` lines ONLY, never the `running N tests` lines (they double-count). 1230 is the measured value at contract time |
+| tests passing | `≥ 1251`, `0 failed` | `cargo test --workspace` — sum the `test result:` lines ONLY, never the `running N tests` lines (they double-count). 1230 was the measured value at contract time; the base moved to `0b64fdd` (#31 added 18 tests of its own), remeasured at 1251 |
 | clippy warnings | `= 0` | exit code of the `-D warnings` command |
 | rustfmt drift | `= 0 files` | `cargo fmt --all -- --check` |
 | sub-requirements with automated evidence | **`≥ 44 of 46`** | manual trace of each GWT to a named test or Gate-1 command. **Baseline measured at contract time is 41.** 3 of the 49 are excluded **by name**: R0.1, R0.4, R6.7 (see Scope). The gap to 44 is three specific items, all missing tests for in-scope behaviour and therefore Auto-fix: **R1.4** (a tab with no `claude` yields no hint *from `hint_for_with`*, not just from `choose_claude`), **R4.3** (`refresh_rivals` publishes a real `RivalSet` from a `Some` hint), and **R3.3's warn emission** (the `tracing::warn!` naming the pid and both directories — currently only the *transition rule* is tested, not that anything emits). **R3.8** may remain code-traceable: it is a property of `ai_monitor`'s tier-1 exact-filename lookup, which R10.2 forbids this feature from touching |
-| files edited outside Declared Surface | `= 0` beyond the 2 recorded deviations | the Gate-1 declared-surface command; `tabs.rs` is the single allowed extra `.rs` file, `docs/architecture.md` the single allowed non-`.rs` |
-| new GUI-toolkit deps | `= 0` | `git diff 7b7c0a2 -- '*/Cargo.toml'` shows no egui/iced/druid/slint/gtk/gpui/dioxus/tao (`no-gui-crates`) |
-| new dependencies of any kind | `= 0` | the spec's Constraints say "No new dependencies"; `git diff 7b7c0a2 -- '*/Cargo.toml' Cargo.lock` |
+| files edited outside Declared Surface | `= 0` beyond the 3 recorded deviations | the Gate-1 declared-surface command; `tabs.rs` is the single allowed extra `.rs` file, `docs/architecture.md` the single allowed non-`.rs` |
+| new GUI-toolkit deps | `= 0` | `git diff 0b64fdd -- '*/Cargo.toml'` shows no egui/iced/druid/slint/gtk/gpui/dioxus/tao (`no-gui-crates`) |
+| new dependencies of any kind | `= 0` | the spec's Constraints say "No new dependencies"; `git diff 0b64fdd -- '*/Cargo.toml' Cargo.lock` |
 | `term-core` GPU/window deps | `= 0` | `grep -nE '^[[:space:]]*(wgpu\|winit)' crates/term-core/Cargo.toml` empty **and** `grep -rHnE '^[[:space:]]*use (wgpu\|winit)' crates/term-core/src/` empty (`dependency-direction`). **Not** a bare `grep -rn "wgpu\|winit"`: that file's doc comments *assert the absence of* these deps and the naive form always fires |
 | unbounded tmux waits on the event-loop thread | `= 0` | every UI-thread resolve routes through `tabsession::resolved_root`'s `recv_timeout(250ms)`, never `effective_root_uncached` directly (R10.1). D4 should have **reduced** the tmux tab's open path from two such waits to one — verify the reduction, not just the bound |
 

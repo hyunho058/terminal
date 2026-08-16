@@ -2914,6 +2914,10 @@ mod tests {
             agent: None,
             cwd: Some(std::path::PathBuf::from(cwd)),
             task: None,
+            // Not what these tests are about — the band row's title comes from `cwd`. Present
+            // because `TabMeta` is destructured exhaustively by a pin in `tabmeta::worker`, so
+            // every literal states every field deliberately.
+            agent_pid: None,
         }
     }
 
