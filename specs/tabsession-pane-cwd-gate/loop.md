@@ -45,9 +45,17 @@ application's log with `owned: true`.
   - **R0.1** (the reported configuration resolves) and **R0.4** (`Resolved.owned == true` for
     it) — needs a live tmux client, a real pane running `claude`, and a real log being written.
     Requires `/run-term` on the reporting machine.
+    **[PASSED 2026-08-16, by human observation — not by this loop.]** Fixture
+    `pane-cwd-gate-test`, pane `17525` → `claude` `17591`, session
+    `9bb64bfb-9722-4ec1-8c4d-3134e86e1073`, kernel and registry cwd agreeing (D7 row 2). The
+    operator reported `CONNECTED` with the session id, where the same shape previously read
+    `NO SESSION`. Recorded in `spec.md` § Post-work. This does **not** move the Gate-2 coverage
+    count, which measures *automated* evidence only.
   - **R6.7** (quit `claude`, `cd`, start a new one → the panel re-points within one tick) —
-    needs a live process tree and a running app.
-  These three are excluded **by name** from the Gate-2 coverage count.
+    needs a live process tree and a running app. **Still outstanding.**
+  These three remain excluded **by name** from the Gate-2 coverage count regardless of the manual
+  result: the metric is about what the suite can prove unattended, not about what a person saw
+  once.
 
 ---
 

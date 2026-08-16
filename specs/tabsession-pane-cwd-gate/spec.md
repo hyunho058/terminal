@@ -1132,8 +1132,30 @@ genuinely parallel slice — it touches only `crates/app/src/tabmeta/`.
   reproduces it.
 
 ### Post-work
-- **Run R0.1's manual gate** on that fixture. No headless test can cover it: it needs a real
-  tmux client, a real pane and a real `claude` writing a real log.
+- **[DONE 2026-08-16] Run R0.1's manual gate** on that fixture. No headless test can cover it: it
+  needs a real tmux client, a real pane and a real `claude` writing a real log — the whole chain
+  the hermetic tests replace with `ProcTable::parse` and injected closures.
+
+  Fixture built for the run, measured rather than assumed:
+
+  | | value |
+  |---|---|
+  | tmux session | `pane-cwd-gate-test`, rooted at this worktree |
+  | pane shell | `17525` |
+  | pane `claude` | `17591`, kernel cwd `…/terminal-fix-tabsession-pane-cwd-gate` |
+  | registry record | `sessionId 9bb64bfb-9722-4ec1-8c4d-3134e86e1073`, `cwd` **agreeing** with the kernel |
+  | chain row | D7 row 2 — `Proven`, tier 2 permitted |
+  | tab shell | a different directory from the pane's `claude` — the condition the deleted gate failed on |
+
+  Result: the panel showed **`CONNECTED` with the session id**, where before this change the same
+  shape read `NO SESSION` / "(no Claude session in this tab)". That settles **R0.1** and, since
+  the pill reads `CONNECTED` only for a confirmed resolution, **R0.4** (`Resolved.owned == true`)
+  with it. The session's log reached 77 KB during the run, so tier 1's exact-filename lookup was
+  resolving against a live, growing file rather than a stale one.
+
+  **R6.7 was not exercised** by this run and remains outstanding: it needs the pane's `claude` to
+  be quit, the pane `cd`'d, and a new `claude` started, so that the published pid changes under a
+  panel that is already attached.
 - **Rebase the sibling `card-live-cwd`** (uncommitted in `terminal-feat-improving-session-card`)
   onto the new `Deriver::tab` signature — see Declared Surface's overlap note.
 - Re-check the ai-monitor panel on a **non**-tmux tab, since R0.3's guarantee is narrower than
