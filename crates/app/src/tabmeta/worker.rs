@@ -92,7 +92,7 @@ impl Deriver {
     /// Derive one tab. cwd is resolved once and shared by the git and activity paths (D10)
     /// **and published on `TabMeta`** (tmux-pane-cwd R1.1). The git and agent sources are each
     /// skipped when their toggle is off (R1.8); the root and cwd never are (D13).
-    fn tab(&mut self, tp: &TabPid, tick: u64, now: SystemTime) -> TabMeta {
+    fn tab(&mut self, tp: &TabPid, tick: u64, now: SystemTime, is_active: bool) -> TabMeta {
         // Re-root at the tmux pane when this tab runs a client. Absent tmux this is `tp.pid`,
         // so every downstream read is byte-identical to today.
         //
@@ -122,32 +122,66 @@ impl Deriver {
             None
         };
 
-        let (agent, task) = if self.enabled_agent {
-            match (self.agent_of)(root) {
-                Some(super::agent::Detected { kind, pid }) => {
-                    // The tab's own agent process, paired with its start time — the identity
-                    // that lets resolution name this tab's session instead of ranking the
-                    // project directory. One `proc_pidinfo` on a pid the walk just touched; it
-                    // is `Option` because a dead or freshly-recycled pid has none, and
-                    // resolution downgrades the tier rather than discarding the identity.
-                    //
-                    // **Behind the Claude gate on purpose.** Only Claude has a session registry
-                    // to validate against (D7), so reading a start time for a Codex or Gemini
-                    // tab buys nothing and would tax every agent tab on the machine to serve
-                    // the Claude ones — which Confirmed Goal 4 ("tabs with no Claude agent pay
-                    // nothing new") forbids. The gate used to sit one frame lower, inside
-                    // `activity`, which read the start time first and discarded it.
-                    let claude = (kind == AgentKind::Claude).then(|| super::ClaudeId {
-                        pid,
-                        start_ms: (self.start_ms_of)(pid),
-                    });
-                    let (state, task) = self.activity(kind, cwd.as_deref(), claude, tick, now);
-                    (Some(Agent { kind, state }), task)
-                }
-                None => (None, None),
+        // The agent walk — and the gate on it is `enabled_agent || is_active`, which is
+        // narrower than it first looks and deliberately so.
+        //
+        // The ai-monitor panel needs a published agent pid to notice that a tab's `claude` has
+        // been replaced; behind `enabled_agent` alone that value would be `None` **forever**
+        // for anyone who turns `[sidebar].show_agent_status` off, so the panel would sit on a
+        // dead session with nothing on screen connecting cause to effect — a display preference
+        // silently disabling a correctness check.
+        //
+        // But lifting the walk *wholesale* is the opposite error, and the precedent usually
+        // cited for it says so outright: tmux-pane-cwd D13 lifted `root`/`cwd` out of these
+        // toggles and ends "The toggles still skip the **expensive work** (`.git` I/O, **the
+        // agent walk**); they no longer skip a `proc_pidinfo`." This walk is not a
+        // `proc_pidinfo` — it is a bounded BFS of up to `MAX_NODES = 64` processes, each a
+        // `proc_pidpath` plus, for an interpreter, a `sysctl` argv read, per rostered tab per
+        // 500 ms tick. Running that for every tab of a user who has the display off would tax
+        // tabs with no agent at all, which `tabmeta-session-keying`'s Confirmed Goal 4 forbids.
+        //
+        // The panel only ever asks about the **active** tab, so that is the whole requirement:
+        // with the toggle off the added cost is one walk per tick for one tab, not one per tab.
+        // Everything else stays exactly as gated as today.
+        let detected = (self.enabled_agent || is_active)
+            .then(|| (self.agent_of)(root))
+            .flatten();
+        // D9 — scoped to the kind the panel tracks. Already true today (`ClaudeId` is built
+        // under the same test), so this *pins* the property rather than introducing it: adding
+        // `agy` support must not silently widen the published pid and turn the panel's compare
+        // into a per-tick storm.
+        let agent_pid = detected.and_then(|super::agent::Detected { kind, pid }| {
+            (kind == AgentKind::Claude).then_some(pid)
+        });
+
+        let (agent, task) = match detected {
+            // `agent`, `task` — and `activity`'s log reads — stay behind their existing toggle.
+            // Turning the display off still stops the `.git` I/O and the log reads; only the
+            // walk itself, and only for the active tab, is now unconditional.
+            Some(super::agent::Detected { kind, .. }) if self.enabled_agent => {
+                // The tab's own agent process, paired with its start time — the identity
+                // that lets resolution name this tab's session instead of ranking the
+                // project directory. One `proc_pidinfo` on a pid the walk just touched; it
+                // is `Option` because a dead or freshly-recycled pid has none, and
+                // resolution downgrades the tier rather than discarding the identity.
+                //
+                // **Behind the Claude gate on purpose.** Only Claude has a session registry
+                // to validate against (D7), so reading a start time for a Codex or Gemini
+                // tab buys nothing and would tax every agent tab on the machine to serve
+                // the Claude ones — which Confirmed Goal 4 ("tabs with no Claude agent pay
+                // nothing new") forbids. The gate used to sit one frame lower, inside
+                // `activity`, which read the start time first and discarded it.
+                //
+                // Derived from `agent_pid` rather than re-testing the kind, so the published
+                // pid and the identity resolution uses can never describe different kinds.
+                let claude = agent_pid.map(|pid| super::ClaudeId {
+                    pid,
+                    start_ms: (self.start_ms_of)(pid),
+                });
+                let (state, task) = self.activity(kind, cwd.as_deref(), claude, tick, now);
+                (Some(Agent { kind, state }), task)
             }
-        } else {
-            (None, None)
+            _ => (None, None),
         };
 
         TabMeta {
@@ -155,6 +189,7 @@ impl Deriver {
             agent,
             task,
             cwd,
+            agent_pid,
         }
     }
 
@@ -222,7 +257,7 @@ impl Deriver {
         for (slot, tp) in roster.iter().enumerate() {
             let is_active = active == Some(tp.id);
             let meta = if should_refresh(is_active, tick, slot) {
-                self.tab(tp, tick, now)
+                self.tab(tp, tick, now, is_active)
             } else {
                 prev.iter()
                     .find(|(id, _)| *id == tp.id)
@@ -286,7 +321,10 @@ pub(crate) fn run(shared: Arc<TabMetaShared>, rx: Receiver<Cmd>, wake: impl Fn()
                 // background tabs, D4).
                 if let Some(id) = a {
                     if let Some(tp) = roster.iter().find(|tp| tp.id == id).copied() {
-                        let meta = deriver.tab(&tp, tick_index, SystemTime::now());
+                        // `is_active = true` by construction: this arm derives the tab that
+                        // just BECAME active. That is also what makes the panel's staleness
+                        // check land in band on a tab switch rather than waiting a tick.
+                        let meta = deriver.tab(&tp, tick_index, SystemTime::now(), true);
                         deriver.note_activity_gap(id, &meta);
                         let mut next = published.clone();
                         match next.iter_mut().find(|(tid, _)| *tid == id) {
@@ -373,6 +411,7 @@ mod tests {
                 agent: None,
                 task: None,
                 cwd: None,
+                agent_pid: None,
             },
         )];
         publish_if_changed(&s, &mut published, one.clone(), &wake);
@@ -396,6 +435,7 @@ mod tests {
                 agent: None,
                 task: None,
                 cwd: None,
+                agent_pid: None,
             },
         )];
         publish_if_changed(&s, &mut published, two, &wake);
@@ -470,7 +510,7 @@ mod tests {
             pid: std::process::id(),
         };
         super::super::probe::reset_all();
-        let meta = d.tab(&tp, 0, SystemTime::now());
+        let meta = d.tab(&tp, 0, SystemTime::now(), true);
         assert!(meta.agent.is_none(), "the test binary runs no agent");
         assert_eq!(
             super::super::probe::PROC_START.get(),
@@ -934,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn tabmeta_still_has_exactly_its_four_published_fields() {
+    fn tabmeta_still_has_exactly_its_five_published_fields() {
         // R6.5 — a compile-time assertion. If a field is added, removed or retyped this stops
         // building, which is the point: the renderer and the snapshot contract are downstream
         // and this feature promised not to move them.
@@ -943,6 +983,7 @@ mod tests {
             agent: _,
             cwd: _,
             task: _,
+            agent_pid: _,
         } = TabMeta::default();
     }
 
@@ -961,10 +1002,10 @@ mod tests {
         };
         let now = SystemTime::now();
         // The test runs inside this project's git repo, so cwd resolves to a repo.
-        let cold = d.tab(&tp, 0, now);
+        let cold = d.tab(&tp, 0, now, false);
         assert!(cold.branch.is_some(), "self cwd is a git repo");
         super::super::probe::reset_all();
-        let _ = d.tab(&tp, 1, now);
+        let _ = d.tab(&tp, 1, now, false);
         assert_eq!(super::super::probe::PROC_CWD.get(), 1, "cwd resolved once");
         assert_eq!(
             super::super::probe::GIT_READ.get(),
@@ -1038,6 +1079,7 @@ mod tests {
                     agent: None,
                     task: None,
                     cwd: Some(PathBuf::from(dir)),
+                    agent_pid: None,
                 },
             )]
         };
@@ -1063,6 +1105,164 @@ mod tests {
         );
     }
 
+    // ---- tabsession-pane-cwd-gate D6/D9: the published agent pid (R6.1-R6.3, R6.8) ----
+
+    #[test]
+    fn the_worker_publishes_the_agent_pid() {
+        // R6.1, producer side. The value is already computed — the walk returns it and
+        // `ClaudeId` is built from it — so publishing costs no new subprocess on any path.
+        let _g = super::super::probe::serial();
+        let (projects, sessions) = fixture_roots("agent-pid");
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        let m = meta_of(&pass_over(&mut d, &[tp(900_101)], 0), 900_101);
+        assert_eq!(
+            m.agent_pid,
+            Some(agent_pid(900_101)),
+            "the pid the walk found, not the tab's shell pid"
+        );
+
+        // ...and a change in it publishes, which is what the panel's wake depends on.
+        // `publish_if_changed` compares `TabMeta` whole, so this holds by construction — the
+        // assertion is that the field is genuinely IN that comparison.
+        let s = TabMetaShared {
+            generation: Default::default(),
+            tabs: std::sync::Mutex::new(Vec::new()),
+        };
+        let woke = std::sync::Arc::new(AtomicU64::new(0));
+        let w = woke.clone();
+        let wake = move || {
+            w.fetch_add(1, Ordering::Relaxed);
+        };
+        let mut published = Vec::new();
+        let at = |pid: Option<u32>| {
+            vec![(
+                TabId(1),
+                TabMeta {
+                    agent_pid: pid,
+                    ..Default::default()
+                },
+            )]
+        };
+        publish_if_changed(&s, &mut published, at(Some(10)), &wake);
+        publish_if_changed(&s, &mut published, at(Some(11)), &wake);
+        assert_eq!(
+            woke.load(Ordering::Relaxed),
+            2,
+            "a pid-only change must publish, or the panel never learns the session moved"
+        );
+        publish_if_changed(&s, &mut published, at(Some(11)), &wake);
+        assert_eq!(
+            woke.load(Ordering::Relaxed),
+            2,
+            "an unchanged pid must stay silent — the G1 idle-CPU property"
+        );
+    }
+
+    #[test]
+    fn the_active_tabs_pid_is_published_with_the_display_toggle_off() {
+        // R6.2 — the hazard D6(a) exists for. Behind `enabled_agent` alone this value would be
+        // `None` forever for anyone who turns `[sidebar].show_agent_status` off, so the panel
+        // would sit on a dead session with nothing on screen connecting cause to effect: a
+        // display preference silently disabling a correctness check.
+        //
+        // And the lift is only as wide as it needs to be. The panel only ever asks about the
+        // ACTIVE tab, so a background tab pays nothing new — which is what keeps
+        // `tabmeta-session-keying`'s Confirmed Goal 4 ("tabs with no Claude agent pay nothing
+        // new") true for the other nineteen tabs.
+        let _g = super::super::probe::serial();
+        let (projects, sessions) = fixture_roots("toggle-off-pid");
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        d.enabled_agent = false;
+        let now = SystemTime::now();
+
+        let active = d.tab(&tp(900_101), 0, now, true);
+        assert_eq!(
+            active.agent_pid,
+            Some(agent_pid(900_101)),
+            "the active tab's pid is published whatever the display toggle says"
+        );
+        // Everything the toggle actually governs stays governed by it.
+        assert_eq!(active.agent, None, "the badge stays gated");
+        assert_eq!(
+            active.task, None,
+            "and so does the label, and its log reads"
+        );
+        assert_eq!(active.branch, None, "git is a separate toggle, still off");
+
+        let background = d.tab(&tp(900_102), 0, now, false);
+        assert_eq!(
+            background.agent_pid, None,
+            "a background tab with the toggle off pays no walk and publishes nothing"
+        );
+        assert_eq!(background.agent, None);
+    }
+
+    #[test]
+    fn only_a_claude_kind_agent_is_published() {
+        // R6.3 / D9 — a correctness constraint, not a preference. `AgentKind` has five
+        // variants and the walk finds *an agent*; an `agy` pid could never equal the `claude`
+        // pid the panel opened on, so an unscoped value would read as "a different pid" on
+        // EVERY tick — a re-point storm, each iteration re-forking `/bin/ps`, respawning the
+        // watcher and re-running the whole backfill.
+        //
+        // Already true today (`ClaudeId` is built under the same test), so this pins the
+        // property rather than introducing one: the sibling `ai-monitor-antigravity` work must
+        // not be able to widen it silently.
+        let _g = super::super::probe::serial();
+        let (projects, sessions) = fixture_roots("kind-scoped-pid");
+        let mut d = deriver_at(projects, sessions);
+        d.cwd_of = |_| Some(PathBuf::from(THE_CWD));
+        let now = SystemTime::now();
+
+        for kind in [
+            AgentKind::Antigravity,
+            AgentKind::Codex,
+            AgentKind::Gemini,
+            AgentKind::Aider,
+        ] {
+            d.agent_of = match kind {
+                AgentKind::Antigravity => |pid| {
+                    Some(super::super::agent::Detected {
+                        kind: AgentKind::Antigravity,
+                        pid,
+                    })
+                },
+                AgentKind::Codex => |pid| {
+                    Some(super::super::agent::Detected {
+                        kind: AgentKind::Codex,
+                        pid,
+                    })
+                },
+                AgentKind::Gemini => |pid| {
+                    Some(super::super::agent::Detected {
+                        kind: AgentKind::Gemini,
+                        pid,
+                    })
+                },
+                _ => |pid| {
+                    Some(super::super::agent::Detected {
+                        kind: AgentKind::Aider,
+                        pid,
+                    })
+                },
+            };
+            let m = d.tab(&tp(900_101), 0, now, true);
+            assert_eq!(
+                m.agent.map(|a| a.kind),
+                Some(kind),
+                "{kind:?} is still DETECTED — only the published pid is scoped"
+            );
+            assert_eq!(m.agent_pid, None, "{kind:?} must publish no pid");
+        }
+
+        // The one kind that does.
+        with_fake_tree(&mut d);
+        let m = d.tab(&tp(900_101), 0, now, true);
+        assert_eq!(m.agent_pid, Some(agent_pid(900_101)));
+    }
+
     #[test]
     fn both_toggles_off_still_resolves_cwd_but_does_no_git_or_agent_work() {
         // tmux-pane-cwd R1.4 — **deliberately inverts** this test's previous contract
@@ -1083,7 +1283,7 @@ mod tests {
             pid: std::process::id(),
         };
         super::super::probe::reset_all();
-        let meta = d.tab(&tp, 0, SystemTime::now());
+        let meta = d.tab(&tp, 0, SystemTime::now(), true);
 
         // The cwd is published even with every display source off.
         assert!(
@@ -1119,7 +1319,7 @@ mod tests {
             pid: me,
         };
         super::super::probe::reset_all();
-        let _ = d.tab(&tp, 0, SystemTime::now());
+        let _ = d.tab(&tp, 0, SystemTime::now(), false);
 
         assert_eq!(
             super::super::probe::TMUX_LIST.get(),
@@ -1157,7 +1357,7 @@ mod tests {
         let mut d = Deriver::new();
         d.enabled_agent = false;
         super::super::probe::reset_all();
-        let _ = d.tab(&tp, 0, SystemTime::now());
+        let _ = d.tab(&tp, 0, SystemTime::now(), false);
         assert_eq!(
             super::super::probe::PROC_CHILDREN.get(),
             1,
@@ -1168,7 +1368,7 @@ mod tests {
         let mut d = Deriver::new();
         d.enabled_git = false;
         super::super::probe::reset_all();
-        let _ = d.tab(&tp, 0, SystemTime::now());
+        let _ = d.tab(&tp, 0, SystemTime::now(), false);
         assert!(
             super::super::probe::PROC_CHILDREN.get() >= 2,
             "agent-only: the gate's listing PLUS agent_of_pid's own walk — at least two. \
@@ -1191,11 +1391,11 @@ mod tests {
             pid: std::process::id(),
         };
         let now = SystemTime::now();
-        let with = d.tab(&tp, 0, now);
+        let with = d.tab(&tp, 0, now, false);
         assert!(with.branch.is_some(), "self cwd is a repo → branch present");
         d.enabled_git = false;
         super::super::probe::reset_all();
-        let without = d.tab(&tp, 1, now);
+        let without = d.tab(&tp, 1, now, false);
         assert!(without.branch.is_none(), "disabled → branch cleared");
         assert_eq!(
             super::super::probe::GIT_STAT.get(),
@@ -1233,6 +1433,7 @@ mod tests {
             }),
             task: None,
             cwd: None,
+            agent_pid: None,
         };
         d.note_activity_gap(id, &unknown);
         assert_eq!(d.debug_seen.get(&id), Some(&AgentKind::Aider));
@@ -1250,6 +1451,7 @@ mod tests {
             }),
             task: None,
             cwd: None,
+            agent_pid: None,
         };
         d.note_activity_gap(id, &busy);
         assert!(!d.debug_seen.contains_key(&id));
@@ -1264,7 +1466,7 @@ mod tests {
             id: TabId(9),
             pid: 0,
         };
-        let meta = d.tab(&tp, 0, SystemTime::now());
+        let meta = d.tab(&tp, 0, SystemTime::now(), true);
         assert_eq!(meta, TabMeta::default());
     }
 }

@@ -56,6 +56,16 @@ zsh ──PTY──> reader thread ──mpsc──> [wake] winit loop
   ai-monitor panel carries its **own** shaping cache — keyed on the model, panel rect, cell
   metrics and atlas identity — because the terminal's re-shape skip does not cover it and the
   layer it replaced re-laid-out its text every frame.)
+- **G5** The ai-monitor panel derives its log directory from the chosen `claude` process's own
+  cwd, while the sidebar card shows the tab's (or tmux pane's) **shell** cwd. After a `cd` inside
+  a pane the two legitimately **disagree** — they answer "where is this session's log" and "where
+  is this tab working", and forcing agreement would make one of them report something untrue. Not
+  a defect; see `specs/tabsession-pane-cwd-gate/spec.md` D11. Two assumptions ride with that
+  design, both named rather than assumed silently: **A1**, that `claude` writes to
+  `encode_cwd` of the directory it runs in (the kernel-vs-registry cross-check in
+  `tabsession::resolve_hint_cwd` is its only detector, and it only fires when a registry record
+  exists); and **A2**, that a `claude` process's cwd is fixed at launch (`process.chdir()` would
+  make the directory stale with no trigger, since the pid does not change).
 - **G2** ~~Inline-image protocol undecided~~ — **resolved**: the Kitty graphics-APC
   protocol shipped (`term-core::image::parse_graphics_apc`).
 - **G3** ~~Glyph atlas not yet wired into the shader~~ — **resolved**: glyphs render
