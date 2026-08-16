@@ -1156,8 +1156,41 @@ genuinely parallel slice — it touches only `crates/app/src/tabmeta/`.
   **R6.7 was not exercised** by this run and remains outstanding: it needs the pane's `claude` to
   be quit, the pane `cd`'d, and a new `claude` started, so that the published pid changes under a
   panel that is already attached.
-- **Rebase the sibling `card-live-cwd`** (uncommitted in `terminal-feat-improving-session-card`)
-  onto the new `Deriver::tab` signature — see Declared Surface's overlap note.
+- **[DONE 2026-08-16] Run R6.7's manual gate** — a new `claude` in the same pane moves the panel.
+  Also outside automated reach: it needs a live pane whose agent process is *replaced* under an
+  already-attached panel, which no headless fixture can produce.
+
+  | | before | after |
+  |---|---|---|
+  | tmux pane | `47553` | `47553` — unchanged, so this is not a tab switch |
+  | pane `claude` | `47594` | **`48112`** — the pid changed, which is D5's trigger |
+  | session | `a44ec234-5510-48ae-952c-ec70a74edc23` | **`cd132e29-7ff0-4f51-bc85-08ecf1b00343`** |
+  | directory | worktree root | worktree root — **unchanged** |
+
+  Result: the panel followed to the new session with no tab switch.
+
+  **This run is a stronger check of D5 × D10 than the scripted one would have been.** The operator
+  restarted `claude` *in place* rather than `cd`-ing first, so the resolved **directory was
+  identical** across the re-point and only the pid differed. `reopen_is_inert` requires directory
+  **and** pid **and** session id to match before it absorbs a re-open; had its condition been
+  written on the directory alone — the obvious spelling — this case would have been swallowed and
+  the panel would have kept showing `a44ec234…`. So the pid condition is confirmed load-bearing
+  and genuinely wired through `TabMeta::agent_pid` → `on_active_changed` → `agent_pid_moved`.
+
+  **Scope not covered:** R6.7's "and directory" half. Staying in one directory means the panel was
+  never asked to follow `claude` into a *new* project dir on a pid change. That path is covered
+  headlessly (R3.1–R3.5 against the `hint_for_with` seam) but not live.
+- **[RESOLVED 2026-08-16] Rebase the sibling `card-live-cwd`** onto the new `Deriver::tab`
+  signature — see Declared Surface's overlap note. Overtaken by events, in the **opposite** order
+  this spec recommended: `card-live-cwd` landed on `main` first as #31, so this feature rebased
+  onto *it*. The predicted collision did not occur — #31 honoured its own spec's non-goal and left
+  `crates/app/src/tabmeta/worker.rs` untouched, so `Deriver::tab`'s new `is_active` parameter
+  rebased cleanly. The real friction was elsewhere and invisible to git: #31 added `meta_at()` test
+  helpers constructing `TabMeta` literals in `sidebar_model.rs` and `terminal_app.rs`, which cannot
+  compile against the widened struct. The rebase reported **zero conflicts** and the result did not
+  build — caught only by `cargo test`, which is `tabmeta_still_has_exactly_its_five_published_fields`
+  doing its job. Worth recording: a declared-surface overlap predicted the right *file* to worry
+  about and the wrong *failure mode*.
 - Re-check the ai-monitor panel on a **non**-tmux tab, since R0.3's guarantee is narrower than
   "unchanged" (a plain shell that `cd`s after launching `claude` now resolves differently — and
   correctly).
