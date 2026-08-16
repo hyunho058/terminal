@@ -50,6 +50,15 @@ pub fn antigravity_root() -> Option<PathBuf> {
 /// reads it, because **its contents prove nothing**. Locks outlive their sessions (30 files
 /// for a handful of live sessions, when measured), so `presence/<id>.lock` existing is not
 /// evidence that `<id>` is running — only an open descriptor on it is (AG1, R1.2).
+/// The presence directory for the real installation, if there is one.
+///
+/// Public because the app arms a [`crate::WatchScope::AwaitingLock`] watch on it: a tab whose
+/// agent has not yet published a lock has nothing to tail, and this is the one directory
+/// where the fact that changes that will appear.
+pub fn presence_dir() -> Option<PathBuf> {
+    Some(presence_dir_in(&antigravity_root()?))
+}
+
 pub fn presence_dir_in(root: &Path) -> PathBuf {
     root.join("presence")
 }

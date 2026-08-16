@@ -1,6 +1,21 @@
 # loop.md — Loop Contract: ai-monitor-antigravity (verification)
 
-## Goal
+## Goal — run 2 (fix)
+
+**Reported defect, 2026-08-16.** An `agy` tab shows `(no Claude session in this tab)` and the
+IN·OUT tile — i.e. `tab_agent` is not `Some(Antigravity)` — even though `agent_for` returns
+`Some((Antigravity, 22428))` for that shell when probed directly. The panel was opened before
+`agy` was detectable and has never re-evaluated since.
+
+Cause: the Antigravity branch arms **no watcher when no log resolves**, so the panel has no
+wake source; Claude's path arms one unconditionally for exactly this reason. Without a wake,
+`on_active_changed` never runs, so neither the `refresh_rivals` worker nor the re-point it
+would trigger ever fires. Fix: give the unattached Antigravity panel a wake source, and make
+the "agent appeared" worker request the follow-up wake its own flag needs.
+
+Everything below (gates, boundary, lessons) carries over from run 1 unchanged.
+
+## Goal — run 1 (verification)
 
 Verify that the **already-complete** implementation of `specs/ai-monitor-antigravity/spec.md`
 satisfies that spec's `## Requirements` — 27 GWT sub-requirements across R0–R5 — and that it
@@ -50,6 +65,7 @@ not a licence to change either one — see the Autonomy Boundary.
 | **no recency tiebreak across `brain/` (AG6/R1.4)** | `cargo test -p ai-monitor --test antigravity 2>&1 \| grep -q "test result: ok"` |
 | **R5.6 — the nine pre-existing panel snapshots are byte-identical** | `test $(git diff --name-only HEAD -- crates/app/src/snapshots/ \| wc -l) -eq 0` |
 | **the Antigravity panel form is pinned** | `cargo test --bin app the_antigravity_panel_matches_its_pinned_form 2>&1 \| grep -q "1 passed"` |
+| **an unattached Antigravity panel always arms a wake source** | `cargo test --bin app an_unattached_antigravity_panel_arms_a_wake_source 2>&1 \| grep -q "1 passed"` |
 | **the Claude fold is untouched by format dispatch (R2.8)** | `cargo test -p ai-monitor --test telemetry 2>&1 \| grep -q "test result: ok"` |
 
 ## Gate 2 — Quantitative (measured vs threshold)

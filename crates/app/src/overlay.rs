@@ -373,11 +373,22 @@ impl AiMonitorOverlay {
             };
             self.session
                 .note(Arc::new(telemetry.snapshot()), self.started_ms, owned);
-            // No log means nothing to watch. Unlike the Claude branch — which arms an
-            // unconditional watch because the tab's own session may write its first line at
-            // any moment into a directory we already know — there is no directory to wait in
-            // here: the conversation id IS the directory name, so until one is resolved there
-            // is no path that could become right. The next re-point asks again.
+            // ARMED EITHER WAY, and the "either" is the fix for a reported defect.
+            //
+            // The original spelling armed nothing when no log resolved, reasoning that "the
+            // conversation id IS the directory name, so until one is resolved there is no
+            // path that could become right — the next re-point asks again". The first half is
+            // true and the conclusion does not follow: **there is no next re-point**. The
+            // panel's re-probe hangs off `on_active_changed`, which only runs on a wake, and
+            // with no watcher armed the sole wake source is the tab-metadata worker — which
+            // publishes only when a `TabMeta` actually changed and so goes silent next to a
+            // steadily-running `agy`. Measured: a panel opened seconds before `agy` became
+            // detectable stayed on "(no Claude session in this tab)" indefinitely, while
+            // `agent_for` answered `Some((Antigravity, …))` for that very shell when probed
+            // directly. Claude's branch has armed unconditionally all along, for this reason.
+            //
+            // So: tail the transcript when there is one, and otherwise watch the presence
+            // directory for the lock that will name it.
             if let Some(log) = log.as_deref() {
                 let proxy = self.proxy.clone();
                 self.watcher = LogWatcher::spawn(
@@ -390,6 +401,24 @@ impl AiMonitorOverlay {
                     },
                     telemetry,
                     offset,
+                    move || {
+                        if let Some(p) = proxy.as_ref() {
+                            let _ = p.send_event(UserEvent::OverlayPending);
+                        }
+                    },
+                );
+            } else if let Some(presence) = ai_monitor::antigravity::presence_dir() {
+                let proxy = self.proxy.clone();
+                self.watcher = LogWatcher::spawn(
+                    Watch {
+                        dir: presence,
+                        log: None,
+                        owned: false,
+                        attached: self.session.attached_flag.clone(),
+                        scope: ai_monitor::WatchScope::AwaitingLock,
+                    },
+                    telemetry,
+                    0,
                     move || {
                         if let Some(p) = proxy.as_ref() {
                             let _ = p.send_event(UserEvent::OverlayPending);
@@ -593,6 +622,18 @@ impl AiMonitorOverlay {
         // life of the process — rival refresh silently dead forever, with nothing to
         // indicate it. Low probability, unbounded consequence, four lines to remove.
         let inflight = InFlight(self.refreshing.clone());
+        // The flag alone is not enough to re-point, and this is why the proxy comes along.
+        // `session_rotated` READS `appeared` on the same tick that `refresh_rivals` spawns
+        // the worker that SETS it, so the value it reads is always the pre-worker one: the
+        // re-point needs a *second* wake, and on a quiet tab there may never be one. Rather
+        // than depend on unrelated traffic arriving later, the worker asks for that wake
+        // itself, the moment it has something new to report.
+        let proxy = self.proxy.clone();
+        let ping = move || {
+            if let Some(p) = proxy.as_ref() {
+                let _ = p.send_event(UserEvent::OverlayPending);
+            }
+        };
         std::thread::spawn(move || {
             // The Antigravity half of "an agent appeared", and the reason a cold-started
             // `agy` tab heals itself (AG6/G8). `agy` publishes its presence lock ~7s after
@@ -609,6 +650,7 @@ impl AiMonitorOverlay {
             {
                 if crate::presence_fd::conversation_of_pid(agy).is_some() {
                     appeared.store(true, Ordering::Release);
+                    ping();
                 }
                 drop(inflight);
                 return;
@@ -618,6 +660,7 @@ impl AiMonitorOverlay {
             // decides whether it cares, and it only cares while unarmed.
             if hint.is_some() {
                 appeared.store(true, Ordering::Release);
+                ping();
             }
             let set = rival_set_of(hint);
             if let Ok(mut g) = handle.lock() {
@@ -3470,6 +3513,47 @@ mod tests {
             offset,
             std::fs::metadata(&new).unwrap().len(),
             "the tail resumes past what was folded, or the watcher re-folds every line"
+        );
+    }
+
+    /// An unattached Antigravity panel must always have something to wake it (loop run 2).
+    ///
+    /// Pinned by asserting the source, for the reason the sibling test below gives: `open()`
+    /// needs a live process tree and an `EventLoopProxy`, so no unit can reach the branch.
+    /// It earns its place the same way too — the defect it guards SHIPPED. With no watcher
+    /// armed on the no-log path, a panel opened before `agy` became detectable had no wake
+    /// source at all, so `on_active_changed` never ran, the re-probe never ran, and the panel
+    /// sat on "(no Claude session in this tab)" indefinitely while `agent_for` answered
+    /// `Some((Antigravity, ..))` for that shell. Every test stayed green throughout.
+    #[test]
+    fn an_unattached_antigravity_panel_arms_a_wake_source() {
+        let src = include_str!("overlay.rs");
+        let (production, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("no `mod tests` marker to split on");
+        let production = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The no-log arm exists and watches the presence directory.
+        assert!(
+            production.contains("ai_monitor::antigravity::presence_dir()"),
+            "with no transcript to tail, the panel must still watch for the lock that will \
+             name one — otherwise nothing can ever wake it"
+        );
+        assert!(
+            production.contains("scope: ai_monitor::WatchScope::AwaitingLock"),
+            "and that watch must use the wake-only scope, not a tailing one"
+        );
+        // The flag the re-point reads is set on a worker; the wake it needs must be
+        // requested by that same worker, because `session_rotated` already read the flag
+        // this tick.
+        assert!(
+            production.contains("ping();"),
+            "the worker that sets `appeared` must also request the follow-up wake, or the \
+             re-point waits for traffic that may never come"
         );
     }
 

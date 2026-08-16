@@ -944,6 +944,19 @@ pub enum WatchScope {
     /// conversation entirely — frequently a subagent of some *other* session — and never a
     /// rotation signal about ours.
     SingleLog,
+    /// Nothing to tail yet — watch for the agent to announce itself, and WAKE the caller.
+    ///
+    /// The unattached state needs a wake source of its own, and this is the whole reason the
+    /// variant exists. Claude's path arms a watch unconditionally ("even when the hint knows
+    /// nothing") precisely so an empty panel has something to fire on; the Antigravity path
+    /// originally armed nothing when no log resolved, and a panel opened before `agy` was
+    /// detectable therefore sat in its opening state **forever** — no wake, so no
+    /// `on_active_changed`, so no re-probe and no re-point. Reported from a live run.
+    ///
+    /// [`Watch::dir`] is the agent's presence directory. This variant reads no file and sends
+    /// no update: it calls `wake` and returns. Deciding what a lock appearing MEANS needs the
+    /// process-tree knowledge only the app has, exactly as with the Claude rotation wake.
+    AwaitingLock,
 }
 
 /// The live rival set, shared between the producer (`app`) and the watch thread.
@@ -999,9 +1012,10 @@ impl LogWatcher {
         } = watch;
         // Unpacked ONCE, out here, so the callback branches on an `Option` it already holds
         // rather than re-matching the enum on every filesystem event.
-        let project = match scope {
-            WatchScope::Project { want, rivals } => Some((want, rivals)),
-            WatchScope::SingleLog => None,
+        let (project, awaiting_lock) = match scope {
+            WatchScope::Project { want, rivals } => (Some((want, rivals)), false),
+            WatchScope::SingleLog => (None, false),
+            WatchScope::AwaitingLock => (None, true),
         };
         // Our side of the path comparison for `SingleLog`, resolved once (see
         // `is_the_one_log`). A directory that cannot be canonicalized — it may not exist
@@ -1045,6 +1059,20 @@ impl LogWatcher {
 
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(ev) = res else { return };
+            if awaiting_lock {
+                // A wake, nothing more — no target to read and no snapshot to send. Scoped to
+                // `.lock` so the whole presence directory's traffic does not reach the event
+                // loop: every conversation on the machine announces itself here, and only the
+                // arrival of a lock can change this tab's answer.
+                if ev
+                    .paths
+                    .iter()
+                    .any(|p| p.extension().is_some_and(|e| e == "lock"))
+                {
+                    wake();
+                }
+                return;
+            }
             let mut switched = false;
             // `SingleLog` never enters this block at all — see `WatchScope::SingleLog`.
             // Its target was named by a presence-lock FD, so there is no better answer for
@@ -1756,6 +1784,65 @@ mod tests {
         assert!(
             hit(canonical_event),
             "the canonical spelling of our own path must match, or the watch is deaf"
+        );
+    }
+
+    /// `AwaitingLock` wakes when a lock appears, and stays quiet otherwise.
+    ///
+    /// The mechanism half of the fix — the app-side wiring is pinned separately by asserting
+    /// the source, since `open()` needs an event loop. Both halves are needed: a watch that
+    /// is armed but never fires is exactly as useless as no watch at all, which is the state
+    /// this variant was added to escape.
+    #[test]
+    fn an_awaiting_lock_watch_wakes_on_a_lock_and_not_on_other_traffic() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let presence = temp_dir("await-lock");
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let _w = {
+            let wakes = wakes.clone();
+            LogWatcher::spawn(
+                Watch {
+                    dir: presence.clone(),
+                    log: None,
+                    owned: false,
+                    attached: unattached(),
+                    scope: WatchScope::AwaitingLock,
+                },
+                SessionTelemetry::with_format(telemetry::LogFormat::Antigravity),
+                0,
+                move || {
+                    wakes.fetch_add(1, Ordering::Relaxed);
+                },
+            )
+            .expect("spawn")
+        };
+
+        // Unrelated traffic in the same directory must not wake the event loop: every
+        // conversation on the machine announces itself here.
+        std::fs::write(presence.join("notes.txt"), "x").unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            0,
+            "a non-lock file must not wake the panel"
+        );
+
+        // The agent publishes its lock — the one event that can change the answer.
+        std::fs::write(
+            presence.join("5c45615b-c452-4726-a938-274c6e0b2b72.lock"),
+            "",
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while wakes.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            wakes.load(Ordering::Relaxed) >= 1,
+            "a lock appearing must wake the caller, which is the only way an unattached \
+             Antigravity panel ever re-probes"
         );
     }
 
