@@ -1871,3 +1871,94 @@ fn the_turn_counters_default_to_nothing_folded() {
         "a fresh Antigravity accumulator is indistinguishable from a fresh Claude one"
     );
 }
+
+/// G5 closed: an async command becomes a TASKS row and its status transitions (2026-08-16).
+///
+/// Bodies transcribed from a live 1.1.13 session, including the `Log:` line and the banner
+/// that follow the fields — the parse is line-scoped precisely so those do not get swallowed.
+///
+/// Antigravity's "task" is an async background COMMAND, not a to-do item, and that is why
+/// the card is worth filling: while a `cargo test --workspace` runs for minutes, it is the
+/// one thing the session is actually waiting on.
+#[test]
+fn an_async_command_becomes_a_task_and_its_status_transitions() {
+    let created = "Created At: 2026-08-16T12:08:57-07:00\nTool is running as a background \
+task with task id: 6436db1a/task-39\nTask Description: cargo test --workspace\nTask logs \
+are available at: file:///Users/x/.gemini/antigravity-cli/brain/6436db1a/.system_generated/\
+tasks/task-39.log\nYOU MUST TRACK THIS TASK";
+    let running = "Created At: 2026-08-16T12:09:10-07:00\nCompleted At: \
+2026-08-16T12:09:10-07:00\nTask: 6436db1a/task-39\nStatus: RUNNING\nLog: /Users/x/t.log";
+    let done = "Created At: 2026-08-16T12:09:21-07:00\nCompleted At: \
+2026-08-16T12:09:21-07:00\nTask: 6436db1a/task-39\nStatus: DONE\nLog: /Users/x/t.log";
+
+    let step = |i: u64, ty: &str, content: &str| {
+        format!(
+            r#"{{"step_index":{i},"source":"MODEL","type":"{ty}","status":"DONE","created_at":"2026-08-14T03:{:02}:00Z","content":{}}}"#,
+            i,
+            serde_json::to_string(content).unwrap()
+        )
+    };
+
+    // born on an async run_command, then two manage_task status checks
+    let s = ag_fold(
+        &[
+            ag_dispatch(
+                1,
+                "run_command",
+                r#""CommandLine":"\"cargo test --workspace\"","WaitMsBeforeAsync":"8000""#,
+            ),
+            step(2, "RUN_COMMAND", created),
+            ag_dispatch(
+                3,
+                "manage_task",
+                r#""Action":"\"status\"","TaskId":"\"6436db1a/task-39\"""#,
+            ),
+            step(4, "GENERIC", running),
+            ag_dispatch(
+                5,
+                "manage_task",
+                r#""Action":"\"status\"","TaskId":"\"6436db1a/task-39\"""#,
+            ),
+            step(6, "GENERIC", done),
+        ]
+        .join("\n"),
+    );
+
+    assert_eq!(s.tasks.len(), 1, "one task, updated twice — not three rows");
+    let (id, e) = &s.tasks[0];
+    assert_eq!(id, "6436db1a/task-39", "keyed as manage_task spells it");
+    assert_eq!(
+        e.subject, "cargo test --workspace",
+        "the subject is the command, which only the creation body carries"
+    );
+    assert_eq!(
+        e.status, "completed",
+        "RUNNING then DONE must land on the vocabulary the card colours green"
+    );
+    assert!(
+        e.updated_ms > e.created_ms,
+        "the last status moved the clock"
+    );
+    assert_eq!(s.orphan_task_updates, 0);
+
+    // A status report with no creation above it must NOT invent a subject-less row.
+    let s = ag_fold(
+        &[
+            ag_dispatch(
+                1,
+                "manage_task",
+                r#""Action":"\"status\"","TaskId":"\"6436db1a/task-99\"""#,
+            ),
+            step(2, "GENERIC", "Task: 6436db1a/task-99\nStatus: RUNNING"),
+        ]
+        .join("\n"),
+    );
+    assert!(
+        s.tasks.is_empty(),
+        "a task whose creation sits above the tail window has no subject to show"
+    );
+    assert_eq!(
+        s.orphan_task_updates, 1,
+        "and the miss is recorded, not silent"
+    );
+}

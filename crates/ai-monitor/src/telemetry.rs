@@ -685,6 +685,43 @@ impl SessionTelemetry {
             _ => None,
         };
 
+        // TASKS, from `content` rather than from `call.kind` (G5, closed 2026-08-16).
+        //
+        // The original reading — "the transcript never records a task model" — was wrong,
+        // and wrong in a way worth naming: it was inferred from `manage_task`'s ARGS, which
+        // carry only an id and an action, without reading the result bodies where the
+        // subject and the status actually live. A user asking why the card was empty is
+        // what prompted the re-read.
+        if let Some(c) = content {
+            if let Some((id, subject)) = ag_task_created(c) {
+                self.tasks.insert(
+                    id,
+                    TaskEntry {
+                        subject,
+                        // Born running: the announcement exists precisely because the
+                        // command outlived its synchronous wait.
+                        status: "in_progress".to_string(),
+                        created_ms: ts.or(call.start_ms),
+                        updated_ms: ts.or(call.start_ms),
+                    },
+                );
+                self.evict_tasks();
+            } else if let Some((id, status)) = ag_task_status(c) {
+                // Only ever UPDATES an entry it already knows. A status report whose
+                // creation announcement sits above the watcher's bounded tail would
+                // otherwise create a subject-less row, and a task card with no subject is
+                // worse than no card: `orphan_task_updates` records it instead, which is
+                // the same accounting the Claude path uses for the same situation.
+                match self.tasks.get_mut(&id) {
+                    Some(entry) => {
+                        entry.status = status;
+                        entry.updated_ms = ts.or(entry.updated_ms);
+                    }
+                    None => self.orphan_task_updates += 1,
+                }
+            }
+        }
+
         match call.kind {
             ToolKind::File(op) => push_capped(
                 &mut self.files,
@@ -733,11 +770,11 @@ impl SessionTelemetry {
                     SUBAGENTS_CAP,
                 )
             }
-            // G5 — `manage_task`'s `TaskId` (`"<conversationId>/task-24"`) implies a
-            // task model the transcript never records: no subject, no status
-            // transitions, nothing a TASKS row could hold. The call is tallied and
-            // nothing is folded. `Skill` is unreachable — no Antigravity tool maps to
-            // it — and shares the arm rather than inventing a placeholder entry.
+            // The TASKS bookkeeping happens above, off `content`, because the two halves
+            // of a task's life arrive on DIFFERENT tools: it is born on a `run_command`
+            // whose async wait expired, and it is updated by `manage_task`. Neither arm
+            // here could see both. `Skill` is unreachable — no Antigravity tool maps to
+            // it — and shares this arm rather than inventing a placeholder entry.
             ToolKind::Task | ToolKind::Skill => {}
             ToolKind::Plain => push_capped(
                 &mut self.tools,
@@ -1259,6 +1296,59 @@ fn ag_arg_str(args: Option<&Value>, key: &str) -> Option<String> {
 /// Scanned, not parsed: the body is pretty-printed JSON embedded in prose
 /// (`Created the following subagents:\n{ "conversationId": "…", "logAbsoluteUri": … }`),
 /// so the whole field is not a JSON document and `serde_json` has nothing to take.
+/// The background-task announcement inside a `RUN_COMMAND` result (G5, closed).
+///
+/// `run_command` with a `WaitMsBeforeAsync` that expires does not return output — it returns
+/// this, and it is the ONLY place a task's description is ever written:
+///
+/// ```text
+/// Tool is running as a background task with task id: <conv>/task-39
+/// Task Description: cargo test --workspace
+/// ```
+///
+/// Returns `(id, description)`. The id keeps its `<conv>/` prefix exactly as
+/// `manage_task`'s `TaskId` spells it, so the two sides key the same map without either
+/// having to normalise.
+fn ag_task_created(content: &str) -> Option<(String, String)> {
+    let id = ag_line_after(content, "background task with task id:")?;
+    let desc = ag_line_after(content, "Task Description:")?;
+    Some((id, desc))
+}
+
+/// A `manage_task` status report inside a `GENERIC` result (G5, closed).
+///
+/// ```text
+/// Task: <conv>/task-39
+/// Status: RUNNING
+/// ```
+///
+/// Returns `(id, status)` with the status translated into the vocabulary the TASKS card
+/// already colours — `RUNNING` -> `in_progress` (amber), `DONE` -> `completed` (green).
+/// Translating here rather than in the app keeps the mapping beside the format it comes
+/// from; an unrecognised status passes through verbatim and renders faint, which is the
+/// honest rendering of a state this build does not know.
+fn ag_task_status(content: &str) -> Option<(String, String)> {
+    let id = ag_line_after(content, "Task:")?;
+    let raw = ag_line_after(content, "Status:")?;
+    let status = match raw.as_str() {
+        "RUNNING" => "in_progress".to_string(),
+        "DONE" => "completed".to_string(),
+        other => other.to_ascii_lowercase(),
+    };
+    Some((id, status))
+}
+
+/// The remainder of the first line containing `key`, trimmed.
+///
+/// Line-scoped deliberately: these bodies also carry a `Log:` path and a `YOU MUST` banner,
+/// and a scan that ran past the newline would swallow them.
+fn ag_line_after(content: &str, key: &str) -> Option<String> {
+    let v = content
+        .lines()
+        .find_map(|l| l.split_once(key).map(|(_, rest)| rest.trim()))?;
+    (!v.is_empty()).then(|| v.to_string())
+}
+
 fn ag_conversation_id(content: &str) -> Option<String> {
     let after = content.split("\"conversationId\"").nth(1)?;
     let after = after.trim_start().strip_prefix(':')?;

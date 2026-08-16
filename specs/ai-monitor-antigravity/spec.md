@@ -660,7 +660,23 @@ are standing limitations, not open decisions.
 
 - **G1 (AG4)** — Antigravity reports no token usage, so CONTEXT and CACHE carry no
   information for these sessions and render as unavailable. This is a limit of the format,
-  not of the implementation; it lifts only if Antigravity starts logging usage.
+  not of the implementation.
+
+  **Re-verified 2026-08-16 on CLI 1.1.13** against a live 56-step session, after a user asked
+  why `/context` shows `53.8k/1.0M (5.1%)` while the panel shows `—`. The CLI computes that
+  figure in memory; it is not persisted anywhere the panel can read. Checked: the transcript
+  carries the same ten keys as the original census and no token field; and
+  `conversations/<brain-id>.db` — which, unlike `conversation_summaries.db`, *is* keyed by the
+  brain directory's id — holds only protobuf blobs whose `gen_metadata.size` is a byte length
+  (sum 257,154 for a 53.8k-token session), not a token count. Recovering it would mean
+  decoding an undocumented protobuf schema. `—` rather than `0%` is the point: the true value
+  was 5.1%, and a zero would have been a confident false statement.
+- **G10 (AG2)** — **SKILLS is always empty for Antigravity, and there is nothing to fill it
+  with.** Claude's card lists `Skill` *tool invocations*; Antigravity has no skill tool. It
+  auto-loads `~/.gemini/skills/` into the system prompt, which `/context` reports as a token
+  *budget* line ("Skills: 5.6k tokens"), not as discrete events. No transcript step records a
+  skill being used, so the card has no source. Listing the contents of `~/.gemini/skills/`
+  instead would answer a different question — what is available, not what ran.
 - **G2 (AG6)** — when a tab's `agy` holds no readable presence FD **and** its workspace has
   never appeared in `history.jsonl`, the panel stays unattached. Sparse-and-correct is the
   chosen failure mode; the observed `history.jsonl` covers only 9 conversations across 2
@@ -671,8 +687,25 @@ are standing limitations, not open decisions.
 - **G4** — `exit_code` (339 records), the `error` key (6), and `ERROR_MESSAGE` steps are not
   yet mapped, so the ERRORS tile and `failed_tool_calls` would read 0 for a session that did
   fail. Cheap to add once AG2 lands; deliberately not in R2 to keep the first pass narrow.
-- **G5** — `manage_task`'s `TaskId` (`"<conversationId>/task-24"`) suggests a task model the
-  transcript never fully records; the TASKS card stays empty for Antigravity.
+- **G5** — ~~`manage_task` suggests a task model the transcript never fully records~~ —
+  **closed 2026-08-16, and the gap was my misreading, not the format's.** It was inferred from
+  `manage_task`'s *args* (an id and an action, nothing else) without reading the result
+  bodies, where both halves of a task's life turn out to be written in full:
+
+  - **Born** on a `run_command` whose async wait expired — the result carries
+    `background task with task id: <conv>/task-N` and `Task Description: <the command>`,
+    the only place a task's subject is ever recorded.
+  - **Updated** by `manage_task`'s `GENERIC` result — `Task: <id>` and
+    `Status: RUNNING | DONE`, translated to the `in_progress` / `completed` vocabulary the
+    TASKS card already colours, so no dashboard change was needed.
+
+  Note what an Antigravity "task" *is*: an async background **command**, not a to-do item.
+  That is what makes the card worth filling — while a `cargo test --workspace` runs for
+  minutes, it is the one thing the session is waiting on. A status report whose creation sits
+  above the watcher's bounded tail updates nothing and increments `orphan_task_updates`; a
+  subject-less task row would be worse than none. Validated against the live 56-step session
+  that prompted the question: 2 tasks, correct commands, `RUNNING`→`completed` on the one that
+  finished, 0 parse errors.
 - **G6** — the corpus is one machine, one user, ~3 weeks. Field names are stable across all
   51 transcripts but Antigravity is a moving target; a version probe is not specified.
 - **G7** — subagent *progress* lives in the child conversation, which AG5 deliberately does
@@ -688,7 +721,16 @@ are standing limitations, not open decisions.
   reader who greps `R0.1` finds a green test whose subject is a five-line enum match, and
   would otherwise have no way to learn that the requirement's own scenario is unverified.
   Closing this needs a manual `/run-term` session.
-- **G8 (AG7)** — *partially closed 2026-08-15.* The **cold-start** half is fixed: the
+- **G8 (AG7)** — *cold start closed 2026-08-16; rotation-while-attached still open.* The
+  2026-08-15 attempt was incomplete: it added the re-probe but not a wake to run it on. An
+  Antigravity tab that resolved no log armed **no watcher at all**, so the panel had no wake
+  source, `on_active_changed` never fired, and it sat in its opening state indefinitely —
+  observed showing "(no Claude session in this tab)" while `agent_for` answered
+  `Some((Antigravity, ..))` for that very shell. Fixed by `WatchScope::AwaitingLock`, which
+  watches the presence directory for the lock that will name the conversation, plus the
+  worker requesting the follow-up wake its own flag needs (`session_rotated` reads that flag
+  on the same tick the worker is spawned to set it, so one wake is never enough).
+- **G8 (AG7)** — *superseded note, 2026-08-15.* The **cold-start** half is fixed: the
   `refresh_rivals` worker now re-probes an `agy` tab off-thread and reports the moment a
   conversation becomes nameable, flipping the unarmed branch of `session_rotated` into a full
   re-point — so a tab that resolved nothing during `agy`'s ~7s startup heals itself instead of
