@@ -63,9 +63,16 @@ application's log with `owned: true`.
     `NO SESSION`. Recorded in `spec.md` § Post-work. This does **not** move the Gate-2 coverage
     count, which measures *automated* evidence only.
   - **R6.7** (quit `claude`, `cd`, start a new one → the panel re-points within one tick) —
-    needs a live process tree and a running app. **Still outstanding.**
-  These three remain excluded **by name** from the Gate-2 coverage count regardless of the manual
-  result: the metric is about what the suite can prove unattended, not about what a person saw
+    needs a live process tree and a running app.
+    **[PASSED 2026-08-16, by human observation — not by this loop.]** Same pane `47553`, its
+    `claude` replaced `47594` → `48112`, session `a44ec234…` → `cd132e29…`, and the panel followed
+    with no tab switch. The operator restarted in place, so the **directory was unchanged** across
+    the re-point — which makes it a sharper D5 × D10 check than the scripted variant: only the pid
+    differed, so a `reopen_is_inert` keyed on the directory alone would have swallowed it.
+    R6.7's "and directory" half remains unexercised live (covered headlessly by R3.1–R3.5).
+    Recorded in `spec.md` § Post-work.
+  All three are now **passed by human observation**, and all three remain excluded **by name**
+  from the Gate-2 coverage count regardless: the metric is about what the suite can prove unattended, not about what a person saw
   once.
 
 ---
