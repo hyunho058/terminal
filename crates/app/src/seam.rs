@@ -249,7 +249,20 @@ pub trait Overlay {
     /// The active tab changed; re-point anything cwd-derived (ai-monitor R3.1).
     /// Carries the new tab's shell pid alongside its cwd, since the two together are
     /// what identify a session. Default: no-op.
-    fn on_active_changed(&mut self, _cwd: Option<PathBuf>, _shell_pid: Option<u32>) {}
+    ///
+    /// `agent_pid` is the tab's **Claude** process as the tabmeta worker last derived it
+    /// (`TabMeta::agent_pid`). Carried because a panel whose directory is a function of that
+    /// process's cwd goes stale exactly when the *pid* changes, and the worker already
+    /// computes it — so this seam is the cheapest place to notice. `None` means **no
+    /// information**, never "a different pid": a consumer must not treat an absent value as a
+    /// change, or a toggle flip or a transient walk failure becomes a re-point storm.
+    fn on_active_changed(
+        &mut self,
+        _cwd: Option<PathBuf>,
+        _shell_pid: Option<u32>,
+        _agent_pid: Option<u32>,
+    ) {
+    }
 
     /// The app is driving this overlay (sticky-tab-title D13/R3.4) — e.g. the card menu's
     /// `Rename` item opening the rename field on a specific tab. Return `Consumed` to stop
@@ -375,9 +388,14 @@ impl OverlayHost {
     }
 
     /// Tell every overlay the active tab changed (ai-monitor re-point, R3.1).
-    pub fn notify_active_changed(&mut self, cwd: Option<PathBuf>, shell_pid: Option<u32>) {
+    pub fn notify_active_changed(
+        &mut self,
+        cwd: Option<PathBuf>,
+        shell_pid: Option<u32>,
+        agent_pid: Option<u32>,
+    ) {
         for o in &mut self.overlays {
-            o.on_active_changed(cwd.clone(), shell_pid);
+            o.on_active_changed(cwd.clone(), shell_pid, agent_pid);
         }
     }
 

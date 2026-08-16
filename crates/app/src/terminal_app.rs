@@ -1074,7 +1074,12 @@ impl Running {
         // `displayed_label` consumes the same generation from its own `sync` first.
         let cwd = self.tabs.active_cwd(&self.tabmeta_snapshot);
         let shell_pid = self.tabs.active_shell_pid();
-        self.overlays.notify_active_changed(cwd, shell_pid);
+        // The same sync also carries the tab's `claude` pid. The panel's directory is a
+        // function of that process's cwd, which is fixed at its launch — so the directory
+        // goes stale exactly when the pid changes, and this wake is where that is noticed.
+        let agent_pid = self.tabs.active_agent_pid(&self.tabmeta_snapshot);
+        self.overlays
+            .notify_active_changed(cwd, shell_pid, agent_pid);
         self.push_agent_states()
     }
 
@@ -1769,8 +1774,9 @@ impl Running {
         self.refresh_hover();
         // Re-point cwd-derived overlays (ai-monitor) at the new active tab (R3.1).
         let cwd = self.tabs.active_cwd(&self.tabmeta_snapshot);
+        let agent_pid = self.tabs.active_agent_pid(&self.tabmeta_snapshot);
         self.overlays
-            .notify_active_changed(cwd, self.tabs.active_shell_pid());
+            .notify_active_changed(cwd, self.tabs.active_shell_pid(), agent_pid);
         self.redraw();
     }
 

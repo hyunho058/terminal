@@ -67,6 +67,26 @@ pub struct TabMeta {
     /// falls back to the cwd title. Derived by the worker (T2), consumed by the sidebar
     /// card (T3); persisted across ticks so an idle agent keeps its last label (D3/D6).
     pub task: Option<String>,
+    /// The pid of this tab's **Claude** agent process, or `None` when it has none.
+    ///
+    /// Published for a consumer that draws nothing with it: the ai-monitor panel derives its
+    /// log directory from the chosen `claude`'s own cwd, and that cwd is fixed at the process's
+    /// launch — so the directory goes stale exactly when the *pid* changes. A user who quits
+    /// `claude`, `cd`s elsewhere in the same pane and starts a new one would otherwise keep
+    /// seeing the old session indefinitely, because the panel stops re-resolving once attached.
+    /// This worker already walks each tab's tree every 500 ms and already re-roots at the tmux
+    /// pane, so the pid is **already computed**; publishing it turns the panel's staleness check
+    /// into an integer compare on a wake it already receives, adding no subprocess to any path.
+    ///
+    /// **Claude-kind only** (D9), and the scoping is a correctness constraint rather than a
+    /// preference: the walk finds *an agent*, and an `agy` or `codex` pid could never equal the
+    /// `claude` pid the panel opened on, so an unscoped value would read as "a different pid"
+    /// on every single tick — a re-point storm, each iteration re-forking `/bin/ps`, respawning
+    /// the watcher and re-running the whole backfill.
+    ///
+    /// **Not gated on `[sidebar].show_agent_status`** for the active tab — see `Deriver::tab`.
+    /// A display preference must not be able to silently disable the panel's staleness check.
+    pub agent_pid: Option<u32>,
 }
 
 /// A running agent: which one, and what it is doing. `Copy` — `Option<Agent>` on
@@ -509,6 +529,7 @@ mod tests {
                         agent: None,
                         task: None,
                         cwd: None,
+                        agent_pid: None,
                     },
                 ),
                 (
@@ -521,6 +542,7 @@ mod tests {
                         }),
                         task: None,
                         cwd: None,
+                        agent_pid: None,
                     },
                 ),
             ],
@@ -564,7 +586,8 @@ mod tests {
                 branch: None,
                 agent: None,
                 task: None,
-                cwd: None
+                cwd: None,
+                agent_pid: None,
             }
         );
     }
