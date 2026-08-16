@@ -104,12 +104,18 @@ pub struct Env {
     pub attached: bool,
     /// `[ai_monitor] context_window` from the TOML config, overriding the table.
     pub context_window: Option<u64>,
-    /// Whether the tab this panel belongs to is running a `claude` process at all —
-    /// answered by walking the tab's process tree in `overlay.rs`, which is why it is
-    /// injected rather than derived: [`model`] reads no process table, and a
-    /// snapshot that does not exist carries nothing to derive it from. It selects
-    /// which of the two [`Detached::NoLog`] wordings the session row shows.
-    pub tab_has_claude: bool,
+    /// Which agent the tab this panel belongs to is running, if any — answered by walking
+    /// the tab's process tree in `overlay.rs`, which is why it is injected rather than
+    /// derived: [`model`] reads no process table, and a snapshot that does not exist carries
+    /// nothing to derive it from. It selects which of the two [`Detached::NoLog`] wordings
+    /// the session row shows.
+    ///
+    /// The KIND, not a bool (AG10). It was `tab_has_claude` while Claude was the only agent
+    /// monitored, and a bool cannot express the case that arrived with this feature: a tab
+    /// running an agent the monitor does not implement. "Waiting for a log" and "there is
+    /// nothing here to watch" are different statements, and only the kind separates them —
+    /// see [`session_row`].
+    pub tab_agent: Option<crate::tabmeta::AgentKind>,
     /// Seconds to add to a UTC epoch to get local wall-clock time (D19), resolved by
     /// `overlay.rs` from the platform timezone each time the model is rebuilt.
     ///
@@ -270,7 +276,7 @@ fn session_row(t: &TelemetrySnapshot, detached: Option<Detached>, env: &Env) -> 
             .as_deref()
             .map(|s| s.chars().take(8).collect::<String>())
             .unwrap_or_else(|| DASH.to_string()),
-        provider: "[Claude]".to_string(),
+        provider: provider_tag(env.tab_agent),
         model: t
             .model
             .as_deref()
@@ -301,10 +307,74 @@ pub fn detached_note(d: Detached, env: &Env) -> String {
         // `claude` started without `--resume`, or whose start time could not be read,
         // yields an empty hint, and telling the user there is no session in a tab where
         // they can watch `claude` running reads as a bug.
-        Detached::NoLog if env.tab_has_claude => {
+        //
+        // MONITORED kinds only, which is the distinction the old bool could not draw. A tab
+        // running an agent this monitor does not implement (`Codex`, `Gemini`, `Aider` — the
+        // sidebar classifies them, nothing reads their logs) must not be told its session
+        // "has not written a log yet": no log is ever going to be resolved for it, and a
+        // wording that implies waiting describes a state that will never arrive.
+        Detached::NoLog if is_monitored(env.tab_agent) => {
             "(this tab's session has not written a log yet)".to_string()
         }
+        // Still names Claude, deliberately, and this is the wording's LAST Claude-specific
+        // corner. It is only reachable when the tab runs no monitored agent, so an `agy` tab
+        // never sees it — that case takes the neutral branch above (R5.1). Generalising the
+        // copy would be a user-visible change to a string two tests pin verbatim, which is
+        // T6's reviewed-diff half of AG10, not this task's mechanical one.
         Detached::NoLog => "(no Claude session in this tab)".to_string(),
+    }
+}
+
+/// The session row's provider tag — which agent this panel is showing (AG10).
+///
+/// This IS the "agent name" surface the spec asked for. R5.1 was drafted as "the panel title
+/// displays 'Antigravity CLI'", written against a title element that does not exist; the
+/// panel has no title, but it has carried a provider tag next to the session id since it was
+/// built. Adding a title row to say a thing an existing row already says would have been new
+/// chrome competing with the design rather than fitting it, so the tag is what varies. The
+/// short form matches the tag's established shape (`[Claude]`, not `[Claude Code]`).
+///
+/// Non-Antigravity keeps `[Claude]` verbatim, which is what leaves the pinned panel
+/// snapshots byte-identical.
+fn provider_tag(kind: Option<crate::tabmeta::AgentKind>) -> String {
+    match kind {
+        Some(crate::tabmeta::AgentKind::Antigravity) => "[Antigravity]".to_string(),
+        _ => "[Claude]".to_string(),
+    }
+}
+
+/// Does this agent's log record token usage at all (AG4)?
+///
+/// Antigravity's does not: grepping the whole measured corpus (51 transcripts, 1,761 steps)
+/// for `usage`, `input_tokens`, `output_tokens`, `prompt_tokens` and `total_tokens` returns
+/// zero hits. So for an `agy` session `total_input`, `total_cache_*` and `context_used` are
+/// not "zero so far", they are **never written** — and the difference is the whole point of
+/// this predicate, because the panel renders those two states very differently.
+///
+/// Exhaustive, for the reason [`is_monitored`] gives.
+fn reports_usage(kind: Option<crate::tabmeta::AgentKind>) -> bool {
+    use crate::tabmeta::AgentKind::*;
+    match kind {
+        Some(Antigravity) => false,
+        // `None` keeps the Claude shape: an attached session whose process has since exited
+        // still has real token totals on screen, and blanking them on process death would
+        // delete data the user is reading.
+        Some(Claude) | Some(Codex) | Some(Gemini) | Some(Aider) | None => true,
+    }
+}
+
+/// Does this monitor actually read this agent's logs?
+///
+/// Exhaustive on purpose — no `_` arm. `AgentKind` is the sidebar's classification vocabulary
+/// and is deliberately wider than what the monitor implements, so the day one of the others
+/// grows a resolver, this match stops compiling until someone decides which side it belongs
+/// on. That is the same guard `sidebar-row-redesign` puts on the skin mapping, for the same
+/// reason: a `_` arm would silently answer for a variant nobody considered.
+fn is_monitored(kind: Option<crate::tabmeta::AgentKind>) -> bool {
+    use crate::tabmeta::AgentKind::*;
+    match kind {
+        Some(Claude) | Some(Antigravity) => true,
+        Some(Codex) | Some(Gemini) | Some(Aider) | None => false,
     }
 }
 
@@ -321,7 +391,7 @@ fn tiles(t: &TelemetrySnapshot, env: &Env) -> Vec<StatTile> {
     // Cumulative and session-wide (D3) — NOT `parse_errors`, which counts parser faults.
     // Showing one under the other's label would be a false statement about what failed.
     let errors = t.failed_tool_calls;
-    vec![
+    let mut out = vec![
         StatTile::new("UPTIME", since(t.first_event_ms), ColorRole::TextPrimary),
         StatTile::new("IDLE", since(t.last_event_ms), ColorRole::TextPrimary),
         StatTile::new(
@@ -335,18 +405,47 @@ fn tiles(t: &TelemetrySnapshot, env: &Env) -> Vec<StatTile> {
                 ColorRole::TextMuted
             },
         ),
-        StatTile::new(
+    ];
+    // The last three tiles are the token trio, and an agent that reports no tokens cannot
+    // fill them (AG4/R5.5). It gets the same three SLOTS — the grid is 3x2 and stays 3x2 —
+    // with the one quantity it does measure in the first of them.
+    if reports_usage(env.tab_agent) {
+        out.push(StatTile::new(
             "IN·OUT",
             format!("{}·{}", tok(t.total_input), tok(t.total_output)),
             ColorRole::TextPrimary,
-        ),
-        StatTile::new(
+        ));
+        out.push(StatTile::new(
             "CACHE",
             tok(t.total_cache_read.saturating_add(t.total_cache_creation)),
             ColorRole::Teal,
-        ),
-        context_tile(t, env),
-    ]
+        ));
+        out.push(context_tile(t, env));
+    } else {
+        // Turns, in the slot tokens would have used: the same "two numbers, one dot" idiom
+        // as IN·OUT, and the one headline quantity an Antigravity transcript does record
+        // (AG3/AG8).
+        out.push(StatTile::new(
+            "TURNS",
+            format!("{}·{}", num(t.turns_user), num(t.turns_assistant)),
+            ColorRole::TextPrimary,
+        ));
+        // Explicitly unavailable, NOT zero.
+        //
+        // Only the CACHE line is load-bearing: `tok(0)` would print a Teal `0`, which
+        // asserts a measurement ("nothing cached") that no line in an Antigravity log
+        // entitles the panel to make. CONTEXT here is belt-and-braces and says so
+        // honestly — `context_pct` already returns `None` the moment `context_used == 0`
+        // (see its first line), so `context_tile` would produce this exact tile anyway.
+        // It is written out rather than delegated so the panel's answer for a token-less
+        // agent does not silently depend on a zero-check living in another function, and
+        // so this branch reads as one decision instead of one decision plus a coincidence.
+        // `StatTile::gauge`'s own doc draws the same distinction from the other
+        // direction — an unknown window rather than an unknown numerator.
+        out.push(StatTile::new("CACHE", DASH, ColorRole::TextMuted));
+        out.push(StatTile::new("CONTEXT", DASH, ColorRole::TextMuted));
+    }
+    out
 }
 
 /// The CONTEXT tile and its gauge (R5.4/R5.5).
@@ -1031,14 +1130,14 @@ mod tests {
 
     /// A default environment at `now`: attached (so nothing is detached) and no
     /// configured window, so every pre-existing expectation keeps its meaning.
-    /// `tab_has_claude` is irrelevant while attached — it only selects between the two
+    /// `tab_agent` is irrelevant while attached — it only selects between the two
     /// `NoLog` wordings — so it takes the same `false` the derived `Default` would.
     fn env(now: u64) -> Env {
         Env {
             now_ms: now,
             attached: true,
             context_window: None,
-            tab_has_claude: false,
+            tab_agent: None,
             utc_offset_secs: 0,
         }
     }
@@ -1052,9 +1151,9 @@ mod tests {
     }
 
     /// The unattached, nothing-resolved environment the two `NoLog` wordings are keyed in.
-    fn no_session(now: u64, tab_has_claude: bool) -> Env {
+    fn no_session(now: u64, tab_agent: Option<crate::tabmeta::AgentKind>) -> Env {
         Env {
-            tab_has_claude,
+            tab_agent,
             ..unattached(now)
         }
     }
@@ -1592,7 +1691,10 @@ mod tests {
             .collect();
         for e in [
             model(None, &env(now)),
-            model(None, &no_session(now, true)),
+            model(
+                None,
+                &no_session(now, Some(crate::tabmeta::AgentKind::Claude)),
+            ),
             model(Some(&t), &unattached(now)),
         ] {
             let labels: Vec<String> = e.sections.iter().map(|s| s.label.clone()).collect();
@@ -2305,9 +2407,9 @@ mod tests {
     }
 
     #[test]
-    fn a_tab_with_no_claude_process_is_told_exactly_that() {
-        // The everyday case: a tab that simply is not running Claude Code.
-        let out = project(&model(None, &no_session(1_785_226_000_000, false)));
+    fn a_tab_with_no_agent_process_is_told_exactly_that() {
+        // The everyday case: a tab that simply is not running an AI agent at all.
+        let out = project(&model(None, &no_session(1_785_226_000_000, None)));
         assert!(out.contains("(no Claude session in this tab)"), "{out}");
         assert!(!out.contains("has not written a log"), "{out}");
     }
@@ -2318,7 +2420,10 @@ mod tests {
         // but no log in the project directory can be confirmed as its own. "(no Claude
         // session in this tab)" here would read as a bug, which is why the wording is
         // keyed on process presence rather than on the hint's usability.
-        let out = project(&model(None, &no_session(1_785_226_000_000, true)));
+        let out = project(&model(
+            None,
+            &no_session(1_785_226_000_000, Some(crate::tabmeta::AgentKind::Claude)),
+        ));
         assert!(
             out.contains("(this tab's session has not written a log yet)"),
             "{out}"
@@ -2347,8 +2452,22 @@ mod tests {
             assert!(leaked.contains(m), "fixture no longer emits {m}:\n{leaked}");
         }
 
-        for tab_has_claude in [false, true] {
-            let out = project(&model(None, &no_session(now, tab_has_claude)));
+        use crate::tabmeta::AgentKind::*;
+        for (tab_agent, wording) in [
+            (None, "(no Claude session in this tab)"),
+            (
+                Some(Claude),
+                "(this tab's session has not written a log yet)",
+            ),
+            // AG10/R5.1: an `agy` tab gets the waiting wording, not a claim about Claude.
+            (
+                Some(Antigravity),
+                "(this tab's session has not written a log yet)",
+            ),
+            // An agent the monitor does not read must not be described as pending.
+            (Some(Codex), "(no Claude session in this tab)"),
+        ] {
+            let out = project(&model(None, &no_session(now, tab_agent)));
             for m in markers {
                 assert!(
                     !out.contains(m),
@@ -2356,15 +2475,114 @@ mod tests {
                 );
             }
             // ... and it is not merely blank: the row says which nothing this is.
-            assert!(
-                out.contains(if tab_has_claude {
-                    "(this tab's session has not written a log yet)"
-                } else {
-                    "(no Claude session in this tab)"
-                }),
-                "{out}"
-            );
+            assert!(out.contains(wording), "{tab_agent:?} -> {out}");
         }
+    }
+
+    // ---- ai-monitor-antigravity T6: the Antigravity panel's own pinned form ----
+
+    /// A whole Antigravity panel, pinned (AG4/AG10).
+    ///
+    /// A NEW snapshot rather than a change to an existing one, which is the shape AG10's
+    /// split was aiming for: the three Claude panels stay byte-identical (R5.6 proved that in
+    /// T5 and still holds), and the presentation this feature adds gets its own baseline
+    /// instead of being reviewed as a diff against Claude's.
+    ///
+    /// What to look for when reviewing the accepted output:
+    /// * `provider="[Antigravity]"` — the agent name, in the tag that already existed.
+    /// * `tile TURNS 3·4` — real data, in the slot IN·OUT would have held.
+    /// * `tile CACHE —` and `tile CONTEXT —` with **`gauge=none`** — the point of R5.5. Not
+    ///   `0` and not `gauge=0`, because this agent reports no tokens at all and a zero would
+    ///   assert a measurement that was never taken.
+    #[test]
+    fn the_antigravity_panel_matches_its_pinned_form() {
+        let now = 1_785_226_000_000u64;
+        let t = TelemetrySnapshot {
+            session_id: None, // AG5: the conversation id is the DIRECTORY's name, not the log's
+            model: Some("Gemini 3.6 Flash (High)".into()),
+            turns_user: 3,
+            turns_assistant: 4,
+            first_event_ms: Some(now - (12 * 60 + 30) * 1000),
+            last_event_ms: Some(now - 8_000),
+            total_tool_calls: 27,
+            tool_calls: vec![
+                ("run_command".into(), 14),
+                ("view_file".into(), 9),
+                ("grep_search".into(), 4),
+            ],
+            subagents: vec![ai_monitor::telemetry::Subagent {
+                subagent_type: Some("skill-portfolio-analyzer".into()),
+                description: Some("Analyzes installed skills and MCP servers".into()),
+                id: "ed14342c-c779-48bd-af30-fbc139e151f2".into(),
+                model: None,
+                start_ms: Some(now - 45_000),
+                end_ms: None,
+                completed: false,
+            }],
+            ..TelemetrySnapshot::default()
+        };
+        let env = Env {
+            tab_agent: Some(crate::tabmeta::AgentKind::Antigravity),
+            ..env(now)
+        };
+        insta::assert_snapshot!(project(&model(Some(&t), &env)));
+    }
+
+    // ---- ai-monitor-antigravity T5: the Antigravity session in the existing cards ----
+
+    /// R4.1: an Antigravity subagent populates ACTIVE AGENTS through the SAME card renderer
+    /// Claude's subagents use.
+    ///
+    /// The point of the test is that no Antigravity-specific rendering exists or is needed.
+    /// AG5 maps the format's two-record subagent (`define_subagent` names it,
+    /// `INVOKE_SUBAGENT` carries the child conversation id) onto the existing `Subagent`
+    /// fields, so if that mapping is ever "simplified" into, say, stuffing the conversation
+    /// id into `subagent_type`, this card starts rendering a UUID at the user and this test
+    /// is what says so.
+    #[test]
+    fn an_antigravity_subagent_renders_in_the_existing_agents_card() {
+        let now = 1_785_226_000_000u64;
+        let t = TelemetrySnapshot {
+            subagents: vec![ai_monitor::telemetry::Subagent {
+                // `define_subagent`'s `name`, which is what a human reads.
+                subagent_type: Some("skill-portfolio-analyzer".into()),
+                description: Some("Analyzes installed skills and MCP servers".into()),
+                // The CHILD conversation id (AG5's join key) — deliberately not the title.
+                id: "ed14342c-c779-48bd-af30-fbc139e151f2".into(),
+                // Antigravity records no per-subagent model, so the detail line must not
+                // invent a separator for one.
+                model: None,
+                start_ms: Some(now - 30_000),
+                end_ms: None,
+                completed: false,
+            }],
+            ..TelemetrySnapshot::default()
+        };
+
+        let out = project(&model(
+            Some(&t),
+            &Env {
+                tab_agent: Some(crate::tabmeta::AgentKind::Antigravity),
+                ..env(now)
+            },
+        ));
+
+        assert!(
+            out.contains("skill-portfolio-analyzer"),
+            "the card must title itself with the subagent's NAME:\n{out}"
+        );
+        assert!(
+            out.contains("Analyzes installed skills"),
+            "the detail line carries the definition's description:\n{out}"
+        );
+        assert!(
+            !out.contains("ed14342c"),
+            "the child conversation id is a join key, not something to show a user:\n{out}"
+        );
+        assert!(
+            !out.contains(" · "),
+            "no model was recorded, so no model separator may appear:\n{out}"
+        );
     }
 
     // ---- the docked panel's chrome (R5.1–R5.5, R5.10) ------------------------
@@ -2377,7 +2595,7 @@ mod tests {
         let (t, now) = populated();
         for m in [
             model(Some(&t), &env(now)),
-            model(None, &no_session(now, false)),
+            model(None, &no_session(now, None)),
             model(Some(&TelemetrySnapshot::default()), &env(now)),
         ] {
             assert_eq!(m.title, "ai-monitor");
@@ -2412,7 +2630,7 @@ mod tests {
         assert_eq!(model(Some(&t), &env(now)).status, PanelStatus::Idle);
         // A tab with no Claude session at all.
         assert_eq!(
-            model(None, &no_session(now, false)).status,
+            model(None, &no_session(now, None)).status,
             PanelStatus::NoSession
         );
         // All four detached cases compress to the one badge — the wordings live on the
@@ -2443,11 +2661,14 @@ mod tests {
             "(no active session — newest log is undated)"
         );
         assert_eq!(
-            note(None, &no_session(now, true)),
+            note(
+                None,
+                &no_session(now, Some(crate::tabmeta::AgentKind::Claude))
+            ),
             "(this tab's session has not written a log yet)"
         );
         assert_eq!(
-            note(None, &no_session(now, false)),
+            note(None, &no_session(now, None)),
             "(no Claude session in this tab)"
         );
         // An attached row carries no note...
@@ -2761,7 +2982,7 @@ mod tests {
         );
         for footer in [
             model(Some(&t), &kst).footer,
-            model(None, &no_session(now, false)).footer,
+            model(None, &no_session(now, None)).footer,
         ] {
             assert!(!footer.contains("ago"), "{footer}");
             assert!(!footer.contains("idle"), "{footer}");
@@ -2794,8 +3015,12 @@ mod tests {
         for footer in [
             model(Some(&t), &kst).footer,
             model(Some(&t), &unattached(now)).footer,
-            model(None, &no_session(now, true)).footer,
-            model(None, &no_session(now, false)).footer,
+            model(
+                None,
+                &no_session(now, Some(crate::tabmeta::AgentKind::Claude)),
+            )
+            .footer,
+            model(None, &no_session(now, None)).footer,
         ] {
             assert!(
                 footer.starts_with("Last update "),

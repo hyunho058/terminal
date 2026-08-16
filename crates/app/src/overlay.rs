@@ -90,11 +90,11 @@ pub struct AiMonitorOverlay {
     /// can show: "no Claude session in this tab" from "this tab's session has not
     /// written a log yet". Same lifecycle as `context_window`: re-decided on every
     /// `open()`, read by `refresh_model`, never recomputed per frame.
-    tab_has_claude: bool,
+    tab_agent: Option<crate::tabmeta::AgentKind>,
     /// Which `claude` process this open asked, and what it answered — the baseline the
     /// rotation check compares against. See [`OpenedOn`] and [`session_rotated_with`].
     ///
-    /// Same lifecycle as `tab_has_claude`: re-decided on every `open()`, never merged.
+    /// Same lifecycle as `tab_agent`: re-decided on every `open()`, never merged.
     /// `None` only when the tab has no `claude` at all; a `claude` that has not yet named a
     /// session is `Some` with a `None` id, which the first valid record ARMS.
     ///
@@ -162,7 +162,7 @@ impl AiMonitorOverlay {
             proxy,
             started_ms: now_ms(),
             context_window: None,
-            tab_has_claude: false,
+            tab_agent: None,
             opened_on: None,
             opened_dir: None,
             last_seen_pid: None,
@@ -215,6 +215,15 @@ impl AiMonitorOverlay {
         // `claude`'s own cwd, and that is what the panel opens on, so the hint has to exist
         // before the directory can be chosen. Two places deciding the directory is the exact
         // shape that produced the re-open storm, so there is still only one.
+        //
+        // Which agent this tab runs decides which of the two attachment paths below applies
+        // (AG7/AG9). Asked once, here, so the format handed to the backfill and the format
+        // handed to the watcher come from the same answer — seeding in one and tailing in
+        // another would fold a session into the wrong shape and report it as parse errors.
+        //
+        // An `agy` tab has no `claude`, so `hint_for` answers `None` and the directory below
+        // falls through to the pane's cwd — which is the one the Antigravity branch wants.
+        let agent = shell_pid.and_then(tabsession::agent_for);
         let h = shell_pid.and_then(tabsession::hint_for);
         // One call does both halves of the bookkeeping: it records the *notified* value as the
         // re-point key and returns the *resolved* value to open on, preferring the chosen
@@ -233,7 +242,28 @@ impl AiMonitorOverlay {
         // cwd with no project directory still gets the "has not written a log yet"
         // wording rather than being told there is no session at all. Unconditional, so
         // re-pointing to a tab with no `claude` clears it.
-        self.tab_has_claude = h.is_some();
+        // The KIND now, not a bool (AG10). `agent_for`'s answer takes precedence, but only
+        // for a kind this monitor actually reads: the two detectors walk the process tree by
+        // different mechanisms (`proc_listchildpids` here, a `/bin/ps` table in `hint_for`),
+        // and R5.6 requires a Claude tab to be unchanged by this feature.
+        //
+        // The `filter` is what makes `hint_for` a real floor. An earlier spelling was
+        // `agent.map(..).or_else(..)` with a comment claiming the same property, and the
+        // claim was false: `or_else` runs only when the left side is `None`, so a tab where
+        // `agent_for` reached an UNMONITORED agent first (a `codex` nearer the root than a
+        // deeper `claude`) lost its confirmed Claude verdict and dropped from "has not
+        // written a log yet" to "no Claude session in this tab". Filtering to the monitored
+        // kinds first means an unmonitored answer can no longer displace a confirmed one,
+        // which is what the floor was always supposed to mean.
+        self.tab_agent = agent
+            .map(|(k, _)| k)
+            .filter(|k| {
+                matches!(
+                    k,
+                    crate::tabmeta::AgentKind::Claude | crate::tabmeta::AgentKind::Antigravity
+                )
+            })
+            .or_else(|| h.is_some().then_some(crate::tabmeta::AgentKind::Claude));
         let hint = h.unwrap_or_default();
         // D10 — everything below rebuilds; if it would rebuild exactly what is already on
         // screen, stop here instead.
@@ -279,7 +309,7 @@ impl AiMonitorOverlay {
         self.opened_dir = cwd.clone();
         // The rotation baseline, from the SAME hint the resolution below uses, so the two can
         // never disagree about which session this open is for. Unconditional, like
-        // `tab_has_claude` above: re-pointing to a tab with no `claude` must CLEAR it — a
+        // `tab_agent` above: re-pointing to a tab with no agent must CLEAR it — a
         // stale baseline would compare the new tab's process against the old tab's session id
         // and re-point on every wake.
         self.opened_on = baseline_from(&hint);
@@ -304,7 +334,70 @@ impl AiMonitorOverlay {
         self.session.repoint();
         self.watcher = None;
 
-        if let Some(dir) = cwd.as_deref().and_then(project_dir) {
+        if let Some(agy_pid) = antigravity_pid(agent) {
+            // The Antigravity path (AG1/AG6/AG7). Deliberately NOT a variation on the Claude
+            // path below: there is no project directory, no `Wanted`, and no rival contest,
+            // because the presence lock names the conversation outright. What is left is a
+            // single question — which transcript — asked once here.
+            //
+            // The FD probe lives in `app` (AG11) because enumerating another process's open
+            // descriptors needs syscalls `ai-monitor` deliberately cannot make; the crate
+            // takes the answer, not the capability.
+            // A live agent is confirmed here by construction — `antigravity_pid` only
+            // answers `Some` when the tree walk found `agy` — so a probe that names nothing
+            // is `LiveButUnnamed`, never `NoAgent`. That distinction is the whole fix: it
+            // stops the history tier adopting an older, possibly `/exit`ed conversation
+            // during the ~7s before `agy` writes its lock.
+            let probed = crate::presence_fd::conversation_of_pid(agy_pid);
+            let probed = match probed.as_deref() {
+                Some(id) => ai_monitor::antigravity::Probed::Conversation(id),
+                None => ai_monitor::antigravity::Probed::LiveButUnnamed,
+            };
+            let resolved = cwd
+                .as_deref()
+                .and_then(|c| ai_monitor::antigravity::resolve(probed, c));
+            let owned = resolved.as_ref().is_some_and(|r| r.owned);
+            let log = resolved.map(|r| r.path);
+            let (telemetry, offset) = match log.as_deref() {
+                Some(p) => ai_monitor::backfill_telemetry_with(
+                    p,
+                    ai_monitor::telemetry::LogFormat::Antigravity,
+                ),
+                // Unresolved is a real, reachable state, not an error: a cold-started `agy`
+                // has no transcript yet, and AG6 leaves a tab whose conversation cannot be
+                // named unattached rather than adopting a neighbour's (R1.5/R1.6).
+                None => (
+                    SessionTelemetry::with_format(ai_monitor::telemetry::LogFormat::Antigravity),
+                    0,
+                ),
+            };
+            self.session
+                .note(Arc::new(telemetry.snapshot()), self.started_ms, owned);
+            // No log means nothing to watch. Unlike the Claude branch — which arms an
+            // unconditional watch because the tab's own session may write its first line at
+            // any moment into a directory we already know — there is no directory to wait in
+            // here: the conversation id IS the directory name, so until one is resolved there
+            // is no path that could become right. The next re-point asks again.
+            if let Some(log) = log.as_deref() {
+                let proxy = self.proxy.clone();
+                self.watcher = LogWatcher::spawn(
+                    Watch {
+                        dir: log.parent().map(PathBuf::from).unwrap_or_default(),
+                        log: Some(log.to_path_buf()),
+                        owned,
+                        attached: self.session.attached_flag.clone(),
+                        scope: ai_monitor::WatchScope::SingleLog,
+                    },
+                    telemetry,
+                    offset,
+                    move || {
+                        if let Some(p) = proxy.as_ref() {
+                            let _ = p.send_event(UserEvent::OverlayPending);
+                        }
+                    },
+                );
+            }
+        } else if let Some(dir) = cwd.as_deref().and_then(project_dir) {
             // Resolve *here* rather than latching one log for the watcher's lifetime:
             // it may not be this tab's session, and the tab's own session may not have
             // written a file yet. The watcher re-resolves with the same hint.
@@ -501,6 +594,25 @@ impl AiMonitorOverlay {
         // indicate it. Low probability, unbounded consequence, four lines to remove.
         let inflight = InFlight(self.refreshing.clone());
         std::thread::spawn(move || {
+            // The Antigravity half of "an agent appeared", and the reason a cold-started
+            // `agy` tab heals itself (AG6/G8). `agy` publishes its presence lock ~7s after
+            // the process starts, so the `open()` that ran at launch legitimately resolved
+            // nothing; this re-probes off-thread and reports the moment the conversation
+            // becomes nameable, which flips the unarmed branch of `session_rotated` and
+            // triggers a full re-point. Without it the panel would sit on the honest but
+            // permanent "has not written a log yet".
+            //
+            // Checked BEFORE `hint_for` because that call forks `/bin/ps`: an `agy` tab has
+            // no `claude` to find, and paying a fork to learn so on every wake is the cost
+            // this ordering avoids.
+            if let Some((crate::tabmeta::AgentKind::Antigravity, agy)) = tabsession::agent_for(pid)
+            {
+                if crate::presence_fd::conversation_of_pid(agy).is_some() {
+                    appeared.store(true, Ordering::Release);
+                }
+                drop(inflight);
+                return;
+            }
             let hint = tabsession::hint_for(pid);
             // A `claude` exists under this tab now. Reported unconditionally — the event loop
             // decides whether it cares, and it only cares while unarmed.
@@ -534,7 +646,7 @@ impl AiMonitorOverlay {
             now_ms: now_ms(),
             attached: self.session.attach.attached,
             context_window: self.context_window,
-            tab_has_claude: self.tab_has_claude,
+            tab_agent: self.tab_agent,
             utc_offset_secs: local_utc_offset_secs(),
         };
         let mut model = dashboard::model(self.session.latest.as_deref(), &env);
@@ -729,6 +841,22 @@ impl Drop for InFlight {
     }
 }
 
+/// The pid of the tab's `agy`, when this open takes the Antigravity path (T4).
+///
+/// A named function rather than an inline pattern because of what it must NOT do.
+/// [`crate::tabmeta::AgentKind`] has five variants and this feature implements exactly one of
+/// them; the other four — and a tab running no agent at all — take the Claude path, which is
+/// correct only because that path degrades to "resolve nothing, show an explained empty
+/// state" rather than to something wrong. The day `Codex` or `Gemini` grows a real
+/// implementation, this is the single place that has to learn about it, and the test below
+/// fails until it does. An inline `if let` would just silently keep routing it to Claude.
+fn antigravity_pid(agent: Option<(crate::tabmeta::AgentKind, u32)>) -> Option<u32> {
+    match agent {
+        Some((crate::tabmeta::AgentKind::Antigravity, pid)) => Some(pid),
+        _ => None,
+    }
+}
+
 /// Build the [`Watch`] whose rival handle is *the one stored in `slot`*.
 ///
 /// The pairing lives in one function so a test can assert it (`Arc::ptr_eq`) without an
@@ -746,10 +874,9 @@ fn watch_with_rivals(
     Watch {
         dir,
         log,
-        want,
         owned,
-        rivals,
         attached,
+        scope: ai_monitor::WatchScope::Project { want, rivals },
     }
 }
 
@@ -1475,7 +1602,7 @@ impl Overlay for AiMonitorOverlay {
             // the panel re-points straight onto it. When it does not, resolution answers
             // `None` and nothing is folded, so what the panel holds is an EMPTY snapshot
             // (not the absence of one) — `Detached::of` reads that as `NoLog` and, with
-            // `tab_has_claude`, shows "this tab's session has not written a log yet" rather
+            // `tab_agent`, shows "this tab's session has not written a log yet" rather
             // than a dead session's numbers. The freshly-spawned watcher, now unattached,
             // adopts the log when it lands.
             //
@@ -1807,16 +1934,57 @@ mod tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
 
+        // The handle now lives inside the scope enum (AG7). Reaching through it rather than
+        // matching loosely keeps this test failing for the reason it was written — a
+        // *different* `Arc` — instead of passing on a wrong-variant watch.
+        let ai_monitor::WatchScope::Project { rivals, .. } = &watch.scope else {
+            panic!("a Claude watch must be built with WatchScope::Project");
+        };
+
         assert!(
-            Arc::ptr_eq(&slot, &watch.rivals),
+            Arc::ptr_eq(&slot, rivals),
             "the watcher must read the handle refresh_rivals writes"
         );
 
         // And a membership change through the slot is visible to the Watch's copy.
         slot.lock().unwrap().list.clear();
         assert!(
-            watch.rivals.lock().unwrap().list.is_empty(),
+            rivals.lock().unwrap().list.is_empty(),
             "a refresh must reach the watcher, or D11 is inert"
+        );
+    }
+
+    // ---- ai-monitor-antigravity T4: which attachment path an open takes (R0.1) ----
+
+    /// Only Antigravity takes the `SingleLog` path — every other kind, and no agent at all,
+    /// falls to the Claude path.
+    ///
+    /// Enumerated over ALL of `AgentKind` on purpose. The routing is a match on one variant
+    /// out of five, so the interesting failure is not "Antigravity stopped working" but "a
+    /// newly-implemented agent silently kept using Claude's resolver" — which no test of the
+    /// Antigravity case alone would catch.
+    #[test]
+    fn only_an_antigravity_tab_takes_the_single_log_path() {
+        use crate::tabmeta::AgentKind::*;
+
+        assert_eq!(
+            super::antigravity_pid(Some((Antigravity, 4242))),
+            Some(4242),
+            "an agy tab must route to the Antigravity path, carrying its pid for the FD probe"
+        );
+
+        for other in [Claude, Codex, Gemini, Aider] {
+            assert_eq!(
+                super::antigravity_pid(Some((other, 4242))),
+                None,
+                "{other:?} has no Antigravity implementation and must not take that path"
+            );
+        }
+
+        assert_eq!(
+            super::antigravity_pid(None),
+            None,
+            "a tab running no agent at all keeps the Claude path's explained empty state"
         );
     }
 
