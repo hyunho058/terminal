@@ -671,12 +671,35 @@ are standing limitations, not open decisions.
   (sum 257,154 for a 53.8k-token session), not a token count. Recovering it would mean
   decoding an undocumented protobuf schema. `—` rather than `0%` is the point: the true value
   was 5.1%, and a zero would have been a confident false statement.
-- **G10 (AG2)** — **SKILLS is always empty for Antigravity, and there is nothing to fill it
-  with.** Claude's card lists `Skill` *tool invocations*; Antigravity has no skill tool. It
-  auto-loads `~/.gemini/skills/` into the system prompt, which `/context` reports as a token
-  *budget* line ("Skills: 5.6k tokens"), not as discrete events. No transcript step records a
-  skill being used, so the card has no source. Listing the contents of `~/.gemini/skills/`
-  instead would answer a different question — what is available, not what ran.
+
+  **A related lag, recorded 2026-08-16.** The model can trail the CLI by one turn. The
+  `<USER_SETTINGS_CHANGE>` sentence rides inside a `USER_INPUT`, so a `/model` change made
+  with no subsequent message is not in the transcript at all: the panel showed
+  `Gemini 3.5 Flash (Low)` — correctly, as the last change the transcript records — while the
+  CLI had since been set back to `Gemini 3.7 Flash (High)`. It corrects itself on the next
+  user turn. `settings.json` does now carry a live `"model"` key, but it is **global**, not
+  per-conversation: reading it would mislabel every tab but the most recently changed one, so
+  the per-session value stays authoritative.
+- **G10 (AG2)** — ~~SKILLS is always empty and there is nothing to fill it with~~ —
+  **closed 2026-08-16, and wrong for the same reason G5 was.** The claim rested on an audit of
+  *tool names*: Antigravity has no skill tool, therefore (it was concluded) no skill signal.
+  It has one, and it is not where a tool would be — an explicit invocation splices a `<SKILL>`
+  block into the user's own turn, naming the skill in parentheses:
+
+  ```text
+  <SKILL>The user has explicitly invoked the (worktree) skill. You must strictly follow ...
+  ```
+
+  Scraped from `USER_INPUT` only, exactly as the model scrape is and for the identical reason
+  (a `grep_search` result quoting one back must not fold as an invocation), and bounded to the
+  introducing sentence so the skill's own markdown body — which is full of parentheses —
+  cannot supply the name. Validated across the corpus: 8 sessions, resolving `worktree`,
+  `zzz-probe`, `antigravity-guide` and `specify`, one of them recording three skills in a
+  single conversation.
+
+  Still true, and the part worth keeping: the "Skills: 5.6k tokens" line in `/context` is a
+  token *budget* for auto-loaded skill files, not an invocation count. The card lists what was
+  explicitly invoked, which is the question it asks.
 - **G2 (AG6)** — when a tab's `agy` holds no readable presence FD **and** its workspace has
   never appeared in `history.jsonl`, the panel stays unattached. Sparse-and-correct is the
   chosen failure mode; the observed `history.jsonl` covers only 9 conversations across 2

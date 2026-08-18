@@ -1962,3 +1962,65 @@ tasks/task-39.log\nYOU MUST TRACK THIS TASK";
         "and the miss is recorded, not silent"
     );
 }
+
+/// G10 closed: an explicitly invoked skill becomes a SKILLS row (2026-08-16).
+///
+/// Body transcribed from the live corpus. Antigravity has no skill TOOL — the invocation is
+/// a `<SKILL>` block spliced into the user's own turn — which is why an audit of tool names
+/// concluded no skill signal existed. It does; it is just not where a tool would be.
+#[test]
+fn an_explicitly_invoked_skill_becomes_a_skills_row() {
+    let with_skill = |i: u64, body: &str| {
+        let content = format!(
+            "<USER_REQUEST>\ndo the thing\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\n{body}\n</ADDITIONAL_METADATA>"
+        );
+        format!(
+            r#"{{"step_index":{i},"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-08-14T03:{:02}:00Z","content":{}}}"#,
+            i,
+            serde_json::to_string(&content).unwrap()
+        )
+    };
+
+    let real = "<SKILL>The user has explicitly invoked the (worktree) skill. You must \
+strictly follow the instructions in this skill to process their request. Here are its \
+contents:\n# /worktree — Isolated Parallel Session Workspaces\n\nManage `git worktree` \
+directories (see below).</SKILL>";
+
+    let s = ag_fold(&with_skill(0, real));
+    assert_eq!(s.skills.len(), 1, "the invocation must be recorded");
+    assert_eq!(
+        s.skills[0].name, "worktree",
+        "the parenthesised name, not the body"
+    );
+    assert_eq!(
+        s.skills[0].start_ms,
+        Some(AG_T0),
+        "stamped with the turn's clock"
+    );
+    assert_eq!(s.turns_user, 1, "and it is still one user turn");
+
+    // The body's own parentheses must not be mistaken for the name — the real bodies are
+    // full markdown documents and contain many.
+    assert!(
+        !s.skills[0].name.contains("see below"),
+        "the scan must stop at the introducing sentence: {:?}",
+        s.skills[0].name
+    );
+
+    // A turn with no skill block folds nothing.
+    let s = ag_fold(&with_skill(
+        0,
+        "The current local time is: 2026-08-14T03:00:00-07:00.",
+    ));
+    assert!(s.skills.is_empty(), "no marker, no row");
+
+    // A malformed block names nothing rather than inventing an unnamed row.
+    let s = ag_fold(&with_skill(
+        0,
+        "<SKILL>The user has explicitly invoked the skill.</SKILL>",
+    ));
+    assert!(
+        s.skills.is_empty(),
+        "a marker with no name must fold nothing"
+    );
+}

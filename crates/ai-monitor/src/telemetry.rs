@@ -575,6 +575,20 @@ impl SessionTelemetry {
                 if let Some(m) = content.and_then(scrape_model_selection) {
                     self.model = Some(m);
                 }
+                // Skills, from the same envelope and for the same reason (G10, closed).
+                // Antigravity has no skill TOOL — which is why an audit of tool names
+                // concluded, wrongly, that no skill signal existed. The signal is a
+                // `<SKILL>` block injected into the user's own turn, and it names the
+                // skill in parentheses. Scoped to `USER_INPUT` exactly as the model
+                // scrape is, and for the identical reason: a `grep_search` result that
+                // quoted one of these back would otherwise be folded as an invocation.
+                if let Some(name) = content.and_then(scrape_skill_invocation) {
+                    push_capped(
+                        &mut self.skills,
+                        SkillEntry { name, start_ms: ts },
+                        SKILLS_CAP,
+                    );
+                }
             }
             // AG3 — a turn is a REPLY. The tool-bearing planner steps are dispatch,
             // and they are the overwhelming majority (772 against 61), so counting
@@ -1354,6 +1368,32 @@ fn ag_conversation_id(content: &str) -> Option<String> {
     let after = after.trim_start().strip_prefix(':')?;
     let id = between(after, "\"", "\"")?;
     (!id.is_empty()).then(|| id.to_string())
+}
+
+/// The skill named by a `<SKILL>` block injected into a `USER_INPUT` (G10).
+///
+/// Antigravity does not invoke a skill through a tool — it splices the skill's text into the
+/// user's turn, prefixed with a sentence that names it:
+///
+/// ```text
+/// <SKILL>The user has explicitly invoked the (worktree) skill. You must strictly follow ...
+/// ```
+///
+/// So the name is the parenthesised word in that sentence, and it is the ONLY place the
+/// invocation is recorded — the body that follows is the skill's whole markdown, which is
+/// why this stops at the name rather than carrying any of it.
+///
+/// One skill per turn: the marker is emitted for an explicit `/skill` invocation, and a turn
+/// has one. A malformed block (marker present, no parenthesised name) yields `None` and folds
+/// nothing rather than inventing an unnamed row.
+fn scrape_skill_invocation(content: &str) -> Option<String> {
+    const MARKER: &str = "<SKILL>";
+    let rest = content.split_once(MARKER)?.1;
+    // Bounded to the sentence that introduces the skill, so a parenthesis anywhere in the
+    // skill's own markdown body cannot be mistaken for its name.
+    let head = rest.get(..rest.find("skill.").map(|i| i + 6).unwrap_or(0))?;
+    let name = head.split_once('(')?.1.split_once(')')?.0.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// The model named by a `Model Selection` settings change (AG4/R3.2).
