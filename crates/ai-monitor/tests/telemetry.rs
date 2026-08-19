@@ -2024,3 +2024,54 @@ directories (see below).</SKILL>";
         "a marker with no name must fold nothing"
     );
 }
+
+/// CLI 1.1.15 renamed the `run_command` result step, and the pairing must survive it.
+///
+/// Reported live: an `agy` tab ran two Bash commands and the panel showed RECENT CALLS and
+/// TOOL USAGE both empty. The CLI had updated itself that minute, and under 1.1.15 a
+/// command's result arrives typed `GENERIC` with no `exit_code` key rather than typed
+/// `RUN_COMMAND` — so no pending call expected the type that arrived and both were orphaned.
+///
+/// The discriminator is the result body, which is why this pins BOTH directions in one test:
+/// the same `GENERIC` type must claim a command and must NOT claim `manage_task`'s result,
+/// which reports through `GENERIC` legitimately. Measured on the corpus, the marker is in all
+/// 352 `RUN_COMMAND` bodies and none of the 68 non-command `GENERIC` ones.
+#[test]
+fn a_command_result_typed_generic_still_pairs_with_its_dispatch() {
+    const BODY: &str = "Created At: 2026-08-18T23:55:35-07:00\\nCompleted At: 2026-08-18T23:55:42-07:00\\n\\nThe command exited with code 0.\\nOutput:\\nhi\\n";
+
+    let s = ag_fold(&format!(
+        "{}\n{}",
+        ag_dispatch(
+            1,
+            "run_command",
+            r#""Cwd":"\"/proj\"","toolSummary":"\"List worktrees\"""#
+        ),
+        ag_step(2, "GENERIC", &format!(r#","content":"{BODY}""#)),
+    ));
+    assert_eq!(
+        s.tool_calls,
+        vec![("run_command".to_string(), 1)],
+        "a GENERIC step carrying a command result is a command result"
+    );
+    assert_eq!(s.tools.len(), 1, "and it reaches RECENT CALLS");
+    assert_eq!(s.tools[0].name, "List worktrees");
+    assert_eq!(s.tools[0].duration_ms, Some(60_000));
+    assert_eq!(s.orphan_tool_results, 0);
+
+    // The other direction. `manage_task` genuinely reports through `GENERIC`, so if the
+    // rewrite were keyed on the type alone this call would be silently mis-attributed to
+    // `run_command` — the exact mis-pairing AG2 refuses to make.
+    let s = ag_fold(&format!(
+        "{}\n{}\n{}",
+        ag_dispatch(1, "run_command", r#""Cwd":"\"/proj\"""#),
+        ag_dispatch(2, "manage_task", r#""TaskId":"\"7\"""#),
+        ag_step(3, "GENERIC", r#","content":"Task 7 updated successfully""#),
+    ));
+    assert_eq!(
+        s.tool_calls,
+        vec![("manage_task".to_string(), 1)],
+        "a GENERIC with no command marker belongs to the tool that really expects GENERIC, \
+         even with an older run_command still pending"
+    );
+}

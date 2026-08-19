@@ -691,6 +691,8 @@ impl SessionTelemetry {
 
     /// Fold one typed result step — the single counting event for a tool call (AG2).
     fn ag_result(&mut self, step_type: &str, v: &Value, content: Option<&str>, ts: Option<u64>) {
+        // What a step reports is not always what it is typed as — see `ag_reported_type`.
+        let step_type = ag_reported_type(step_type, content);
         // Steps that report no tool call fold nothing: `CHECKPOINT`,
         // `CONVERSATION_HISTORY`, `SYSTEM_MESSAGE`, and — for now — `ERROR_MESSAGE`.
         // G4 leaves the whole error family (`exit_code`, the `error` key,
@@ -1397,6 +1399,35 @@ fn ag_line_after(content: &str, key: &str) -> Option<String> {
         .lines()
         .find_map(|l| l.split_once(key).map(|(_, rest)| rest.trim()))?;
     (!v.is_empty()).then(|| v.to_string())
+}
+
+/// The result type a step actually REPORTS, which since CLI 1.1.15 is not always the type it
+/// is labelled with.
+///
+/// `run_command` results arrived as `RUN_COMMAND` steps carrying an `exit_code` key for the
+/// whole measured corpus — 352 of them — until the CLI updated itself mid-session on
+/// 2026-08-18 (binary mtime 23:55, session `e73dca15` at 23:55:32). Under 1.1.15 the same
+/// results arrive typed `GENERIC` with no `exit_code`, and the exit status only in prose.
+/// `GENERIC` is the type four *other* tools report through, so the pairing found no pending
+/// call expecting it and orphaned both calls: the panel showed a session that had run two
+/// commands as having made no tool calls at all.
+///
+/// The discriminator is the result body, not the version, so this holds whichever shape the
+/// CLI emits — and it is measured, not guessed: the marker below appears in **all 352**
+/// `RUN_COMMAND` results and in **none** of the 68 `GENERIC` steps belonging to `manage_task`,
+/// `send_message`, `define_subagent`, `manage_subagents` or `schedule`. Zero false positives
+/// on the corpus, which is what makes this safe to apply before the pairing rather than as a
+/// fallback after it: a `manage_task` result cannot reach this branch.
+///
+/// Strictly a widening. A step this does not rewrite pairs exactly as it did before, so the
+/// only calls it can newly claim are ones that were being dropped.
+fn ag_reported_type<'a>(step_type: &'a str, content: Option<&str>) -> &'a str {
+    /// The sentence every command result carries, in both the typed and the untyped shape.
+    const COMMAND_RESULT: &str = "The command exited with code";
+    if step_type == "GENERIC" && content.is_some_and(|c| c.contains(COMMAND_RESULT)) {
+        return "RUN_COMMAND";
+    }
+    step_type
 }
 
 fn ag_conversation_id(content: &str) -> Option<String> {

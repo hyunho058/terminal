@@ -658,6 +658,38 @@ detached wordings. `MODEL_WINDOWS` matches by `model.starts_with(prefix)` over *
 All four sign-off items are closed (AG4, AG6, AG8, AG10, approved 2026-08-13). What remains
 are standing limitations, not open decisions.
 
+- **G12 (AG2)** — ~~`run_command` results are `RUN_COMMAND` steps~~ — **amended 2026-08-19.**
+  Reported live: an `agy` tab ran two Bash commands and RECENT CALLS and TOOL USAGE were both
+  empty. **Antigravity CLI 1.1.15 changed the shape.** For the whole measured corpus a command
+  result was a `RUN_COMMAND` step carrying an `exit_code` key — 352 of them. Under 1.1.15 the
+  same result arrives typed `GENERIC`, with no `exit_code` and the status only in prose. Since
+  `GENERIC` is the type `manage_task`, `send_message`, `define_subagent`, `manage_subagents`
+  and `schedule` report through, no pending call expected it and both calls were orphaned.
+
+  The CLI updated **itself mid-session**: binary mtime 23:55, session `e73dca15` at 23:55:32,
+  `updater/update_status.json` reading `"Update successful, restart CLI to use"`. So the
+  discriminator deliberately keys on the **result body**, not on a version — the panel cannot
+  see which binary wrote a transcript, and both shapes will coexist in any corpus that spans
+  the upgrade.
+
+  Measured before choosing it: the sentence `The command exited with code` appears in **all
+  352** `RUN_COMMAND` bodies and in **none of the 68** non-command `GENERIC` bodies. Zero false
+  positives, which is what allows the rewrite to run *before* the pairing rather than as a
+  fallback after it. It is strictly a widening — folded over the real corpus it moved the
+  totals from 800 calls / 6 orphans to **802 / 4**, changing exactly the one affected session
+  (`e73dca15`: 0 calls 2 orphans → 2 calls 0 orphans) and no other.
+
+  **Two false leads, recorded because each looked convincing.** First, a naive FIFO census
+  suggested a dozen mismatched dispatch→result pairings; almost all were artifacts of the
+  census itself, which pops the oldest pending call regardless of type and so stays misaligned
+  after one miss. Re-run with the shipped rule, the real figure was 12 orphans in 812. Second,
+  the obvious cause — the async wait expiring — is **refuted**: 9 commands exceeded their
+  `WaitMsBeforeAsync` (one by 80 minutes) and still returned `RUN_COMMAND`, while one of the
+  two `GENERIC` results finished in 1s, well inside its 5s wait. Duration does not discriminate.
+
+  Open: whether 1.1.15 also re-typed the results of other tools. Only `run_command` was
+  observed, n=2, in the single session that straddled the upgrade. `orphan_tool_results` is the
+  detector if it did.
 - **G11 (AG5)** — ~~an Antigravity panel's header shows `session —`~~ — **closed 2026-08-18,
   reported from a side-by-side screenshot** of a Claude tab (`session 382ed568 [Claude]`) next
   to an Antigravity one (`session — [Antigravity]`). The id was never unavailable, only
