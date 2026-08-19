@@ -1,10 +1,9 @@
 ---
 source: crates/app/src/dashboard.rs
-assertion_line: 2523
 expression: "project(&model(Some(&t), &env))"
 ---
 ai-monitor [CONNECTED]
-  session name="session" id="—" provider="[Antigravity]" model="Gemini 3.6 Flash (High)"
+  session name="session" id="4de5fc70" provider="[Antigravity]" model="Gemini 3.6 Flash (High)"
   note —
   tile UPTIME    12m30s TextPrimary gauge=none
   tile IDLE          8s TextPrimary gauge=none

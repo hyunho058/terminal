@@ -372,6 +372,12 @@ pub struct SessionTelemetry {
     /// Fixed at construction (AG9). `apply` dispatches on it and never re-decides.
     format: LogFormat,
     session_id: Option<String>,
+    /// The session id the LOG PATH names, when the caller knew it at construction —
+    /// Antigravity's case, where the conversation id is the `brain/<id>/` directory and
+    /// appears nowhere in the file. Deliberately a second field rather than a pre-set
+    /// `session_id`: this one is a fact about *which log this is*, so it must survive the
+    /// truncation reset that clears every folded number.
+    log_session_id: Option<String>,
     model: Option<String>,
     total_input: u64,
     total_output: u64,
@@ -431,6 +437,28 @@ impl SessionTelemetry {
             format,
             ..Self::default()
         }
+    }
+
+    /// Tell the accumulator the session id its log's PATH names, for a format that does not
+    /// write one into the file (Antigravity — see `antigravity::conversation_id_of`).
+    ///
+    /// `None` is a legitimate argument and means only "the caller could not name it": the
+    /// panel then shows a dash, which is the honest reading of an unresolved tab.
+    pub fn with_log_session_id(mut self, session_id: Option<String>) -> Self {
+        self.log_session_id = session_id;
+        self
+    }
+
+    /// A fresh accumulator for the SAME log — used when the file is truncated under the tail.
+    ///
+    /// Keeps exactly the two things that are properties of the log rather than of its
+    /// contents: the dialect and the path-derived id. Everything folded is dropped, which is
+    /// the entire point of the reset. `SessionTelemetry::new()` was used here before and
+    /// silently reset the dialect to Claude, contradicting [`format`](Self::format)'s own
+    /// "fixed for its whole life" — an Antigravity transcript that shrank would have kept
+    /// tailing in the wrong dialect for the rest of its life.
+    pub fn restarted(&self) -> Self {
+        Self::with_format(self.format).with_log_session_id(self.log_session_id.clone())
     }
 
     /// The dialect this accumulator folds. Fixed for its whole life.
@@ -830,7 +858,15 @@ impl SessionTelemetry {
         tool_calls.sort_by(|a, b| a.0.cmp(&b.0));
 
         TelemetrySnapshot {
-            session_id: self.session_id.clone(),
+            // Folded first, path second — and `or_else` fires ONLY when the fold found
+            // nothing, which is not a tiebreak but a partition: Claude writes `sessionId`
+            // into every line and seeds no path id, Antigravity writes none and is the only
+            // format seeded. So neither format can reach the other's branch, and no log can
+            // have its own recorded id overridden by an inference from its path.
+            session_id: self
+                .session_id
+                .clone()
+                .or_else(|| self.log_session_id.clone()),
             model: self.model.clone(),
             total_input: self.total_input,
             total_output: self.total_output,

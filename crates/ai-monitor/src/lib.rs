@@ -800,7 +800,14 @@ pub fn backfill_telemetry_with(
     log: &Path,
     format: telemetry::LogFormat,
 ) -> (SessionTelemetry, u64) {
-    let mut t = SessionTelemetry::with_format(format);
+    // The Antigravity id comes from the path because the file never states it; the Claude id
+    // is folded out of the lines and is deliberately NOT derived here, so this stays a pure
+    // addition to the new path and leaves the existing one byte-for-byte as it was (R5.6).
+    let named = match format {
+        telemetry::LogFormat::Antigravity => antigravity::conversation_id_of(log),
+        telemetry::LogFormat::Claude => None,
+    };
+    let mut t = SessionTelemetry::with_format(format).with_log_session_id(named);
     let Ok(bytes) = std::fs::read(log) else {
         return (t, 0);
     };
@@ -1100,7 +1107,13 @@ impl LogWatcher {
                         target = Some(newest);
                         offset = 0;
                         partial.clear();
-                        telemetry = SessionTelemetry::new();
+                        // A DIFFERENT file, so unlike the truncation reset below this must
+                        // drop the path-derived id — it named the log we just stopped
+                        // following. The dialect is carried across because it is the
+                        // watcher's, not the file's. (Reachable only in `Project` scope,
+                        // which is Claude's alone; carrying the format keeps that a fact
+                        // about the code rather than a coincidence of who calls it.)
+                        telemetry = SessionTelemetry::with_format(telemetry.format());
                         switched = true;
                     }
                 }
@@ -1191,9 +1204,13 @@ impl LogWatcher {
                 // accumulator. Until there was accumulated state a rewind was
                 // enough; continuing to fold a different session's lines into the
                 // previous session's totals would silently produce nonsense.
+                //
+                // Same FILE, so the dialect and the path-derived id both still hold — hence
+                // `restarted()` and not `new()`, which would have reset an Antigravity tail
+                // to the Claude dialect and dropped the conversation id the path names.
                 offset = 0;
                 partial.clear();
-                telemetry = SessionTelemetry::new();
+                telemetry = telemetry.restarted();
                 reset = true;
             }
             if f.seek(SeekFrom::Start(offset)).is_err() {
@@ -1727,6 +1744,65 @@ mod tests {
             .join("logs");
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// An Antigravity session is identified in the panel even though its log never says who
+    /// it is — the reported defect where the header read `session —` beside `[Antigravity]`.
+    ///
+    /// Laid out for real (`brain/<id>/.system_generated/logs/`) because the id is recovered
+    /// from exactly those components; a flat fixture would pass while the shipped path failed.
+    #[test]
+    fn an_antigravity_backfill_takes_its_session_id_from_the_path() {
+        const ID: &str = "aaaaaaaa-0000-4000-8000-00000000abcd";
+        let root = temp_dir("ag-session-id");
+        let log = ag_logs_dir(&root, ID).join("transcript.jsonl");
+        std::fs::write(
+            &log,
+            concat!(
+                r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-08-14T03:48:57Z","content":"hi"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let (t, _) = backfill_telemetry_with(&log, telemetry::LogFormat::Antigravity);
+        assert_eq!(
+            t.snapshot().session_id.as_deref(),
+            Some(ID),
+            "the conversation id is the brain/<id>/ directory's name"
+        );
+
+        // The Claude path is untouched (R5.6): its id is folded from `sessionId` lines, and a
+        // log that carries none reports none rather than inheriting this inference.
+        let (claude, _) = backfill_telemetry(&log);
+        assert_eq!(
+            claude.snapshot().session_id,
+            None,
+            "deriving an id from the path must not leak into the format that states its own"
+        );
+    }
+
+    /// A truncated log keeps its identity: same file, so same dialect and same id.
+    ///
+    /// This is the half of the reset that is a property of the LOG rather than of what was
+    /// folded from it. Before `restarted()`, this path called `SessionTelemetry::new()` and
+    /// silently reset an Antigravity tail to the Claude dialect — after which every later
+    /// line in the file would have counted as nothing at all.
+    #[test]
+    fn a_truncation_reset_keeps_the_dialect_and_the_path_derived_id() {
+        const ID: &str = "aaaaaaaa-0000-4000-8000-00000000ef01";
+        let mut t = SessionTelemetry::with_format(telemetry::LogFormat::Antigravity)
+            .with_log_session_id(Some(ID.to_string()));
+        t.apply(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-08-14T03:48:57Z","content":"hi"}"#,
+        );
+        assert_eq!(t.snapshot().turns_user, 1, "folded before the reset");
+
+        let fresh = t.restarted();
+        let snap = fresh.snapshot();
+        assert_eq!(fresh.format(), telemetry::LogFormat::Antigravity);
+        assert_eq!(snap.session_id.as_deref(), Some(ID), "identity survives");
+        assert_eq!(snap.turns_user, 0, "everything folded is dropped");
     }
 
     /// R5.3 + R5.4, pinned on the predicate that decides them.

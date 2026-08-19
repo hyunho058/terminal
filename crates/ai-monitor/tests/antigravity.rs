@@ -488,3 +488,77 @@ fn a_live_agent_never_adopts_an_older_conversation_from_history() {
     assert!(got.path.to_string_lossy().contains(PARENT), "{got:?}");
     assert!(got.owned, "a probed conversation is owned");
 }
+
+/// A transcript is identified by the directory that holds it, never by what it says (AG5).
+///
+/// The temptation is to scrape `conversationId` out of the file, and on the author's corpus
+/// that would be worse than useless: 6 of 60 transcripts contain that key and in every one
+/// it is a *child* subagent's id, spliced into an `INVOKE_SUBAGENT` result. A scraper would
+/// therefore label those six sessions with a conversation that is not theirs. This pins the
+/// path as the source, and the round trip through `transcript_in` is what keeps the two
+/// spellings of the layout from drifting apart.
+#[test]
+fn a_transcripts_conversation_id_comes_from_its_directory_not_its_contents() {
+    let r = root("id-from-path");
+    let log = write_transcript(&r, PARENT, "2026-08-15T07:07:29Z");
+    // The trap, made concrete: the file names the CHILD and nothing else.
+    std::fs::write(
+        &log,
+        format!("{{\"content\":\"{{\\\"conversationId\\\": \\\"{SUBAGENT}\\\"}}\"}}\n"),
+    )
+    .expect("write");
+
+    assert_eq!(
+        antigravity::conversation_id_of(&log).as_deref(),
+        Some(PARENT),
+        "the id is the brain/<id>/ directory — the subagent id inside the file must not win"
+    );
+}
+
+/// Only a real transcript path yields an id; anything else yields `None` rather than
+/// whatever string happens to sit three levels up.
+#[test]
+fn a_path_that_is_not_a_transcript_names_no_conversation() {
+    let r = root("id-rejects");
+    let good = antigravity::transcript_in(&r, PARENT).expect("uuid-shaped id");
+
+    for (bad, why) in [
+        (
+            r.join("brain").join(PARENT).join("transcript.jsonl"),
+            "the two intervening dirs are absent",
+        ),
+        (
+            r.join("brain")
+                .join("not-a-uuid")
+                .join(".system_generated")
+                .join("logs")
+                .join("transcript.jsonl"),
+            "the directory is not UUID-shaped",
+        ),
+        (
+            r.join("brain")
+                .join(PARENT)
+                .join(".system_generated")
+                .join("elsewhere")
+                .join("transcript.jsonl"),
+            "the parent dir is not `logs`",
+        ),
+        (
+            PathBuf::from("transcript.jsonl"),
+            "there is no parent at all",
+        ),
+    ] {
+        assert_eq!(
+            antigravity::conversation_id_of(&bad),
+            None,
+            "{why}: {}",
+            bad.display()
+        );
+    }
+
+    assert_eq!(
+        antigravity::conversation_id_of(&good).as_deref(),
+        Some(PARENT),
+        "the canonical layout still resolves — otherwise the guards above prove nothing"
+    );
+}

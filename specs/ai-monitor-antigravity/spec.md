@@ -658,6 +658,35 @@ detached wordings. `MODEL_WINDOWS` matches by `model.starts_with(prefix)` over *
 All four sign-off items are closed (AG4, AG6, AG8, AG10, approved 2026-08-13). What remains
 are standing limitations, not open decisions.
 
+- **G11 (AG5)** — ~~an Antigravity panel's header shows `session —`~~ — **closed 2026-08-18,
+  reported from a side-by-side screenshot** of a Claude tab (`session 382ed568 [Claude]`) next
+  to an Antigravity one (`session — [Antigravity]`). The id was never unavailable, only
+  unwired: `session_id` was folded exclusively in `apply_claude`, and the Antigravity fold —
+  correctly — has nothing to fold, because **a transcript does not name itself**.
+
+  Measured across all 60 transcripts on this machine: **none** carries its own conversation id
+  anywhere in its content. Six carry a `conversationId`, and in every one it is a *child*
+  subagent's, spliced into an `INVOKE_SUBAGENT` result — `22c93e00…`'s transcript names only
+  `7070769f…`. So the obvious repair, scraping the field the parser already knows how to read,
+  would not have failed quietly; on those six it would have labelled the session with another
+  conversation's id. The id lives in the path (`brain/<id>/…`) and nowhere else, which is what
+  `antigravity::conversation_id_of` recovers — the checked inverse of `transcript_in`.
+
+  Carried as a second field (`log_session_id`) rather than pre-set into `session_id`, because
+  the two answer different questions: one is what the file said, the other is which file this
+  is. `snapshot()` prefers the folded value, and the `or_else` is a partition rather than a
+  tiebreak — Claude states its id and seeds no path, Antigravity states none and is the only
+  format seeded, so neither can reach the other's branch.
+
+  **A second defect surfaced in the same code and is fixed with it**: the truncation reset in
+  `LogWatcher` called `SessionTelemetry::new()`, which resets the dialect to Claude. An
+  Antigravity transcript that shrank under the tail would have gone on folding in the wrong
+  dialect for the rest of its life — counting every subsequent line as nothing — while
+  `format()` documented itself as "fixed for its whole life". Now `restarted()`, which keeps
+  precisely what is a property of the log (dialect, path-derived id) and drops everything
+  folded from it. The re-point at a *different* target keeps the dialect and drops the id,
+  which is the opposite pairing and the correct one there.
+
 - **G1 (AG4)** — Antigravity reports no token usage, so CONTEXT and CACHE carry no
   information for these sessions and render as unavailable. This is a limit of the format,
   not of the implementation.

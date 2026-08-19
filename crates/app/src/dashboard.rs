@@ -2494,11 +2494,16 @@ mod tests {
     /// * `tile CACHE —` and `tile CONTEXT —` with **`gauge=none`** — the point of R5.5. Not
     ///   `0` and not `gauge=0`, because this agent reports no tokens at all and a zero would
     ///   assert a measurement that was never taken.
+    /// * `short_id="4de5fc70"` — an id the log never states. It is the `brain/<id>/`
+    ///   directory's name, recovered from the path, and it renders through the same
+    ///   eight-character clip as Claude's.
     #[test]
     fn the_antigravity_panel_matches_its_pinned_form() {
         let now = 1_785_226_000_000u64;
         let t = TelemetrySnapshot {
-            session_id: None, // AG5: the conversation id is the DIRECTORY's name, not the log's
+            // AG5: the conversation id is the DIRECTORY's name, not the log's — so it is
+            // seeded from the path at construction rather than folded out of a line.
+            session_id: Some("4de5fc70-2d8a-44c2-8e25-a6901c93fb86".into()),
             model: Some("Gemini 3.6 Flash (High)".into()),
             turns_user: 3,
             turns_assistant: 4,

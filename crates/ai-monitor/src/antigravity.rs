@@ -110,6 +110,30 @@ pub fn history_path_in(root: &Path) -> PathBuf {
     root.join("history.jsonl")
 }
 
+/// The conversation that owns `log`, recovered from its PATH (AG5).
+///
+/// The inverse of [`transcript_in`], and the only correct source for this id. A transcript
+/// does not name itself: measured across all 60 on this machine, **none** carries its own
+/// conversation id anywhere in its content. Six do contain a `conversationId` — every one of
+/// them a *child* subagent's, spliced into an `INVOKE_SUBAGENT` result, which is why
+/// [`ag_conversation_id`](crate::telemetry) reads that field for the SUBAGENTS card and
+/// nothing else. Scraping the file for a session id would therefore not merely fail; on those
+/// six it would confidently display another conversation's id (`22c93e00…`'s transcript names
+/// only `7070769f…`).
+///
+/// Every component is checked, not just the last: a path that is not laid out like a
+/// transcript, or whose directory is not UUID-shaped, yields `None` rather than a fabricated
+/// id built out of whatever happened to sit three levels up.
+pub fn conversation_id_of(log: &Path) -> Option<String> {
+    let logs = log.parent()?;
+    let generated = logs.parent()?;
+    let brain_child = generated.parent()?;
+    if logs.file_name()? != "logs" || generated.file_name()? != ".system_generated" {
+        return None;
+    }
+    checked_id(brain_child.file_name()?.to_str()?).map(str::to_string)
+}
+
 /// The conversation `history.jsonl` most recently recorded for `cwd` (AG6, R1.3).
 ///
 /// The only source on disk that pairs a conversation with a working directory. It is sparse
