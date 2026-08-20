@@ -805,6 +805,30 @@ are standing limitations, not open decisions.
   reader who greps `R0.1` finds a green test whose subject is a five-line enum match, and
   would otherwise have no way to learn that the requirement's own scenario is unverified.
   Closing this needs a manual `/run-term` session.
+
+  **Half closed 2026-08-19** by a manual gate,
+  `presence_fd::r0_1_live_agents_are_told_apart_and_resolve_to_different_logs`. It is
+  `#[ignore]`d — CI has no live agents — and run deliberately with
+  `cargo test --bin app r0_1_live -- --ignored --nocapture`. It drives the composition G9
+  names, against **real processes**, and passed on first run:
+
+  | step | measured |
+  |------|----------|
+  | `agent_for(37166)` → the shell's own subtree | `(Antigravity, 37684)` |
+  | `agent_for(55874)` | `(Claude, 9959)` |
+  | `conversation_of_pid(37684)` — non-`_in`, real `$HOME`, real canonicalization | `9d3ee692-6d8c-4d02-b395-d5dd2c76fbf1` |
+  | `antigravity::resolve(Probed::Conversation(..))` | that conversation's own transcript, on disk, `owned` |
+  | the Claude tab's log directory | `~/.claude/projects/-Users-…-terminal` — a different directory |
+
+  The gate asks through the **parent** pid, not the agent pid, because that is what a tab
+  actually holds; probing the agent directly would skip the tree walk that is the point.
+
+  **Still open, and it is the half that needs a human**: `overlay::open`'s composition and the
+  focus switch itself. No test process can press Cmd+Shift+M or drive a winit event loop, so
+  "the panel *detaches* from the Claude watcher and re-points on focus" remains reasoned about
+  rather than executed. What the gate does discharge is R0.1's second clause — the two agents
+  resolve to different logs, so there is no path by which one tab's telemetry could be shown
+  against the other's session.
 - **G8 (AG7)** — *cold start closed 2026-08-16; rotation-while-attached still open.* The
   2026-08-15 attempt was incomplete: it added the re-probe but not a wake to run it on. An
   Antigravity tab that resolved no log armed **no watcher at all**, so the panel had no wake

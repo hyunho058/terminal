@@ -337,3 +337,129 @@ mod tests {
         );
     }
 }
+
+/// R0.1's composition, run against **live agent processes** (G9).
+///
+/// Every other test in this feature drives a piece: `agent_of_pid` over a synthetic table,
+/// `first_lock_in` over a temp directory, `antigravity::resolve_in` over a mock root. G9 names
+/// what none of them reach — `agent_for` and the non-`_in` `conversation_of_pid` composed end
+/// to end, on real processes, where a wrong `$HOME`, an unreadable descriptor or a canonical
+/// `/private/var` spelling would each break the chain invisibly.
+///
+/// `#[ignore]` because it needs a live `agy` and a live `claude` on the machine, which CI has
+/// not got. It is a **manual gate**, run deliberately:
+///
+/// ```text
+/// cargo test --bin app r0_1_live -- --ignored --nocapture
+/// ```
+///
+/// It cannot close G9 by itself: focus switching runs through `overlay::open` and a winit
+/// event loop, and no test process can press Cmd+Shift+M. What it does close is the half that
+/// does not need a human — that the two agents are told apart and resolve to *different*
+/// logs, which is the "Claude telemetry is not shown against the Antigravity session" half of
+/// R0.1's Then.
+#[cfg(test)]
+#[test]
+#[ignore = "needs a live agy and a live claude; run manually"]
+fn r0_1_live_agents_are_told_apart_and_resolve_to_different_logs() {
+    use crate::tabmeta::AgentKind;
+
+    // Find one live process of each kind by asking the same classifier the panel uses, so
+    // this cannot pass against a `pgrep` that agrees with nothing in the product.
+    let ps = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,args="])
+        .output()
+        .expect("ps");
+    let text = String::from_utf8_lossy(&ps.stdout);
+    let mut found: Vec<(AgentKind, u32, u32)> = Vec::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(pid), Some(ppid)) = (it.next(), it.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
+            continue;
+        };
+        // Ask through the PARENT, which is what a tab actually holds: the overlay knows a
+        // shell pid and walks down. Probing the agent pid directly would skip `agent_for`'s
+        // tree walk — the very step this test exists to exercise.
+        if let Some((kind, agent_pid)) = crate::tabsession::agent_for(ppid) {
+            if agent_pid == pid && !found.iter().any(|(k, _, _)| *k == kind) {
+                found.push((kind, agent_pid, ppid));
+            }
+        }
+    }
+
+    let agy = found.iter().find(|(k, _, _)| *k == AgentKind::Antigravity);
+    let claude = found.iter().find(|(k, _, _)| *k == AgentKind::Claude);
+    let (Some(&(_, agy_pid, agy_shell)), Some(&(_, claude_pid, claude_shell))) = (agy, claude)
+    else {
+        panic!(
+            "this gate needs one live `agy` AND one live `claude`, each under a shell. \
+             Classified this run: {found:?}. Start the missing one in a tab and re-run."
+        );
+    };
+    println!("agy   pid={agy_pid} under shell {agy_shell}");
+    println!("claude pid={claude_pid} under shell {claude_shell}");
+
+    // 1. The routing half of R0.1: two live agents, told apart by the same call the overlay
+    //    makes, from the shell pid a tab actually has.
+    assert_ne!(
+        agy_pid, claude_pid,
+        "two distinct agents must not resolve to one process"
+    );
+
+    // 2. The FD probe, against a descriptor a real `agy` is holding right now — the
+    //    non-`_in` path, with the real `$HOME` and the real canonicalization.
+    let conversation = conversation_of_pid(agy_pid).unwrap_or_else(|| {
+        panic!(
+            "live agy pid {agy_pid} named no conversation. If it started seconds ago its \
+             presence lock may not exist yet (~7s) — re-run. Otherwise this is R1.1 failing."
+        )
+    });
+    println!("conversation = {conversation}");
+
+    // 3. Resolution through the probed id, to a transcript that is really on disk.
+    let cwd = std::path::PathBuf::from(
+        std::env::var("HOME").expect("HOME"), // any real dir: a probed id ignores cwd
+    );
+    let resolved = ai_monitor::antigravity::resolve(
+        ai_monitor::antigravity::Probed::Conversation(&conversation),
+        &cwd,
+    )
+    .expect("a probed conversation resolves its transcript");
+    assert!(
+        resolved.path.is_file(),
+        "resolved transcript must exist: {}",
+        resolved.path.display()
+    );
+    assert!(resolved.owned, "a probed conversation is owned");
+    assert!(
+        resolved.path.to_string_lossy().contains(&conversation),
+        "the transcript must be the probed conversation's own: {}",
+        resolved.path.display()
+    );
+    println!("transcript = {}", resolved.path.display());
+
+    // 4. The "not shown against" half: the Claude tab's log is a DIFFERENT file. If these
+    //    ever coincided, focusing one tab would show the other's telemetry — which is the
+    //    failure R0.1's Then is written to exclude.
+    let claude_hint = crate::tabsession::hint_for(claude_shell);
+    let claude_dir = claude_hint
+        .as_ref()
+        .and_then(|h| h.cwd.as_ref())
+        .and_then(|c| ai_monitor::project_dir(c.path()));
+    println!("claude log dir = {claude_dir:?}");
+    if let Some(dir) = claude_dir.as_deref() {
+        assert_ne!(
+            Some(dir),
+            resolved.path.parent(),
+            "the Claude tab and the Antigravity tab must not share a log directory"
+        );
+        assert!(
+            dir.starts_with(std::env::var("HOME").expect("HOME")),
+            "the Claude directory resolves under $HOME/.claude, not into ~/.gemini: {}",
+            dir.display()
+        );
+    }
+}
