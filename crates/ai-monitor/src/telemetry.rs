@@ -146,6 +146,18 @@ pub struct Subagent {
     pub start_ms: Option<u64>,
     pub end_ms: Option<u64>,
     pub completed: bool,
+    /// The agent's OWN id, read from `toolUseResult.agentId`. Distinct from `id`,
+    /// which is the `tool_use_id` of the call that launched it: a task-notification
+    /// names *this* one, so it is the only key that can end a background agent at its
+    /// real time. Captured from EVERY `Agent` result, not just async launches — a
+    /// synchronously finished agent can still be resumed in the background later
+    /// (D5/R3).
+    pub agent_id: Option<String>,
+    /// Whether the end was a success. Written ONLY by the notification branch, so an
+    /// in-flight agent, a synchronous completion and a never-notified agent all keep
+    /// the initial value — which is why that value must be `true`. Initialising
+    /// `false` would paint every one of them as a failure (D13/R7.1).
+    pub ended_ok: bool,
 }
 
 /// A tracked task. `status` is whatever string the task tool carried — the
@@ -156,6 +168,22 @@ pub struct TaskEntry {
     pub status: String,
     pub created_ms: Option<u64>,
     pub updated_ms: Option<u64>,
+}
+
+/// What a background task's completion notification says (D12).
+///
+/// Not part of `TelemetrySnapshot` — it is a message the fold consumes, not state the
+/// app reads. Public only so the parse can be asserted directly: its guard against
+/// false positives is a set of NEGATIVE behaviours, and those are far more honestly
+/// tested on a return value than on the absence of a downstream mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskNotification {
+    /// The agent's own id, and the join key — this equals `toolUseResult.agentId`,
+    /// never the `tool_use_id` of the call that woke it.
+    pub task_id: String,
+    /// `completed`, `failed` or `killed` in every observed log. Not enumerated here,
+    /// so a value invented upstream passes through intact.
+    pub status: Option<String>,
 }
 
 /// The versioned contract the watcher sends and the app formats (D11).
@@ -342,9 +370,13 @@ impl SessionTelemetry {
 
         // Tool blocks arrive both as top-level events and nested in message.content
         // (the form real logs use). Handle both (D5).
+        // `on_tool_result` needs BOTH halves of the record: the content block carries
+        // the result's text, while `toolUseResult` — which says whether an agent was
+        // merely launched, and what its own id is — is a sibling of `message` at the
+        // top level. In the top-level form the two are the same value (D10/R1.6).
         match v.get("type").and_then(Value::as_str) {
             Some("tool_use") => self.on_tool_use(&v, ts),
-            Some("tool_result") => self.on_tool_result(&v, ts),
+            Some("tool_result") => self.on_tool_result(&v, &v, ts),
             _ => {}
         }
         match v.pointer("/message/content") {
@@ -352,7 +384,7 @@ impl SessionTelemetry {
                 for it in items {
                     match it.get("type").and_then(Value::as_str) {
                         Some("tool_use") => self.on_tool_use(it, ts),
-                        Some("tool_result") => self.on_tool_result(it, ts),
+                        Some("tool_result") => self.on_tool_result(it, &v, ts),
                         Some("text") => {
                             if let Some(t) = it.get("text").and_then(Value::as_str) {
                                 self.scan_command_name(t, ts);
@@ -364,7 +396,22 @@ impl SessionTelemetry {
             }
             // Both content forms occur in the wild; the TS reference checks only
             // this one and would miss the array form above.
-            Some(Value::String(s)) => self.scan_command_name(s, ts),
+            Some(Value::String(s)) => {
+                // A task-notification lands here, as a bare string, and is the ONLY
+                // signal a background agent ever ends by. It gets its own branch and
+                // stops: routing it on to `scan_command_name` would let a command
+                // wrapper quoted in its free-text body register a phantom skill.
+                //
+                // Deliberately NOT folded into `scan_command_name` — the array arm
+                // above feeds arbitrary assistant and user prose into that same
+                // function, so a parse living there could be reached by anything that
+                // merely mentions a notification (D12/R4.3/R4.4).
+                if let Some(n) = parse_task_notification(s) {
+                    self.on_task_notification(&n, ts);
+                    return;
+                }
+                self.scan_command_name(s, ts)
+            }
             _ => {}
         }
     }
@@ -573,7 +620,9 @@ impl SessionTelemetry {
         }
 
         // An `Agent` opens a NOT-completed entry in the ring immediately, so an
-        // in-flight delegation is visible (D9/R6.1).
+        // in-flight delegation is visible (`telemetry-model` D9/R6.1). The two
+        // lifecycle fields open honest as well: no agent id has been observed yet, and
+        // nothing has failed (`agent-elapsed-sidechain` R6.1/R7.1).
         if kind == ToolKind::Agent {
             push_capped(
                 &mut self.subagents,
@@ -585,6 +634,8 @@ impl SessionTelemetry {
                     start_ms: ts,
                     end_ms: None,
                     completed: false,
+                    agent_id: None,
+                    ended_ok: true,
                 },
                 SUBAGENTS_CAP,
             );
@@ -604,7 +655,10 @@ impl SessionTelemetry {
         }
     }
 
-    fn on_tool_result(&mut self, it: &Value, ts: Option<u64>) {
+    /// `it` is the `tool_result` content block; `line` is the whole record it arrived
+    /// on. They differ in the nested form real logs use, and only `line` carries
+    /// `toolUseResult` (D10).
+    fn on_tool_result(&mut self, it: &Value, line: &Value, ts: Option<u64>) {
         let Some(tid) = it
             .get("tool_use_id")
             .and_then(Value::as_str)
@@ -657,9 +711,25 @@ impl SessionTelemetry {
                 FILES_CAP,
             ),
             ToolKind::Agent => {
+                // Read from EVERY `Agent` result, not just async launches. A
+                // synchronously finished agent can be resumed in the background much
+                // later, and without its id captured here that notification has nothing
+                // to join against — that case is where most of this feature's reach
+                // comes from (D5/R3).
+                let agent_id = line
+                    .pointer("/toolUseResult/agentId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                // An async dispatch answers with a RECEIPT, not an answer. Treating it
+                // as a completion is the whole defect: the agent runs for minutes while
+                // its card reads DONE at 0s (D3/R2).
+                let launched = is_async_launch(line, it);
                 if let Some(a) = self.subagents.iter_mut().find(|a| a.id == tid) {
-                    a.completed = true;
-                    a.end_ms = ts;
+                    a.agent_id = agent_id;
+                    if !launched {
+                        a.completed = true;
+                        a.end_ms = ts;
+                    }
                 }
             }
             ToolKind::Task => self.on_task_result(&p, it, ts, ok),
@@ -676,6 +746,57 @@ impl SessionTelemetry {
                 TOOLS_CAP,
             ),
         }
+    }
+
+    /// End the agent a task-notification names (D4/D6/D11).
+    ///
+    /// Joined on `task-id` against the agent's OWN id, never on the notification's
+    /// `tool-use-id`: that names the call that woke the agent — a `SendMessage`, a
+    /// `Bash`, sometimes the original `Agent` — and it is distinct on every
+    /// notification, so keying on it makes a re-notified agent unrepresentable.
+    fn on_task_notification(&mut self, n: &TaskNotification, ts: Option<u64>) {
+        let Some(a) = self
+            .subagents
+            .iter_mut()
+            .find(|a| a.agent_id.as_deref() == Some(n.task_id.as_str()))
+        else {
+            // Ignored, and deliberately UNCOUNTED (D8). The residue is real but
+            // unactionable: background `Bash` tasks, which are not subagents and have
+            // no card, and agents already aged out of the ring. A counter would blend
+            // those two into one number nobody can act on, and carrying it to the app
+            // would widen the versioned contract to say so.
+            return;
+        };
+        // Unconditional and last-wins, even on an entry already marked complete. If
+        // both launch witnesses missed, the fallback ended it at ~83ms and this
+        // correction is the entire point; if the agent was resumed, this reports
+        // cumulative time ALIVE rather than the length of the final leg. `start_ms` is
+        // never rewritten — an agent has one start.
+        a.completed = true;
+        // Guarded, unlike the two writes around it. `ts` is `Option`, and a `None` is
+        // the absence of a reading rather than a reading of zero: writing it would leave
+        // `completed: true` with no end, which `agent_elapsed` renders as an EMPTY value
+        // — and, on an agent that already had a good end, it would erase a true duration
+        // in favour of a blank. That is strictly worse than the `0s` this feature exists
+        // to remove, so last-wins (D6) applies to values, not to their absence.
+        //
+        // `completed` and `ended_ok` stay unconditional on purpose: whatever the
+        // timestamp, the log did say this agent stopped, and an entry must never be left
+        // permanently un-completable by a line that reported its ending.
+        if ts.is_some() {
+            a.end_ms = ts;
+        }
+        // Reduced to a boolean here rather than carried as a string: `failed` and
+        // `killed` are the only non-`completed` values any log has shown, nothing
+        // renders the difference, and a value invented upstream lands on the safe side
+        // of `!= "completed"` automatically. Last-wins with `end_ms`, so an agent that
+        // failed and was then resumed to success goes back to reading as a success
+        // (D13/R7).
+        //
+        // No count is quoted here on purpose. The logs this was measured against are a
+        // rolling ~30-day window, so any tally goes stale on its own; the vocabulary,
+        // not its frequency, is what this line depends on.
+        a.ended_ok = n.status.as_deref() == Some("completed");
     }
 
     /// Task state changes (D9). `TaskCreate.input` carries no id — the assigned id
@@ -895,6 +1016,34 @@ fn extract_path(tool: &str, input: Option<&Value>) -> Option<String> {
     Some(tool.to_string())
 }
 
+/// The prose an async dispatch answers with. The second witness in `is_async_launch`.
+const ASYNC_LAUNCH_PROSE: &str = "Async agent launched successfully.";
+
+/// Whether an `Agent` result is a launch RECEIPT rather than an answer (D1).
+///
+/// Two witnesses, chosen for INDEPENDENT failure domains: `toolUseResult.isAsync` is an
+/// undocumented on-disk detail of another program, and the prose drifts with wording.
+/// Either firing is enough, so both must break before the old defect returns.
+/// `status == "async_launched"` discriminates just as well but lives in the same object
+/// as `isAsync` and would die in the same upstream edit — which is the one thing a
+/// second witness must not do.
+///
+/// The key is tested for PRESENCE-and-true, never compared against `false`: no observed
+/// log carries `isAsync: false`. A synchronous completion simply omits the field, so a
+/// `== false` test would classify every one of them as a launch by accident of absence.
+///
+/// Call this ONLY from the `ToolKind::Agent` arm. The scoping is load-bearing rather
+/// than tidy: a shell command that greps for the prose echoes it back into the log as a
+/// `Bash` result, and a prose false positive on a real agent would strand it as a
+/// permanent LIVE ghost — the failure the conservative fallback (D2) exists to refuse.
+fn is_async_launch(line: &Value, it: &Value) -> bool {
+    let key = line
+        .pointer("/toolUseResult/isAsync")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    key || result_text(it).trim_start().starts_with(ASYNC_LAUNCH_PROSE)
+}
+
 /// A `tool_result`'s content, which is either a bare string or an array of blocks.
 fn result_text(it: &Value) -> String {
     match it.get("content") {
@@ -925,6 +1074,37 @@ fn parse_task_created(s: &str) -> Option<(String, String)> {
         .trim()
         .to_string();
     Some((digits, subject))
+}
+
+/// The opening tag of a background task's completion notification.
+const TASK_NOTIFICATION_TAG: &str = "<task-notification>";
+
+/// Read a bare-string `message.content` as a task-notification, or `None` (D12).
+///
+/// Gated on STARTS-WITH, never `contains`. The notification block is quoted by things
+/// that are not notifications — a `/compact` continuation summary recaps one inside its
+/// own prose — and a `contains` test would let that summary end a live agent at the
+/// summary's timestamp. Measured 2026-08-19 over the logs then on disk: of the
+/// bare-string records carrying the tag, all but one begin with it, and that one is
+/// exactly such a summary. (Those logs are a rolling ~30-day window, so read the
+/// proportion as an as-of reading; the shape it describes is what this gate rests on.)
+///
+/// Every tag is read at its FIRST occurrence, which `between` already does. The field
+/// order upstream emits — `task-id`, `tool-use-id`, `output-file`, `status`, `summary`,
+/// `note`, `result`, `usage` — puts both fields read here ahead of the free-text
+/// `<result>`, which is the only place an inner block could be quoted.
+pub fn parse_task_notification(s: &str) -> Option<TaskNotification> {
+    if !s.trim_start().starts_with(TASK_NOTIFICATION_TAG) {
+        return None;
+    }
+    let task_id = between(s, "<task-id>", "</task-id>")?.trim();
+    if task_id.is_empty() {
+        return None;
+    }
+    Some(TaskNotification {
+        task_id: task_id.to_string(),
+        status: between(s, "<status>", "</status>").map(|v| v.trim().to_string()),
+    })
 }
 
 fn between<'a>(s: &'a str, open: &str, close: &str) -> Option<&'a str> {

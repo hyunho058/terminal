@@ -587,10 +587,17 @@ fn agents(t: &TelemetrySnapshot, env: &Env) -> Section {
         .subagents
         .iter()
         .map(|a| Card {
-            accent: Some(if a.completed {
-                ColorRole::TextFaint
-            } else {
-                ColorRole::Amber
+            // Three-way, and the failure arm is gated on `completed` for a reason:
+            // `ended_ok` starts `true` and is written only when a notification arrives,
+            // so an ungated rule would be meaningless for a live agent — whose elapsed
+            // is still growing — and would mislabel every synchronous completion, which
+            // no notification ever describes. The colour rides the accent bar because
+            // `Card` has no colour channel for its value; TASKS already derives an
+            // accent from a status the same way (`task_role`) (D13/R7.4).
+            accent: Some(match (a.completed, a.ended_ok) {
+                (false, _) => ColorRole::Amber,
+                (true, true) => ColorRole::TextFaint,
+                (true, false) => ColorRole::Rose,
             }),
             title: format!(
                 "{} {}",
@@ -1025,7 +1032,7 @@ pub fn dur(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_monitor::telemetry::{CompletedTool, FileActivity, SkillEntry};
+    use ai_monitor::telemetry::{CompletedTool, FileActivity, SessionTelemetry, SkillEntry};
     use renderer::monitor_layout::{layout, PanelDraw};
     use std::fmt::Write as _;
 
@@ -1168,6 +1175,8 @@ mod tests {
                 start_ms: Some(now - 90_000),
                 end_ms: None,
                 completed: false,
+                agent_id: None,
+                ended_ok: true,
             },
             agent_done(
                 "a2",
@@ -1261,6 +1270,8 @@ mod tests {
             start_ms: Some(start),
             end_ms: Some(end),
             completed: true,
+            agent_id: None,
+            ended_ok: true,
         }
     }
 
@@ -1780,6 +1791,289 @@ mod tests {
         assert_eq!(values(now + 600_000)[1], "30s", "the completed one did not");
     }
 
+    /// One agent, launched and never ended — the state an async launch now leaves.
+    fn launched_agent(start: u64) -> TelemetrySnapshot {
+        TelemetrySnapshot {
+            subagents: vec![Subagent {
+                id: "a1".into(),
+                subagent_type: Some("general-purpose".into()),
+                description: Some("background sweep".into()),
+                model: Some("opus".into()),
+                start_ms: Some(start),
+                end_ms: None,
+                completed: false,
+                agent_id: Some("agent-11".into()),
+                ended_ok: true,
+            }],
+            ..TelemetrySnapshot::default()
+        }
+    }
+
+    #[test]
+    fn an_async_launched_agent_renders_live_and_climbing() {
+        // R2.3 — the render half of "a launch is not an ending". Before this feature
+        // the same log produced `◯ 0s` here, frozen 83ms after dispatch.
+        let start = 1_787_097_600_000;
+        let t = launched_agent(start);
+        let card = |now: u64| match agents(&t, &env(now)).body {
+            SectionBody::Cards(v) => v.into_iter().next().expect("one card"),
+            body => panic!("agents are cards, got {body:?}"),
+        };
+        let c = card(start + 90_000);
+        assert_eq!(c.value, "1m30s");
+        assert!(c.title.starts_with(LIVE), "{}", c.title);
+        assert_eq!(c.accent, Some(ColorRole::Amber));
+        assert_eq!(card(start + 900_000).value, "15m00s", "it climbs");
+    }
+
+    #[test]
+    fn a_never_notified_agent_stays_live_unclamped() {
+        // R6.4 / R6.5 — roughly one async launch in eight never notifies (measured
+        // 2026-08-19; the corpus is a rolling ~30-day window, so the exact ratio drifts
+        // and only the magnitude is durable). The panel does not invent an ending for
+        // them: clamping to the last event would put up a number the log never
+        // asserted, which is the fabrication this feature removes.
+        let start = 1_787_097_600_000;
+        let t = launched_agent(start);
+        let SectionBody::Cards(v) = agents(&t, &env(start + 31 * 3_600_000)).body else {
+            panic!("agents are cards");
+        };
+        assert!(v[0].title.starts_with(LIVE));
+        assert_eq!(v[0].accent, Some(ColorRole::Amber));
+        assert_eq!(v[0].value, "31h00m", "hours format; u64 cannot overflow");
+    }
+
+    /// 2026-08-19T00:00:00.000Z — the launch the three lines below share.
+    const AGENT_T0: u64 = 1_787_097_600_000;
+    const LAUNCH_USE: &str = r#"{"type":"tool_use","id":"a1","name":"Agent","input":{"subagent_type":"general-purpose","description":"background sweep"},"timestamp":"2026-08-19T00:00:00.000Z"}"#;
+    const LAUNCH_RECEIPT: &str = r#"{"type":"tool_result","tool_use_id":"a1","timestamp":"2026-08-19T00:00:00.083Z","content":"(receipt)","toolUseResult":{"isAsync":true,"agentId":"agent-11"}}"#;
+    const NOTIFICATION: &str = r#"{"type":"user","timestamp":"2026-08-19T00:24:21.000Z","message":{"content":"<task-notification>\n<task-id>agent-11</task-id>\n<status>completed</status>\n</task-notification>"}}"#;
+
+    /// Fold real JSONL, so these two assert the whole path rather than a hand-built
+    /// snapshot that could agree with the renderer while disagreeing with the log.
+    fn fold_lines(lines: &[&str]) -> TelemetrySnapshot {
+        let mut t = SessionTelemetry::new();
+        for l in lines {
+            t.apply(l);
+        }
+        t.snapshot()
+    }
+
+    #[test]
+    fn a_background_agent_reports_its_real_duration_end_to_end() {
+        // R0.1 — the feature in one assertion. The ground truth is an agent that ran
+        // 24m21s while this card read 0s.
+        let t = fold_lines(&[LAUNCH_USE, LAUNCH_RECEIPT, NOTIFICATION]);
+        let SectionBody::Cards(v) = agents(&t, &env(AGENT_T0 + 3_600_000)).body else {
+            panic!("agents are cards");
+        };
+        assert_eq!(v[0].value, "24m21s", "never 0s");
+        assert!(v[0].title.starts_with(DONE), "{}", v[0].title);
+        assert_eq!(v[0].accent, Some(ColorRole::TextFaint));
+    }
+
+    #[test]
+    fn a_launched_agent_is_live_until_its_notification_arrives() {
+        // R0.2 — the same log one line short. This is the state the defect used to
+        // render as a frozen `◯ 0s`, 83ms after dispatch.
+        let t = fold_lines(&[LAUNCH_USE, LAUNCH_RECEIPT]);
+        let SectionBody::Cards(v) = agents(&t, &env(AGENT_T0 + 300_000)).body else {
+            panic!("agents are cards");
+        };
+        assert_eq!(v[0].value, "5m00s");
+        assert!(v[0].title.starts_with(LIVE), "{}", v[0].title);
+        assert_eq!(v[0].accent, Some(ColorRole::Amber));
+    }
+
+    /// A `<task-notification>` line for `task_id`, at `ts`.
+    fn note_line(task_id: &str, status: &str, ts: &str) -> String {
+        format!(
+            r#"{{"type":"user","timestamp":"{ts}","message":{{"content":"<task-notification>\n<task-id>{task_id}</task-id>\n<status>{status}</status>\n</task-notification>"}}}}"#
+        )
+    }
+
+    /// The single card `agents()` produces for a folded transcript, at `now`.
+    fn one_card(lines: &[&str], now: u64) -> Card {
+        let t = fold_lines(lines);
+        match agents(&t, &env(now)).body {
+            SectionBody::Cards(v) => {
+                assert_eq!(v.len(), 1, "expected exactly one card: {v:?}");
+                v.into_iter().next().expect("one card")
+            }
+            body => panic!("agents are cards, got {body:?}"),
+        }
+    }
+
+    #[test]
+    fn a_renotified_card_reads_cumulative_time_alive() {
+        // R5.3's render half — the second leg is 4m long, but the card promises time
+        // ALIVE, so it must read 16m and not 4m.
+        let first = note_line("agent-11", "completed", "2026-08-19T00:12:00.000Z");
+        let second = note_line("agent-11", "completed", "2026-08-19T00:16:00.000Z");
+        let c = one_card(
+            &[LAUNCH_USE, LAUNCH_RECEIPT, &first, &second],
+            AGENT_T0 + 7_200_000,
+        );
+        assert_eq!(c.value, "16m00s");
+        assert!(c.title.starts_with(DONE));
+    }
+
+    #[test]
+    fn a_fallback_completed_card_is_corrected_by_its_notification() {
+        // R5.4's render half — the drift path, seen the way a user sees it. Both states
+        // are `◯`; what changes is the number, from a lie to the truth.
+        let fallback = r#"{"type":"tool_result","tool_use_id":"a1","timestamp":"2026-08-19T00:00:00.083Z","content":"(an unrecognised receipt)","toolUseResult":{"agentId":"agent-11"}}"#;
+        let note = note_line("agent-11", "completed", "2026-08-19T00:24:21.000Z");
+        let before = one_card(&[LAUNCH_USE, fallback], AGENT_T0 + 3_600_000);
+        assert_eq!(before.value, "0s", "the defect, reproduced");
+        assert!(before.title.starts_with(DONE));
+
+        let after = one_card(&[LAUNCH_USE, fallback, &note], AGENT_T0 + 3_600_000);
+        assert_eq!(after.value, "24m21s", "and corrected");
+        assert!(after.title.starts_with(DONE));
+    }
+
+    #[test]
+    fn a_sync_agents_card_grows_when_it_is_resumed() {
+        // R5.5's render half — the Known Gap made visible: the same card reads `4s` and
+        // then, hours later, `2h13m`. Surprising, intended, and asserted so that a
+        // reader who finds it surprising can see it was a decision.
+        let sync = r#"{"type":"tool_result","tool_use_id":"a1","timestamp":"2026-08-19T00:00:04.000Z","content":"Mapped the seam.","toolUseResult":{"status":"completed","agentId":"agent-11"}}"#;
+        let note = note_line("agent-11", "completed", "2026-08-19T02:13:00.000Z");
+        let before = one_card(&[LAUNCH_USE, sync], AGENT_T0 + 60_000);
+        assert_eq!(before.value, "4s");
+
+        let after = one_card(&[LAUNCH_USE, sync, &note], AGENT_T0 + 10_800_000);
+        assert_eq!(after.value, "2h13m");
+        assert!(after.title.starts_with(DONE), "the glyph never changed");
+    }
+
+    #[test]
+    fn a_failed_card_returns_to_faint_when_the_resume_succeeds() {
+        // R7.6's render half — `ended_ok` is last-wins like `end_ms`, so Rose is not a
+        // one-way door.
+        let failed = note_line("agent-11", "failed", "2026-08-19T00:12:00.000Z");
+        let fixed = note_line("agent-11", "completed", "2026-08-19T00:16:00.000Z");
+        let c1 = one_card(&[LAUNCH_USE, LAUNCH_RECEIPT, &failed], AGENT_T0 + 7_200_000);
+        assert_eq!(c1.accent, Some(ColorRole::Rose));
+
+        let c2 = one_card(
+            &[LAUNCH_USE, LAUNCH_RECEIPT, &failed, &fixed],
+            AGENT_T0 + 7_200_000,
+        );
+        assert_eq!(c2.accent, Some(ColorRole::TextFaint));
+        assert_eq!(c2.value, "16m00s");
+    }
+
+    #[test]
+    fn a_resumed_agents_card_stays_frozen_through_the_resume_window() {
+        // R8.1's render half — the declared gap. The `SendMessage` below is the resume:
+        // it is in the transcript, the fold does not inspect it, and the card therefore
+        // says DONE while the agent is running again. Folding it is what makes this
+        // test discriminate — without it the assertion is just R5.1 restated.
+        let note = note_line("agent-11", "completed", "2026-08-19T00:12:00.000Z");
+        let resume = r#"{"type":"tool_use","id":"s1","name":"SendMessage","input":{"to":"agent-11","message":"keep going"},"timestamp":"2026-08-19T00:13:00.000Z"}"#;
+        let resume_res = r#"{"type":"tool_result","tool_use_id":"s1","timestamp":"2026-08-19T00:13:00.200Z","content":"delivered"}"#;
+        let c = one_card(
+            &[LAUNCH_USE, LAUNCH_RECEIPT, &note, resume, resume_res],
+            AGENT_T0 + 7_200_000,
+        );
+        assert!(c.title.starts_with(DONE));
+        assert_eq!(c.value, "12m00s", "frozen, though two hours have passed");
+        assert_eq!(c.accent, Some(ColorRole::TextFaint));
+    }
+
+    #[test]
+    fn a_failed_end_colours_the_accent_not_the_glyph() {
+        // R7.4 — the section's `●`/`◯` vocabulary means live-or-not and nothing else,
+        // so the failure rides the accent bar. The elapsed still freezes at the
+        // notification: a failed run took as long as it took.
+        let failed = r#"{"type":"user","timestamp":"2026-08-19T00:24:21.000Z","message":{"content":"<task-notification>\n<task-id>agent-11</task-id>\n<status>failed</status>\n</task-notification>"}}"#;
+        let t = fold_lines(&[LAUNCH_USE, LAUNCH_RECEIPT, failed]);
+        let SectionBody::Cards(v) = agents(&t, &env(AGENT_T0 + 3_600_000)).body else {
+            panic!("agents are cards");
+        };
+        assert_eq!(v[0].accent, Some(ColorRole::Rose));
+        assert!(v[0].title.starts_with(DONE), "the glyph is unchanged");
+        assert_eq!(
+            v[0].value, "24m21s",
+            "a failed run's duration is still real"
+        );
+    }
+
+    #[test]
+    fn only_a_notified_failure_is_ever_rose() {
+        // R7.5 — three agents no notification ever described: one in flight, one
+        // completed synchronously, one completed by the unrecognised-result fallback.
+        //
+        // Note precisely what this does and does not discriminate. All three carry
+        // `ended_ok == true` (only the notification branch ever writes that field), so
+        // an ungated `!ended_ok -> Rose` rule would not paint them either. What is
+        // pinned here is the other half of the gate: `completed` alone must never imply
+        // Rose. The `ended_ok == false` side is pinned separately below, because the
+        // fold cannot reach `completed == false` with `ended_ok == false` at all.
+        let sync_use = r#"{"type":"tool_use","id":"a2","name":"Agent","input":{"subagent_type":"sync"},"timestamp":"2026-08-19T00:00:00.000Z"}"#;
+        let sync_res = r#"{"type":"tool_result","tool_use_id":"a2","timestamp":"2026-08-19T00:00:04.000Z","content":"Done.","toolUseResult":{"agentId":"agent-sync"}}"#;
+        let fallback_use = r#"{"type":"tool_use","id":"a3","name":"Agent","input":{"subagent_type":"fallback"},"timestamp":"2026-08-19T00:00:00.000Z"}"#;
+        let fallback_res = r#"{"type":"tool_result","tool_use_id":"a3","timestamp":"2026-08-19T00:00:09.000Z","content":"(a shape nobody has seen)","toolUseResult":{"someNewKey":true}}"#;
+        let t = fold_lines(&[
+            LAUNCH_USE,
+            LAUNCH_RECEIPT,
+            sync_use,
+            sync_res,
+            fallback_use,
+            fallback_res,
+        ]);
+        let SectionBody::Cards(v) = agents(&t, &env(AGENT_T0 + 300_000)).body else {
+            panic!("agents are cards");
+        };
+        let accent = |kind: &str| {
+            v.iter()
+                .find(|c| c.title.contains(kind))
+                .unwrap_or_else(|| panic!("no card for {kind}: {v:?}"))
+                .accent
+        };
+        assert_eq!(
+            accent("general-purpose"),
+            Some(ColorRole::Amber),
+            "in flight"
+        );
+        assert_eq!(
+            accent("sync"),
+            Some(ColorRole::TextFaint),
+            "sync completion"
+        );
+        assert_eq!(accent("fallback"), Some(ColorRole::TextFaint), "fallback");
+        assert!(
+            v.iter().all(|c| c.accent != Some(ColorRole::Rose)),
+            "nothing here failed: {v:?}"
+        );
+    }
+
+    #[test]
+    fn liveness_outranks_ended_ok_in_the_accent() {
+        // R7.5's unreachable corner, pinned by hand because the fold cannot produce it:
+        // `ended_ok` is written only by the notification branch, which also sets
+        // `completed`, so `(completed: false, ended_ok: false)` never occurs in practice.
+        // Without this, `(false, _) => Amber` could be rewritten as
+        // `(false, false) => Rose` and the entire suite would still pass.
+        //
+        // The rule it fixes: an agent that is still running is not a failure, whatever
+        // else its fields say. Rose means "it ended, and it ended badly".
+        let start = 1_787_097_600_000;
+        let mut t = launched_agent(start);
+        t.subagents[0].ended_ok = false;
+        let SectionBody::Cards(v) = agents(&t, &env(start + 90_000)).body else {
+            panic!("agents are cards");
+        };
+        assert_eq!(
+            v[0].accent,
+            Some(ColorRole::Amber),
+            "still live, not failed"
+        );
+        assert!(v[0].title.starts_with(LIVE));
+    }
+
     #[test]
     fn agent_cards_carry_type_description_and_model() {
         let (t, now) = full();
@@ -2112,10 +2406,14 @@ mod tests {
     #[test]
     fn no_model_string_is_unbounded_on_hostile_telemetry() {
         // The passthrough fields — a task's subject and status, an agent's type,
-        // description and model, a tool's name, a file's path — are raw strings the crate
-        // never bounds. The renderer truncates for the panel's width, but an unbounded
-        // one would still be cloned into the model and compared field by field on every
-        // frame by the R7.3 shaping cache.
+        // description, model and agent id, a tool's name, a file's path — are raw strings
+        // the crate never bounds. The renderer truncates for the panel's width, but an
+        // unbounded one would still be cloned into the model and compared field by field
+        // on every frame by the R7.3 shaping cache.
+        //
+        // `agent_id` reaches no string in the model today — it is a join key, never
+        // rendered — so it is loaded here purely as a tripwire: the day someone surfaces
+        // it on a card, this assertion fails instead of the panel.
         let now = 1_785_226_000_000;
         let t = TelemetrySnapshot {
             model: Some("m".repeat(400)),
@@ -2128,6 +2426,8 @@ mod tests {
                 start_ms: Some(0),
                 end_ms: None,
                 completed: false,
+                agent_id: Some("g".repeat(300)),
+                ended_ok: true,
             }],
             files: vec![file(FileOp::Read, &"p".repeat(400), true, Some(u64::MAX))],
             tools: vec![CompletedTool {
