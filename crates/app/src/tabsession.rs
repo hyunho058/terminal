@@ -145,6 +145,33 @@ const MAX_VISITED: usize = 512;
 /// Every failure — a dead pid, a permission refusal, an unreadable process table —
 /// yields `None`, and the caller falls back to ranking the log directory. Being unable
 /// to identify the tab's session must never be worse than not having looked.
+/// Which agent this tab is running, and that process's pid.
+///
+/// Separate from [`hint_for`] rather than folded into it, because the two answer different
+/// questions and only one of them generalises. `hint_for` builds Claude's *session identity*
+/// — a `--resume` id, a start time, a rival set — machinery that exists because Claude's logs
+/// record no owner. Antigravity's presence lock names its conversation outright, so none of
+/// that applies; what the overlay needs from this side is only "which agent, and which pid",
+/// and asking `hint_for` to carry a field meaningless to its own resolution would blur a
+/// boundary that is currently exact.
+///
+/// The classification is `tabmeta::agent`'s, reused rather than reimplemented: it already
+/// handles `agy`, the auto-updater's `agy.<id>.old` in-place rename, and the interpreter/argv
+/// gate, each of which cost a spec to get right (`specs/antigravity-agy-detection`).
+///
+/// Resolves through the tmux pane root first, matching `hint_for`, so a tab whose agent runs
+/// inside a pane is found rather than missed.
+pub fn agent_for(shell_pid: u32) -> Option<(crate::tabmeta::AgentKind, u32)> {
+    let root = resolved_root(shell_pid);
+    // The pane root first, then the tab's own subtree. `resolved_root` returns `shell_pid`
+    // unchanged for a non-tmux tab, so the second call is skipped in the common case rather
+    // than paying for a duplicate walk.
+    let found = crate::tabmeta::agent::agent_of_pid(root).or_else(|| {
+        (root != shell_pid).then(|| crate::tabmeta::agent::agent_of_pid(shell_pid))?
+    })?;
+    Some((found.kind, found.pid))
+}
+
 pub fn hint_for(shell_pid: u32) -> Option<SessionHint> {
     let table = ProcTable::read()?;
     let root = resolved_root(shell_pid);

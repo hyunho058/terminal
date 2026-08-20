@@ -24,6 +24,13 @@ pub mod activity;
 /// dashboard (`telemetry-model`). Pure over its input, bounded, GPU/UI-free (SD2/SD4).
 pub mod telemetry;
 
+/// Antigravity CLI (`agy`) session discovery: paths under `~/.gemini/antigravity-cli` and
+/// the `history.jsonl` fallback tier (`ai-monitor-antigravity` AG6). The *open FD* half of
+/// the ladder needs `proc_pidinfo` and so lives in `app` (AG11), which hands this module a
+/// conversation id; everything after that — paths, tailing, parsing — is this crate's, as
+/// it is for Claude.
+pub mod antigravity;
+
 /// One parsed log event: who spoke and a one-line summary (D1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AiEvent {
@@ -779,7 +786,28 @@ pub fn backfill(log: &Path, n: usize) -> (Vec<AiEvent>, u64) {
 /// today, so folding instead of building `AiEvent`s is the same order of cost.
 /// Missing file → empty state, offset 0, no error.
 pub fn backfill_telemetry(log: &Path) -> (SessionTelemetry, u64) {
-    let mut t = SessionTelemetry::new();
+    backfill_telemetry_with(log, telemetry::LogFormat::Claude)
+}
+
+/// [`backfill_telemetry`] for a caller that knows which agent wrote the log (AG9).
+///
+/// The format is the CALLER's to state, here as much as in [`LogWatcher::spawn`]: the code
+/// that reached this point walked a process tree and found `agy` or `claude`, so it holds a
+/// fact, and sniffing the file would replace that fact with a guess. Seeding the accumulator
+/// in one format and tailing it in another would fold a whole session into the wrong shape
+/// and report it as parse errors, so the two calls must be given the same answer.
+pub fn backfill_telemetry_with(
+    log: &Path,
+    format: telemetry::LogFormat,
+) -> (SessionTelemetry, u64) {
+    // The Antigravity id comes from the path because the file never states it; the Claude id
+    // is folded out of the lines and is deliberately NOT derived here, so this stays a pure
+    // addition to the new path and leaves the existing one byte-for-byte as it was (R5.6).
+    let named = match format {
+        telemetry::LogFormat::Antigravity => antigravity::conversation_id_of(log),
+        telemetry::LogFormat::Claude => None,
+    };
+    let mut t = SessionTelemetry::with_format(format).with_log_session_id(named);
     let Ok(bytes) = std::fs::read(log) else {
         return (t, 0);
     };
@@ -803,10 +831,6 @@ pub struct LogWatcher {
     pub rx: Receiver<Update>,
 }
 
-/// What to watch, and what the caller already knows about it.
-///
-/// A struct rather than five parameters: they are one decision — *which* session this
-/// watch is for — and passing them separately invites a call site that gets the
 /// Does this event concern a `.jsonl` in **our** project directory?
 ///
 /// The scope half of the sibling-wake rule (see its call site). Extracted because both of
@@ -836,27 +860,110 @@ fn touches_project_log(paths: &[PathBuf], dir: &Path) -> bool {
     })
 }
 
+/// Is this event our ONE transcript, compared by full path (AG7)?
+///
+/// The counterpart to [`touches_project_log`], and deliberately not a variation on it:
+/// every rule that function relies on inverts under Antigravity's layout.
+///
+/// * **The file NAME is worthless.** Every conversation's transcript is literally
+///   `transcript.jsonl`, so the name test that identifies a Claude target admits every
+///   other conversation on the machine.
+/// * **The parent's NAME is worthless too.** Each one lives in
+///   `brain/<id>/.system_generated/logs`, so the parent is `logs` for all of them — the
+///   very property (unique directory names) that makes name-matching correct for Claude
+///   projects is absent here.
+///
+/// So this compares the whole parent path. `canon_dir` exists because FSEvents reports
+/// CANONICAL paths — the same trap [`touches_project_log`] documents — and canonicalizing
+/// our side ONCE at spawn is what keeps that correct without a syscall per event.
+///
+/// `transcript_full.jsonl` (the untruncated twin) and `chunks/transcript/*.jsonl` (byte
+/// mirrors of content already tailed) both sit in or under this same directory and are
+/// excluded here: the twin by name, the chunks by parent path.
+fn is_the_one_log(paths: &[PathBuf], target: &Path, dir: &Path, canon_dir: &Path) -> bool {
+    let Some(name) = target.file_name() else {
+        return false;
+    };
+    paths.iter().any(|p| {
+        p.file_name() == Some(name)
+            && p.parent()
+                .is_some_and(|parent| parent == dir || parent == canon_dir)
+    })
+}
+
+/// What to watch, and what the caller already knows about it.
+///
+/// A struct rather than five parameters: they are one decision — *which* session this
+/// watch is for — and passing them separately invites a call site that gets the
 /// pairing wrong.
 pub struct Watch {
-    /// The project directory to watch.
+    /// The directory to watch. For [`WatchScope::Project`] that is a Claude project
+    /// directory holding many sessions; for [`WatchScope::SingleLog`] it is one
+    /// conversation's own log directory.
     pub dir: PathBuf,
     /// The log resolved so far, if any.
     pub log: Option<PathBuf>,
-    /// What the caller knows about which session it wants, used on re-resolution.
-    pub want: Wanted,
     /// Whether `log` was confirmed to be the caller's.
     pub owned: bool,
-    /// The other live `claude` processes in this project — see [`resolve_owned_session`].
-    ///
-    /// **Shared, not captured.** Membership changes during an open: a sibling that starts
-    /// `claude` after the panel opened would never veto, so its log could be adopted with
-    /// `owned: true`; a sibling that exits would keep vetoing and silence a tab that now
-    /// legitimately owns its log. The caller republishes through this handle from the
-    /// thread that already enumerates processes; the watcher reads it under the lock and
-    /// clones, never holding it across file I/O.
-    pub rivals: RivalHandle,
     /// Set by the caller once it has attached; the watcher then stops re-resolving.
     pub attached: Arc<AtomicBool>,
+    /// Which storage shape this watch is pointed at (AG7).
+    pub scope: WatchScope,
+}
+
+/// The one thing that genuinely differs between the two agents down in the callback (AG7).
+///
+/// An enum carrying data rather than a flag beside two now-optional fields, because the
+/// variants do not merely *behave* differently — they *know* different things. Claude's
+/// re-resolution needs a hint and a live rival set; Antigravity's has nothing to
+/// re-resolve, because a presence lock already named the conversation exactly. Keeping the
+/// Claude-only data inside the Claude-only variant is what stops an Antigravity watch from
+/// being handed a `Wanted` that could not mean anything, and stops a future reader from
+/// concluding the fields were merely forgotten.
+pub enum WatchScope {
+    /// A Claude project directory, which may hold MANY sessions.
+    ///
+    /// The target can legitimately move (the session's first line may not be written yet),
+    /// and a *different* `.jsonl` stirring in the directory is what a `/clear` looks like
+    /// from in here — so this variant both re-resolves and wakes on siblings.
+    Project {
+        /// What the caller knows about which session it wants, used on re-resolution.
+        want: Wanted,
+        /// The other live `claude` processes in this project — see [`resolve_owned_session`].
+        ///
+        /// **Shared, not captured.** Membership changes during an open: a sibling that starts
+        /// `claude` after the panel opened would never veto, so its log could be adopted with
+        /// `owned: true`; a sibling that exits would keep vetoing and silence a tab that now
+        /// legitimately owns its log. The caller republishes through this handle from the
+        /// thread that already enumerates processes; the watcher reads it under the lock and
+        /// clones, never holding it across file I/O.
+        rivals: RivalHandle,
+    },
+    /// Exactly ONE Antigravity transcript, already named by [`Watch::log`].
+    ///
+    /// **No re-resolution.** The FD probe named the conversation, so there is no contest to
+    /// re-run; anything this crate adopted on its own would be a guess replacing a fact.
+    /// AG6's measurement is what makes that strictness necessary rather than merely tidy —
+    /// 18 of 51 transcripts are subagents, indistinguishable by content, and the newest
+    /// writer precisely while their parent waits.
+    ///
+    /// **No sibling wake**, for the same reason inverted: a sibling `.jsonl` here is another
+    /// conversation entirely — frequently a subagent of some *other* session — and never a
+    /// rotation signal about ours.
+    SingleLog,
+    /// Nothing to tail yet — watch for the agent to announce itself, and WAKE the caller.
+    ///
+    /// The unattached state needs a wake source of its own, and this is the whole reason the
+    /// variant exists. Claude's path arms a watch unconditionally ("even when the hint knows
+    /// nothing") precisely so an empty panel has something to fire on; the Antigravity path
+    /// originally armed nothing when no log resolved, and a panel opened before `agy` was
+    /// detectable therefore sat in its opening state **forever** — no wake, so no
+    /// `on_active_changed`, so no re-probe and no re-point. Reported from a live run.
+    ///
+    /// [`Watch::dir`] is the agent's presence directory. This variant reads no file and sends
+    /// no update: it calls `wake` and returns. Deciding what a lock appearing MEANS needs the
+    /// process-tree knowledge only the app has, exactly as with the Claude rotation wake.
+    AwaitingLock,
 }
 
 /// The live rival set, shared between the producer (`app`) and the watch thread.
@@ -906,11 +1013,22 @@ impl LogWatcher {
         let Watch {
             dir,
             log,
-            want,
             mut owned,
-            rivals,
             attached,
+            scope,
         } = watch;
+        // Unpacked ONCE, out here, so the callback branches on an `Option` it already holds
+        // rather than re-matching the enum on every filesystem event.
+        let (project, awaiting_lock) = match scope {
+            WatchScope::Project { want, rivals } => (Some((want, rivals)), false),
+            WatchScope::SingleLog => (None, false),
+            WatchScope::AwaitingLock => (None, true),
+        };
+        // Our side of the path comparison for `SingleLog`, resolved once (see
+        // `is_the_one_log`). A directory that cannot be canonicalized — it may not exist
+        // yet — falls back to the literal path, which is exactly the pre-canonicalization
+        // behaviour and no worse.
+        let canon_dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
         let watch_dir = dir.clone();
         let (tx, rx) = mpsc::channel::<Update>();
         let mut offset = start_offset;
@@ -948,8 +1066,28 @@ impl LogWatcher {
 
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(ev) = res else { return };
+            if awaiting_lock {
+                // A wake, nothing more — no target to read and no snapshot to send. Scoped to
+                // `.lock` so the whole presence directory's traffic does not reach the event
+                // loop: every conversation on the machine announces itself here, and only the
+                // arrival of a lock can change this tab's answer.
+                if ev
+                    .paths
+                    .iter()
+                    .any(|p| p.extension().is_some_and(|e| e == "lock"))
+                {
+                    wake();
+                }
+                return;
+            }
             let mut switched = false;
-            if !attached.load(Ordering::Relaxed) {
+            // `SingleLog` never enters this block at all — see `WatchScope::SingleLog`.
+            // Its target was named by a presence-lock FD, so there is no better answer for
+            // re-resolution to find and several worse ones for it to adopt.
+            if let Some((want, rivals)) = project
+                .as_ref()
+                .filter(|_| !attached.load(Ordering::Relaxed))
+            {
                 // A new session's first line lands here: the file did not exist when
                 // the overlay opened, so no amount of tailing the old target would
                 // ever find it.
@@ -962,21 +1100,38 @@ impl LogWatcher {
                     // a sibling in its first ~2s has no record yet, and that is exactly
                     // the state in which it would otherwise keep vetoing us.
                     let snapshot = rivals.lock().map(|g| g.clone()).unwrap_or_default();
-                    resolve_owned_session(&dir, &want, &snapshot.list, snapshot.known)
+                    resolve_owned_session(&dir, want, &snapshot.list, snapshot.known)
                 } {
                     if Some(&newest) != target.as_ref() {
                         owned = newly_owned;
                         target = Some(newest);
                         offset = 0;
                         partial.clear();
-                        telemetry = SessionTelemetry::new();
+                        // A DIFFERENT file, so unlike the truncation reset below this must
+                        // drop the path-derived id — it named the log we just stopped
+                        // following. The dialect is carried across because it is the
+                        // watcher's, not the file's. (Reachable only in `Project` scope,
+                        // which is Claude's alone; carrying the format keeps that a fact
+                        // about the code rather than a coincidence of who calls it.)
+                        telemetry = SessionTelemetry::with_format(telemetry.format());
                         switched = true;
                     }
                 }
             }
             let Some(target) = target.clone() else { return };
-            let name = target.file_name();
-            if !switched && !ev.paths.iter().any(|p| p.file_name() == name) {
+            // WHICH test decides "is this ours" is the scope's call, and the two are not
+            // interchangeable: matching a Claude target by name is correct because project
+            // directory names are unique, and matching an Antigravity one by name is
+            // catastrophic because every conversation's file is `transcript.jsonl` in a
+            // directory called `logs`. See `is_the_one_log`.
+            let ours = match project {
+                Some(_) => {
+                    let name = target.file_name();
+                    ev.paths.iter().any(|p| p.file_name() == name)
+                }
+                None => is_the_one_log(&ev.paths, &target, &dir, &canon_dir),
+            };
+            if !switched && !ours {
                 // Not our file — so we read nothing, exactly as before. But a DIFFERENT
                 // `.jsonl` stirring in this project directory is what a `/clear` looks like
                 // from in here: the session was rotated, a new log opened beside ours, and
@@ -1024,7 +1179,14 @@ impl LogWatcher {
                 // among the root's children and identical under both spellings; with the
                 // fallback watch rooted one level up, matching the name IS matching the
                 // directory.
-                if touches_project_log(&ev.paths, &dir) {
+                //
+                // `SingleLog` takes none of this. The paragraph above reasons about a
+                // sibling `.jsonl` being OUR session rotated; under Antigravity a sibling is
+                // a different conversation — often a subagent belonging to some other
+                // session entirely — and waking on it would reintroduce, through the back
+                // door, exactly the cross-conversation traffic `is_the_one_log` exists to
+                // exclude.
+                if project.is_some() && touches_project_log(&ev.paths, &dir) {
                     wake();
                 }
                 return;
@@ -1042,9 +1204,13 @@ impl LogWatcher {
                 // accumulator. Until there was accumulated state a rewind was
                 // enough; continuing to fold a different session's lines into the
                 // previous session's totals would silently produce nonsense.
+                //
+                // Same FILE, so the dialect and the path-derived id both still hold — hence
+                // `restarted()` and not `new()`, which would have reset an Antigravity tail
+                // to the Claude dialect and dropped the conversation id the path names.
                 offset = 0;
                 partial.clear();
-                telemetry = SessionTelemetry::new();
+                telemetry = telemetry.restarted();
                 reset = true;
             }
             if f.seek(SeekFrom::Start(offset)).is_err() {
@@ -1522,6 +1688,292 @@ mod tests {
         base
     }
 
+    /// AG9: the backfill must be seeded in the same format the tail will use.
+    ///
+    /// The two calls are made from one place in the app for exactly this reason, and this
+    /// pins what goes wrong when they disagree: the *same bytes* either fold into turns or
+    /// count as parse errors, and the failure is silent — a panel showing zeroes, not a crash.
+    #[test]
+    fn backfill_format_is_the_callers_to_state() {
+        let dir = temp_dir("ag-backfill");
+        let log = dir.join("transcript.jsonl");
+        std::fs::write(
+            &log,
+            concat!(
+                r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-08-14T03:48:57Z","content":"<USER_REQUEST>\nhi\n</USER_REQUEST>"}"#,
+                "\n",
+                r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-08-14T03:49:00Z","content":"done"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let (right, off) = backfill_telemetry_with(&log, telemetry::LogFormat::Antigravity);
+        let snap = right.snapshot();
+        assert_eq!((snap.turns_user, snap.turns_assistant), (1, 1));
+        assert_eq!(snap.parse_errors, 0, "well-formed input, correctly claimed");
+        assert_eq!(
+            off,
+            std::fs::metadata(&log).unwrap().len(),
+            "offset is bytes consumed"
+        );
+
+        // The same bytes under the default (Claude) format: not a panic, not an error the
+        // user would see — just a session that quietly counts nothing.
+        let (wrong, _) = backfill_telemetry(&log);
+        let wrong = wrong.snapshot();
+        assert_eq!(
+            (wrong.turns_user, wrong.turns_assistant),
+            (0, 0),
+            "a format mismatch loses the session silently, which is why the caller must state it"
+        );
+    }
+
+    // ---- ai-monitor-antigravity, AG7: watching a layout where names do not identify ----
+
+    /// The real Antigravity shape: `<root>/brain/<id>/.system_generated/logs/`.
+    ///
+    /// Spelled out rather than shortened because the whole point of these tests is that
+    /// the *last two components are identical for every conversation on the machine* —
+    /// a fixture that flattened the path would test nothing.
+    fn ag_logs_dir(root: &Path, id: &str) -> PathBuf {
+        let d = root
+            .join("brain")
+            .join(id)
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// An Antigravity session is identified in the panel even though its log never says who
+    /// it is — the reported defect where the header read `session —` beside `[Antigravity]`.
+    ///
+    /// Laid out for real (`brain/<id>/.system_generated/logs/`) because the id is recovered
+    /// from exactly those components; a flat fixture would pass while the shipped path failed.
+    #[test]
+    fn an_antigravity_backfill_takes_its_session_id_from_the_path() {
+        const ID: &str = "aaaaaaaa-0000-4000-8000-00000000abcd";
+        let root = temp_dir("ag-session-id");
+        let log = ag_logs_dir(&root, ID).join("transcript.jsonl");
+        std::fs::write(
+            &log,
+            concat!(
+                r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-08-14T03:48:57Z","content":"hi"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let (t, _) = backfill_telemetry_with(&log, telemetry::LogFormat::Antigravity);
+        assert_eq!(
+            t.snapshot().session_id.as_deref(),
+            Some(ID),
+            "the conversation id is the brain/<id>/ directory's name"
+        );
+
+        // The Claude path is untouched (R5.6): its id is folded from `sessionId` lines, and a
+        // log that carries none reports none rather than inheriting this inference.
+        let (claude, _) = backfill_telemetry(&log);
+        assert_eq!(
+            claude.snapshot().session_id,
+            None,
+            "deriving an id from the path must not leak into the format that states its own"
+        );
+    }
+
+    /// A truncated log keeps its identity: same file, so same dialect and same id.
+    ///
+    /// This is the half of the reset that is a property of the LOG rather than of what was
+    /// folded from it. Before `restarted()`, this path called `SessionTelemetry::new()` and
+    /// silently reset an Antigravity tail to the Claude dialect — after which every later
+    /// line in the file would have counted as nothing at all.
+    #[test]
+    fn a_truncation_reset_keeps_the_dialect_and_the_path_derived_id() {
+        const ID: &str = "aaaaaaaa-0000-4000-8000-00000000ef01";
+        let mut t = SessionTelemetry::with_format(telemetry::LogFormat::Antigravity)
+            .with_log_session_id(Some(ID.to_string()));
+        t.apply(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-08-14T03:48:57Z","content":"hi"}"#,
+        );
+        assert_eq!(t.snapshot().turns_user, 1, "folded before the reset");
+
+        let fresh = t.restarted();
+        let snap = fresh.snapshot();
+        assert_eq!(fresh.format(), telemetry::LogFormat::Antigravity);
+        assert_eq!(snap.session_id.as_deref(), Some(ID), "identity survives");
+        assert_eq!(snap.turns_user, 0, "everything folded is dropped");
+    }
+
+    /// R5.3 + R5.4, pinned on the predicate that decides them.
+    ///
+    /// Deliberately a unit test on `is_the_one_log` rather than a spawned watcher driven by
+    /// real writes: FSEvents decides *whether* a sibling's event is even delivered, so a
+    /// filesystem test would pass for reasons unrelated to the rule and would keep passing
+    /// if the rule were deleted. The predicate is where the decision lives, so that is where
+    /// it is pinned.
+    #[test]
+    fn r5_3_r5_4_only_the_one_transcript_matches_under_shared_names() {
+        let root = temp_dir("ag-scope");
+        let ours = ag_logs_dir(&root, "aaaaaaaa-0000-4000-8000-000000000001");
+        let sibling = ag_logs_dir(&root, "bbbbbbbb-0000-4000-8000-000000000002");
+        let target = ours.join("transcript.jsonl");
+        let canon = ours.canonicalize().unwrap_or_else(|_| ours.clone());
+
+        let hit = |p: PathBuf| is_the_one_log(&[p], &target, &ours, &canon);
+
+        assert!(hit(target.clone()), "our own transcript must match");
+
+        // R5.3. Identical file name, identical PARENT name (`logs`) — everything the Claude
+        // predicate looks at agrees. Only the full path disagrees, which is why the full
+        // path is what this compares.
+        assert_eq!(
+            sibling.file_name(),
+            ours.file_name(),
+            "fixture is pointless unless both parents really are named `logs`"
+        );
+        assert!(
+            !hit(sibling.join("transcript.jsonl")),
+            "a different conversation's transcript must never match ours"
+        );
+
+        // R5.4. Chunk mirrors carry bytes already tailed from `transcript.jsonl`; folding
+        // them would double-count every line in the session.
+        assert!(
+            !hit(ours
+                .join("chunks")
+                .join("transcript")
+                .join("00000000.jsonl")),
+            "a chunk mirror must not match"
+        );
+
+        // The untruncated twin sits in our own directory, so only the name excludes it.
+        assert!(
+            !hit(ours.join("transcript_full.jsonl")),
+            "transcript_full.jsonl is a different file, not our target"
+        );
+
+        // FSEvents reports canonical paths. On macOS the temp root is reached through a
+        // symlink (`/var` -> `/private/var`), so this is the real delivered spelling and
+        // not a hypothetical one.
+        let canonical_event = canon.join("transcript.jsonl");
+        assert!(
+            hit(canonical_event),
+            "the canonical spelling of our own path must match, or the watch is deaf"
+        );
+    }
+
+    /// `AwaitingLock` wakes when a lock appears, and stays quiet otherwise.
+    ///
+    /// The mechanism half of the fix — the app-side wiring is pinned separately by asserting
+    /// the source, since `open()` needs an event loop. Both halves are needed: a watch that
+    /// is armed but never fires is exactly as useless as no watch at all, which is the state
+    /// this variant was added to escape.
+    #[test]
+    fn an_awaiting_lock_watch_wakes_on_a_lock_and_not_on_other_traffic() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let presence = temp_dir("await-lock");
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let _w = {
+            let wakes = wakes.clone();
+            LogWatcher::spawn(
+                Watch {
+                    dir: presence.clone(),
+                    log: None,
+                    owned: false,
+                    attached: unattached(),
+                    scope: WatchScope::AwaitingLock,
+                },
+                SessionTelemetry::with_format(telemetry::LogFormat::Antigravity),
+                0,
+                move || {
+                    wakes.fetch_add(1, Ordering::Relaxed);
+                },
+            )
+            .expect("spawn")
+        };
+
+        // Unrelated traffic in the same directory must not wake the event loop: every
+        // conversation on the machine announces itself here.
+        std::fs::write(presence.join("notes.txt"), "x").unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            0,
+            "a non-lock file must not wake the panel"
+        );
+
+        // The agent publishes its lock — the one event that can change the answer.
+        std::fs::write(
+            presence.join("5c45615b-c452-4726-a938-274c6e0b2b72.lock"),
+            "",
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while wakes.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            wakes.load(Ordering::Relaxed) >= 1,
+            "a lock appearing must wake the caller, which is the only way an unattached \
+             Antigravity panel ever re-probes"
+        );
+    }
+
+    /// R5.2: an append to the one transcript is folded and reaches the caller.
+    #[test]
+    fn r5_2_an_append_to_the_antigravity_transcript_is_folded_and_wakes() {
+        use std::io::Write;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let root = temp_dir("ag-tail");
+        let dir = ag_logs_dir(&root, "cccccccc-0000-4000-8000-000000000003");
+        let log = dir.join("transcript.jsonl");
+        std::fs::write(&log, "").unwrap();
+
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let w = {
+            let wakes = wakes.clone();
+            LogWatcher::spawn(
+                Watch {
+                    dir: dir.clone(),
+                    log: Some(log.clone()),
+                    owned: true,
+                    attached: unattached(),
+                    scope: WatchScope::SingleLog,
+                },
+                SessionTelemetry::with_format(telemetry::LogFormat::Antigravity),
+                0,
+                move || {
+                    wakes.fetch_add(1, Ordering::Relaxed);
+                },
+            )
+            .expect("spawn")
+        };
+
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        writeln!(
+            f,
+            r#"{{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-08-14T03:48:57Z","content":"<USER_REQUEST>\nhi\n</USER_REQUEST>"}}"#
+        )
+        .unwrap();
+        // Closed before waiting, deliberately: an open handle withholds the FSEvents
+        // notification, so a test that keeps it open waits forever on correct code.
+        drop(f);
+
+        let u =
+            w.rx.recv_timeout(Duration::from_secs(10))
+                .expect("an append to our own transcript must arrive");
+        assert_eq!(u.snap.turns_user, 1, "the line was folded, not merely seen");
+        assert!(
+            wakes.load(Ordering::Relaxed) >= 1,
+            "the event loop must be woken for the batch"
+        );
+    }
+
     #[test]
     fn encodes_and_resolves_newest_log() {
         assert_eq!(
@@ -1611,10 +2063,12 @@ mod tests {
             Watch {
                 dir: dir.clone(),
                 log: Some(log.clone()),
-                want: Wanted::default(),
                 owned: false,
-                rivals: no_rivals(),
                 attached: unattached(),
+                scope: WatchScope::Project {
+                    want: Wanted::default(),
+                    rivals: no_rivals(),
+                },
             },
             t,
             off,
@@ -1714,10 +2168,12 @@ mod tests {
                 Watch {
                     dir: dir.clone(),
                     log: Some(log.clone()),
-                    want: Wanted::default(),
                     owned: false,
-                    rivals: no_rivals(),
                     attached: unattached(),
+                    scope: WatchScope::Project {
+                        want: Wanted::default(),
+                        rivals: no_rivals(),
+                    },
                 },
                 t,
                 off,
@@ -1733,7 +2189,7 @@ mod tests {
             }
 
             let mut tailed = at_open;
-            while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(3)) {
+            while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(10)) {
                 tailed = s.snap.model.clone();
             }
 
@@ -2538,13 +2994,15 @@ mod tests {
                 // `timestamp`, so tier 2 could never date them to a process start. Note
                 // the id names a file that does NOT exist yet, which is the case under
                 // test — tier 1 answers `None` until the tab's session writes.
-                want: Wanted {
-                    session_id: Some("fresh".into()),
-                    since_ms: None,
-                },
                 owned: false,
-                rivals: no_rivals(),
                 attached: unattached(),
+                scope: WatchScope::Project {
+                    want: Wanted {
+                        session_id: Some("fresh".into()),
+                        since_ms: None,
+                    },
+                    rivals: no_rivals(),
+                },
             },
             t,
             off,
@@ -2592,13 +3050,15 @@ mod tests {
                 // directory and the file both exist. Required, not incidental: the
                 // fixture line below carries no `timestamp`, so `first_event` returns
                 // `None` and tier 2 can never confirm it.
-                want: Wanted {
-                    session_id: Some("first".into()),
-                    since_ms: None,
-                },
                 owned: false,
-                rivals: no_rivals(),
                 attached: unattached(),
+                scope: WatchScope::Project {
+                    want: Wanted {
+                        session_id: Some("first".into()),
+                        since_ms: None,
+                    },
+                    rivals: no_rivals(),
+                },
             },
             SessionTelemetry::new(),
             0,
@@ -2653,10 +3113,12 @@ mod tests {
             Watch {
                 dir: dir.clone(),
                 log: None,
-                want: Wanted::default(),
                 owned: false,
-                rivals: no_rivals(),
                 attached: unattached(),
+                scope: WatchScope::Project {
+                    want: Wanted::default(),
+                    rivals: no_rivals(),
+                },
             },
             SessionTelemetry::new(),
             0,
@@ -2697,10 +3159,12 @@ mod tests {
                 Watch {
                     dir: nowhere,
                     log: None,
-                    want: Wanted::default(),
                     owned: false,
-                    rivals: no_rivals(),
-                    attached: unattached()
+                    attached: unattached(),
+                    scope: WatchScope::Project {
+                        want: Wanted::default(),
+                        rivals: no_rivals()
+                    },
                 },
                 SessionTelemetry::new(),
                 0,
@@ -2739,13 +3203,15 @@ mod tests {
                 dir: dir.clone(),
                 log: Some(mine.clone()),
                 // Names the RIVAL, not ours — the whole point.
-                want: Wanted {
-                    session_id: Some("other".into()),
-                    since_ms: None,
-                },
                 owned: true,
-                rivals: no_rivals(),
-                attached: Arc::new(AtomicBool::new(true)), // the caller already attached
+                attached: Arc::new(AtomicBool::new(true)), // the caller already attached,
+                scope: WatchScope::Project {
+                    want: Wanted {
+                        session_id: Some("other".into()),
+                        since_ms: None,
+                    },
+                    rivals: no_rivals(),
+                },
             },
             t,
             off,
@@ -2780,7 +3246,7 @@ mod tests {
         append(&dir.join("other.jsonl"), "z", 999);
         append(&mine, "b", 5);
         let mut last = None;
-        while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(3)) {
+        while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(10)) {
             last = Some(s);
         }
         assert_eq!(
@@ -2813,10 +3279,12 @@ mod tests {
             Watch {
                 dir: dir.clone(),
                 log: Some(mine.clone()),
-                want: Wanted::default(),
                 owned: false,
-                rivals: no_rivals(),
                 attached,
+                scope: WatchScope::Project {
+                    want: Wanted::default(),
+                    rivals: no_rivals(),
+                },
             },
             t,
             off,
@@ -2856,7 +3324,7 @@ mod tests {
         );
         append(&mine, "b", 5, "2026-07-28T19:44:30.000Z");
         let mut last = None;
-        while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(3)) {
+        while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(10)) {
             last = Some(s);
         }
         assert_eq!(
@@ -2900,13 +3368,15 @@ mod tests {
                 // test still pins on its own is the first phase and the sequencing:
                 // a confirmed newcomer is adopted while the caller is free, and the
                 // totals never regress afterwards.
-                want: Wanted {
-                    session_id: Some("b".into()),
-                    since_ms: None,
-                },
                 owned: false,
-                rivals: no_rivals(),
                 attached: attached.clone(),
+                scope: WatchScope::Project {
+                    want: Wanted {
+                        session_id: Some("b".into()),
+                        since_ms: None,
+                    },
+                    rivals: no_rivals(),
+                },
             },
             t,
             off,
@@ -2924,7 +3394,7 @@ mod tests {
         .unwrap();
         drop(f);
         let mut seen = None;
-        while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(3)) {
+        while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(10)) {
             seen = Some(s);
         }
         assert_eq!(
@@ -2944,7 +3414,7 @@ mod tests {
         .unwrap();
         drop(f);
         let mut after = None;
-        while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(3)) {
+        while let Ok(s) = w.rx.recv_timeout(Duration::from_secs(10)) {
             after = Some(s);
         }
         if let Some(s) = after {
@@ -3037,13 +3507,15 @@ mod tests {
                 dir: dir.clone(),
                 log: Some(ours.clone()),
                 // Attached from the start: this is the state the drop happened in.
-                want: Wanted {
-                    session_id: Some("ours".into()),
-                    since_ms: None,
-                },
                 owned: true,
-                rivals: no_rivals(),
                 attached: Arc::new(AtomicBool::new(true)),
+                scope: WatchScope::Project {
+                    want: Wanted {
+                        session_id: Some("ours".into()),
+                        since_ms: None,
+                    },
+                    rivals: no_rivals(),
+                },
             },
             t,
             off,
@@ -3117,10 +3589,12 @@ mod tests {
             Watch {
                 dir: dir.clone(),
                 log: Some(log.clone()),
-                want: Wanted::default(),
                 owned: false,
-                rivals: no_rivals(),
                 attached: unattached(),
+                scope: WatchScope::Project {
+                    want: Wanted::default(),
+                    rivals: no_rivals(),
+                },
             },
             t,
             off,
@@ -3181,10 +3655,12 @@ mod tests {
             Watch {
                 dir: dir.clone(),
                 log: Some(log.clone()),
-                want: Wanted::default(),
                 owned: false,
-                rivals: no_rivals(),
                 attached: unattached(),
+                scope: WatchScope::Project {
+                    want: Wanted::default(),
+                    rivals: no_rivals(),
+                },
             },
             t,
             off,

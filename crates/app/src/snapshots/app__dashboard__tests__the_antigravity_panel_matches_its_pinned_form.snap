@@ -1,0 +1,28 @@
+---
+source: crates/app/src/dashboard.rs
+expression: "project(&model(Some(&t), &env))"
+---
+ai-monitor [CONNECTED]
+  session name="session" id="4de5fc70" provider="[Antigravity]" model="Gemini 3.6 Flash (High)"
+  note —
+  tile UPTIME    12m30s TextPrimary gauge=none
+  tile IDLE          8s TextPrimary gauge=none
+  tile ERRORS         0 TextMuted gauge=none
+  tile TURNS        3·4 TextPrimary gauge=none
+  tile CACHE          — TextMuted gauge=none
+  tile CONTEXT        — TextMuted gauge=none
+  TASKS (total 0)
+    empty "(no tasks)"
+  ACTIVE AGENTS (total 1)
+    card Amber        "● skill-portfolio-analyzer" value="45s" detail="Analyzes installed skills and MCP servers"
+  SKILLS (total 0)
+    empty "(no skills yet)"
+  FILE ACTIVITY (total 0)
+    empty "(no file activity)"
+  RECENT CALLS (total 0)
+    empty "(no other tool calls)"
+  TOOL USAGE (total 3)
+    bar  run_command     14 1.00
+    bar  view_file        9 0.64
+    bar  grep_search      4 0.29
+  footer "Last update 08:06:32"

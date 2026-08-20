@@ -15,7 +15,11 @@
 //! vocabulary (the intent-grep in T1's gate checks for exactly those symbols).
 
 mod activity;
-mod agent;
+// `pub(crate)` since ai-monitor-antigravity T4: `tabsession` asks which agent a tab is
+// running so the overlay can pick the matching watcher, and the classification tables
+// (including the auto-updater's `agy.<id>.old` rename) already live here. Re-deriving them
+// in `tabsession` would be a second copy of a table that took its own spec to get right.
+pub(crate) mod agent;
 mod git;
 // `pub(crate)` unlike its private siblings: the crate-root `tabsession` module consumes
 // `start_ms_of_pid` from here (tabmeta-session-keying D6), so that the process start time
