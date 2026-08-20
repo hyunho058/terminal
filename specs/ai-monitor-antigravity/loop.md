@@ -85,6 +85,13 @@ not a licence to change either one — see the Autonomy Boundary.
 > requirement fails this gate; an honestly-recorded one does not. R0.1 is the known case (it
 > needs two live tabs and real processes), and it must appear as a *recorded* gap, not as a
 > claimed pass.
+>
+> **Update 2026-08-19: R0.1 passed, and still does not count here.** Its composition half is
+> now driven by a live-process gate (`r0_1_live…`, `#[ignore]`d) and its focus-switch half by
+> human observation. Both are recorded in `spec.md` § G9. Neither moves this metric: the count
+> measures what the suite proves **unattended**, and an `#[ignore]`d test proves nothing
+> unattended. R0.1 therefore stays on the "recorded as a gap" side of the ledger — the same
+> treatment `specs/tabsession-pane-cwd-gate` gives its three manual gates.
 
 ## Gate 3 — Qualitative (score + grounds + action; checker-scored by a separate subagent)
 
@@ -98,9 +105,12 @@ not a licence to change either one — see the Autonomy Boundary.
 - **Test strength** — would these tests fail if the defect they guard were reintroduced, or do
   they pass for incidental reasons? Specifically: the R1.4 subagent test, the R2.2
   count-once test, and the R5.5 `gauge=none` assertion.
-- **R0.1 honesty** — the end-to-end two-tab scenario was never run against live processes.
-  Is that recorded as a gap in the right place, or is it papered over by unit tests that
-  cover only its pieces?
+- **R0.1 honesty** — the end-to-end two-tab scenario has now been run (`r0_1_live…` for the
+  composition, human observation for the focus switch; `spec.md` § G9). The question is no
+  longer "is the gap recorded" but **"does the record overstate what was seen"** — the machine
+  half carries measured values, the human half carries a confirmation and no per-value detail,
+  and G9 must keep those two apart rather than letting the table lend its precision to the
+  clause it does not cover.
 - **Claude-path neutrality (R5.6)** — beyond the snapshots being byte-identical, is there any
   behavioural change to a Claude tab from `WatchScope`, `tab_agent`, or the `agent_for`/
   `hint_for` fallback?

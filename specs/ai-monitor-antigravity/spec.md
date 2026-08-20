@@ -794,7 +794,30 @@ are standing limitations, not open decisions.
   51 transcripts but Antigravity is a moving target; a version probe is not specified.
 - **G7** — subagent *progress* lives in the child conversation, which AG5 deliberately does
   not tail. The Subagents card shows invocation and status, not the child's work.
-- **G9 (R0.1)** — **R0.1's scenario was never executed.** Two live tabs, one running
+- **G9 (R0.1)** — ~~R0.1's scenario was never executed~~ — **CLOSED 2026-08-19**, in two halves
+  by two different kinds of evidence, kept apart on purpose.
+
+  **Half one, by machine**, `presence_fd::r0_1_live_agents_are_told_apart_and_resolve_to_different_logs`
+  — the table below. Repeatable on demand.
+
+  **Half two, by human observation — not by this loop.** `[PASSED 2026-08-19]` The operator ran
+  two tabs, one `claude` and one `agy`, switched focus with the panel open, and confirmed the
+  panel re-points. This is the half no test process can reach: it goes through `overlay::open`
+  and a winit event loop, and nothing automated can press Cmd+Shift+M.
+
+  **What this record does and does not carry.** It carries the operator's confirmation that the
+  scenario behaves; it does **not** carry per-value detail, because none was recorded at the
+  time — unlike `specs/tabsession-pane-cwd-gate`'s R6.7 entry, which tabulates the pane, pid and
+  session id observed on both sides of its re-point. A future run that wants the sharper record
+  should write down the session id and provider tag before and after the switch. The values in
+  the table below are the machine half's, and are not a substitute for that.
+
+  **Excluded from Gate 2's coverage count regardless**, exactly as the three
+  `tabsession-pane-cwd-gate` gates are: that metric measures what the suite can prove
+  unattended, not what a person saw.
+
+  *Original text follows, since it states what was missing and why.* **R0.1's scenario was
+  never executed.** Two live tabs, one running
   `claude` and one running `agy`, switching focus and re-pointing the panel, has only ever
   been reasoned about. Its *pieces* are covered — `antigravity_pid` pins the routing over all
   five `AgentKind`s, `presence_fd` pins the FD probe against a descriptor the test process
@@ -823,12 +846,10 @@ are standing limitations, not open decisions.
   The gate asks through the **parent** pid, not the agent pid, because that is what a tab
   actually holds; probing the agent directly would skip the tree walk that is the point.
 
-  **Still open, and it is the half that needs a human**: `overlay::open`'s composition and the
-  focus switch itself. No test process can press Cmd+Shift+M or drive a winit event loop, so
-  "the panel *detaches* from the Claude watcher and re-points on focus" remains reasoned about
-  rather than executed. What the gate does discharge is R0.1's second clause — the two agents
-  resolve to different logs, so there is no path by which one tab's telemetry could be shown
-  against the other's session.
+  What the gate discharges by itself is R0.1's second clause — the two agents resolve to
+  different logs, so there is no path by which one tab's telemetry could be shown against the
+  other's session. The first clause, the detach-and-re-point on focus, is the operator's
+  observation recorded at the top of this entry.
 - **G8 (AG7)** — *cold start closed 2026-08-16; rotation-while-attached still open.* The
   2026-08-15 attempt was incomplete: it added the re-probe but not a wake to run it on. An
   Antigravity tab that resolved no log armed **no watcher at all**, so the panel had no wake
