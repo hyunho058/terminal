@@ -235,6 +235,16 @@ impl Tabs {
     pub fn active_shell_pid(&self) -> Option<u32> {
         self.active().shell_pid()
     }
+
+    /// The active tab's **Claude** process pid, as last derived by the metadata worker.
+    ///
+    /// Straight off the snapshot with no fallback, unlike [`active_cwd`](Self::active_cwd):
+    /// there is no second source to fall back *to*, and an absent entry (a tab not yet polled,
+    /// or one with no agent) must read as "no information" rather than as a value. The
+    /// ai-monitor panel is the only consumer, and it treats `None` that way by construction.
+    pub fn active_agent_pid(&self, meta: &crate::tabmeta::TabMetaSnapshot) -> Option<u32> {
+        meta.get(self.active().id).and_then(|m| m.agent_pid)
+    }
 }
 
 /// The active index after closing a **different** tab (sticky-tab-title R3.7): the active

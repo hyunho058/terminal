@@ -14,6 +14,7 @@ mod dashboard;
 mod hyperlink;
 mod input;
 mod overlay;
+mod presence_fd;
 mod prompt;
 mod rename;
 mod seam;

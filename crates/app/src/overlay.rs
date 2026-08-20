@@ -90,15 +90,43 @@ pub struct AiMonitorOverlay {
     /// can show: "no Claude session in this tab" from "this tab's session has not
     /// written a log yet". Same lifecycle as `context_window`: re-decided on every
     /// `open()`, read by `refresh_model`, never recomputed per frame.
-    tab_has_claude: bool,
+    tab_agent: Option<crate::tabmeta::AgentKind>,
     /// Which `claude` process this open asked, and what it answered — the baseline the
     /// rotation check compares against. See [`OpenedOn`] and [`session_rotated_with`].
     ///
-    /// Same lifecycle as `tab_has_claude`: re-decided on every `open()`, never merged.
+    /// Same lifecycle as `tab_agent`: re-decided on every `open()`, never merged.
     /// `None` only when the tab has no `claude` at all; a `claude` that has not yet named a
     /// session is `Some` with a `None` id, which the first valid record ARMS.
     ///
     opened_on: Option<OpenedOn>,
+    /// The directory this open actually settled on — the **resolved** value, not the notified
+    /// one `Repoint` keys on. The two are deliberately different quantities, and conflating
+    /// them is the storm.
+    ///
+    /// Kept as its own field rather than folded into [`OpenedOn`] because `baseline_from` is
+    /// built from the hint alone and is pinned that way; the directory is decided one step
+    /// later, by the resolver. Read only by [`reopen_is_inert`].
+    opened_dir: Option<PathBuf>,
+    /// The last **published** `claude` pid this panel was told about (`TabMeta::agent_pid`) —
+    /// the comparand for [`agent_pid_moved`].
+    ///
+    /// Deliberately **not** `opened_on.pid`: that is level-triggered (it changes only on a
+    /// re-open) and it is `None` for a perfectly live session whose start time could not be
+    /// read, while this is edge-triggered against what the worker last said. The two
+    /// derivations are different algorithms and may legitimately disagree; against
+    /// `opened_on.pid` a stable disagreement would be permanent inequality, i.e. a per-wake
+    /// re-point storm. Against this it fires once, on the value *changing*, and then rests.
+    ///
+    /// Updated only by a `Some` publish, so a transient walk failure or a flipped display
+    /// toggle cannot erase the memory and make the next real publish look like a change.
+    ///
+    /// Maintained by `on_active_changed` rather than seeded inside `open()`, which is what
+    /// makes all three `open()` callers work uniformly: the chord and the launch restore carry
+    /// no agent pid of their own, and this field is already current by the time either runs,
+    /// because the seam fires on every metadata sync. A panel opened before any sync simply has
+    /// `None` here, and the `Some`-guard makes the first publish a no-op rather than a
+    /// re-point. `reopen_is_inert` remains the backstop if one ever slips through.
+    last_seen_pid: Option<u32>,
     /// Set by the rival worker when it finds a `claude` under a tab whose panel opened
     /// WITHOUT one — the state `opened_on: None` describes (D-rot2).
     ///
@@ -134,8 +162,10 @@ impl AiMonitorOverlay {
             proxy,
             started_ms: now_ms(),
             context_window: None,
-            tab_has_claude: false,
+            tab_agent: None,
             opened_on: None,
+            opened_dir: None,
+            last_seen_pid: None,
             claude_appeared: Arc::new(AtomicBool::new(false)),
             rivals: Arc::new(Mutex::new(ai_monitor::RivalSet::default())),
             refreshing: Arc::new(AtomicBool::new(false)),
@@ -177,21 +207,34 @@ impl AiMonitorOverlay {
 
     /// Open on `cwd`: resolve the log, backfill, and start tailing (D1/D6).
     fn open(&mut self, cwd: Option<PathBuf>, shell_pid: Option<u32>) {
-        // Re-read on open rather than holding a live handle: `settings::apply` does
-        // not reach the overlays, and a value that takes effect the next time the
-        // panel is opened is honest about that. A malformed config keeps the table.
-        self.context_window = common::config::Config::load()
-            .ok()
-            .and_then(|c| c.ai_monitor.context_window);
-        // One call does both halves of the bookkeeping: it records the *notified* value as the
-        // re-point key and returns the *resolved* value to open on, preferring the tmux pane's
-        // cwd and falling back to the tab's own (R3.3). Keeping the two straight is the whole
-        // storm fix, so it lives in a unit a test can drive (see `Repoint`).
-        let cwd = self.repoint.opened(cwd, shell_pid, Self::pane_cwd);
         // Ask the tab's own process tree which session it is running. This is the
         // only signal that distinguishes it from a session another application is
         // running in the same project directory.
+        //
+        // ABOVE the directory, where it used to sit below: the hint now carries the chosen
+        // `claude`'s own cwd, and that is what the panel opens on, so the hint has to exist
+        // before the directory can be chosen. Two places deciding the directory is the exact
+        // shape that produced the re-open storm, so there is still only one.
+        //
+        // Which agent this tab runs decides which of the two attachment paths below applies
+        // (AG7/AG9). Asked once, here, so the format handed to the backfill and the format
+        // handed to the watcher come from the same answer — seeding in one and tailing in
+        // another would fold a session into the wrong shape and report it as parse errors.
+        //
+        // An `agy` tab has no `claude`, so `hint_for` answers `None` and the directory below
+        // falls through to the pane's cwd — which is the one the Antigravity branch wants.
+        let agent = shell_pid.and_then(tabsession::agent_for);
         let h = shell_pid.and_then(tabsession::hint_for);
+        // One call does both halves of the bookkeeping: it records the *notified* value as the
+        // re-point key and returns the *resolved* value to open on, preferring the chosen
+        // `claude`'s directory and falling back to the tmux pane's (R3.3). Keeping the two
+        // straight is the whole storm fix, so it lives in a unit a test can drive (see
+        // `Repoint`). A tmux tab that has a session now pays ONE `resolved_root` rather than
+        // two, because `pane_cwd` — the other caller of it — is reached only when the hint
+        // supplied no directory at all.
+        let cwd = self
+            .repoint
+            .opened(cwd, shell_pid, h.as_ref(), hint_or_pane_cwd);
         // Recorded from the `Option`'s *shape*, before `unwrap_or_default()` destroys
         // it: `None` means no `claude` under this tab, while an empty-but-present hint
         // means one is running that named neither an id nor a start time. Assigned
@@ -199,11 +242,74 @@ impl AiMonitorOverlay {
         // cwd with no project directory still gets the "has not written a log yet"
         // wording rather than being told there is no session at all. Unconditional, so
         // re-pointing to a tab with no `claude` clears it.
-        self.tab_has_claude = h.is_some();
+        // The KIND now, not a bool (AG10). `agent_for`'s answer takes precedence, but only
+        // for a kind this monitor actually reads: the two detectors walk the process tree by
+        // different mechanisms (`proc_listchildpids` here, a `/bin/ps` table in `hint_for`),
+        // and R5.6 requires a Claude tab to be unchanged by this feature.
+        //
+        // The `filter` is what makes `hint_for` a real floor. An earlier spelling was
+        // `agent.map(..).or_else(..)` with a comment claiming the same property, and the
+        // claim was false: `or_else` runs only when the left side is `None`, so a tab where
+        // `agent_for` reached an UNMONITORED agent first (a `codex` nearer the root than a
+        // deeper `claude`) lost its confirmed Claude verdict and dropped from "has not
+        // written a log yet" to "no Claude session in this tab". Filtering to the monitored
+        // kinds first means an unmonitored answer can no longer displace a confirmed one,
+        // which is what the floor was always supposed to mean.
+        self.tab_agent = agent
+            .map(|(k, _)| k)
+            .filter(|k| {
+                matches!(
+                    k,
+                    crate::tabmeta::AgentKind::Claude | crate::tabmeta::AgentKind::Antigravity
+                )
+            })
+            .or_else(|| h.is_some().then_some(crate::tabmeta::AgentKind::Claude));
         let hint = h.unwrap_or_default();
+        // D10 — everything below rebuilds; if it would rebuild exactly what is already on
+        // screen, stop here instead.
+        //
+        // Deriving the directory from `claude`'s cwd made this worth having: `Repoint` keys on
+        // the **notified** cwd, which under tmux is the pane *shell's*, republished by the
+        // tabmeta worker on every `cd`. So a `cd` inside the pane fires a full re-point — fork,
+        // watcher respawn, complete backfill — that resolves the same `claude`, the same
+        // directory and the same session. Correct, and entirely wasted, on the path this
+        // feature exists to make cheaper.
+        //
+        // **AFTER `Repoint::opened` has re-keyed, and that ordering is load-bearing.** The
+        // motivating case IS a changed notified cwd — that is why `changed()` fired at all — so
+        // returning before `key_cwd` was updated would leave `changed()` true on every
+        // subsequent wake and re-enter `open()` forever: the storm this decision opens by
+        // warning about. Safe by construction here (condition 1 needs `opened`'s return value),
+        // but this file has shipped that exact bug once, so it is stated rather than inferred.
+        //
+        // Honest scope: the hint lookup above still ran, so a pane `cd` still costs a `/bin/ps`
+        // fork and a 250 ms-budgeted `tmux list-clients`. What this saves is the teardown, the
+        // respawn and the full backfill. It also skips the `Config::load()` below, so an edited
+        // `ai_monitor.context_window` waits for a real re-point — acceptable, since that value
+        // is already documented as applying the next time the panel is opened.
+        if reopen_is_inert(
+            self.visible,
+            self.watcher.is_some(),
+            self.opened_dir.as_deref(),
+            self.opened_on.as_ref(),
+            cwd.as_deref(),
+            &hint,
+        ) {
+            return;
+        }
+        // Re-read on open rather than holding a live handle: `settings::apply` does
+        // not reach the overlays, and a value that takes effect the next time the
+        // panel is opened is honest about that. A malformed config keeps the table.
+        self.context_window = common::config::Config::load()
+            .ok()
+            .and_then(|c| c.ai_monitor.context_window);
+        // What this open settled on, so the next one can tell an identical re-point from a real
+        // move (D10 condition 1). Recorded unconditionally, beside the baseline it is compared
+        // with: a stale directory here would make a genuine move look inert.
+        self.opened_dir = cwd.clone();
         // The rotation baseline, from the SAME hint the resolution below uses, so the two can
         // never disagree about which session this open is for. Unconditional, like
-        // `tab_has_claude` above: re-pointing to a tab with no `claude` must CLEAR it — a
+        // `tab_agent` above: re-pointing to a tab with no agent must CLEAR it — a
         // stale baseline would compare the new tab's process against the old tab's session id
         // and re-point on every wake.
         self.opened_on = baseline_from(&hint);
@@ -228,7 +334,99 @@ impl AiMonitorOverlay {
         self.session.repoint();
         self.watcher = None;
 
-        if let Some(dir) = cwd.as_deref().and_then(project_dir) {
+        if let Some(agy_pid) = antigravity_pid(agent) {
+            // The Antigravity path (AG1/AG6/AG7). Deliberately NOT a variation on the Claude
+            // path below: there is no project directory, no `Wanted`, and no rival contest,
+            // because the presence lock names the conversation outright. What is left is a
+            // single question — which transcript — asked once here.
+            //
+            // The FD probe lives in `app` (AG11) because enumerating another process's open
+            // descriptors needs syscalls `ai-monitor` deliberately cannot make; the crate
+            // takes the answer, not the capability.
+            // A live agent is confirmed here by construction — `antigravity_pid` only
+            // answers `Some` when the tree walk found `agy` — so a probe that names nothing
+            // is `LiveButUnnamed`, never `NoAgent`. That distinction is the whole fix: it
+            // stops the history tier adopting an older, possibly `/exit`ed conversation
+            // during the ~7s before `agy` writes its lock.
+            let probed = crate::presence_fd::conversation_of_pid(agy_pid);
+            let probed = match probed.as_deref() {
+                Some(id) => ai_monitor::antigravity::Probed::Conversation(id),
+                None => ai_monitor::antigravity::Probed::LiveButUnnamed,
+            };
+            let resolved = cwd
+                .as_deref()
+                .and_then(|c| ai_monitor::antigravity::resolve(probed, c));
+            let owned = resolved.as_ref().is_some_and(|r| r.owned);
+            let log = resolved.map(|r| r.path);
+            let (telemetry, offset) = match log.as_deref() {
+                Some(p) => ai_monitor::backfill_telemetry_with(
+                    p,
+                    ai_monitor::telemetry::LogFormat::Antigravity,
+                ),
+                // Unresolved is a real, reachable state, not an error: a cold-started `agy`
+                // has no transcript yet, and AG6 leaves a tab whose conversation cannot be
+                // named unattached rather than adopting a neighbour's (R1.5/R1.6).
+                None => (
+                    SessionTelemetry::with_format(ai_monitor::telemetry::LogFormat::Antigravity),
+                    0,
+                ),
+            };
+            self.session
+                .note(Arc::new(telemetry.snapshot()), self.started_ms, owned);
+            // ARMED EITHER WAY, and the "either" is the fix for a reported defect.
+            //
+            // The original spelling armed nothing when no log resolved, reasoning that "the
+            // conversation id IS the directory name, so until one is resolved there is no
+            // path that could become right — the next re-point asks again". The first half is
+            // true and the conclusion does not follow: **there is no next re-point**. The
+            // panel's re-probe hangs off `on_active_changed`, which only runs on a wake, and
+            // with no watcher armed the sole wake source is the tab-metadata worker — which
+            // publishes only when a `TabMeta` actually changed and so goes silent next to a
+            // steadily-running `agy`. Measured: a panel opened seconds before `agy` became
+            // detectable stayed on "(no Claude session in this tab)" indefinitely, while
+            // `agent_for` answered `Some((Antigravity, …))` for that very shell when probed
+            // directly. Claude's branch has armed unconditionally all along, for this reason.
+            //
+            // So: tail the transcript when there is one, and otherwise watch the presence
+            // directory for the lock that will name it.
+            if let Some(log) = log.as_deref() {
+                let proxy = self.proxy.clone();
+                self.watcher = LogWatcher::spawn(
+                    Watch {
+                        dir: log.parent().map(PathBuf::from).unwrap_or_default(),
+                        log: Some(log.to_path_buf()),
+                        owned,
+                        attached: self.session.attached_flag.clone(),
+                        scope: ai_monitor::WatchScope::SingleLog,
+                    },
+                    telemetry,
+                    offset,
+                    move || {
+                        if let Some(p) = proxy.as_ref() {
+                            let _ = p.send_event(UserEvent::OverlayPending);
+                        }
+                    },
+                );
+            } else if let Some(presence) = ai_monitor::antigravity::presence_dir() {
+                let proxy = self.proxy.clone();
+                self.watcher = LogWatcher::spawn(
+                    Watch {
+                        dir: presence,
+                        log: None,
+                        owned: false,
+                        attached: self.session.attached_flag.clone(),
+                        scope: ai_monitor::WatchScope::AwaitingLock,
+                    },
+                    telemetry,
+                    0,
+                    move || {
+                        if let Some(p) = proxy.as_ref() {
+                            let _ = p.send_event(UserEvent::OverlayPending);
+                        }
+                    },
+                );
+            }
+        } else if let Some(dir) = cwd.as_deref().and_then(project_dir) {
             // Resolve *here* rather than latching one log for the watcher's lifetime:
             // it may not be this tab's session, and the tab's own session may not have
             // written a file yet. The watcher re-resolves with the same hint.
@@ -241,7 +439,28 @@ impl AiMonitorOverlay {
                 true => Wanted::default(),
                 false => Wanted {
                     session_id: hint.session_id.clone(),
-                    since_ms: hint.started_ms,
+                    // TIER 2 ONLY AGAINST A PROVABLE DIRECTORY. This is where the protection
+                    // the deleted cwd gate used to provide actually lives now, and in a
+                    // stronger form: not "compare two directories and refuse on mismatch", but
+                    // "the timing window only ever runs against a directory the chosen `claude`
+                    // is provably in". Tier 1 is untouched either way — it looks the log up by
+                    // exact filename, so a wrong directory merely fails to find one, while tier
+                    // 2's asymmetric window plus rival assignment can return a STRANGER's log
+                    // with `owned: true`, which this file then latches.
+                    //
+                    // Expressed here, on `Wanted`, and emphatically NOT by zeroing
+                    // `hint.started_ms` — the two hold the same quantity and are easy to
+                    // confuse. Zeroing the hint field would make `baseline_from` yield `None`,
+                    // so `opened_on` would be `None`, so `session_rotated` would short-circuit
+                    // and rotation detection would be dead for the life of the open; and
+                    // `rival_refresh_needed(attached, armed = false)` would then return `true`
+                    // forever, putting a `/bin/ps` fork and a 250 ms `resolved_root` on every
+                    // append burst — the exact cost `refresh_rivals`' attached guard exists to
+                    // prevent.
+                    since_ms: match hint.cwd.as_ref().is_some_and(tabsession::HintCwd::tier2_ok) {
+                        true => hint.started_ms,
+                        false => None,
+                    },
                 },
             };
             // STRICT: confirmation-only (R4.1). A session this tab cannot prove is its
@@ -403,20 +622,47 @@ impl AiMonitorOverlay {
         // life of the process — rival refresh silently dead forever, with nothing to
         // indicate it. Low probability, unbounded consequence, four lines to remove.
         let inflight = InFlight(self.refreshing.clone());
+        // The flag alone is not enough to re-point, and this is why the proxy comes along.
+        // `session_rotated` READS `appeared` on the same tick that `refresh_rivals` spawns
+        // the worker that SETS it, so the value it reads is always the pre-worker one: the
+        // re-point needs a *second* wake, and on a quiet tab there may never be one. Rather
+        // than depend on unrelated traffic arriving later, the worker asks for that wake
+        // itself, the moment it has something new to report.
+        let proxy = self.proxy.clone();
+        let ping = move || {
+            if let Some(p) = proxy.as_ref() {
+                let _ = p.send_event(UserEvent::OverlayPending);
+            }
+        };
         std::thread::spawn(move || {
+            // The Antigravity half of "an agent appeared", and the reason a cold-started
+            // `agy` tab heals itself (AG6/G8). `agy` publishes its presence lock ~7s after
+            // the process starts, so the `open()` that ran at launch legitimately resolved
+            // nothing; this re-probes off-thread and reports the moment the conversation
+            // becomes nameable, which flips the unarmed branch of `session_rotated` and
+            // triggers a full re-point. Without it the panel would sit on the honest but
+            // permanent "has not written a log yet".
+            //
+            // Checked BEFORE `hint_for` because that call forks `/bin/ps`: an `agy` tab has
+            // no `claude` to find, and paying a fork to learn so on every wake is the cost
+            // this ordering avoids.
+            if let Some((crate::tabmeta::AgentKind::Antigravity, agy)) = tabsession::agent_for(pid)
+            {
+                if crate::presence_fd::conversation_of_pid(agy).is_some() {
+                    appeared.store(true, Ordering::Release);
+                    ping();
+                }
+                drop(inflight);
+                return;
+            }
             let hint = tabsession::hint_for(pid);
             // A `claude` exists under this tab now. Reported unconditionally — the event loop
             // decides whether it cares, and it only cares while unarmed.
             if hint.is_some() {
                 appeared.store(true, Ordering::Release);
+                ping();
             }
-            let set = match hint {
-                Some(h) => ai_monitor::RivalSet {
-                    list: h.rival_starts,
-                    known: h.rivals_known,
-                },
-                None => ai_monitor::RivalSet::default(),
-            };
+            let set = rival_set_of(hint);
             if let Ok(mut g) = handle.lock() {
                 *g = set;
             }
@@ -443,7 +689,7 @@ impl AiMonitorOverlay {
             now_ms: now_ms(),
             attached: self.session.attach.attached,
             context_window: self.context_window,
-            tab_has_claude: self.tab_has_claude,
+            tab_agent: self.tab_agent,
             utc_offset_secs: local_utc_offset_secs(),
         };
         let mut model = dashboard::model(self.session.latest.as_deref(), &env);
@@ -494,15 +740,32 @@ impl Repoint {
     /// wrapped in `||` still type-checks. Passing the pid *into* the resolver removes the
     /// second candidate entirely, so reintroducing the bug now requires writing a visibly wrong
     /// `|_| cwd` rather than transposing two arguments.
+    ///
+    /// **The hint now travels through the resolver, and that is a strengthening rather than a
+    /// concession.** Deriving the directory from the chosen `claude` puts a second candidate
+    /// (`hint.cwd`) back within reach of this call, so the "nothing to swap" property had to be
+    /// re-earned rather than assumed. It is re-earned twice over: `Option<PathBuf>` and
+    /// `Option<&SessionHint>` are not interchangeable types, so the transposition is no longer
+    /// *expressible*; and the resolver is passed **by name** ([`hint_or_pane_cwd`]), never as a
+    /// closure, so there is no capture scope for `|_, _| cwd` to reach a second candidate from.
+    /// The spelling an implementer reaches for first — keeping the arity-1 resolver and writing
+    /// `|pid| hint_or_pane_cwd(h.as_ref(), pid)` — compiles silently and is exactly the
+    /// captured-closure state this guard depends on not existing. It is rejected knowingly.
+    ///
+    /// A unit test cannot cover this: the hazard lives at the **`open()` call site**, and such a
+    /// test types its own arguments — the note above records an earlier version of these tests
+    /// doing exactly that and passing against the buggy call site. The backstop is a
+    /// source-text pin over `open()`, in the idiom used for the other pins in this file.
     fn opened(
         &mut self,
         notified: Option<PathBuf>,
         shell_pid: Option<u32>,
-        resolve: impl FnOnce(Option<u32>) -> Option<PathBuf>,
+        hint: Option<&tabsession::SessionHint>,
+        resolve: impl FnOnce(Option<&tabsession::SessionHint>, Option<u32>) -> Option<PathBuf>,
     ) -> Option<PathBuf> {
         self.key_cwd = notified.clone();
         self.key_pid = shell_pid;
-        resolve(shell_pid).or(notified)
+        resolve(hint, shell_pid).or(notified)
     }
 
     /// Whether an incoming notification is a real change worth re-opening for.
@@ -523,6 +786,55 @@ impl Repoint {
     }
 }
 
+/// The directory this open should watch: the chosen `claude`'s own, falling back to the tmux
+/// pane's only when the hint supplied none at all.
+///
+/// **A named free function, and the name is the guard.** It is passed to [`Repoint::opened`] by
+/// name rather than wrapped in a closure, so it has no capture scope — which is the property
+/// `opened`'s doc says the anti-transposition guard actually depends on. A closure here, however
+/// innocuous, makes `|_, _| <some other cwd>` a legitimate spelling again and puts a
+/// one-token, type-checking re-introduction of the storm back on the table.
+///
+/// **The card and this panel may therefore name different directories, and that is correct
+/// rather than a defect.** After a `cd` in a tmux pane the sidebar card shows the pane shell's
+/// directory while the panel watches where `claude` runs. They answer different questions —
+/// "where is this tab working" versus "where is this session's log" — and forcing agreement
+/// would require one of them to report something untrue. Recorded here, and in
+/// `docs/architecture.md`, so the next reader does not file it as a bug.
+///
+/// **Both `HintCwd` variants supply the directory; only `None` falls back.** `Disputed` carries
+/// the *registry's* path — `claude`'s own statement about where it is running — and the panel
+/// opens on it, with tier 2 suppressed back in `open()`. Sweeping `Disputed` into the `pane_cwd`
+/// fallback instead would open on a **third** directory, the pane *shell's*: neither the
+/// kernel's nor the registry's, so tier 1's exact-filename lookup would miss, the whole reason
+/// for preferring the registry on a disagreement would be nullified, and `Disputed`'s payload
+/// would be read by nobody. An earlier draft did precisely that.
+fn hint_or_pane_cwd(
+    hint: Option<&tabsession::SessionHint>,
+    shell_pid: Option<u32>,
+) -> Option<PathBuf> {
+    hint_or_pane_cwd_with(AiMonitorOverlay::pane_cwd, hint, shell_pid)
+}
+
+/// [`hint_or_pane_cwd`]'s body, with the fallback injected — the same split `pane_cwd_with` and
+/// `resolved_root_with` already use, and here it is what makes the *non*-occurrence assertable:
+/// on a tmux tab that has a session the pane resolver must not run at all, which is how the open
+/// path went from two 250 ms-budgeted `tmux list-clients` calls on the winit event-loop thread
+/// to one (`hint_for` performs the surviving one internally).
+fn hint_or_pane_cwd_with(
+    pane: impl FnOnce(Option<u32>) -> Option<PathBuf>,
+    hint: Option<&tabsession::SessionHint>,
+    shell_pid: Option<u32>,
+) -> Option<PathBuf> {
+    match hint.and_then(|h| h.cwd.as_ref()) {
+        Some(cwd) => Some(cwd.path().to_path_buf()),
+        // No `claude`, or neither the kernel nor its own record could say where it is. The
+        // pane's cwd is a guess about the right project rather than a claim about this process,
+        // which is why `open()` runs tier 1 only against it.
+        None => pane(shell_pid),
+    }
+}
+
 /// [`AiMonitorOverlay::pane_cwd`]'s body, generic over the two syscall-backed steps so the
 /// re-root decision is testable on a machine with no tmux (tmux-pane-cwd R10.3) — the same
 /// split `tabsession::resolved_root_with` uses.
@@ -540,12 +852,51 @@ fn pane_cwd_with(
     (root != shell_pid).then(|| cwd_of(root))?
 }
 
+/// The rival set a hint publishes into the shared handle.
+///
+/// Split out of `refresh_rivals`' worker closure so the recovery this feature delivers is
+/// **assertable**. `refresh_rivals` is the second `hint_for` caller, and the deleted cwd gate
+/// degraded it silently: under tmux the gate made `hint_for` answer `None` on every refresh, so
+/// this published `RivalSet::default()` for the life of the panel — `known: false`, the
+/// uniqueness rescue permanently withheld, and `claude_appeared` never set. It was a second
+/// victim of the gate rather than a constraint on removing it, and nothing could see that,
+/// because the mapping lived inside a spawned closure no test can reach.
+///
+/// `None` still means `known: false`, and that direction must not drift: failing toward "we do
+/// not know" is the whole point of the flag, since the alternative grants the resolver's
+/// strongest branch on the strength of a read that did not work.
+fn rival_set_of(hint: Option<tabsession::SessionHint>) -> ai_monitor::RivalSet {
+    match hint {
+        Some(h) => ai_monitor::RivalSet {
+            list: h.rival_starts,
+            known: h.rivals_known,
+        },
+        None => ai_monitor::RivalSet::default(),
+    }
+}
+
 /// Clears the in-flight flag on drop, so a panicking refresh worker cannot latch it.
 struct InFlight(Arc<AtomicBool>);
 
 impl Drop for InFlight {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
+    }
+}
+
+/// The pid of the tab's `agy`, when this open takes the Antigravity path (T4).
+///
+/// A named function rather than an inline pattern because of what it must NOT do.
+/// [`crate::tabmeta::AgentKind`] has five variants and this feature implements exactly one of
+/// them; the other four — and a tab running no agent at all — take the Claude path, which is
+/// correct only because that path degrades to "resolve nothing, show an explained empty
+/// state" rather than to something wrong. The day `Codex` or `Gemini` grows a real
+/// implementation, this is the single place that has to learn about it, and the test below
+/// fails until it does. An inline `if let` would just silently keep routing it to Claude.
+fn antigravity_pid(agent: Option<(crate::tabmeta::AgentKind, u32)>) -> Option<u32> {
+    match agent {
+        Some((crate::tabmeta::AgentKind::Antigravity, pid)) => Some(pid),
+        _ => None,
     }
 }
 
@@ -566,10 +917,9 @@ fn watch_with_rivals(
     Watch {
         dir,
         log,
-        want,
         owned,
-        rivals,
         attached,
+        scope: ai_monitor::WatchScope::Project { want, rivals },
     }
 }
 
@@ -863,17 +1213,61 @@ enum Tick {
 /// re-opening regardless, and `open()` re-reads everything anyway) or when the panel is
 /// closed (there is nothing on screen to correct). Passing it lazily is what lets a test
 /// prove those reads do not happen, with a thunk that panics if it is touched.
-fn tick_action(tab_changed: bool, visible: bool, rotated: impl FnOnce() -> bool) -> Tick {
+fn tick_action(
+    tab_changed: bool,
+    visible: bool,
+    agent_moved: bool,
+    rotated: impl FnOnce() -> bool,
+) -> Tick {
     if tab_changed {
         return Tick::Reopen;
     }
     if !visible {
         return Tick::Idle;
     }
+    // A DIFFERENT `claude` in the same tab. The panel's directory is that process's cwd, fixed
+    // at its launch, so it goes stale exactly when the pid changes — and the panel stops
+    // re-resolving once attached, so a user who quits `claude`, `cd`s elsewhere in the same
+    // pane and starts a new one would otherwise keep seeing the old session indefinitely.
+    // `apply_rotation` already handles "same pid, new session id" (`/clear`); this is the same
+    // question one level up.
+    //
+    // **Its rank is stated rather than left to a reader.** Below `tab_changed`, because a tab
+    // change re-opens unconditionally and re-reads everything anyway. Below `!visible`, because
+    // a closed panel must decide nothing: above that gate a pid change would return
+    // `Tick::Reopen` for a CLOSED panel, and `open()` sets `self.visible = true` without the
+    // `ctx.set_monitor_open` only the chord path performs — so the panel would paint into a
+    // band the renderer never reserved. Above `rotated()`, because a changed pid makes the
+    // rotation question moot: it concerns a process that is no longer the one being tracked,
+    // and asking costs a file read.
+    if agent_moved {
+        return Tick::Reopen;
+    }
     if rotated() {
         return Tick::Reopen;
     }
     Tick::RefreshRivals
+}
+
+/// Has the tab's `claude` been **replaced** since the last value we were told about?
+///
+/// **`Some`-guarded, not a bare `published != last_seen`, and the difference is a storm.** Both
+/// are `Option<u32>`, so `None != Some(x)` is `true`: an absent published value would read as
+/// "a different pid" and re-point on every wake. And absent is not exotic — it is what the
+/// worker publishes for a tab whose agent walk failed transiently, and what the two derivations
+/// legitimately disagree about (the panel's `hint_for` walks `ps` argv to depth 6 pane-first;
+/// the worker walks `proc_pidpath` to depth 3 with a different fallback trigger, so a
+/// `node …/cli.js` install or a pane-less-but-tab-ful tree yields one answer from one and
+/// another from the other). A `None` publish therefore means **no information**: it re-points
+/// nothing and, at the call site, it does not overwrite `last_seen_pid` either — so a toggle
+/// flip or one failed walk cannot erase the trigger's memory.
+///
+/// **Edge-triggered against `last_seen_pid`, not level-triggered against `opened_on.pid`.** A
+/// stable disagreement between the two derivations then costs exactly one re-point rather than
+/// one per wake. `opened_on.pid` would be the wrong comparand twice over: it changes only on a
+/// re-open, and it is `None` for a perfectly live session whose start time could not be read.
+fn agent_pid_moved(published: Option<u32>, last_seen: Option<u32>) -> bool {
+    matches!((published, last_seen), (Some(a), Some(b)) if a != b)
 }
 
 /// The identity an `open()` was based on: the tab's `claude` process, and the session that
@@ -973,6 +1367,56 @@ fn session_rotated_with(
         Some(_) => Rotation::Rotated,
         None => Rotation::Arm(current.to_string()),
     }
+}
+
+/// Would this `open()` tear down and rebuild exactly what is already on screen? (D10)
+///
+/// **All four conditions, and none of them is belt-and-braces** — without each of the last two
+/// this breaks a shipped feature:
+///
+/// 1. the resolved directory equals the one currently open on;
+/// 2. the chosen `claude` pid equals the one this open was based on;
+/// 3. the resolved session id equals the baseline's; and
+/// 4. the panel is visible **and** holds a watcher — i.e. there is actually a live one to keep.
+///
+/// **Without (3) this swallows `/clear` re-pointing.** `tick_action` returns `Tick::Reopen` for a
+/// *rotation* as well as a tab change, and a rotation is by definition **same directory, same
+/// pid, new session id** — precisely what conditions 1 and 2 compare equal. A two-value early-out
+/// would discard exactly the re-point `ai-monitor-session-rotation` shipped to add. (It works
+/// because `apply_rotation` answers `Rotated` *without* moving the baseline, so the old id is
+/// still there to disagree with the hint's new one.)
+///
+/// **Without (4) the toggle chord stops working.** `close()` sets `visible = false` and
+/// `watcher = None` but leaves `opened_on`, `repoint` and the session intact, while `open()` sets
+/// `visible = true` only at its end. Open → Cmd+Shift+M → Cmd+Shift+M on an unchanged tab would
+/// match conditions 1–3, return early, and leave the panel invisible with no watcher until the
+/// user switched tabs. "Keep the existing watcher" presumes a watcher `close()` has already
+/// dropped.
+///
+/// Unavailable for the whole `opened_on: None` class — a live session whose start time could not
+/// be read — because condition 2 then has nothing to compare. Those tabs keep today's re-point
+/// cost, which is the honest trade rather than a guess.
+fn reopen_is_inert(
+    visible: bool,
+    has_watcher: bool,
+    opened_dir: Option<&std::path::Path>,
+    opened_on: Option<&OpenedOn>,
+    cwd: Option<&std::path::Path>,
+    hint: &tabsession::SessionHint,
+) -> bool {
+    // (4) — first, because it is the one that is about the panel rather than about the tab.
+    if !visible || !has_watcher {
+        return false;
+    }
+    let (Some(dir), Some(prev)) = (opened_dir, opened_on) else {
+        return false;
+    };
+    // (1) and (2) — the same place, watching the same process.
+    if cwd != Some(dir) || hint.pid != Some(prev.pid) {
+        return false;
+    }
+    // (3) — and running the same session it was running then.
+    hint.session_id.as_deref() == prev.session_id.as_deref()
 }
 
 /// Is a rival refresh still worth its `/bin/ps` fork?
@@ -1169,11 +1613,23 @@ impl Overlay for AiMonitorOverlay {
         }
     }
 
-    fn on_active_changed(&mut self, cwd: Option<PathBuf>, shell_pid: Option<u32>) {
+    fn on_active_changed(
+        &mut self,
+        cwd: Option<PathBuf>,
+        shell_pid: Option<u32>,
+        agent_pid: Option<u32>,
+    ) {
         let visible = self.visible;
         let tab_changed = self.repoint.changed(visible, cwd.as_deref(), shell_pid);
+        let agent_moved = agent_pid_moved(agent_pid, self.last_seen_pid);
+        // A `None` publish is NO INFORMATION: it must not overwrite the memory, or a transient
+        // walk failure (or a flipped display toggle, before D6 lifted the active tab's walk out
+        // of it) would erase `last_seen_pid` and make the next real publish look like a change.
+        if agent_pid.is_some() {
+            self.last_seen_pid = agent_pid;
+        }
         // The order, and the laziness, live in `tick_action` — one author for both.
-        match tick_action(tab_changed, visible, || self.session_rotated()) {
+        match tick_action(tab_changed, visible, agent_moved, || self.session_rotated()) {
             // A tab change and a rotation take the SAME action, and deliberately so.
             // `open()` is the whole re-point in both cases: `Session::repoint` drops the
             // old attachment and its flag, the accumulator is rebuilt from scratch
@@ -1189,7 +1645,7 @@ impl Overlay for AiMonitorOverlay {
             // the panel re-points straight onto it. When it does not, resolution answers
             // `None` and nothing is folded, so what the panel holds is an EMPTY snapshot
             // (not the absence of one) — `Detached::of` reads that as `NoLog` and, with
-            // `tab_has_claude`, shows "this tab's session has not written a log yet" rather
+            // `tab_agent`, shows "this tab's session has not written a log yet" rather
             // than a dead session's numbers. The freshly-spawned watcher, now unattached,
             // adopts the log when it lands.
             //
@@ -1211,9 +1667,10 @@ impl Overlay for AiMonitorOverlay {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_rotation, backfill_from_scratch, baseline_from, drain_to_newest, pane_cwd_with,
-        proves_ownership, rival_refresh_needed, session_rotated_with, tick_action,
-        AiMonitorOverlay, Attachment, OpenedOn, Repoint, Rotation, Session, Tick,
+        agent_pid_moved, apply_rotation, backfill_from_scratch, baseline_from, drain_to_newest,
+        hint_or_pane_cwd, hint_or_pane_cwd_with, pane_cwd_with, proves_ownership, reopen_is_inert,
+        rival_refresh_needed, rival_set_of, session_rotated_with, tick_action, AiMonitorOverlay,
+        Attachment, OpenedOn, Repoint, Rotation, Session, Tick,
     };
     use crate::seam::{AppCtx, AppRequest, Handled, KeyInput, Overlay, WriteProbe};
     use crate::tabsession;
@@ -1455,6 +1912,7 @@ mod tests {
             pid: None,
             session_id: None,
             started_ms: Some(1_000),
+            cwd: None,
             rival_starts: vec![ai_monitor::Rival {
                 pid: 42,
                 started_ms: 999,
@@ -1501,6 +1959,7 @@ mod tests {
             pid: None,
             session_id: None,
             started_ms: Some(1_000),
+            cwd: None,
             rival_starts: vec![ai_monitor::Rival {
                 pid: 7,
                 started_ms: 999,
@@ -1518,16 +1977,57 @@ mod tests {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
 
+        // The handle now lives inside the scope enum (AG7). Reaching through it rather than
+        // matching loosely keeps this test failing for the reason it was written — a
+        // *different* `Arc` — instead of passing on a wrong-variant watch.
+        let ai_monitor::WatchScope::Project { rivals, .. } = &watch.scope else {
+            panic!("a Claude watch must be built with WatchScope::Project");
+        };
+
         assert!(
-            Arc::ptr_eq(&slot, &watch.rivals),
+            Arc::ptr_eq(&slot, rivals),
             "the watcher must read the handle refresh_rivals writes"
         );
 
         // And a membership change through the slot is visible to the Watch's copy.
         slot.lock().unwrap().list.clear();
         assert!(
-            watch.rivals.lock().unwrap().list.is_empty(),
+            rivals.lock().unwrap().list.is_empty(),
             "a refresh must reach the watcher, or D11 is inert"
+        );
+    }
+
+    // ---- ai-monitor-antigravity T4: which attachment path an open takes (R0.1) ----
+
+    /// Only Antigravity takes the `SingleLog` path — every other kind, and no agent at all,
+    /// falls to the Claude path.
+    ///
+    /// Enumerated over ALL of `AgentKind` on purpose. The routing is a match on one variant
+    /// out of five, so the interesting failure is not "Antigravity stopped working" but "a
+    /// newly-implemented agent silently kept using Claude's resolver" — which no test of the
+    /// Antigravity case alone would catch.
+    #[test]
+    fn only_an_antigravity_tab_takes_the_single_log_path() {
+        use crate::tabmeta::AgentKind::*;
+
+        assert_eq!(
+            super::antigravity_pid(Some((Antigravity, 4242))),
+            Some(4242),
+            "an agy tab must route to the Antigravity path, carrying its pid for the FD probe"
+        );
+
+        for other in [Claude, Codex, Gemini, Aider] {
+            assert_eq!(
+                super::antigravity_pid(Some((other, 4242))),
+                None,
+                "{other:?} has no Antigravity implementation and must not take that path"
+            );
+        }
+
+        assert_eq!(
+            super::antigravity_pid(None),
+            None,
+            "a tab running no agent at all keeps the Claude path's explained empty state"
         );
     }
 
@@ -1550,7 +2050,7 @@ mod tests {
         // If `opened` keys on the resolved value, every subsequent identical notification looks
         // like a change and re-opens forever — and the overlay's own watcher supplies the wakes.
         let mut r = Repoint::default();
-        let opened_on = r.opened(Some(PathBuf::from(CLIENT)), Some(8060), |_| {
+        let opened_on = r.opened(Some(PathBuf::from(CLIENT)), Some(8060), None, |_, _| {
             Some(PathBuf::from(PANE))
         });
         // D12: the panel opens on the pane, not the client — that part must not regress either.
@@ -1573,7 +2073,7 @@ mod tests {
         // R4.2 — the case the trigger exists for: a tmux window switch moves the pane while the
         // tab is unchanged, so the published cwd changes under a stable shell pid.
         let mut r = Repoint::default();
-        r.opened(Some(PathBuf::from("/proj/a")), Some(99), |_| None);
+        r.opened(Some(PathBuf::from("/proj/a")), Some(99), None, |_, _| None);
         assert!(r.changed(true, Some(Path::new("/proj/b")), Some(99)));
         // A genuine tab switch (both change) still re-points.
         assert!(r.changed(true, Some(Path::new("/proj/b")), Some(100)));
@@ -1588,11 +2088,11 @@ mod tests {
     fn an_unchanged_cwd_is_a_no_op() {
         // R4.3 — load-bearing for cost: D6 fires this after EVERY metadata sync.
         let mut r = Repoint::default();
-        r.opened(Some(PathBuf::from("/proj/a")), Some(99), |_| None);
+        r.opened(Some(PathBuf::from("/proj/a")), Some(99), None, |_, _| None);
         assert!(!r.changed(true, Some(Path::new("/proj/a")), Some(99)));
 
         let mut empty = Repoint::default();
-        empty.opened(None, None, |_| None);
+        empty.opened(None, None, None, |_, _| None);
         assert!(!empty.changed(true, None, None));
     }
 
@@ -1600,9 +2100,359 @@ mod tests {
     fn a_hidden_overlay_never_repoints() {
         // R4.3 — a closed panel holds no watcher and must not spin one up.
         let mut r = Repoint::default();
-        r.opened(Some(PathBuf::from("/proj/a")), Some(99), |_| None);
+        r.opened(Some(PathBuf::from("/proj/a")), Some(99), None, |_, _| None);
         assert!(!r.changed(false, Some(Path::new("/proj/b")), Some(1)));
         assert!(!r.changed(false, None, None));
+    }
+
+    // ---- tabsession-pane-cwd-gate: the hint supplies the directory (R5) ----
+
+    /// A hint carrying `cwd`, which is the only field these tests read.
+    fn hint_at(cwd: Option<tabsession::HintCwd>) -> tabsession::SessionHint {
+        tabsession::SessionHint {
+            pid: Some(4242),
+            started_ms: Some(1_000),
+            cwd,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn both_hint_cwd_variants_supply_the_directory_only_none_falls_back() {
+        // R5.3 / R5.5 — and the counter is the point, not decoration.
+        //
+        // `Disputed` must NOT fall back: its payload is the registry's path, and routing it to
+        // `pane_cwd` would open the panel on a THIRD directory — the pane shell's — making tier
+        // 1's exact-filename lookup miss and leaving the payload read by nobody. An earlier
+        // draft of this rule did exactly that.
+        let calls = std::cell::Cell::new(0usize);
+        let pane = |_: Option<u32>| {
+            calls.set(calls.get() + 1);
+            Some(PathBuf::from(PANE))
+        };
+
+        for variant in [
+            tabsession::HintCwd::Proven(PathBuf::from("/proj/a")),
+            tabsession::HintCwd::Disputed(PathBuf::from("/proj/a")),
+        ] {
+            calls.set(0);
+            let h = hint_at(Some(variant.clone()));
+            assert_eq!(
+                hint_or_pane_cwd_with(pane, Some(&h), Some(8060)),
+                Some(PathBuf::from("/proj/a")),
+                "{variant:?} names the directory itself"
+            );
+            assert_eq!(
+                calls.get(),
+                0,
+                "R5.5: a tab whose hint has a directory must not pay a second tmux resolve"
+            );
+        }
+
+        // Only a hint with NO directory at all reaches the pane — and so does no hint.
+        for h in [Some(hint_at(None)), None] {
+            calls.set(0);
+            assert_eq!(
+                hint_or_pane_cwd_with(pane, h.as_ref(), Some(8060)),
+                Some(PathBuf::from(PANE))
+            );
+            assert_eq!(calls.get(), 1);
+        }
+    }
+
+    #[test]
+    fn refresh_rivals_recovers_under_tmux() {
+        // R4.3 — the second victim of the deleted gate, and the one nothing could see. Under
+        // tmux the gate made `hint_for` answer `None` on every refresh, so this path published
+        // `RivalSet::default()` for the life of the panel: `known: false`, the uniqueness
+        // rescue permanently withheld, "a claude appeared" never reported. The fix is entirely
+        // in `hint_for` — so what must be pinned HERE is that a `Some` hint's rival data
+        // actually survives the mapping rather than being flattened on the way to the handle.
+        let h = tabsession::SessionHint {
+            pid: Some(74922),
+            started_ms: Some(1_000),
+            cwd: Some(tabsession::HintCwd::Proven(PathBuf::from("/proj/a"))),
+            rival_starts: vec![ai_monitor::Rival {
+                pid: 55502,
+                started_ms: 999,
+            }],
+            rivals_known: true,
+            ..Default::default()
+        };
+        let set = rival_set_of(Some(h));
+        assert_eq!(
+            set.list.iter().map(|r| r.pid).collect::<Vec<_>>(),
+            vec![55502]
+        );
+        assert!(
+            set.known,
+            "a complete enumeration must publish known:true, or the rescue stays withheld \
+             forever — which is exactly what the gate used to cause"
+        );
+
+        // The failure direction must NOT drift: no hint means we did not look, and that has to
+        // withhold the rescue rather than grant it on the strength of a read that did not work.
+        let empty = rival_set_of(None);
+        assert!(empty.list.is_empty());
+        assert!(!empty.known, "a failed lookup is never known-empty");
+
+        // ...and a `Some` hint that itself came back unknown stays unknown.
+        let unknown = rival_set_of(Some(tabsession::SessionHint {
+            pid: Some(74922),
+            rivals_known: false,
+            ..Default::default()
+        }));
+        assert!(!unknown.known);
+    }
+
+    #[test]
+    fn the_repoint_key_stays_the_notified_cwd_when_the_hint_names_another() {
+        // R5.4 — THE storm assertion, re-run for the case this feature creates. The resolved
+        // directory is now the chosen `claude`'s, which under tmux routinely differs from the
+        // notified one; if `opened` keyed on what it returned, every subsequent identical
+        // notification would look like a change and re-open forever.
+        let mut r = Repoint::default();
+        let h = hint_at(Some(tabsession::HintCwd::Proven(PathBuf::from(PANE))));
+        let opened_on = r.opened(
+            Some(PathBuf::from(CLIENT)),
+            Some(8060),
+            Some(&h),
+            hint_or_pane_cwd,
+        );
+        assert_eq!(
+            opened_on,
+            Some(PathBuf::from(PANE)),
+            "the panel opens on the claude's own directory"
+        );
+        for i in 0..5 {
+            assert!(
+                !r.changed(true, Some(Path::new(CLIENT)), Some(8060)),
+                "wake {i}: the key is the NOTIFIED cwd, so repeats stay inert"
+            );
+        }
+    }
+
+    /// This file's production half, comments stripped — the same split
+    /// `a_rotation_re_points_rather_than_refreshing_rivals` documents at length.
+    fn production_half() -> String {
+        let src = include_str!("overlay.rs");
+        let (production, tests) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("no `mod tests` marker to split on");
+        assert!(
+            !tests.is_empty() && production.len() > src.len() / 4,
+            "the split found the marker in an implausible place"
+        );
+        production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // ---- tabsession-pane-cwd-gate D10: the idempotence early-out (R7) ----
+
+    const DIR: &str = "/proj/a";
+    const CLAUDE_PID: u32 = 74922;
+    const SESSION: &str = "2b1ca0f2-8a99-4aff-90f1-115839f17f01";
+
+    fn baseline(session_id: Option<&str>) -> OpenedOn {
+        OpenedOn {
+            pid: CLAUDE_PID,
+            process_start_ms: 1_785_449_383_000,
+            session_id: session_id.map(str::to_string),
+        }
+    }
+
+    /// A hint that resolves to exactly the state `baseline(Some(SESSION))` was opened for.
+    fn same_hint() -> tabsession::SessionHint {
+        tabsession::SessionHint {
+            pid: Some(CLAUDE_PID),
+            session_id: Some(SESSION.to_string()),
+            started_ms: Some(1_785_449_383_000),
+            cwd: Some(tabsession::HintCwd::Proven(PathBuf::from(DIR))),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_pane_cd_that_does_not_move_claude_keeps_the_watcher() {
+        // R7.1 — the case D10 exists for. `Repoint` keys on the NOTIFIED cwd (the pane shell's,
+        // republished on every `cd`), so `changed()` fires and `open()` re-runs; everything it
+        // resolves is identical, so the teardown, respawn and full backfill are pure waste.
+        assert!(reopen_is_inert(
+            true,
+            true,
+            Some(Path::new(DIR)),
+            Some(&baseline(Some(SESSION))),
+            Some(Path::new(DIR)),
+            &same_hint(),
+        ));
+    }
+
+    #[test]
+    fn a_clear_rotation_still_re_points() {
+        // R7.2 — condition (3), and it is not belt-and-braces. A `/clear` rotation is by
+        // definition SAME directory, SAME pid, NEW session id, which is exactly what conditions
+        // 1 and 2 compare equal: a two-value early-out would silently discard the re-point
+        // `ai-monitor-session-rotation` shipped to add.
+        let mut rotated = same_hint();
+        rotated.session_id = Some("11111111-2222-3333-4444-555555555555".into());
+        assert!(!reopen_is_inert(
+            true,
+            true,
+            Some(Path::new(DIR)),
+            Some(&baseline(Some(SESSION))),
+            Some(Path::new(DIR)),
+            &rotated,
+        ));
+        // And the arming direction — a baseline that named nothing, now naming something — is a
+        // real change too, so it must not be swallowed either.
+        assert!(!reopen_is_inert(
+            true,
+            true,
+            Some(Path::new(DIR)),
+            Some(&baseline(None)),
+            Some(Path::new(DIR)),
+            &same_hint(),
+        ));
+    }
+
+    #[test]
+    fn the_toggle_chord_still_shows_the_panel() {
+        // R7.3 — condition (4). `close()` drops the watcher and clears `visible` but leaves
+        // `opened_on`, `repoint` and the session intact, so conditions 1-3 all still match on an
+        // unchanged tab. Without (4), Cmd+Shift+M off then on would return early and leave the
+        // panel invisible with no watcher until the user switched tabs.
+        for (visible, has_watcher) in [(false, false), (false, true), (true, false)] {
+            assert!(
+                !reopen_is_inert(
+                    visible,
+                    has_watcher,
+                    Some(Path::new(DIR)),
+                    Some(&baseline(Some(SESSION))),
+                    Some(Path::new(DIR)),
+                    &same_hint(),
+                ),
+                "visible={visible} watcher={has_watcher}: there is no live watcher to keep"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_move_is_never_absorbed() {
+        // The other half of R7: everything the early-out must NOT swallow.
+        let elsewhere = Path::new("/proj/b");
+        // A different directory — the tab moved.
+        assert!(!reopen_is_inert(
+            true,
+            true,
+            Some(Path::new(DIR)),
+            Some(&baseline(Some(SESSION))),
+            Some(elsewhere),
+            &same_hint(),
+        ));
+        // A different `claude` in the same pane (D5's trigger, one level down).
+        let mut new_pid = same_hint();
+        new_pid.pid = Some(CLAUDE_PID + 1);
+        assert!(!reopen_is_inert(
+            true,
+            true,
+            Some(Path::new(DIR)),
+            Some(&baseline(Some(SESSION))),
+            Some(Path::new(DIR)),
+            &new_pid,
+        ));
+        // No baseline at all — the `opened_on: None` class D10 declares itself unavailable for,
+        // because condition 2 has nothing to compare.
+        assert!(!reopen_is_inert(
+            true,
+            true,
+            Some(Path::new(DIR)),
+            None,
+            Some(Path::new(DIR)),
+            &same_hint(),
+        ));
+        // And a tab with no `claude` at all can never match, whatever else agrees.
+        assert!(!reopen_is_inert(
+            true,
+            true,
+            Some(Path::new(DIR)),
+            Some(&baseline(Some(SESSION))),
+            Some(Path::new(DIR)),
+            &tabsession::SessionHint::default(),
+        ));
+    }
+
+    #[test]
+    fn the_early_out_returns_only_after_repoint_has_re_keyed() {
+        // R7.4 — a source-text pin, because the hazard is an ORDERING inside `open()` and its
+        // failure mode is silent: D10's motivating case is a CHANGED notified cwd (that is why
+        // `changed()` fired), so returning before `key_cwd` was updated leaves `changed()` true
+        // on every subsequent wake and re-enters `open()` forever. This file has shipped that
+        // exact bug once.
+        let p = production_half()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+        let (before, after) = p
+            .split_once("ifreopen_is_inert(")
+            .expect("open() must consult the early-out");
+        assert!(
+            before.contains(".repoint.opened(cwd,shell_pid,h.as_ref(),hint_or_pane_cwd);"),
+            "R7.4: `Repoint::opened` must have re-keyed BEFORE the early-out can return"
+        );
+        // ...and what it returns before must genuinely be the teardown, not a no-op.
+        assert!(
+            after.contains("self.session.repoint();") && after.contains("self.watcher=None;"),
+            "the early-out must sit above the teardown it exists to skip"
+        );
+    }
+
+    #[test]
+    fn open_resolves_the_hint_first_through_a_named_resolver() {
+        // R5.1 / R5.2 — a source-text pin, because BOTH properties live at the `open()` call
+        // site and a unit test there types its own arguments (the note above this section
+        // records an earlier version doing exactly that and passing against a buggy call site).
+        //
+        // The hazard is specific: deriving the directory from the hint puts a second candidate
+        // back inside reach of the `opened` call, so `|_, _| <captured cwd>` becomes a
+        // legitimate spelling again — a type-checking, one-token reintroduction of the storm.
+        // Passing the resolver BY NAME is what removes the capture scope, and that is the
+        // property being pinned here, not merely the ordering.
+        // ALL whitespace stripped, so these pin the calls rather than rustfmt's line breaking —
+        // this file's other pins have been broken by re-wrapping before.
+        let p = production_half()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+        let (before, after) = p
+            .split_once("letcwd=self")
+            .expect("open() must still resolve a directory through `self.repoint`");
+        assert!(
+            before.contains("leth=shell_pid.and_then(tabsession::hint_for);"),
+            "R5.1: the hint must be resolved ABOVE the directory — it is what supplies it"
+        );
+        assert!(
+            after.starts_with(".repoint.opened(cwd,shell_pid,h.as_ref(),hint_or_pane_cwd);"),
+            "R5.2: the resolver must be passed BY NAME, never wrapped in a closure — a closure \
+             has a capture scope and `|_, _| cwd` becomes writable again. Found: {:?}",
+            &after[..after.len().min(90)]
+        );
+        assert!(
+            p.contains(
+                "resolve:implFnOnce(Option<&tabsession::SessionHint>,Option<u32>)->Option<PathBuf>,"
+            ),
+            "R5.2: the resolver parameter carries the hint, so a transposition with \
+             `Option<PathBuf>` is not even expressible"
+        );
+        // And the suppression must be expressed on `Wanted`, never by blanking the hint.
+        assert!(
+            p.contains(
+                "since_ms:matchhint.cwd.as_ref().is_some_and(tabsession::HintCwd::tier2_ok)"
+            ),
+            "tier 2 must be gated on the directory's provenance at the point `Wanted` is built"
+        );
     }
 
     #[test]
@@ -1610,7 +2460,7 @@ mod tests {
         // A non-tmux tab resolves nothing, so both the key and the directory are the notified
         // value — and the first published cwd equal to it is correctly inert.
         let mut r = Repoint::default();
-        let opened_on = r.opened(Some(PathBuf::from(CLIENT)), Some(4242), |_| None);
+        let opened_on = r.opened(Some(PathBuf::from(CLIENT)), Some(4242), None, |_, _| None);
         assert_eq!(opened_on, Some(PathBuf::from(CLIENT)));
         assert!(!r.changed(true, Some(Path::new(CLIENT)), Some(4242)));
     }
@@ -2119,13 +2969,13 @@ mod tests {
         // what makes the re-point converge instead of firing on every subsequent metadata
         // sync (the storm `Repoint` exists to stop).
         let mut r = Repoint::default();
-        r.opened(Some(PathBuf::from("/proj/a")), Some(101), |_| None);
+        r.opened(Some(PathBuf::from("/proj/a")), Some(101), None, |_, _| None);
 
         assert!(
             r.changed(true, Some(Path::new("/proj/b")), Some(202)),
             "a tab switch is a real change: `on_active_changed` re-opens on tab B"
         );
-        r.opened(Some(PathBuf::from("/proj/b")), Some(202), |_| None);
+        r.opened(Some(PathBuf::from("/proj/b")), Some(202), None, |_, _| None);
         assert!(
             !r.changed(true, Some(Path::new("/proj/b")), Some(202)),
             "and the panel then settles on tab B"
@@ -2193,7 +3043,11 @@ mod tests {
         // cwd and a pid and nothing else — no `AppCtx`, hence no `AppRequest`. Give it one
         // and this coercion stops compiling. `on_command`, the launch restore's route
         // (R6.6), is held to the same rule for the same reason.
-        let _: fn(&mut AiMonitorOverlay, Option<PathBuf>, Option<u32>) =
+        // RE-TYPED for the widened seam, not deleted: the property is "no value a width
+        // could travel in", and a third `Option<u32>` — an agent pid — preserves it exactly.
+        // Deleting the pin because the signature moved would have thrown away the guarantee
+        // along with the shape it was asserted through.
+        let _: fn(&mut AiMonitorOverlay, Option<PathBuf>, Option<u32>, Option<u32>) =
             <AiMonitorOverlay as Overlay>::on_active_changed;
         let _: fn(&mut AiMonitorOverlay, &crate::seam::OverlayCommand) -> crate::seam::Handled =
             <AiMonitorOverlay as Overlay>::on_command;
@@ -2441,14 +3295,17 @@ mod tests {
 
     #[test]
     fn a_rotation_re_points_the_panel() {
-        assert_eq!(tick_action(false, true, || true), Tick::Reopen);
+        assert_eq!(tick_action(false, true, false, || true), Tick::Reopen);
     }
 
     #[test]
     fn no_rotation_falls_through_to_the_rival_refresh() {
         // The rotation check is ADDITIVE: it must not displace D11's per-wake republish,
         // which is what keeps rival membership live during an unattached open.
-        assert_eq!(tick_action(false, true, || false), Tick::RefreshRivals);
+        assert_eq!(
+            tick_action(false, true, false, || false),
+            Tick::RefreshRivals
+        );
     }
 
     #[test]
@@ -2457,7 +3314,7 @@ mod tests {
         // `open()` re-reads the hint from scratch — so asking here would be a wasted read
         // whose answer is discarded, on the event-loop thread, after every wake.
         assert_eq!(
-            tick_action(true, true, || panic!(
+            tick_action(true, true, false, || panic!(
                 "a tab change must not consult the registry"
             )),
             Tick::Reopen
@@ -2470,11 +3327,89 @@ mod tests {
         // add exactly zero I/O to a wake — and wakes arrive for the whole life of the
         // process whether or not anyone has ever pressed Cmd+Shift+M.
         assert_eq!(
-            tick_action(false, false, || panic!(
+            tick_action(false, false, false, || panic!(
                 "a closed panel must not read anything"
             )),
             Tick::Idle
         );
+    }
+
+    // ---- tabsession-pane-cwd-gate D5/D6/D9: a changed `claude` pid re-points (R6) ----
+
+    #[test]
+    fn the_compare_is_some_guarded() {
+        // R6.4 — a bare `published != last_seen` reads `None != Some(x)` as `true`, so an
+        // absent published value would be "a different pid" and re-point on EVERY wake. Absent
+        // is not exotic: it is a transient walk failure, and it is what the two derivations
+        // legitimately disagree about.
+        assert!(
+            !agent_pid_moved(None, Some(74922)),
+            "absent is no information"
+        );
+        assert!(
+            !agent_pid_moved(Some(74922), None),
+            "nothing to compare yet"
+        );
+        assert!(!agent_pid_moved(None, None));
+        assert!(!agent_pid_moved(Some(74922), Some(74922)), "unchanged");
+        assert!(agent_pid_moved(Some(74923), Some(74922)), "a real change");
+    }
+
+    #[test]
+    fn a_none_publish_never_erases_the_memory() {
+        // R6.4, the other half — and it is the half a pure predicate cannot cover, because the
+        // hazard is in the WRITE. If a `None` publish overwrote `last_seen_pid`, the next real
+        // publish would compare against `None`, and the wake after that against the new value:
+        // one transient walk failure would cost a spurious full re-point.
+        let mut o = AiMonitorOverlay::detached();
+        // Closed, so every one of these is `Tick::Idle` and no `open()` is attempted — the
+        // memory rule is what is under test, not the action.
+        o.on_active_changed(None, Some(8060), Some(74922));
+        assert_eq!(o.last_seen_pid, Some(74922));
+        o.on_active_changed(None, Some(8060), None);
+        assert_eq!(
+            o.last_seen_pid,
+            Some(74922),
+            "a None publish is no information, not an erasure"
+        );
+        o.on_active_changed(None, Some(8060), Some(74923));
+        assert_eq!(o.last_seen_pid, Some(74923), "a real publish moves it");
+    }
+
+    #[test]
+    fn a_changed_pid_re_points_and_an_unchanged_one_does_not() {
+        // R6.5 — and note the rotation thunk PANICS on the changed path: a changed pid makes
+        // the rotation question moot (it concerns a process that is no longer the one being
+        // tracked), so asking it would be a wasted file read on the event-loop thread.
+        assert_eq!(
+            tick_action(false, true, true, || panic!(
+                "a changed pid must not consult the registry"
+            )),
+            Tick::Reopen
+        );
+        assert_eq!(
+            tick_action(false, true, false, || false),
+            Tick::RefreshRivals,
+            "an unchanged pid falls through to D11's per-wake republish"
+        );
+    }
+
+    #[test]
+    fn a_closed_panel_decides_nothing_about_a_changed_pid() {
+        // R6.6 — the pid check sits BELOW the `!visible` gate, and the placement is not
+        // cosmetic. Above it, a pid change would return `Tick::Reopen` for a closed panel;
+        // `open()` sets `self.visible = true` without the `ctx.set_monitor_open` that only the
+        // chord path performs, so the panel would paint into a band the renderer never
+        // reserved.
+        assert_eq!(
+            tick_action(false, false, true, || panic!(
+                "a closed panel must not read anything"
+            )),
+            Tick::Idle,
+            "closed outranks a changed pid"
+        );
+        // ...and a tab change still outranks it, since `open()` re-reads everything anyway.
+        assert_eq!(tick_action(true, true, true, || false), Tick::Reopen);
     }
 
     // ---- the state transition: arming, and what it does to the baseline ----
@@ -2581,6 +3516,47 @@ mod tests {
         );
     }
 
+    /// An unattached Antigravity panel must always have something to wake it (loop run 2).
+    ///
+    /// Pinned by asserting the source, for the reason the sibling test below gives: `open()`
+    /// needs a live process tree and an `EventLoopProxy`, so no unit can reach the branch.
+    /// It earns its place the same way too — the defect it guards SHIPPED. With no watcher
+    /// armed on the no-log path, a panel opened before `agy` became detectable had no wake
+    /// source at all, so `on_active_changed` never ran, the re-probe never ran, and the panel
+    /// sat on "(no Claude session in this tab)" indefinitely while `agent_for` answered
+    /// `Some((Antigravity, ..))` for that shell. Every test stayed green throughout.
+    #[test]
+    fn an_unattached_antigravity_panel_arms_a_wake_source() {
+        let src = include_str!("overlay.rs");
+        let (production, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("no `mod tests` marker to split on");
+        let production = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The no-log arm exists and watches the presence directory.
+        assert!(
+            production.contains("ai_monitor::antigravity::presence_dir()"),
+            "with no transcript to tail, the panel must still watch for the lock that will \
+             name one — otherwise nothing can ever wake it"
+        );
+        assert!(
+            production.contains("scope: ai_monitor::WatchScope::AwaitingLock"),
+            "and that watch must use the wake-only scope, not a tailing one"
+        );
+        // The flag the re-point reads is set on a worker; the wake it needs must be
+        // requested by that same worker, because `session_rotated` already read the flag
+        // this tick.
+        assert!(
+            production.contains("ping();"),
+            "the worker that sets `appeared` must also request the follow-up wake, or the \
+             re-point waits for traffic that may never come"
+        );
+    }
+
     #[test]
     fn a_rotation_re_points_rather_than_refreshing_rivals() {
         // The `Tick::Reopen -> open()` mapping is one line and no unit can reach it: `open()`
@@ -2658,6 +3634,9 @@ mod tests {
             pid,
             session_id: sid.map(str::to_string),
             started_ms: started,
+            // These fixtures are about the rotation baseline, which reads pid/started/session
+            // only. The directory has its own tests against the `hint_or_pane_cwd` resolver.
+            cwd: None,
             rival_starts: vec![],
             rivals_known: true,
         }

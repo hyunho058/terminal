@@ -5,7 +5,8 @@
 //! numbers are the same on every machine and every run (R10.1).
 
 use ai_monitor::telemetry::{
-    classify, parse_task_notification, FileOp, SessionTelemetry, TelemetrySnapshot, ToolKind,
+    classify, parse_task_notification, FileOp, LogFormat, SessionTelemetry, TelemetrySnapshot,
+    ToolKind,
 };
 
 fn fold(lines: &str) -> TelemetrySnapshot {
@@ -1838,4 +1839,978 @@ fn the_context_high_water_is_monotone_while_the_gauge_follows_occupancy_down() {
     // extra, so it can never inflate a window on its own.
     let s = fold(&assistant_usage("m1", 50_000, 3_268));
     assert_eq!(s.context_used, s.context_high_water);
+}
+
+// ---- ai-monitor-antigravity: the second dialect (AG2/AG3/AG4/AG5/AG9) ---------
+//
+// Every fixture below is SYNTHETIC. It reproduces the measured envelope exactly —
+// the five universal keys, the dispatch/result pair, the double-encoded `args` — with
+// invented paths and prompts, because a real `brain/<uuid>` transcript is somebody's
+// prompts and somebody's project layout and this repo is version-controlled.
+
+/// `2026-08-14T03:00:00Z` — the base the minute-per-step helper below counts from.
+const AG_T0: u64 = 1_786_676_400_000;
+/// The fixture's first `created_at`, `2026-08-14T03:48:57Z`.
+const AG_FIX_T0: u64 = 1_786_679_337_000;
+
+fn ag_fold(lines: &str) -> TelemetrySnapshot {
+    let mut t = SessionTelemetry::with_format(LogFormat::Antigravity);
+    for l in lines.lines() {
+        t.apply(l);
+    }
+    t.snapshot()
+}
+
+/// One step in the measured envelope: `step_index`, `source`, `type`, `status` and
+/// `created_at` are on every one of the 1,761 corpus steps, so they are on every one
+/// here. `extra` is raw JSON appended to the object and must start with a comma.
+///
+/// One step per minute, so a dispatch/result pair is 60_000ms apart and a duration
+/// assertion reads as arithmetic rather than as a magic number.
+fn ag_step(i: u64, ty: &str, extra: &str) -> String {
+    format!(
+        r#"{{"step_index":{i},"source":"MODEL","type":"{ty}","status":"DONE","created_at":"2026-08-14T03:{:02}:00Z"{extra}}}"#,
+        i
+    )
+}
+
+/// A `PLANNER_RESPONSE` dispatching one tool call. `args` is the raw body of the args
+/// object — written with its real double-encoding, which is the whole point of R2.3.
+fn ag_dispatch(i: u64, name: &str, args: &str) -> String {
+    ag_step(
+        i,
+        "PLANNER_RESPONSE",
+        &format!(r#","tool_calls":[{{"name":"{name}","args":{{{args}}}}}]"#),
+    )
+}
+
+/// A dispatch/result pair, the shape every Antigravity tool call actually takes.
+fn ag_call(i: u64, name: &str, result_step: &str, args: &str) -> String {
+    format!(
+        "{}\n{}",
+        ag_dispatch(i, name, args),
+        ag_step(i + 1, result_step, "")
+    )
+}
+
+#[test]
+fn antigravity_fixture_folds_to_expected_telemetry() {
+    // The end-to-end shape: two human turns, two replies, six tool calls each written
+    // twice, a defined-then-invoked subagent, and a checkpoint that folds nothing.
+    let s = ag_fold(include_str!("fixtures/antigravity_transcript.jsonl"));
+
+    // AG3 — 2 user prompts, 2 tool-less planner replies. The other 6 planner steps
+    // are dispatch. Counting all 8 is the 15:1 bug the ratio exists to catch.
+    assert_eq!(s.turns_user, 2);
+    assert_eq!(s.turns_assistant, 2);
+
+    // AG4 — the model is prose in a settings sentence, tier retained, period dropped.
+    assert_eq!(s.model.as_deref(), Some("Gemini 3.6 Flash (High)"));
+    // The transcript names no session: the conversation id is the DIRECTORY's name,
+    // which only the resolver (T1) knows. `None` is the honest value here.
+    assert_eq!(s.session_id, None);
+
+    // R3.1 — from the `Z`-suffixed step field, never the local-offset `Created At:`
+    // lines inside `content`. Those read 20:48 where these read 03:48.
+    assert_eq!(s.first_event_ms, Some(AG_FIX_T0));
+    assert_eq!(s.last_event_ms, Some(AG_FIX_T0 + 23_000));
+
+    // AG2 — six calls, each counted once at its result step. Twelve is what counting
+    // the dispatch as well produces.
+    assert_eq!(s.total_tool_calls, 6);
+    assert_eq!(
+        s.tool_calls,
+        vec![
+            ("define_subagent".to_string(), 1),
+            ("grep_search".to_string(), 1),
+            ("invoke_subagent".to_string(), 1),
+            ("list_dir".to_string(), 1),
+            ("run_command".to_string(), 1),
+            ("view_file".to_string(), 1),
+        ],
+        "tools keep the names the LOG supplied — no Claude vocabulary"
+    );
+    assert_eq!(
+        s.failed_tool_calls, 0,
+        "G4 leaves the error family unmapped"
+    );
+    assert_eq!(s.parse_errors, 0, "the whole fixture is well-formed");
+    assert_eq!(s.orphan_tool_results, 0, "every result found its dispatch");
+
+    // FILE ACTIVITY, newest first, paths unquoted.
+    let files: Vec<(FileOp, &str)> = s.files.iter().map(|f| (f.op, f.path.as_str())).collect();
+    assert_eq!(
+        files,
+        vec![
+            (FileOp::Grep, "/proj/crates/renderer"),
+            (FileOp::List, "/proj/crates/renderer"),
+            (FileOp::Read, "/proj/crates/renderer/atlas.rs"),
+        ]
+    );
+    // Duration spans the dispatch and its result step, both on the same UTC clock.
+    assert_eq!(s.files[2].duration_ms, Some(1_000));
+    assert_eq!(s.files[2].start_ms, Some(AG_FIX_T0 + 1_000));
+
+    // RECENT CALLS displays `toolSummary`, which is on every measured call.
+    let tools: Vec<&str> = s.tools.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(
+        tools,
+        vec![
+            "Define the code-reviewer subagent",
+            "Run the renderer tests"
+        ]
+    );
+    assert_eq!(s.tools[1].duration_ms, Some(4_000));
+
+    // AG5 — named by the preceding definition, joined to the child by conversation id.
+    assert_eq!(s.subagents.len(), 1);
+    let a = &s.subagents[0];
+    assert_eq!(a.subagent_type.as_deref(), Some("code-reviewer"));
+    assert_eq!(
+        a.description.as_deref(),
+        Some("Reviews a diff for correctness")
+    );
+    assert_eq!(a.id, "ed14342c-0000-4000-8000-00000000beef");
+    assert!(a.completed, "the step's status is DONE");
+    assert_eq!(a.end_ms, Some(AG_FIX_T0 + 14_000));
+
+    // R2.6 — the child has its own `USER_INPUT`; folding it would double the turns.
+    // Nothing here reads it, so the parent's count is the parent's alone.
+    assert_eq!(s.turns_user, 2, "one invocation, still two human prompts");
+
+    // AG4/G1 — the format carries no token accounting at all, and nothing here may
+    // invent one from content lengths.
+    assert_eq!(
+        (
+            s.total_input,
+            s.total_output,
+            s.total_cache_read,
+            s.total_cache_creation,
+            s.context_used,
+            s.context_high_water
+        ),
+        (0, 0, 0, 0, 0, 0)
+    );
+    // G5 — `manage_task` implies a task model the transcript never records.
+    assert!(s.tasks.is_empty());
+    // No Antigravity tool maps to `Skill`.
+    assert!(s.skills.is_empty());
+}
+
+#[test]
+fn r2_1_a_tool_bearing_planner_step_is_not_a_turn() {
+    // AG3, at its exact boundary. Measured 54 user inputs against 61 tool-less planner
+    // responses and 772 tool-bearing ones — so this single branch is the difference
+    // between a 1.13 ratio and a 15:1 one.
+    let s = ag_fold(&format!(
+        "{}\n{}\n{}",
+        ag_step(1, "USER_INPUT", r#","content":"do the thing""#),
+        ag_dispatch(2, "view_file", r#""AbsolutePath":"\"/a/b.rs\"""#),
+        ag_step(3, "PLANNER_RESPONSE", r#","content":"done""#),
+    ));
+    assert_eq!(s.turns_user, 1);
+    assert_eq!(
+        s.turns_assistant, 1,
+        "the dispatch increments no turn counter"
+    );
+
+    // An EMPTY `tool_calls` array dispatched nothing, so it is a reply like any other.
+    let s = ag_fold(&ag_step(1, "PLANNER_RESPONSE", r#","tool_calls":[]"#));
+    assert_eq!(s.turns_assistant, 1);
+    assert_eq!(s.total_tool_calls, 0);
+}
+
+#[test]
+fn r2_2_each_tool_call_is_counted_exactly_once() {
+    // The single largest correctness trap in the format: every call is written twice,
+    // once as a `tool_calls` dispatch and once as its own result step. The corpus holds
+    // 773 dispatch entries against 754 result steps, so counting both nearly doubles
+    // every tally the panel shows.
+    let s = ag_fold(&ag_call(
+        1,
+        "view_file",
+        "VIEW_FILE",
+        r#""AbsolutePath":"\"/a/b.rs\"""#,
+    ));
+    assert_eq!(s.total_tool_calls, 1);
+    assert_eq!(s.tool_calls, vec![("view_file".to_string(), 1)]);
+    assert_eq!(s.files.len(), 1);
+
+    // The dispatch ALONE counts nothing — an in-flight call is not a completed one.
+    let s = ag_fold(&ag_dispatch(
+        1,
+        "view_file",
+        r#""AbsolutePath":"\"/a/b.rs\"""#,
+    ));
+    assert_eq!(s.total_tool_calls, 0);
+    assert!(s.files.is_empty());
+}
+
+#[test]
+fn r2_3_paths_are_unwrapped_from_their_json_encoding() {
+    // Every `args` value is a String whose CONTENTS are a JSON document (3,470 of
+    // 3,470 measured values). Reading the value directly renders the wrapper quotes,
+    // so every path on the panel would come out as `"/a/b.rs"`.
+    let s = ag_fold(
+        &[
+            ag_call(
+                1,
+                "view_file",
+                "VIEW_FILE",
+                r#""AbsolutePath":"\"/a/b.rs\"""#,
+            ),
+            ag_call(
+                3,
+                "write_to_file",
+                "CODE_ACTION",
+                r#""TargetFile":"\"/a/c.rs\"""#,
+            ),
+            ag_call(5, "grep_search", "GREP_SEARCH", r#""SearchPath":"\"/a\"""#),
+            ag_call(
+                7,
+                "list_dir",
+                "LIST_DIRECTORY",
+                r#""DirectoryPath":"\"/a\"""#,
+            ),
+        ]
+        .join("\n"),
+    );
+    let files: Vec<(FileOp, &str)> = s.files.iter().map(|f| (f.op, f.path.as_str())).collect();
+    assert_eq!(
+        files,
+        vec![
+            (FileOp::List, "/a"),
+            (FileOp::Grep, "/a"),
+            (FileOp::Write, "/a/c.rs"),
+            (FileOp::Read, "/a/b.rs"),
+        ],
+        "newest first"
+    );
+    assert!(
+        s.files.iter().all(|f| !f.path.contains('"')),
+        "no path may carry a literal quote"
+    );
+    assert_eq!(s.parse_errors, 0);
+}
+
+#[test]
+fn r2_3_writes_arrive_as_code_action_and_finds_as_find() {
+    // There is no `WRITE_FILE` step type — the first draft of the spec mapped one, and
+    // the corpus has none. Writes land as `CODE_ACTION` under two different tool names,
+    // and `find_by_name` reports through `FIND` while listing a directory.
+    let s = ag_fold(
+        &[
+            ag_call(
+                1,
+                "replace_file_content",
+                "CODE_ACTION",
+                r#""TargetFile":"\"/a/d.rs\"""#,
+            ),
+            ag_call(3, "find_by_name", "FIND", r#""SearchDirectory":"\"/a\"""#),
+        ]
+        .join("\n"),
+    );
+    let files: Vec<(FileOp, &str)> = s.files.iter().map(|f| (f.op, f.path.as_str())).collect();
+    assert_eq!(
+        files,
+        vec![(FileOp::List, "/a"), (FileOp::Write, "/a/d.rs")]
+    );
+
+    // A `WRITE_FILE` step claims no pending call, so it folds nothing and is not even
+    // an orphan — it is not a result step type this format has.
+    let s = ag_fold(&format!(
+        "{}\n{}",
+        ag_dispatch(1, "write_to_file", r#""TargetFile":"\"/a/c.rs\"""#),
+        ag_step(2, "WRITE_FILE", "")
+    ));
+    assert_eq!(s.total_tool_calls, 0);
+    assert_eq!(s.orphan_tool_results, 0);
+}
+
+#[test]
+fn r2_4_a_command_is_displayed_by_its_tool_summary() {
+    // `toolSummary` is on all 773 measured calls and is written for a human, so nothing
+    // has to be synthesised from the tool name for RECENT CALLS. The tally still keys
+    // on the NAME, so the two views can never disagree about what ran.
+    let s = ag_fold(&ag_call(
+        1,
+        "run_command",
+        "RUN_COMMAND",
+        r#""CommandLine":"\"cargo test\"","Cwd":"\"/proj\"","WaitMsBeforeAsync":"5000","toolSummary":"\"Run the test suite\"""#,
+    ));
+    assert_eq!(s.tool_calls, vec![("run_command".to_string(), 1)]);
+    assert_eq!(s.tools.len(), 1);
+    assert_eq!(s.tools[0].name, "Run the test suite");
+    assert_eq!(s.tools[0].duration_ms, Some(60_000));
+
+    // Without one, the ring names the tool rather than showing nothing.
+    let s = ag_fold(&ag_call(
+        1,
+        "run_command",
+        "RUN_COMMAND",
+        r#""Cwd":"\"/proj\"""#,
+    ));
+    assert_eq!(s.tools[0].name, "run_command");
+    assert_eq!(
+        s.parse_errors, 0,
+        "a missing display label is not a parse fault — the call still names itself"
+    );
+}
+
+#[test]
+fn r2_5_a_subagent_is_named_by_the_preceding_definition() {
+    // AG5 — `invoke_subagent`'s args carry only `Subagents[].Model` and `.Prompt`. The
+    // name exists only on the `define_subagent` that precedes it, and the child's
+    // conversation id exists only in the invocation's result `content`.
+    let s = ag_fold(&format!(
+        "{}\n{}\n{}",
+        ag_call(
+            1,
+            "define_subagent",
+            "GENERIC",
+            r#""name":"\"code-reviewer\"","description":"\"Reviews a diff\"""#
+        ),
+        ag_dispatch(
+            3,
+            "invoke_subagent",
+            r#""Subagents":"[{\"Model\":\"gemini\",\"Prompt\":\"review\"}]""#
+        ),
+        ag_step(
+            4,
+            "INVOKE_SUBAGENT",
+            r#","content":"Created the following subagents:\n{\n  \"conversationId\": \"ed14342c-0000-4000-8000-00000000beef\"\n}""#
+        ),
+    ));
+    assert_eq!(s.subagents.len(), 1, "the invocation, not the definition");
+    let a = &s.subagents[0];
+    assert_eq!(a.subagent_type.as_deref(), Some("code-reviewer"));
+    assert_eq!(a.description.as_deref(), Some("Reviews a diff"));
+    assert_eq!(
+        a.id, "ed14342c-0000-4000-8000-00000000beef",
+        "the join key to the child's own transcript, which AG5 does not tail"
+    );
+    assert!(a.completed, "status DONE");
+    // Both calls are still calls, under their own names.
+    assert_eq!(s.total_tool_calls, 2);
+
+    // A `RUNNING` invocation is not finished, and its timer must not be frozen at a
+    // duration it never took.
+    let s = ag_fold(&format!(
+        "{}\n{}",
+        ag_dispatch(1, "invoke_subagent", r#""Subagents":"[]""#),
+        r#"{"step_index":2,"source":"MODEL","type":"INVOKE_SUBAGENT","status":"RUNNING","created_at":"2026-08-14T03:02:00Z","content":"{\"conversationId\": \"abc\"}"}"#,
+    ));
+    assert!(!s.subagents[0].completed);
+    assert_eq!(s.subagents[0].end_ms, None);
+}
+
+#[test]
+fn r2_6_turn_counts_are_not_multiplied_by_subagents() {
+    // AG5/R2.6 — a subagent gets its OWN conversation directory under `brain/`, and its
+    // step 0 is a `USER_INPUT` / `USER_EXPLICIT` carrying a `<USER_REQUEST>` envelope
+    // indistinguishable from a human's: the prompt text is simply the one the parent
+    // wrote. 18 of the 51 measured transcripts are such children, with no marker
+    // separating them from top-level conversations. So "count `USER_INPUT` steps" is
+    // only a turn count for as long as the fold reads ONE transcript.
+    const CHILD: &str = "ed14342c-0000-4000-8000-00000000beef";
+    let parent = [
+        ag_step(1, "USER_INPUT", r#","content":"<USER_REQUEST>\nShip it\n</USER_REQUEST>""#),
+        // define -> invoke -> a lifecycle notice, the full subagent sequence. Every one
+        // of these is a dispatch or a result step; none of them is a turn.
+        ag_dispatch(2, "define_subagent", r#""name":"\"reviewer\"""#),
+        ag_step(3, "GENERIC", r#","content":"Subagent \"reviewer\" defined.""#),
+        ag_dispatch(4, "invoke_subagent", r#""Subagents":"[]""#),
+        ag_step(
+            5,
+            "INVOKE_SUBAGENT",
+            &format!(r#","content":"Created the following subagents:\n{{\n  \"conversationId\": \"{CHILD}\",\n  \"logAbsoluteUri\": \"file:///tmp/brain/{CHILD}\"\n}}""#),
+        ),
+        ag_dispatch(6, "send_message", r#""Recipient":"\"reviewer\"""#),
+        ag_step(7, "GENERIC", &format!(r#","content":"Message sent to \"{CHILD}\".""#)),
+        ag_step(8, "PLANNER_RESPONSE", r#","content":"Shipped.""#),
+    ]
+    .join("\n");
+
+    let s = ag_fold(&parent);
+    assert_eq!(
+        s.turns_user, 1,
+        "one human prompt, whatever the parent delegated"
+    );
+    assert_eq!(
+        s.turns_assistant, 1,
+        "one reply; the three dispatches and their results are not turns"
+    );
+    assert_eq!(s.total_tool_calls, 3, "the delegation is calls, not turns");
+
+    // The child is NAMED, and named only. `apply` takes `&mut self` + `&str` and reads
+    // no filesystem at all (D3), so `logAbsoluteUri` is inert text here — the id is a
+    // join key the app may follow later, not a transcript this fold opens.
+    assert_eq!(s.subagents.len(), 1);
+    assert_eq!(s.subagents[0].id, CHILD);
+    assert_eq!(s.subagents[0].subagent_type.as_deref(), Some("reviewer"));
+
+    // And what interleaving would cost, as a number rather than as a warning. The
+    // child's transcript opens with a `USER_INPUT` of its own, so folding it into this
+    // accumulator doubles the human turn count for a session with one human prompt —
+    // the exact corruption AG5 refuses child transcripts to avoid.
+    let child = r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-08-14T03:09:00Z","content":"<USER_REQUEST>\nReview it\n</USER_REQUEST>"}"#;
+    let both = ag_fold(&format!("{parent}\n{child}"));
+    assert_eq!(both.turns_user, 2, "the count R2.6 exists to prevent");
+}
+
+#[test]
+fn r2_7_malformed_antigravity_input_preserves_state() {
+    // Constraint: no line, however malformed, may panic the fold or lose what was
+    // already counted. Each line below is a different way to be wrong.
+    let mut t = SessionTelemetry::with_format(LogFormat::Antigravity);
+    for l in ag_call(
+        1,
+        "view_file",
+        "VIEW_FILE",
+        r#""AbsolutePath":"\"/a/b.rs\"""#,
+    )
+    .lines()
+    {
+        t.apply(l);
+    }
+    let before = t.snapshot();
+    assert_eq!(before.total_tool_calls, 1);
+
+    for bad in [
+        "not json at all",
+        r#"{"step_index":9,"type":"VIEW_FILE""#,
+        // No `step_index`: the envelope is the format check, and half an envelope is
+        // not something to guess the rest of.
+        r#"{"type":"VIEW_FILE","status":"DONE","created_at":"2026-08-14T03:09:00Z"}"#,
+        // `type` missing entirely.
+        r#"{"step_index":9,"source":"MODEL","status":"DONE","created_at":"2026-08-14T03:09:00Z"}"#,
+        // `tool_calls` present but not an array.
+        &ag_step(
+            9,
+            "PLANNER_RESPONSE",
+            r#","tool_calls":{"name":"view_file"}"#,
+        ),
+        // A call with no name.
+        &ag_step(9, "PLANNER_RESPONSE", r#","tool_calls":[{"args":{}}]"#),
+        // An `AbsolutePath` whose inner document is a bare number, not a string.
+        &ag_dispatch(9, "view_file", r#""AbsolutePath":"100""#),
+        // ... and one that is not a string at all.
+        &ag_dispatch(9, "view_file", r#""AbsolutePath":100"#),
+    ] {
+        t.apply(bad);
+    }
+    let after = t.snapshot();
+    assert_eq!(after.parse_errors, 8, "one per malformed line");
+    assert_eq!(after.total_tool_calls, before.total_tool_calls);
+    assert_eq!(after.files, before.files);
+    assert_eq!(after.turns_user, before.turns_user);
+    assert_eq!(after.turns_assistant, before.turns_assistant);
+
+    // A call whose path could not be unwrapped still folds — dropping it would cost
+    // the tally a real invocation to save one FILE ACTIVITY row.
+    t.apply(&ag_step(10, "VIEW_FILE", ""));
+    let s = t.snapshot();
+    assert_eq!(s.total_tool_calls, 2);
+    assert_eq!(s.files[0].path, "view_file", "the tool names itself");
+}
+
+#[test]
+fn r2_8_a_claude_line_in_antigravity_format_is_a_parse_error() {
+    // AG9 — a line from the wrong format is a bug upstream, not input to interpret.
+    // Both dialects carry a `type` key, so folding what looks foldable would produce
+    // real-looking telemetry for a session that never ran.
+    let claude = concat!(
+        r#"{"type":"assistant","sessionId":"5e59b629","timestamp":"2026-07-28T07:17:00.461Z","requestId":"r1","message":{"id":"m1","model":"claude-opus-5","usage":{"input_tokens":2,"output_tokens":441}}}"#,
+        "\n",
+        r#"{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/a/b.rs"}}"#,
+        "\n",
+        r#"{"type":"tool_result","tool_use_id":"t1"}"#,
+    );
+    let s = ag_fold(claude);
+    assert_eq!(
+        s.parse_errors, 3,
+        "three well-formed Claude lines, three faults"
+    );
+    assert_eq!(
+        TelemetrySnapshot {
+            parse_errors: 0,
+            ..s.clone()
+        },
+        TelemetrySnapshot::default(),
+        "nothing else moved: no model, no tokens, no clock, no tool call"
+    );
+}
+
+#[test]
+fn the_format_is_fixed_at_construction() {
+    // AG9, from both sides. The default is Claude, so every existing call site keeps
+    // the behaviour it had.
+    assert_eq!(SessionTelemetry::new().format(), LogFormat::Claude);
+    assert_eq!(SessionTelemetry::default().format(), LogFormat::Claude);
+    assert_eq!(
+        SessionTelemetry::with_format(LogFormat::Antigravity).format(),
+        LogFormat::Antigravity
+    );
+
+    // The mirror of R2.8: an Antigravity step fed to a Claude accumulator folds
+    // nothing. Its `type` is not a Claude block type, its clock key is `created_at`,
+    // and it has no `message`. A per-line sniff is what this pair makes unnecessary.
+    let s = fold(&ag_step(1, "USER_INPUT", r#","content":"hello""#));
+    assert_eq!(s, TelemetrySnapshot::default());
+    assert_eq!(s.turns_user, 0, "the Claude fold populates neither counter");
+}
+
+#[test]
+fn r3_1_timestamps_come_from_created_at_not_from_content() {
+    // Antigravity's `created_at` is RFC 3339 with a `Z` and no fractional part — the
+    // same shape `parse_ts` already reads for Claude, one field name away. The
+    // `Created At:` line inside `content` is a LOCAL-offset clock seven hours away,
+    // and folding it would shift every uptime by the machine's offset.
+    let s = ag_fold(&format!(
+        "{}\n{}",
+        ag_step(
+            5,
+            "USER_INPUT",
+            r#","content":"Created At: 2026-08-13T20:05:00-07:00\n""#
+        ),
+        ag_step(9, "PLANNER_RESPONSE", r#","content":"ok""#),
+    ));
+    assert_eq!(s.first_event_ms, Some(AG_T0 + 5 * 60_000));
+    assert_eq!(s.last_event_ms, Some(AG_T0 + 9 * 60_000));
+
+    // An unparseable `created_at` leaves the clock where it was rather than defaulting
+    // to "now" — the step still folds, because the turn happened.
+    let s = ag_fold(&format!(
+        "{}\n{}",
+        ag_step(5, "USER_INPUT", ""),
+        r#"{"step_index":6,"source":"MODEL","type":"USER_INPUT","status":"DONE","created_at":"yesterday"}"#,
+    ));
+    assert_eq!(s.last_event_ms, Some(AG_T0 + 5 * 60_000));
+    assert_eq!(s.turns_user, 2);
+}
+
+#[test]
+fn r3_2_r3_3_the_last_model_selection_wins() {
+    // The model is a sentence, not a field. The effort tier is part of the value; the
+    // sentence's terminating period is not — and the value CONTAINS periods, so
+    // cutting at the first one yields `Gemini 3`.
+    let change = |i: u64, model: &str| {
+        ag_step(
+            i,
+            "USER_INPUT",
+            &format!(
+                r#","content":"<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to {model}. No need to comment on this change if the user doesn't ask about it.\n</USER_SETTINGS_CHANGE>""#
+            ),
+        )
+    };
+    let s = ag_fold(&change(1, "Gemini 3.6 Flash (High)"));
+    assert_eq!(s.model.as_deref(), Some("Gemini 3.6 Flash (High)"));
+
+    // R3.3 — last-wins, matching the existing field's contract.
+    let s = ag_fold(&format!(
+        "{}\n{}",
+        change(1, "Gemini 3.6 Flash (High)"),
+        change(2, "Gemini 3.7 Flash (High)")
+    ));
+    assert_eq!(s.model.as_deref(), Some("Gemini 3.7 Flash (High)"));
+
+    // Only a USER_INPUT is authoritative: one measured `grep_search` result echoed a
+    // settings sentence back, and scraping every step adopts a session's own log
+    // output as its model.
+    let echo = ag_step(
+        1,
+        "GREP_SEARCH",
+        r#","content":"match: The user changed setting `Model Selection` from None to Gemini 9.9 Flash (Low). No need""#,
+    );
+    assert_eq!(ag_fold(&echo).model, None);
+}
+
+#[test]
+fn r3_4_no_settings_block_leaves_the_model_unknown() {
+    // 21 of 54 measured `USER_INPUT` steps carry no settings block at all, so this is
+    // the common case, not the edge one. `None` renders the panel's existing
+    // unknown-model form; a guessed default would be a claim nothing measured.
+    let s = ag_fold(&format!(
+        "{}\n{}",
+        ag_step(
+            1,
+            "USER_INPUT",
+            r#","content":"<USER_REQUEST>\nhi\n</USER_REQUEST>""#
+        ),
+        ag_step(2, "PLANNER_RESPONSE", r#","content":"hello""#),
+    ));
+    assert_eq!(s.model, None);
+    assert_eq!(s.turns_user, 1, "the step still counts as a turn");
+}
+
+#[test]
+fn an_unmapped_result_step_is_not_an_orphan_but_a_missing_dispatch_is() {
+    // The two ways a result step can claim no pending call are different facts, and
+    // `orphan_tool_results` names only the second. `ERROR_MESSAGE`, `CHECKPOINT`,
+    // `SYSTEM_MESSAGE` and `CONVERSATION_HISTORY` report no tool call at all (G4
+    // leaves the error family unmapped in this pass), so counting them would make the
+    // diagnostic read as a parser fault on every well-formed transcript.
+    let s = ag_fold(
+        &[
+            ag_step(1, "CHECKPOINT", ""),
+            ag_step(2, "CONVERSATION_HISTORY", ""),
+            ag_step(3, "SYSTEM_MESSAGE", ""),
+            ag_step(4, "ERROR_MESSAGE", r#","error":"boom""#),
+        ]
+        .join("\n"),
+    );
+    assert_eq!(s.orphan_tool_results, 0);
+    assert_eq!(s.parse_errors, 0);
+    assert_eq!(s.total_tool_calls, 0);
+
+    // A real orphan: the watcher starts from a bounded tail, so a result whose
+    // dispatch sits above the window is guaranteed, not hypothetical.
+    let s = ag_fold(&ag_step(1, "VIEW_FILE", ""));
+    assert_eq!(s.orphan_tool_results, 1);
+}
+
+#[test]
+fn the_antigravity_pending_queue_is_bounded() {
+    // D6 is absolute, and this queue is the one structure the Antigravity fold adds
+    // that a session can grow without bound: an async `run_command` interrupted before
+    // its result step leaves an entry behind, and 7 such dispatches were in flight at
+    // EOF across the measured corpus. Observable consequence of the cap: dispatch 70
+    // calls, then answer all 70 — only the 64 the queue still holds can be matched.
+    let mut t = SessionTelemetry::with_format(LogFormat::Antigravity);
+    for i in 0..70 {
+        t.apply(&ag_dispatch(
+            i,
+            "view_file",
+            r#""AbsolutePath":"\"/a/b.rs\"""#,
+        ));
+    }
+    assert_eq!(t.snapshot().total_tool_calls, 0, "premise: none completed");
+    for i in 0..70 {
+        t.apply(&ag_step(i, "VIEW_FILE", ""));
+    }
+    let s = t.snapshot();
+    assert_eq!(s.total_tool_calls, 64, "PENDING_CAP, and not one more");
+    assert_eq!(s.orphan_tool_results, 6, "the 6 evicted dispatches");
+}
+
+/// AG2's join rule, pinned by the one observable that distinguishes it: **duration**.
+///
+/// Two `run_command`s are in flight when a single `RUN_COMMAND` result arrives — the async
+/// shape AG2 names, and the reason the rule is "oldest pending" rather than "the dispatch
+/// just above me" (measured, nearest-preceding is right only 736 of 772 times).
+///
+/// Both rules produce the same `tool_calls` tally, the same `tools.len()`, and the same
+/// names, so nothing about the *counts* can tell them apart. Only the pairing differs, and
+/// only `duration_ms` exposes it: oldest-first pairs step 1 with step 5 (4 min), while
+/// nearest-preceding pairs step 2 with step 5 (3 min). This test exists because mutating
+/// `.position(` to `.rposition(` in `claim_pending` — inverting exactly this rule — left the
+/// entire 1252-test suite green.
+#[test]
+fn an_async_result_claims_the_oldest_pending_call_not_the_nearest() {
+    let s = ag_fold(
+        &[
+            // A long-running command dispatched first...
+            ag_dispatch(
+                1,
+                "run_command",
+                r#""CommandLine":"\"cargo test --workspace\"""#,
+            ),
+            // ...and a second one dispatched while the first is still running.
+            ag_dispatch(2, "run_command", r#""CommandLine":"\"git status\"""#),
+            // One result. Which call does it belong to?
+            ag_step(5, "RUN_COMMAND", ""),
+        ]
+        .join("\n"),
+    );
+
+    assert_eq!(s.total_tool_calls, 1, "one result step, one counted call");
+    assert_eq!(s.tools.len(), 1);
+    assert_eq!(
+        s.tools[0].duration_ms,
+        Some(240_000),
+        "the result must claim the OLDEST pending dispatch (step 1 -> 5 = 4min). \
+         180_000 here means the join became nearest-preceding, which AG2 rejects"
+    );
+    assert_eq!(
+        s.tools[0].start_ms,
+        Some(AG_T0 + 60_000),
+        "step 1's clock, not step 2's"
+    );
+
+    // And the queue drains in the same order: a second result takes the one left over.
+    let s = ag_fold(
+        &[
+            ag_dispatch(1, "run_command", r#""CommandLine":"\"slow\"""#),
+            ag_dispatch(2, "run_command", r#""CommandLine":"\"fast\"""#),
+            ag_step(5, "RUN_COMMAND", ""),
+            ag_step(6, "RUN_COMMAND", ""),
+        ]
+        .join("\n"),
+    );
+    assert_eq!(s.total_tool_calls, 2);
+    let mut durs: Vec<Option<u64>> = s.tools.iter().map(|t| t.duration_ms).collect();
+    durs.sort();
+    assert_eq!(
+        durs,
+        vec![Some(240_000), Some(240_000)],
+        "step1->5 is 4min and step2->6 is 4min; any other pair means the queue \
+         did not drain oldest-first"
+    );
+}
+
+#[test]
+fn results_are_claimed_in_dispatch_order_by_expected_step_type() {
+    // Antigravity's calls carry no id, so the pairing is by expected result-step type,
+    // oldest first. That ordering is what an async `run_command` needs — its result
+    // step can arrive several steps after a later call's — and `GENERIC` is what makes
+    // it load-bearing rather than incidental: five different tools report through it.
+    let s = ag_fold(
+        &[
+            ag_dispatch(1, "define_subagent", r#""name":"\"first\"""#),
+            ag_dispatch(2, "manage_task", r#""Action":"\"create\"""#),
+            ag_step(3, "GENERIC", ""),
+            ag_step(4, "GENERIC", ""),
+        ]
+        .join("\n"),
+    );
+    assert_eq!(
+        s.tool_calls,
+        vec![
+            ("define_subagent".to_string(), 1),
+            ("manage_task".to_string(), 1)
+        ]
+    );
+    // G5 — `manage_task` is classified `Task`, so it reaches neither the tools ring
+    // nor the TASKS map: the transcript records no subject and no status transitions.
+    assert_eq!(s.tools.len(), 1, "only the Plain `define_subagent`");
+    assert!(s.tasks.is_empty());
+
+    // A name the mapping does not know is never matched to a result step. Counting it
+    // would mean crediting a real call to the wrong tool; the miss is visible instead.
+    let s = ag_fold(&format!(
+        "{}\n{}",
+        ag_dispatch(1, "brand_new_tool", r#""toolSummary":"\"Do a new thing\"""#),
+        ag_step(2, "VIEW_FILE", "")
+    ));
+    assert_eq!(s.total_tool_calls, 0);
+    assert_eq!(s.orphan_tool_results, 1);
+}
+
+#[test]
+fn the_turn_counters_default_to_nothing_folded() {
+    // AG8 widens the versioned contract, and the app decides its empty state with
+    // `*t == TelemetrySnapshot::default()`. A counter whose default meant anything
+    // other than "not measured" would make an empty session read as an attached one.
+    let d = TelemetrySnapshot::default();
+    assert_eq!(d.turns_user, 0);
+    assert_eq!(d.turns_assistant, 0);
+    assert_eq!(
+        SessionTelemetry::with_format(LogFormat::Antigravity).snapshot(),
+        d,
+        "a fresh Antigravity accumulator is indistinguishable from a fresh Claude one"
+    );
+}
+
+/// G5 closed: an async command becomes a TASKS row and its status transitions (2026-08-16).
+///
+/// Bodies transcribed from a live 1.1.13 session, including the `Log:` line and the banner
+/// that follow the fields — the parse is line-scoped precisely so those do not get swallowed.
+///
+/// Antigravity's "task" is an async background COMMAND, not a to-do item, and that is why
+/// the card is worth filling: while a `cargo test --workspace` runs for minutes, it is the
+/// one thing the session is actually waiting on.
+#[test]
+fn an_async_command_becomes_a_task_and_its_status_transitions() {
+    let created = "Created At: 2026-08-16T12:08:57-07:00\nTool is running as a background \
+task with task id: 6436db1a/task-39\nTask Description: cargo test --workspace\nTask logs \
+are available at: file:///Users/x/.gemini/antigravity-cli/brain/6436db1a/.system_generated/\
+tasks/task-39.log\nYOU MUST TRACK THIS TASK";
+    let running = "Created At: 2026-08-16T12:09:10-07:00\nCompleted At: \
+2026-08-16T12:09:10-07:00\nTask: 6436db1a/task-39\nStatus: RUNNING\nLog: /Users/x/t.log";
+    let done = "Created At: 2026-08-16T12:09:21-07:00\nCompleted At: \
+2026-08-16T12:09:21-07:00\nTask: 6436db1a/task-39\nStatus: DONE\nLog: /Users/x/t.log";
+
+    let step = |i: u64, ty: &str, content: &str| {
+        format!(
+            r#"{{"step_index":{i},"source":"MODEL","type":"{ty}","status":"DONE","created_at":"2026-08-14T03:{:02}:00Z","content":{}}}"#,
+            i,
+            serde_json::to_string(content).unwrap()
+        )
+    };
+
+    // born on an async run_command, then two manage_task status checks
+    let s = ag_fold(
+        &[
+            ag_dispatch(
+                1,
+                "run_command",
+                r#""CommandLine":"\"cargo test --workspace\"","WaitMsBeforeAsync":"8000""#,
+            ),
+            step(2, "RUN_COMMAND", created),
+            ag_dispatch(
+                3,
+                "manage_task",
+                r#""Action":"\"status\"","TaskId":"\"6436db1a/task-39\"""#,
+            ),
+            step(4, "GENERIC", running),
+            ag_dispatch(
+                5,
+                "manage_task",
+                r#""Action":"\"status\"","TaskId":"\"6436db1a/task-39\"""#,
+            ),
+            step(6, "GENERIC", done),
+        ]
+        .join("\n"),
+    );
+
+    assert_eq!(s.tasks.len(), 1, "one task, updated twice — not three rows");
+    let (id, e) = &s.tasks[0];
+    assert_eq!(id, "6436db1a/task-39", "keyed as manage_task spells it");
+    assert_eq!(
+        e.subject, "cargo test --workspace",
+        "the subject is the command, which only the creation body carries"
+    );
+    assert_eq!(
+        e.status, "completed",
+        "RUNNING then DONE must land on the vocabulary the card colours green"
+    );
+    assert!(
+        e.updated_ms > e.created_ms,
+        "the last status moved the clock"
+    );
+    assert_eq!(s.orphan_task_updates, 0);
+
+    // A status report with no creation above it must NOT invent a subject-less row.
+    let s = ag_fold(
+        &[
+            ag_dispatch(
+                1,
+                "manage_task",
+                r#""Action":"\"status\"","TaskId":"\"6436db1a/task-99\"""#,
+            ),
+            step(2, "GENERIC", "Task: 6436db1a/task-99\nStatus: RUNNING"),
+        ]
+        .join("\n"),
+    );
+    assert!(
+        s.tasks.is_empty(),
+        "a task whose creation sits above the tail window has no subject to show"
+    );
+    assert_eq!(
+        s.orphan_task_updates, 1,
+        "and the miss is recorded, not silent"
+    );
+}
+
+/// G10 closed: an explicitly invoked skill becomes a SKILLS row (2026-08-16).
+///
+/// Body transcribed from the live corpus. Antigravity has no skill TOOL — the invocation is
+/// a `<SKILL>` block spliced into the user's own turn — which is why an audit of tool names
+/// concluded no skill signal existed. It does; it is just not where a tool would be.
+#[test]
+fn an_explicitly_invoked_skill_becomes_a_skills_row() {
+    let with_skill = |i: u64, body: &str| {
+        let content = format!(
+            "<USER_REQUEST>\ndo the thing\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\n{body}\n</ADDITIONAL_METADATA>"
+        );
+        format!(
+            r#"{{"step_index":{i},"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-08-14T03:{:02}:00Z","content":{}}}"#,
+            i,
+            serde_json::to_string(&content).unwrap()
+        )
+    };
+
+    let real = "<SKILL>The user has explicitly invoked the (worktree) skill. You must \
+strictly follow the instructions in this skill to process their request. Here are its \
+contents:\n# /worktree — Isolated Parallel Session Workspaces\n\nManage `git worktree` \
+directories (see below).</SKILL>";
+
+    let s = ag_fold(&with_skill(0, real));
+    assert_eq!(s.skills.len(), 1, "the invocation must be recorded");
+    assert_eq!(
+        s.skills[0].name, "worktree",
+        "the parenthesised name, not the body"
+    );
+    assert_eq!(
+        s.skills[0].start_ms,
+        Some(AG_T0),
+        "stamped with the turn's clock"
+    );
+    assert_eq!(s.turns_user, 1, "and it is still one user turn");
+
+    // The body's own parentheses must not be mistaken for the name — the real bodies are
+    // full markdown documents and contain many.
+    assert!(
+        !s.skills[0].name.contains("see below"),
+        "the scan must stop at the introducing sentence: {:?}",
+        s.skills[0].name
+    );
+
+    // A turn with no skill block folds nothing.
+    let s = ag_fold(&with_skill(
+        0,
+        "The current local time is: 2026-08-14T03:00:00-07:00.",
+    ));
+    assert!(s.skills.is_empty(), "no marker, no row");
+
+    // A malformed block names nothing rather than inventing an unnamed row.
+    let s = ag_fold(&with_skill(
+        0,
+        "<SKILL>The user has explicitly invoked the skill.</SKILL>",
+    ));
+    assert!(
+        s.skills.is_empty(),
+        "a marker with no name must fold nothing"
+    );
+}
+
+/// CLI 1.1.15 renamed the `run_command` result step, and the pairing must survive it.
+///
+/// Reported live: an `agy` tab ran two Bash commands and the panel showed RECENT CALLS and
+/// TOOL USAGE both empty. The CLI had updated itself that minute, and under 1.1.15 a
+/// command's result arrives typed `GENERIC` with no `exit_code` key rather than typed
+/// `RUN_COMMAND` — so no pending call expected the type that arrived and both were orphaned.
+///
+/// The discriminator is the result body, which is why this pins BOTH directions in one test:
+/// the same `GENERIC` type must claim a command and must NOT claim `manage_task`'s result,
+/// which reports through `GENERIC` legitimately. Measured on the corpus, the marker is in all
+/// 352 `RUN_COMMAND` bodies and none of the 68 non-command `GENERIC` ones.
+#[test]
+fn a_command_result_typed_generic_still_pairs_with_its_dispatch() {
+    const BODY: &str = "Created At: 2026-08-18T23:55:35-07:00\\nCompleted At: 2026-08-18T23:55:42-07:00\\n\\nThe command exited with code 0.\\nOutput:\\nhi\\n";
+
+    let s = ag_fold(&format!(
+        "{}\n{}",
+        ag_dispatch(
+            1,
+            "run_command",
+            r#""Cwd":"\"/proj\"","toolSummary":"\"List worktrees\"""#
+        ),
+        ag_step(2, "GENERIC", &format!(r#","content":"{BODY}""#)),
+    ));
+    assert_eq!(
+        s.tool_calls,
+        vec![("run_command".to_string(), 1)],
+        "a GENERIC step carrying a command result is a command result"
+    );
+    assert_eq!(s.tools.len(), 1, "and it reaches RECENT CALLS");
+    assert_eq!(s.tools[0].name, "List worktrees");
+    assert_eq!(s.tools[0].duration_ms, Some(60_000));
+    assert_eq!(s.orphan_tool_results, 0);
+
+    // The other direction. `manage_task` genuinely reports through `GENERIC`, so if the
+    // rewrite were keyed on the type alone this call would be silently mis-attributed to
+    // `run_command` — the exact mis-pairing AG2 refuses to make.
+    let s = ag_fold(&format!(
+        "{}\n{}\n{}",
+        ag_dispatch(1, "run_command", r#""Cwd":"\"/proj\"""#),
+        ag_dispatch(2, "manage_task", r#""TaskId":"\"7\"""#),
+        ag_step(3, "GENERIC", r#","content":"Task 7 updated successfully""#),
+    ));
+    assert_eq!(
+        s.tool_calls,
+        vec![("manage_task".to_string(), 1)],
+        "a GENERIC with no command marker belongs to the tool that really expects GENERIC, \
+         even with an older run_command still pending"
+    );
 }
