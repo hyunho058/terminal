@@ -310,6 +310,14 @@ survived a full review cycle:
    notification carries a parseable timestamp — so this is a latent fix, not a bug that had
    bitten. Found by the Gate-3 checker, not by the 44 GWTs.
 
+11. **Post-implementation (2026-08-20).** D9 attributed the never-notified ghosts to
+   sessions that end or are cleared before the notification is written. Measured: of 8
+   ghosts, **8 had a notification written and 0 did not** — every one into `attachment` and
+   `queue-operation`, carriers Research already knew the fold cannot reach. The carrier table
+   and the ghost rate were both correct; the *causal link between them* was never drawn, so
+   the decision recorded a cause it had not measured. Found by running the feature against a
+   live agent rather than by re-reading the spec.
+
 ## Decisions
 
 ### D1: An async launch is detected by `toolUseResult.isAsync` **being present and true**, with a scoped prose marker as a second witness
@@ -411,14 +419,32 @@ survived a full review cycle:
   contract: an aged-out agent stays out. Rejected: re-inserting the entry (an old agent
   would displace a newer one and reorder the list under the user).
 
-### D9: A launched-but-never-notified **async** agent stays LIVE, with no clamp
+### D9: An **async** agent this fold never sees notified stays LIVE, with no clamp
 - **Status**: resolved
-- **Rationale**: If a session ends or is cleared before the notification is written, the
-  log never says the agent finished, and the panel does not invent an ending. Measured:
-  **9 of 73 launches (12.3%)**. `dur()` handles unbounded growth safely — hours format as
-  `31h00m`, `u64` cannot overflow (`dashboard.rs:1013-1022`). Rejected: freezing at
-  `last_event_ms` (a plausible number the log never asserted — the same fabrication this
-  spec exists to remove).
+- **Rationale**: When no notification reaches the fold, nothing in what the fold reads says
+  the agent finished, and the panel does not invent an ending. Roughly one async launch in
+  eight lands here. `dur()` handles unbounded growth safely — hours format as `31h00m`,
+  `u64` cannot overflow (`dashboard.rs:1013-1022`). Rejected: freezing at `last_event_ms`
+  (a plausible number the log never asserted — the same fabrication this spec exists to
+  remove).
+- **Corrected 2026-08-20 — the cause is not what this decision first claimed.** The original
+  rationale read: *"If a session ends or is cleared before the notification is written, the
+  log never says the agent finished."* Measured across the corpus that day: of 60 async
+  launches, 52 were notified in a form this fold reads and **8 were not — and all 8 had a
+  notification written anyway.** Every one of them landed in `attachment` and
+  `queue-operation` records, the two carriers Research already lists as *"reaches the fold?
+  no"*. **Zero were never written.** A live instance was captured while testing this very
+  feature: a background agent whose notification appeared six times in the log, never once as
+  a bare-string `user` record, leaving its card reading `● 6h01m`.
+- **What this changes.** Nothing about the shipped behaviour — the gap is accepted either
+  way, and D12's bare-string gate stays exactly as specified. What it changes is
+  *tractability*: under the original rationale the data does not exist and there is nothing
+  to recover; in fact the data exists and is merely unread, so the ghost rate is recoverable
+  by widening the carrier set rather than inherent. That is deliberately **not** attempted
+  here — those two carriers hold several times more occurrences than the bare-string
+  population, mostly duplicates of notifications already handled, so widening needs its own
+  measurement of double-completion and timestamp disagreement. Recorded as a follow-up, not
+  a defect of this change.
 
 ### D10: `on_tool_result` takes the top-level line as a distinct parameter
 - **Status**: assumed
@@ -524,9 +550,14 @@ survived a full review cycle:
 
 - **The resume window renders DONE while the agent runs** (D7). Bounded by the next
   notification, which restores a correct cumulative total.
-- **12.3% of async launches are permanent LIVE ghosts** (D9) — 9 of 73 measured. Accepted
-  deliberately; today these render a wrong `0s ◯` instead. Sync agents are unaffected:
-  they complete from their own `tool_result` and never depend on a notification.
+- **Roughly one async launch in eight becomes a permanent LIVE ghost** (D9). Accepted
+  deliberately; today these render a wrong `0s ◯` instead. Sync agents are unaffected: they
+  complete from their own `tool_result` and never depend on a notification. **Their
+  notifications are written — just not where this fold reads.** Measured 2026-08-20: 8 of 8
+  ghosts had a notification in `attachment` and `queue-operation` records, 0 had none. So
+  this gap is *recoverable* by widening the carrier set, not inherent to the data — see D9's
+  correction for why that widening is a follow-up with its own measurement rather than a
+  line-change here.
 - **A sync agent's card can jump long after it finished** (D11 sub-decision) — a background
   resume notifying hours later rewrites its elapsed from e.g. `4s ◯` to `2h13m ◯`.
   Intended, and the mechanism behind D4's 30-agent coverage gain, but surprising in the UI
