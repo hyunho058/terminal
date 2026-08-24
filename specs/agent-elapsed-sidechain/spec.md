@@ -345,6 +345,21 @@ survived a full review cycle:
   upstream edit. The point of a second witness is an independent failure domain, so the
   prose is chosen despite being the weaker signal. Rejected: `isSidechain` (uniformly
   `false` in the parent file).
+- **Reviewed 2026-08-23 (run 2, finding 3) — `starts_with` is kept, deliberately.** The review
+  raised the matching rule as a false-positive risk: a genuine synchronous answer that merely
+  *opened* with that sentence would be read as a receipt, and since no notification describes a
+  sync completion, the agent would be stranded as a permanent `● LIVE` ghost — exactly the
+  failure D2 refuses. The risk is real and the scoping paragraph above is what bounds it. Two
+  measurements decided it against tightening: **zero** false positives were found (every result
+  in the corpus opening with the literal was a genuine receipt), and **8** of them were caught
+  by the prose witness *alone*, their `toolUseResult` carrying no `isAsync` — so the second
+  witness is not decoration, and narrowing the literal risks losing detections that only it
+  makes. Rejected: extending the literal to the ~179-character prefix all observed receipts
+  share (it would make an accidental match essentially impossible and keep all 8, but it buys
+  that by binding the witness harder to upstream *wording* — the precise fragility this witness
+  was chosen in spite of, and the opposite direction from `isAsync`'s independence). Rejected:
+  dropping the prose witness for `isAsync` alone (loses the 8, and collapses R10.3's
+  independence requirement). Both counts are as-of readings of a rolling ~30-day window.
 
 ### D2: When neither witness fires, keep today's behaviour
 - **Status**: resolved
@@ -488,11 +503,17 @@ survived a full review cycle:
 ### D13: The end is reduced to a boolean initialised `true`; a failed end keeps `◯` and turns the **accent bar** Rose
 - **Status**: resolved
 - **Rationale**: `Subagent` gains one `bool` — `ended_ok` — **initialised `true` at
-  `on_tool_use`** and set to `status == "completed"` when a notification arrives. `true` is
-  the only safe initial value: the field is written *only* in the notification branch, so
-  the ghosts (D9), every in-flight agent, every sync completion and every D2 fallback
-  completion keep whatever it starts as — initialising `false` would paint all of them as
-  failures. `Subagent` has no `Default` derive, so this value is stated at every literal
+  `on_tool_use`** and written wherever an ending is *observed*: set from the notification's
+  status when one arrives, and from the result's own `is_error` when an `Agent` result
+  completes the entry on the non-launch path. `true` is the only safe initial value: the
+  ghosts (D9) and every in-flight agent keep whatever it starts as, and initialising `false`
+  would paint all of them as failures.
+  *(Corrected 2026-08-23 — see R7.1's amendment. This read "the field is written *only* in the
+  notification branch, so … every sync completion and every D2 fallback completion keep
+  whatever it starts as". The initial-value argument was right and is kept; the "only the
+  notification branch" clause was not. A sync `Agent` result carries `is_error`, which
+  `tally_call` was already folding into `failed_tool_calls` one branch earlier, so withholding
+  it from the card left the panel contradicting its own counter.)* `Subagent` has no `Default` derive, so this value is stated at every literal
   site, whatever their number (see R9.1). A `bool` keeps the contract change minimal and
   classifies future status vocabulary automatically: `failed` and `killed` need no separate
   handling, and a fourth value invented upstream lands on the safe side.
@@ -568,6 +589,26 @@ survived a full review cycle:
   distinction later means widening the boolean.
 - **Upstream format drift is mitigated, not eliminated** (D1/D2). Two witnesses must both
   fail before the defect returns, and the failure is silent.
+- **A log truncation loses live background agents, and this feature widened that window**
+  (run 2, finding 2). When the watched `.jsonl` shrinks under the tail, `lib.rs` rebuilds the
+  accumulator via `SessionTelemetry::restarted()`, which drops everything folded — the
+  `subagents` ring included. Before this feature an agent was completed ~83ms after its
+  launch, so the exposure was that sliver; now an agent stays live for its whole run, so a
+  truncation mid-run drops a card that will never come back — the notification that would
+  have ended it arrives, finds no entry with that `agent_id`, and returns silently and
+  uncounted (D8). The window went from milliseconds to an agent's full lifetime, and that
+  cost is real.
+  **Kept anyway, because the obvious repair points the wrong way down D2.** A file that
+  shrank is most likely no longer the same session's content, so carrying its live entries
+  into the fresh fold imports agents whose notifications may never arrive — manufacturing
+  precisely the permanent `● LIVE` ghost D2 exists to refuse, and doing it to *every*
+  truncation rather than the rare one. Dropping degrades to a missing card, which is the
+  quieter and more honest of the two failures and matches the direction D2 already chose
+  everywhere else. Rejected for the same reason: carrying only `completed == false` entries
+  (narrower, same ghost risk). Fixing this properly means giving `restarted()` a way to know
+  whether the shrunken file is still the same session — a question this feature does not have
+  the evidence to answer, and one that belongs to `restarted()`'s own feature rather than
+  to a sidechain-elapsed fix.
 
 ## Requirements
 
@@ -743,10 +784,25 @@ survived a full review cycle:
 
 ### R7: A failed end is visible without a second glyph vocabulary (D13)
 
-#### R7.1: `ended_ok` starts true
+#### R7.1: `ended_ok` starts true, and is written wherever an ending is observed
 - **Given**: any newly opened ring entry (R6.1)
 - **When**: the snapshot is taken
-- **Then**: `ended_ok` is `true`; it is written **only** by the notification branch, so in-flight agents, sync completions, D2 fallbacks and never-notified ghosts all retain this value
+- **Then**: `ended_ok` is `true`, and it is written by every branch that *observes* an ending — the notification branch, and the non-launch `Agent` result branch, which carries `is_error`. In-flight agents and never-notified ghosts retain the opening value because nothing has observed their end; a synchronous completion retains it only when its result reports no error
+
+> **Amended 2026-08-23 (run 2, finding 1).** This sub-requirement previously read "it is
+> written **only** by the notification branch, so in-flight agents, sync completions, D2
+> fallbacks and never-notified ghosts all retain this value". That was wrong, and D13 carried
+> the same error. The reasoning it came from is sound — `true` must be the initial value, or
+> every un-notified agent reads as a failure — but it over-generalised from "the initial value
+> must be safe" to "nothing but a notification may ever write the field", and a synchronous
+> `Agent` result **does** carry an ending and **does** say whether it succeeded. The fold was
+> already reading that very bit one branch earlier: `ok` is derived at `telemetry.rs:1166` and
+> folded into `failed_tool_calls` by `tally_call`, so the panel counted a failed call while the
+> card for the agent it failed on rendered in the success colour — two readings of one result,
+> disagreeing. The corrected rule keeps the property that mattered (nothing *unobserved* is
+> ever painted a failure) and drops the clause that was merely how it happened to be
+> implemented. Kept visible rather than rewritten away, so the next reader can see this was a
+> claim that got tested and lost.
 
 #### R7.2: A `completed` notification keeps it true
 - **Given**: the fold of R5.1, whose `<status>` is `completed`
@@ -758,15 +814,44 @@ survived a full review cycle:
 - **When**: both are folded
 - **Then**: both entries carry `ended_ok: false` and both carry the notified `end_ms`; a hypothetical fourth upstream status would also land on `false`, which is the safe side
 
+#### R7.3a: An **absent** `<status>` tag is not a failure
+- **Given**: a notification that parses — `parse_task_notification` requires only `<task-id>` — but carries no `<status>` tag at all, so `TaskNotification::status` is `None`
+- **When**: it is folded
+- **Then**: `ended_ok` stays `true` and the agent still completes at the notified `end_ms`; only a status that is **present and not `completed`** sets `false`
+
+> **Added 2026-08-23 (run 2, finding 4).** R7.3's "safe side" rule was written about unknown
+> *values* and silently assumed a value was always there. It was implemented as
+> `n.status.as_deref() == Some("completed")`, under which `None` compares unequal and an agent
+> is painted Rose for the sole reason that its status could not be read. That inverts D2: an
+> absent field is the absence of a reading, never a reading of "it failed" — the same rule the
+> fold already applies to `is_error`, where only an explicit `true` is a failure. The safe side
+> of a *missing* signal and the safe side of an *unrecognised* one point in opposite
+> directions, which is why this needs its own sub-requirement rather than a clause on R7.3.
+> Measured 2026-08-23: of the bare-string task-notifications then on disk, none lacked the tag
+> (`completed`/`failed`/`killed` only) — read as an as-of reading of a rolling ~30-day window;
+> the case is reachable by construction, which is what this rests on, not on its frequency.
+
 #### R7.4: A failed end colours the accent bar, not the glyph
 - **Given**: the snapshot of R7.3
 - **When**: `agents()` renders
 - **Then**: the card's accent is `ColorRole::Rose`, its title still begins with `◯`, and its value is the frozen real duration — a failed run's elapsed is as real as a successful one's
 
-#### R7.5: Nothing else is ever Rose
-- **Given**: a live agent, a synchronously completed agent, and a D2-fallback completion in one snapshot
+#### R7.5: Nothing *unobserved* is ever Rose
+- **Given**: a live agent, a synchronously completed agent whose result reported **no** error, and a D2-fallback completion in one snapshot
 - **When**: `agents()` renders
 - **Then**: their accents are `Amber`, `TextFaint`, `TextFaint` — the Rose rule is gated on `completed && !ended_ok`, so it can never fire on an agent whose elapsed is still growing
+
+#### R7.5a: A **failed** synchronous completion is Rose
+- **Given**: an `Agent` result carrying `is_error: true` and neither launch witness (D1), so it completes on the non-launch path
+- **When**: `agents()` renders
+- **Then**: the card's accent is `ColorRole::Rose`, its title still begins with `◯`, and its value is the frozen real duration — the same treatment R7.4 gives a notified failure, because the fold knows this one failed just as certainly
+
+> **Amended 2026-08-23 (run 2, finding 1).** R7.5 previously listed "a synchronously completed
+> agent" flatly among the things that are never Rose, which read as a rule about *sync
+> completions* when the property it was actually pinning is that `completed` alone must never
+> imply Rose. A sync completion that errored is an observed failure and is coloured like one;
+> what stays exempt is an agent whose end nothing has observed. The gate itself is unchanged —
+> `completed && !ended_ok` — so no in-flight card can go Rose.
 
 #### R7.6: `ended_ok` is last-wins, like `end_ms`
 - **Given**: an agent notified `failed`, then resumed and notified `completed`

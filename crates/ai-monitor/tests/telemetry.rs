@@ -1172,6 +1172,39 @@ fn a_status_nobody_has_seen_lands_on_the_safe_side() {
 }
 
 #[test]
+fn an_absent_status_tag_is_not_a_failure() {
+    // R7.3a — the OTHER side of "the safe side", and the one R7.3 does not cover. An
+    // unknown *value* is evidence of a bad ending; an absent *tag* is no
+    // evidence at all, and reading it as a failure paints an agent Rose for the sole
+    // reason that its status could not be read.
+    //
+    // Reachable by construction, not hypothetically: `parse_task_notification` requires
+    // only `<task-id>`, so this notification parses and joins.
+    let no_status = "<task-notification>\n\
+         <task-id>agent-11</task-id>\n\
+         <tool-use-id>toolu_the_call_that_woke_it</tool-use-id>\n\
+         <result>finished, but the status tag never arrived</result>\n\
+         </task-notification>";
+    let parsed = parse_task_notification(no_status).expect("no <status> still parses");
+    assert_eq!(parsed.status, None, "the tag really is absent");
+
+    let s = fold(&format!(
+        "{}\n{}",
+        async_launch("a1", "agent-11"),
+        bare_string_line(no_status, "2026-08-19T00:24:21.000Z")
+    ));
+    // Catches reverting `is_none_or` to `== Some("completed")` or to
+    // `map_or(false, ..)`: either reads the absence as a failure and flips this.
+    assert!(
+        s.subagents[0].ended_ok,
+        "an unreadable status is not a failed one"
+    );
+    // The ending itself is still recorded — the notification did say the agent stopped.
+    assert!(s.subagents[0].completed);
+    assert_eq!(s.subagents[0].end_ms, Some(T0 + 1_461_000));
+}
+
+#[test]
 fn a_failed_agent_resumed_to_success_reads_as_success() {
     // R7.6 — `ended_ok` is last-wins, like `end_ms`. Stated and tested because it
     // follows from two rules rather than from one, which is how it would be missed.
@@ -1193,9 +1226,13 @@ fn a_failed_agent_resumed_to_success_reads_as_success() {
 
 #[test]
 fn an_agent_no_notification_describes_keeps_ended_ok() {
-    // R7.1 at the far end: the field is written ONLY in the notification branch, so a
-    // synchronous completion and a never-notified launch both keep `true`. Seeding
-    // `false` would paint every one of them as a failure.
+    // R7.1 at the far end: a synchronous completion that did NOT error, and a launch no
+    // notification has described yet, both keep `true`. Seeding `false` would paint
+    // every one of them as a failure.
+    //
+    // The sync result below carries no `is_error`, which is how a success is written —
+    // so this stays a test about the OPENING value surviving, not about the failure
+    // path. Its failing twin is `a_failed_sync_agent_is_not_coloured_as_a_success`.
     let sync = fold(&format!(
         "{}\n{}",
         r#"{"type":"tool_use","id":"a1","name":"Agent","input":{"subagent_type":"Explore"},"timestamp":"2026-08-19T00:00:00.000Z"}"#,
@@ -1207,6 +1244,27 @@ fn an_agent_no_notification_describes_keeps_ended_ok() {
     let ghost = fold(&async_launch("a1", "agent-11"));
     assert!(!ghost.subagents[0].completed);
     assert!(ghost.subagents[0].ended_ok);
+}
+
+#[test]
+fn a_failed_sync_agent_is_not_coloured_as_a_success() {
+    // R7.1 — an `Agent` result carrying `is_error: true` is an observed failure, so the
+    // ring entry says so. Catches dropping `a.ended_ok = ok` from the non-launch path:
+    // without it this entry reads `ended_ok: true` and the card renders TextFaint, i.e.
+    // identical to a clean run.
+    let s = agent_pair(
+        r#"{"type":"tool_result","tool_use_id":"a1","is_error":true,"timestamp":"2026-08-19T00:00:04.000Z","content":"Agent failed: terminal API error","toolUseResult":{"agentId":"agent-sync"}}"#,
+    );
+    assert!(s.subagents[0].completed, "a failure is still an ending");
+    assert!(
+        !s.subagents[0].ended_ok,
+        "the failure reaches the ring entry"
+    );
+    // The point of the fix: the card and the counter now agree about one result. Before
+    // it, `failed_tool_calls` was 1 while the entry claimed success.
+    assert_eq!(s.failed_tool_calls, 1, "and the counter agrees");
+    // The end time is still real — a failed run's duration is as true as a good one's.
+    assert_eq!(s.subagents[0].end_ms, Some(T0 + 4_000));
 }
 
 #[test]

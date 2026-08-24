@@ -234,10 +234,16 @@ pub struct Subagent {
     /// synchronously finished agent can still be resumed in the background later
     /// (D5/R3).
     pub agent_id: Option<String>,
-    /// Whether the end was a success. Written ONLY by the notification branch, so an
-    /// in-flight agent, a synchronous completion and a never-notified agent all keep
-    /// the initial value — which is why that value must be `true`. Initialising
-    /// `false` would paint every one of them as a failure (D13/R7.1).
+    /// Whether the end was a success. Written wherever an ending is *observed* — by the
+    /// notification branch, and by the `Agent` result itself when that result is an
+    /// answer rather than a launch receipt. An in-flight agent and a never-notified
+    /// agent keep the initial value, which is why that value must be `true`:
+    /// initialising `false` would paint both as failures (D13/R7.1).
+    ///
+    /// The "notification branch only" rule this field shipped with was narrower than the
+    /// facts. A synchronous `Agent` result carries `is_error`, so its success is *known*
+    /// at fold time and was already being folded into `failed_tool_calls` — withholding
+    /// it here left the card and the counter disagreeing about one result.
     pub ended_ok: bool,
 }
 
@@ -485,6 +491,15 @@ impl SessionTelemetry {
     /// silently reset the dialect to Claude, contradicting [`format`](Self::format)'s own
     /// "fixed for its whole life" — an Antigravity transcript that shrank would have kept
     /// tailing in the wrong dialect for the rest of its life.
+    ///
+    /// **The `subagents` ring is dropped too, and that has a known cost.** A live background
+    /// agent loses its card here, and the `<task-notification>` that would have ended it later
+    /// finds no entry to join and is discarded. Since agents began staying live for their whole
+    /// run, this window is an agent's lifetime rather than the ~83ms it used to be. Carrying
+    /// live entries across the reset was considered and refused: a file that shrank is most
+    /// likely not the same session any more, so importing its agents manufactures the permanent
+    /// LIVE ghost the conservative-failure rule (D2) exists to refuse — and does it on every
+    /// truncation, not the rare one. See `specs/agent-elapsed-sidechain/spec.md` § Known Gaps.
     pub fn restarted(&self) -> Self {
         Self::with_format(self.format).with_log_session_id(self.log_session_id.clone())
     }
@@ -1217,6 +1232,23 @@ impl SessionTelemetry {
                     if !launched {
                         a.completed = true;
                         a.end_ms = ts;
+                        // The SAME `ok` the counters above folded. Omitting it here was
+                        // the defect: `tally_call` had already charged this call to
+                        // `failed_tool_calls` while the card kept the `true` it opened
+                        // with, so the panel's own two readings of one result disagreed
+                        // — the aggregate said a call failed and the agent it failed on
+                        // rendered in the success colour.
+                        //
+                        // Inside the gate because a receipt reports on the DISPATCH, not
+                        // on the run it started — but that placement is a statement of
+                        // meaning, not a guard, and no test pins it: hoisting this line
+                        // above `if !launched` was measured to change no rendered output.
+                        // A receipt carries no `is_error`, so it would write the `true`
+                        // the entry already holds; and an errored receipt would leave
+                        // `completed: false`, which the accent reads as live whatever
+                        // `ended_ok` says. Stated here rather than defended by a test
+                        // that would only look like one.
+                        a.ended_ok = ok;
                     }
                 }
             }
@@ -1281,10 +1313,19 @@ impl SessionTelemetry {
         // failed and was then resumed to success goes back to reading as a success
         // (D13/R7).
         //
+        // An ABSENT `<status>` is a third case, and it is not the same as an unknown
+        // value. `parse_task_notification` requires only `<task-id>`, so a notification
+        // with no status tag parses and arrives here with `None` — and a plain
+        // `== Some("completed")` reads that as a failure, painting an agent Rose for the
+        // sole reason that the tag could not be read. That inverts D2: a missing field is
+        // the absence of a reading, never a reading of "it failed". `is_none_or` keeps
+        // the failure side reserved for a status that is present and explicitly not
+        // `completed`, which is the same rule `is_error` follows where `ok` is derived.
+        //
         // No count is quoted here on purpose. The logs this was measured against are a
         // rolling ~30-day window, so any tally goes stale on its own; the vocabulary,
         // not its frequency, is what this line depends on.
-        a.ended_ok = n.status.as_deref() == Some("completed");
+        a.ended_ok = n.status.as_deref().is_none_or(|s| s == "completed");
     }
 
     /// Task state changes (D9). `TaskCreate.input` carries no id — the assigned id

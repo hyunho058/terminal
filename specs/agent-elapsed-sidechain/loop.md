@@ -6,14 +6,39 @@ R0–R10 and violates none of its Constraints: an async `Agent` launch must no l
 as a completion, and a background agent must end at the time its `<task-notification>` reports
 — 24m21s reading as `24m21s`, never `0s`.
 
-**The implementation is complete.** This loop starts at VERIFY; iteration 1 does no work.
+**Run 2 (2026-08-23) — four review findings.** The implementation shipped; a review then raised
+four defects in the fold. All four were measured against the log corpus before any decision, and
+all four turned out to be **unobserved** there — robustness, not live breakage. The human ruled on
+each (see `## Run 2 decisions`): fix two, record-and-keep two. Two of the rulings authorise an
+edit to `spec.md`, which the previous run's Scope forbade; that reversal is deliberate and
+recorded below rather than taken silently.
+
+## Run 2 decisions
+| # | Finding | Ruling | Touches |
+|---|---------|--------|---------|
+| 1 | A sync `Agent` failure (`is_error: true`) renders in the success colour: `ok` is computed at `telemetry.rs:1166` and used by `tally_call`, but never reaches `ended_ok` on the non-launch path — so `failed_tool_calls` counts a failure the card denies | **fix + amend spec** | `telemetry.rs`, tests, `spec.md` (R7.1, R7.5, D13) |
+| 2 | `restarted()` drops the `subagents` ring, and this feature widened the loss window from ~83ms to an agent's whole run | **keep; record the reasoning** | `spec.md` (known gap) |
+| 3 | The prose witness matches on `starts_with`, so a genuine sync answer opening with that sentence would be misread as a launch receipt and strand the agent as a permanent LIVE ghost | **keep; record the measurement** | `spec.md` (D1 note) |
+| 4 | An absent `<status>` tag is read as a failure — `None == Some("completed")` is `false`, so "could not read it" renders as Rose | **fix** | `telemetry.rs`, tests, `spec.md` (R7.3 GWT) |
+
+Findings 2 and 3 are kept because **fixing them points the wrong way down D2**: preserving live
+agents across a log truncation manufactures the permanent LIVE ghost D2 exists to refuse, and
+narrowing the prose literal would discard the 8 real launches it was measured to be the only
+witness for. Both are recorded with their grounds, not left silent.
 
 ## Scope & non-goals
 - **In:** `crates/ai-monitor/src/telemetry.rs`, `crates/ai-monitor/tests/telemetry.rs`,
-  `crates/app/src/dashboard.rs` — the three files the change touched.
-- **Out:** `crates/renderer/**` and `crates/term-core/**` (R9.2/R9.3); any second watch target,
-  second accumulator, or recursion into `subagents/`; and `spec.md` itself — the spec is the bar
-  being measured against, not an artifact this loop may bend to fit the code.
+  `crates/app/src/dashboard.rs` — the three files the change touched — **and, for run 2 only,
+  `specs/agent-elapsed-sidechain/spec.md`**, under the human ruling recorded above.
+- **Out:** `crates/renderer/**` and `crates/term-core/**` (R9.2/R9.3); `crates/ai-monitor/src/lib.rs`
+  (the `restarted()` caller — finding 2 is recorded, not fixed); any second watch target, second
+  accumulator, or recursion into `subagents/`.
+- **The spec-edit carve-out is narrow and one-directional.** Run 1 barred `spec.md` so the code
+  could not be made to pass by moving the bar. That bar still stands for everything the run
+  measures. What is permitted here is the opposite act: R7.1/R7.5/D13 assert that `ended_ok` is
+  written *only* by the notification branch, and the human ruled that assertion **wrong** — so the
+  spec is being corrected to what it should have said, with the code following. Any amendment that
+  is not one of the four rulings above is still a 🛑 escalation.
 
 ---
 
@@ -52,7 +77,7 @@ as a completion, and a background agent must end at the time its `<task-notifica
 | sub-requirement coverage | `44 / 44` — every `#### Rn.m` in spec.md is covered by at least one test **or Gate-1 command** | audit R-tags in the two test files; R9.2, R9.3 and R10.4 are diff/toolchain properties and are covered by the Gate-1 rows above, not by any test |
 | **the defect's number** | folded `end_ms - start_ms == 1_461_000` ms **and** the rendered card value is exactly `24m21s` | `a_notification_ends_the_agent_it_names` + `a_background_agent_reports_its_real_duration_end_to_end` |
 | **witness independence (R10.3)** | disabling either witness alone fails `>= 1` test, and the two failure sets are **disjoint** | temporarily neutralise one witness in `is_async_launch`, run `cargo test -p ai-monitor`, revert with `git checkout --`; repeat for the other |
-| changed files | `== 3` | `git diff --name-only \| wc -l` |
+| changed files | every path is in the **In** set — no bare count | `git diff --name-only \| grep -vE '^(crates/ai-monitor/(src/telemetry\.rs\|tests/telemetry\.rs)\|crates/app/src/dashboard\.rs\|specs/agent-elapsed-sidechain/(spec\|loop)\.md)$'` must print nothing. Measured `0` changed files at run-2 start, so the set below is exactly what this run added. A count was the run-1 form and is dropped for the same reason as the literal-site row (L4): the confinement is the requirement, the number is an accident of how many files a correct fix happens to need |
 | `Subagent` literals stating both new fields | **all of them** — 5 today; the count is informational, never a threshold | the build. The type has no `Default` derive, so a missed literal is a compile error whatever the count; pinning a number instead only breaks when a test legitimately adds a literal |
 | fold assertions | `>= 78` in `crates/ai-monitor/tests/telemetry.rs` (was 51 before this feature) | `cargo test -p ai-monitor` |
 
@@ -77,6 +102,31 @@ as a completion, and a background agent must end at the time its `<task-notifica
   fact when it is an as-of measurement, and none may claim a count that the current corpus
   contradicts.
 
+**Run-2 items (the four findings):**
+
+- **Both fixes point the same way down D2** — "absent" and "unreadable" must resolve to the
+  benign side, and only an *explicit* adverse signal to the failure side. Finding 4's fix has to
+  read as the same idiom as `telemetry.rs:1166` (`is_error`: only an explicit `true` is a
+  failure), not as a second, differently-shaped rule for the same question.
+- **The spec amendment corrects the reasoning, not the score** — R7.1/R7.5/D13 must end up saying
+  what is *true* of the fold, with the reason the original wording was wrong preserved. An
+  amendment that merely deletes the sentence the code now violates is a gate failure: the next
+  reader must be able to see that "written only by the notification branch" was a claim that got
+  tested and lost, not a line that quietly vanished.
+- **The two non-fixes are recorded with grounds, not with silence** — findings 2 and 3 were
+  *decided*, not missed. Each needs its measured grounds and the D2 argument for keeping it, dated
+  as an as-of reading (L3), so a later reader does not re-file them as undiscovered bugs. Finding
+  2's record must state the widened window honestly rather than implying no cost.
+- **Every new test names the mutation it catches (L2)** — for each assertion added, the mutation
+  it claims to catch must actually fail it. In particular the finding-4 test must fail if
+  `is_none_or` is reverted to `map_or(false, ..)`/`== Some("completed")`, and the finding-1 test
+  must fail if `ended_ok = ok` is dropped from the non-launch path — verified by running the
+  mutation, not by asserting it in a comment.
+- **R7.5's "nothing else is ever Rose" survives narrowing** — the rule loses its sync-completion
+  arm only for *failed* sync completions. A successful sync completion, a live agent and a D2
+  fallback whose result carried no `is_error` must all still be non-Rose, and the existing test
+  must still cover that.
+
 ---
 
 ## Autonomy Boundary
@@ -94,7 +144,12 @@ local renames, behaviour-preserving refactors that keep every Gate-1 command gre
 - Changing `SUBAGENTS_CAP` or the ring's "latest 32" contract.
 - Adding a fixture containing `"isAsync": false` — a shape that occurs in no observed log.
 - **Editing `spec.md` so the code passes.** If a requirement is genuinely wrong, that is an
-  escalation with the evidence, not a quiet edit.
+  escalation with the evidence, not a quiet edit. Run 2 raised exactly that escalation and the
+  human ruled on it, which is why R7.1/R7.5/D13 and the R7.3 GWT may be amended here — those four
+  edits and no others. A fifth amendment is a fresh escalation.
+- **Fixing findings 2 or 3.** Both were escalated and both were ruled *keep*. Preserving the
+  `subagents` ring across `restarted()`, touching `lib.rs`, or narrowing the prose literal are all
+  reversals of a human decision, not auto-fixes.
 - Applying `.rs` edits through the shell instead of Write/Edit — it bypasses the `rustfmt`
   PostToolUse hook and surfaces much later as a `cargo fmt --check` failure.
 - Anything conflicting with this Goal or `spec.md`.
@@ -141,3 +196,11 @@ escalation, not completion.
 - status: active
 - check: —
 - note: two Gate-2 rows in this contract were unreachable the moment they were written — a `44/44` coverage target that three structural sub-requirements can never satisfy by test, and a `== 4` literal count that any new test helper invalidates. Both looked reasonable while drafting and neither had been executed. Drafting a threshold and measuring it are different acts; do the second before committing to the first.
+
+### L5 — a test that cannot fail is not a test; delete it and say so
+- cause: gate-fail
+- source: human-approved
+- form: gate3-item
+- status: active
+- check: When L2's mutation check finds that NO test fails, do not engineer a fixture until one does. First ask whether the mutation changes any observable output. If it does not, the guard is imaginary — delete the test rather than dress it up, and record the non-guarantee where the code is instead.
+- note: run 2 added `a_launch_receipt_never_reports_on_the_run_it_started`, claiming to catch hoisting the `ended_ok` write above the `if !launched` gate. Running that mutation failed nothing, and the reason was not a weak fixture: a receipt carries no `is_error`, so the hoisted write stores the value already there, and an errored receipt leaves `completed: false`, which the accent renders Amber whatever `ended_ok` says. The mutation is unobservable in every reachable render, so no honest test could exist. The tempting repair — invent a receipt carrying `is_error: true`, a shape no log has shown — would have bought a green assertion by importing exactly the non-occurring-fixture problem L1 exists to stop. L2 asks why a test passes; this asks what to do when the answer is "nothing could make it fail".
