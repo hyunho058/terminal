@@ -26,6 +26,36 @@ agents across a log truncation manufactures the permanent LIVE ghost D2 exists t
 narrowing the prose literal would discard the 8 real launches it was measured to be the only
 witness for. Both are recorded with their grounds, not left silent.
 
+## Run 3 decisions (2026-08-24)
+A third review round re-reported findings 1 and 4 of run 2 — those rounds ran against
+**pre-fix code**, and both are already fixed in `88dc62a` (`:1251`, `:1328`). What is new:
+
+| # | Finding | Ruling |
+|---|---------|--------|
+| `is_async_launch` | The prose witness fires even when `toolUseResult` is present and says otherwise, so a genuine sync answer opening with the receipt sentence becomes a permanent LIVE ghost | **fix + amend D1.** Gate the prose witness on `toolUseResult` being ABSENT |
+| `apply_claude` bare-string arm | A notification that FAILS to parse falls through to `scan_command_name`, registering a phantom skill from a `<command-name>` quoted in its body — the exact thing the comment two lines above forbids | **fix + add R4.4a** |
+| `ToolKind::Agent` arm | `a.agent_id = agent_id` is unconditional, so a second result for the same `tool_use_id` carrying no `agentId` overwrites a good id with `None` and severs the join | **fix** (`is_some()` guard) |
+| `result_text` | Clones a whole sync report — tens of KB — to test a 33-byte prefix, on every `Agent` result | **fix** (behaviour-preserving, early-terminating comparison) |
+| `agent_elapsed` / `refresh_model` | A LIVE card's timer only advances when the log wakes the panel, so a quiet session freezes a 25-minute run at `12s` | **record only; split to its own spec.** Out of scope here |
+| `Subagent` 2-bool lifecycle → enum; shared JSONL fixture module | **deferred**, both |
+
+**Why the prose-witness ruling reversed.** Run 2 ruled *keep* on this witness, and that ruling
+stands as made — it was taken on two proposals that both lost real detections (narrowing the
+literal, dropping the witness). This round proposed a different shape, and the measurement
+separates cleanly: of the results the prose witness alone catches, **all** have no
+`toolUseResult` at all; of genuine sync answers, **all** carry one. Gating on its absence keeps
+every detection and closes the false-positive path structurally.
+
+**And what that first ruling missed.** The trade was named at approval time — "prose no longer
+rescues an `isAsync` rename while `toolUseResult` still exists" — but its **size** was not
+measured, and the direction alone made it sound partial. The Gate-3 checker measured it: **63 of
+63** launch receipts also open with the prose, so the OR form had been carrying every one of them
+under that drift and the ordered form carried none. A second ruling in the same run added the
+`status` backstop (`status == "async_launched"`, measured 63 of 63 launches and 0 of 113
+synchronous answers) so the drift is covered again without reopening the prose false positive.
+Final shape: three readings, two domains, per-drift coverage stated in R10.3 — see the amendment
+list under Scope.
+
 ## Scope & non-goals
 - **In:** `crates/ai-monitor/src/telemetry.rs`, `crates/ai-monitor/tests/telemetry.rs`,
   `crates/app/src/dashboard.rs` — the three files the change touched — **and, for run 2 only,
@@ -33,6 +63,19 @@ witness for. Both are recorded with their grounds, not left silent.
 - **Out:** `crates/renderer/**` and `crates/term-core/**` (R9.2/R9.3); `crates/ai-monitor/src/lib.rs`
   (the `restarted()` caller — finding 2 is recorded, not fixed); any second watch target, second
   accumulator, or recursion into `subagents/`.
+- **Run 3's approved amendments, as they finally stood.** Four, not the two first authorised —
+  the extra two were approved mid-run after the Gate-3 checker surfaced what the first two broke:
+  1. **D1** — the prose-witness gate (approved up front).
+  2. **R4.4a** — the parse-failure path (approved up front).
+  3. **R10.3** — amended because amendment 1 made its "the other still protects the panel" clause
+     false, and it had been left standing. Approved once measured (63 of 63 launches lost under
+     an `isAsync` rename).
+  4. **R1.2a/R1.2b/R1.2c** — the sub-requirements that pin amendment 1's behaviour, plus the
+     `status` backstop that repairs the coverage it cost. R1.4/R1.5 qualified to match.
+
+  Also repaired, and **not** an amendment: the `### R4:` heading, deleted by accident when R3.3a
+  was inserted and restored to byte-identical with `HEAD`. `crates/app/src/overlay.rs` and the
+  event loop stay **out** — the frozen-timer finding is recorded, not fixed.
 - **The spec-edit carve-out is narrow and one-directional.** Run 1 barred `spec.md` so the code
   could not be made to pass by moving the bar. That bar still stands for everything the run
   measures. What is permitted here is the opposite act: R7.1/R7.5/D13 assert that `ended_ok` is
@@ -55,6 +98,7 @@ witness for. Both are recorded with their grounds, not left silent.
 | confinement (R9.2/R9.3) | `! git diff --name-only \| grep -qE 'crates/(renderer\|term-core)/'` |
 | no `unwrap()` in the changed fold | `! grep -q 'unwrap()' crates/ai-monitor/src/telemetry.rs` |
 | no `unwrap()` in the changed render | `! sed -n '1,/#\[cfg(test)\]/p' crates/app/src/dashboard.rs \| grep -q 'unwrap()'` |
+| no spec section silently lost (L8) | `! comm -23 <(git show HEAD:specs/agent-elapsed-sidechain/spec.md \| grep '^#\{2,3\} ' \| sort -u) <(grep '^#\{2,3\} ' specs/agent-elapsed-sidechain/spec.md \| sort -u) \| grep -q .` |
 
 > Every command above was run before this contract was proposed and is currently green.
 > None is a placeholder.
@@ -74,7 +118,7 @@ witness for. Both are recorded with their grounds, not left silent.
 | Metric | Threshold | How measured |
 |--------|-----------|--------------|
 | test failures | `== 0` | `cargo test --workspace` |
-| sub-requirement coverage | `44 / 44` — every `#### Rn.m` in spec.md is covered by at least one test **or Gate-1 command** | audit R-tags in the two test files; R9.2, R9.3 and R10.4 are diff/toolchain properties and are covered by the Gate-1 rows above, not by any test |
+| sub-requirement coverage | **all of them** — every `#### Rn.m` in spec.md is covered by at least one test **or Gate-1 command**; 48 as of run 3, and the count is informational | audit R-tags in the two test files; R9.2, R9.3 and R10.4 are diff/toolchain properties and are covered by the Gate-1 rows above, not by any test. The count is no longer a threshold: it was written `44 / 44`, went stale the moment a run added a sub-requirement, and was still reading `44` when the spec held 48 — the same mistake L4 records for the literal-site row, repeated in the row right beside it. The requirement is total coverage; the number is an accident of how many sub-requirements exist |
 | **the defect's number** | folded `end_ms - start_ms == 1_461_000` ms **and** the rendered card value is exactly `24m21s` | `a_notification_ends_the_agent_it_names` + `a_background_agent_reports_its_real_duration_end_to_end` |
 | **witness independence (R10.3)** | disabling either witness alone fails `>= 1` test, and the two failure sets are **disjoint** | temporarily neutralise one witness in `is_async_launch`, run `cargo test -p ai-monitor`, revert with `git checkout --`; repeat for the other |
 | changed files | every path is in the **In** set — no bare count | `git diff --name-only \| grep -vE '^(crates/ai-monitor/(src/telemetry\.rs\|tests/telemetry\.rs)\|crates/app/src/dashboard\.rs\|specs/agent-elapsed-sidechain/(spec\|loop)\.md)$'` must print nothing. Measured `0` changed files at run-2 start, so the set below is exactly what this run added. A count was the run-1 form and is dropped for the same reason as the literal-site row (L4): the confinement is the requirement, the number is an accident of how many files a correct fix happens to need |
@@ -204,3 +248,28 @@ escalation, not completion.
 - status: active
 - check: When L2's mutation check finds that NO test fails, do not engineer a fixture until one does. First ask whether the mutation changes any observable output. If it does not, the guard is imaginary — delete the test rather than dress it up, and record the non-guarantee where the code is instead.
 - note: run 2 added `a_launch_receipt_never_reports_on_the_run_it_started`, claiming to catch hoisting the `ended_ok` write above the `if !launched` gate. Running that mutation failed nothing, and the reason was not a weak fixture: a receipt carries no `is_error`, so the hoisted write stores the value already there, and an errored receipt leaves `completed: false`, which the accent renders Amber whatever `ended_ok` says. The mutation is unobservable in every reachable render, so no honest test could exist. The tempting repair — invent a receipt carrying `is_error: true`, a shape no log has shown — would have bought a green assertion by importing exactly the non-occurring-fixture problem L1 exists to stop. L2 asks why a test passes; this asks what to do when the answer is "nothing could make it fail".
+
+### L6 — a rejection is about the proposal, not about the defect
+- cause: gate-fail
+- source: human-approved
+- form: gate3-item
+- status: active
+- check: Never reuse an earlier round's "keep / won't fix" as grounds for rejecting a NEW proposal against the same defect. Re-measure against the proposal actually on the table, and say which alternatives the earlier ruling was made over.
+- note: run 2 ruled the prose witness "keep" after measuring two proposals that both lost real detections — narrowing the literal, dropping the witness. Run 3 proposed a different shape (gate the prose on `toolUseResult` being absent) and the measurement separated cleanly: every prose-only detection lacks the object, every genuine sync answer carries one, so the gate lost nothing and made the false positive unreachable. Citing the run-2 ruling would have buried a strictly better option under a decision that had never seen it.
+
+### L7 — establish that a reported defect is REACHABLE before fixing it
+- cause: gate-fail
+- source: human-approved
+- form: gate3-item
+- status: active
+- check: For each review finding, run the mutation that removes the proposed guard BEFORE writing its test. If nothing fails, determine whether the path is reachable at all. If it is not, keep the guard if it is cheap, record the unreachability, and do NOT manufacture a fixture to turn it green.
+- note: the review reported an unconditional `agent_id` write as severing the notification join via a duplicate `tool_use`. Removing the guard failed no test, and the reason was structural, not thin coverage: a repeat `tool_result` never reaches the `Agent` arm because `pending.remove(tid)` already consumed the entry, and a duplicate `tool_use` pushes a fresh ring entry to the front that the lookup matches instead of the one holding the id. Writing a passing test would have meant inventing a shape the fold cannot produce — the L1/L5 failure mode arriving through a review finding rather than through a spec.
+
+### L8 — a spec section can vanish inside an edit and no gate will notice
+- cause: gate-fail
+- source: human-approved
+- form: gate1-command
+- status: active
+- check: `! comm -23 <(git show HEAD:specs/agent-elapsed-sidechain/spec.md | grep '^#\{2,3\} ' | sort -u) <(grep '^#\{2,3\} ' specs/agent-elapsed-sidechain/spec.md | sort -u) | grep -q .`
+- note: inserting R3.3a meant matching the text that ended at `### R4:`, and the replacement did not put that heading back — so R4.1-R4.5 silently reparented under R3. Every gate stayed green: the compiler does not read markdown, the coverage audit walks `#### Rn.m` and never checks its parent, and the tests knew nothing. A separate Gate-3 checker found it, which is not a gate. The command above compares HEAD's `##`/`###` headings against the working tree and fails only on ones that DISAPPEARED, so legitimate new sections still pass — verified both ways at record time.
+

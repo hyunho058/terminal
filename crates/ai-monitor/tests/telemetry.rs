@@ -584,6 +584,98 @@ fn the_launch_prose_alone_marks_a_launch() {
 }
 
 #[test]
+fn the_prose_witness_reads_array_content_as_a_single_space_joined_whole() {
+    // R1.2b — the prefix test is now early-terminating rather than building the whole
+    // result string, and it has to stay EXACTLY equivalent to the old
+    // `result_text(it).trim_start().starts_with(..)`. These three shapes are where a
+    // hand-rolled version drifts: a leading empty block (the join emits a separator the
+    // trim then removes), the literal reconstituted across the join, and a join that
+    // produces a double space and therefore must NOT match.
+    let arr = |blocks: &str| {
+        format!(
+            r#"{{"type":"tool_result","tool_use_id":"a1","timestamp":"2026-08-19T00:00:04.000Z","content":[{blocks}]}}"#
+        )
+    };
+
+    // A leading block of pure whitespace, long enough on its own to reach the prefix
+    // length. This is the case that pins the trim: the early-terminating scan must keep
+    // accumulating while the head is still all whitespace, and must compare on the
+    // TRIMMED head. Dropping either the `trim_start()` in the break test or the one in
+    // the final comparison misses this launch.
+    let s = agent_pair(&arr(&format!(
+        r#"{{"type":"text","text":"{}"}},{{"type":"text","text":"Async agent launched successfully. off it goes"}}"#,
+        " ".repeat(40)
+    )));
+    assert!(!s.subagents[0].completed, "a launch, past the blank block");
+
+    // The literal spans two blocks and the single-space join puts it back together.
+    let s = agent_pair(&arr(
+        r#"{"type":"text","text":"Async agent launched"},{"type":"text","text":"successfully."}"#,
+    ));
+    assert!(!s.subagents[0].completed, "the join separator is real");
+
+    // Same split, but the first block already ends in a space, so the join yields TWO —
+    // no longer the literal, so this is an ordinary answer and completes.
+    let s = agent_pair(&arr(
+        r#"{"type":"text","text":"Async agent launched "},{"type":"text","text":"successfully."}"#,
+    ));
+    assert!(
+        s.subagents[0].completed,
+        "a double space is not the literal"
+    );
+}
+
+#[test]
+fn the_status_backstop_marks_a_launch_when_the_key_is_gone() {
+    // R1.2c — the same-object backstop. This receipt has NO `isAsync` at all (the shape an
+    // upstream rename of that key would leave) but still says `status: async_launched`, so
+    // it is a launch and the entry stays live.
+    //
+    // Catches deleting the `status` arm: without it this receipt is read as an ordinary
+    // answer, the agent completes at its receipt timestamp, and the card reads the `0s`
+    // this whole feature exists to remove.
+    let s = agent_pair(
+        r#"{"type":"tool_result","tool_use_id":"a1","timestamp":"2026-08-19T00:00:00.083Z","content":"(receipt)","toolUseResult":{"status":"async_launched","agentId":"agent-11"}}"#,
+    );
+    assert!(!s.subagents[0].completed, "status alone marks the launch");
+    assert_eq!(s.subagents[0].end_ms, None);
+    assert_eq!(s.subagents[0].agent_id.as_deref(), Some("agent-11"));
+}
+
+#[test]
+fn a_completed_status_is_not_a_launch() {
+    // R1.2c's other half — the backstop must discriminate, not just fire. `completed` is
+    // what every synchronous answer carries, and reading any non-empty `status` as a
+    // launch would strand all of them as permanent LIVE ghosts.
+    let s = agent_pair(
+        r#"{"type":"tool_result","tool_use_id":"a1","timestamp":"2026-08-19T00:00:30.000Z","content":"Done.","toolUseResult":{"status":"completed","agentId":"agent-sync"}}"#,
+    );
+    assert!(s.subagents[0].completed);
+    assert_eq!(s.subagents[0].end_ms, Some(T0 + 30_000));
+}
+
+#[test]
+fn a_real_answer_that_opens_with_the_receipt_prose_still_completes() {
+    // R1.2a — the prose is a FALLBACK, not a co-equal vote. This agent finished
+    // synchronously and its report happens to open with the receipt sentence (an agent
+    // reporting on a launch it made does exactly this). Its `toolUseResult` is present
+    // and says nothing about `isAsync`, so the structured object decides and the entry
+    // completes.
+    //
+    // Catches restoring the `key || prose` OR: under it this agent is classed a launch,
+    // never completes, and — since no notification describes a sync completion — reads
+    // `● LIVE` with a growing timer forever.
+    let s = agent_pair(
+        r#"{"type":"tool_result","tool_use_id":"a1","timestamp":"2026-08-19T00:00:30.000Z","content":"Async agent launched successfully. That is what I was asked to verify, and it did.","toolUseResult":{"agentId":"agent-sync"}}"#,
+    );
+    assert!(
+        s.subagents[0].completed,
+        "toolUseResult present and not async -> an ending, whatever the prose says"
+    );
+    assert_eq!(s.subagents[0].end_ms, Some(T0 + 30_000));
+}
+
+#[test]
 fn the_launch_prose_on_a_bash_result_touches_no_agent() {
     // R1.3 — the witnesses are consulted ONLY inside the Agent arm. Grepping for the
     // prose echoes it back into the log as a Bash result; if that classified anything,
@@ -797,6 +889,32 @@ fn a_matched_notification_does_not_register_a_phantom_skill() {
     assert!(
         !s.skills.iter().any(|k| k.name == "deploy"),
         "a notification is not a command invocation: {:?}",
+        s.skills
+    );
+}
+
+#[test]
+fn an_unparseable_notification_registers_no_phantom_skill_either() {
+    // R4.4a — the guard belongs to the TAG, not to the parse succeeding. This block
+    // announces itself as a notification and then fails to parse (no `<task-id>`), which
+    // is the shape a truncated write leaves behind. It must still not be treated as
+    // arbitrary prose.
+    //
+    // Catches gating the return on `parse_task_notification` returning `Some`: with that,
+    // this string falls through to `scan_command_name` and `deploy` enters the skills
+    // ring — the exact phantom R4.4 exists to prevent, arriving by the failure path.
+    let malformed = "<task-notification>\n\
+         <status>completed</status>\n\
+         <result>the agent ran <command-name>/deploy</command-name> for me</result>\n\
+         </task-notification>";
+    assert!(
+        parse_task_notification(malformed).is_none(),
+        "no <task-id>, so the parse really does fail"
+    );
+    let s = fold(&bare_string_line(malformed, "2026-08-19T00:24:21.000Z"));
+    assert!(
+        !s.skills.iter().any(|k| k.name == "deploy"),
+        "unreadable is still not arbitrary prose: {:?}",
         s.skills
     );
 }
@@ -1265,6 +1383,27 @@ fn a_failed_sync_agent_is_not_coloured_as_a_success() {
     assert_eq!(s.failed_tool_calls, 1, "and the counter agrees");
     // The end time is still real — a failed run's duration is as true as a good one's.
     assert_eq!(s.subagents[0].end_ms, Some(T0 + 4_000));
+}
+
+#[test]
+fn a_repeat_result_for_one_tool_use_id_is_an_orphan_not_a_second_fold() {
+    // R3.3a — why the id-clearing the review raised cannot happen. The second result
+    // below is rejected before the `Agent` arm runs, because `pending` was consumed by
+    // the first; it lands in the orphan counter instead. Asserting the counter, not the
+    // absence of a mutation, keeps this honest about WHAT it observed (L2).
+    let s = fold(&format!(
+        "{}\n{}\n{}",
+        r#"{"type":"tool_use","id":"a1","name":"Agent","input":{"subagent_type":"Explore"},"timestamp":"2026-08-19T00:00:00.000Z"}"#,
+        r#"{"type":"tool_result","tool_use_id":"a1","timestamp":"2026-08-19T00:00:04.000Z","content":"(receipt)","toolUseResult":{"isAsync":true,"agentId":"agent-11"}}"#,
+        r#"{"type":"tool_result","tool_use_id":"a1","timestamp":"2026-08-19T00:00:05.000Z","content":"(the same result again, minus the id)","toolUseResult":{"isAsync":true}}"#
+    ));
+    assert_eq!(s.orphan_tool_results, 1, "the repeat never reached the arm");
+    assert_eq!(
+        s.subagents[0].agent_id.as_deref(),
+        Some("agent-11"),
+        "so the id it captured stands"
+    );
+    assert_eq!(s.total_tool_calls, 1, "and it was not counted twice");
 }
 
 #[test]
