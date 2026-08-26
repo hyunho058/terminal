@@ -687,12 +687,16 @@ fn agents(t: &TelemetrySnapshot, env: &Env) -> Section {
         .iter()
         .map(|a| Card {
             // Three-way, and the failure arm is gated on `completed` for a reason:
-            // `ended_ok` starts `true` and is written only when a notification arrives,
+            // `ended_ok` starts `true` and is written only where an ending is observed,
             // so an ungated rule would be meaningless for a live agent — whose elapsed
-            // is still growing — and would mislabel every synchronous completion, which
-            // no notification ever describes. The colour rides the accent bar because
-            // `Card` has no colour channel for its value; TASKS already derives an
-            // accent from a status the same way (`task_role`) (D13/R7.4).
+            // is still growing and whose field therefore still holds its opening value.
+            // The gate is what keeps Rose off in-flight cards; it is NOT what decides
+            // which completions are Rose. A synchronous completion whose result carried
+            // `is_error: true` is a real failure and is coloured like one — the fold
+            // knows it failed, so the card says so (D13/R7.1/R7.5). The colour rides the
+            // accent bar because `Card` has no colour channel for its value; TASKS
+            // already derives an accent from a status the same way (`task_role`)
+            // (D13/R7.4).
             accent: Some(match (a.completed, a.ended_ok) {
                 (false, _) => ColorRole::Amber,
                 (true, true) => ColorRole::TextFaint,
@@ -2104,16 +2108,22 @@ mod tests {
     }
 
     #[test]
-    fn only_a_notified_failure_is_ever_rose() {
+    fn nothing_unobserved_is_ever_rose() {
         // R7.5 — three agents no notification ever described: one in flight, one
         // completed synchronously, one completed by the unrecognised-result fallback.
         //
         // Note precisely what this does and does not discriminate. All three carry
-        // `ended_ok == true` (only the notification branch ever writes that field), so
-        // an ungated `!ended_ok -> Rose` rule would not paint them either. What is
-        // pinned here is the other half of the gate: `completed` alone must never imply
-        // Rose. The `ended_ok == false` side is pinned separately below, because the
-        // fold cannot reach `completed == false` with `ended_ok == false` at all.
+        // `ended_ok == true` — the in-flight one because nothing has observed its end,
+        // and the other two because their results carry no `is_error`, which is how a
+        // success is written. So an ungated `!ended_ok -> Rose` rule would not paint them
+        // either. What is pinned here is the other half of the gate: `completed` alone
+        // must never imply Rose. The `ended_ok == false` side is pinned separately below,
+        // because the fold cannot reach `completed == false` with `ended_ok == false` at
+        // all.
+        //
+        // "Sync completions are never Rose" is NOT what this asserts, and must not be
+        // read that way: a sync completion whose result DID carry `is_error: true` is a
+        // real failure and is Rose — see `a_failed_sync_completion_is_rose`.
         let sync_use = r#"{"type":"tool_use","id":"a2","name":"Agent","input":{"subagent_type":"sync"},"timestamp":"2026-08-19T00:00:00.000Z"}"#;
         let sync_res = r#"{"type":"tool_result","tool_use_id":"a2","timestamp":"2026-08-19T00:00:04.000Z","content":"Done.","toolUseResult":{"agentId":"agent-sync"}}"#;
         let fallback_use = r#"{"type":"tool_use","id":"a3","name":"Agent","input":{"subagent_type":"fallback"},"timestamp":"2026-08-19T00:00:00.000Z"}"#;
@@ -2153,10 +2163,31 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_sync_completion_is_rose() {
+        // R7.5a — the arm R7.5 used to exempt wholesale. A synchronously completed
+        // agent whose result carried `is_error: true` ended, and ended badly, so it gets
+        // the failure colour like any other bad ending. No notification is involved.
+        //
+        // Catches a regression to "only a notified failure is ever Rose": with
+        // `ended_ok` left at its opening `true`, this card renders TextFaint — visually
+        // identical to the clean sync completion in the test above.
+        let use_line = r#"{"type":"tool_use","id":"a2","name":"Agent","input":{"subagent_type":"sync-failed"},"timestamp":"2026-08-19T00:00:00.000Z"}"#;
+        let res_line = r#"{"type":"tool_result","tool_use_id":"a2","is_error":true,"timestamp":"2026-08-19T00:00:04.000Z","content":"Agent failed: terminal API error","toolUseResult":{"agentId":"agent-sync"}}"#;
+        let t = fold_lines(&[use_line, res_line]);
+        let SectionBody::Cards(v) = agents(&t, &env(AGENT_T0 + 300_000)).body else {
+            panic!("agents are cards");
+        };
+        assert_eq!(v[0].accent, Some(ColorRole::Rose));
+        assert!(v[0].title.starts_with(DONE), "the glyph is unchanged");
+        assert_eq!(v[0].value, "4s", "a failed run's duration is still real");
+    }
+
+    #[test]
     fn liveness_outranks_ended_ok_in_the_accent() {
         // R7.5's unreachable corner, pinned by hand because the fold cannot produce it:
-        // `ended_ok` is written only by the notification branch, which also sets
-        // `completed`, so `(completed: false, ended_ok: false)` never occurs in practice.
+        // every writer of `ended_ok` — the notification branch and the non-launch `Agent`
+        // result — sets `completed` in the same breath, so `(completed: false, ended_ok:
+        // false)` never occurs in practice.
         // Without this, `(false, _) => Amber` could be rewritten as
         // `(false, false) => Rose` and the entire suite would still pass.
         //

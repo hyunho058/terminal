@@ -234,10 +234,16 @@ pub struct Subagent {
     /// synchronously finished agent can still be resumed in the background later
     /// (D5/R3).
     pub agent_id: Option<String>,
-    /// Whether the end was a success. Written ONLY by the notification branch, so an
-    /// in-flight agent, a synchronous completion and a never-notified agent all keep
-    /// the initial value — which is why that value must be `true`. Initialising
-    /// `false` would paint every one of them as a failure (D13/R7.1).
+    /// Whether the end was a success. Written wherever an ending is *observed* — by the
+    /// notification branch, and by the `Agent` result itself when that result is an
+    /// answer rather than a launch receipt. An in-flight agent and a never-notified
+    /// agent keep the initial value, which is why that value must be `true`:
+    /// initialising `false` would paint both as failures (D13/R7.1).
+    ///
+    /// The "notification branch only" rule this field shipped with was narrower than the
+    /// facts. A synchronous `Agent` result carries `is_error`, so its success is *known*
+    /// at fold time and was already being folded into `failed_tool_calls` — withholding
+    /// it here left the card and the counter disagreeing about one result.
     pub ended_ok: bool,
 }
 
@@ -485,6 +491,15 @@ impl SessionTelemetry {
     /// silently reset the dialect to Claude, contradicting [`format`](Self::format)'s own
     /// "fixed for its whole life" — an Antigravity transcript that shrank would have kept
     /// tailing in the wrong dialect for the rest of its life.
+    ///
+    /// **The `subagents` ring is dropped too, and that has a known cost.** A live background
+    /// agent loses its card here, and the `<task-notification>` that would have ended it later
+    /// finds no entry to join and is discarded. Since agents began staying live for their whole
+    /// run, this window is an agent's lifetime rather than the ~83ms it used to be. Carrying
+    /// live entries across the reset was considered and refused: a file that shrank is most
+    /// likely not the same session any more, so importing its agents manufactures the permanent
+    /// LIVE ghost the conservative-failure rule (D2) exists to refuse — and does it on every
+    /// truncation, not the rare one. See `specs/agent-elapsed-sidechain/spec.md` § Known Gaps.
     pub fn restarted(&self) -> Self {
         Self::with_format(self.format).with_log_session_id(self.log_session_id.clone())
     }
@@ -590,8 +605,17 @@ impl SessionTelemetry {
                 // above feeds arbitrary assistant and user prose into that same
                 // function, so a parse living there could be reached by anything that
                 // merely mentions a notification (D12/R4.3/R4.4).
-                if let Some(n) = parse_task_notification(s) {
-                    self.on_task_notification(&n, ts);
+                // Routed on the TAG, acted on by the parse. Gating the return on parse
+                // SUCCESS was the bug: a truncated or malformed notification — one whose
+                // `<task-id>` is missing or empty — fell through to `scan_command_name`
+                // and let a `<command-name>` quoted in its body register the very phantom
+                // skill the paragraph above forbids. A string that announces itself as a
+                // notification is never arbitrary prose, whether or not we could read it,
+                // so it leaves here either way (R4.4/R4.4a).
+                if s.trim_start().starts_with(TASK_NOTIFICATION_TAG) {
+                    if let Some(n) = parse_task_notification(s) {
+                        self.on_task_notification(&n, ts);
+                    }
                     return;
                 }
                 self.scan_command_name(s, ts)
@@ -1213,10 +1237,45 @@ impl SessionTelemetry {
                 // its card reads DONE at 0s (D3/R2).
                 let launched = is_async_launch(line, it);
                 if let Some(a) = self.subagents.iter_mut().find(|a| a.id == tid) {
-                    a.agent_id = agent_id;
+                    // Only ever ADD an id, never clear one — a guard for an invariant two
+                    // other mechanisms currently enforce, kept because it is the one that
+                    // states the intent locally.
+                    //
+                    // No test pins it, and that is deliberate rather than an omission: the
+                    // clearing it prevents is unreachable today. A repeat `tool_result` for
+                    // one `tool_use_id` never arrives here at all — `pending.remove(tid)`
+                    // consumed the entry, so the second is rejected as an orphan above —
+                    // and a duplicate `tool_use` pushes a FRESH ring entry to the front,
+                    // which this `find` then matches instead of the one holding the id.
+                    // Removing the guard was measured to fail nothing. Should either of
+                    // those change, this line is what keeps a captured id from being
+                    // erased and the notification join from being severed.
+                    //
+                    // R3.3 is unaffected: an entry that never saw an id keeps `None`,
+                    // because there is nothing to preserve.
+                    if agent_id.is_some() {
+                        a.agent_id = agent_id;
+                    }
                     if !launched {
                         a.completed = true;
                         a.end_ms = ts;
+                        // The SAME `ok` the counters above folded. Omitting it here was
+                        // the defect: `tally_call` had already charged this call to
+                        // `failed_tool_calls` while the card kept the `true` it opened
+                        // with, so the panel's own two readings of one result disagreed
+                        // — the aggregate said a call failed and the agent it failed on
+                        // rendered in the success colour.
+                        //
+                        // Inside the gate because a receipt reports on the DISPATCH, not
+                        // on the run it started — but that placement is a statement of
+                        // meaning, not a guard, and no test pins it: hoisting this line
+                        // above `if !launched` was measured to change no rendered output.
+                        // A receipt carries no `is_error`, so it would write the `true`
+                        // the entry already holds; and an errored receipt would leave
+                        // `completed: false`, which the accent reads as live whatever
+                        // `ended_ok` says. Stated here rather than defended by a test
+                        // that would only look like one.
+                        a.ended_ok = ok;
                     }
                 }
             }
@@ -1281,10 +1340,19 @@ impl SessionTelemetry {
         // failed and was then resumed to success goes back to reading as a success
         // (D13/R7).
         //
+        // An ABSENT `<status>` is a third case, and it is not the same as an unknown
+        // value. `parse_task_notification` requires only `<task-id>`, so a notification
+        // with no status tag parses and arrives here with `None` — and a plain
+        // `== Some("completed")` reads that as a failure, painting an agent Rose for the
+        // sole reason that the tag could not be read. That inverts D2: a missing field is
+        // the absence of a reading, never a reading of "it failed". `is_none_or` keeps
+        // the failure side reserved for a status that is present and explicitly not
+        // `completed`, which is the same rule `is_error` follows where `ok` is derived.
+        //
         // No count is quoted here on purpose. The logs this was measured against are a
         // rolling ~30-day window, so any tally goes stale on its own; the vocabulary,
         // not its frequency, is what this line depends on.
-        a.ended_ok = n.status.as_deref() == Some("completed");
+        a.ended_ok = n.status.as_deref().is_none_or(|s| s == "completed");
     }
 
     /// Task state changes (D9). `TaskCreate.input` carries no id — the assigned id
@@ -1698,32 +1766,112 @@ fn extract_path(tool: &str, input: Option<&Value>) -> Option<String> {
     Some(tool.to_string())
 }
 
-/// The prose an async dispatch answers with. The second witness in `is_async_launch`.
+/// The prose an async dispatch answers with. The fallback witness in `is_async_launch`.
 const ASYNC_LAUNCH_PROSE: &str = "Async agent launched successfully.";
+
+/// `toolUseResult.status` on a launch receipt — the same-object backstop for `isAsync`.
+const ASYNC_LAUNCH_STATUS: &str = "async_launched";
 
 /// Whether an `Agent` result is a launch RECEIPT rather than an answer (D1).
 ///
-/// Two witnesses, chosen for INDEPENDENT failure domains: `toolUseResult.isAsync` is an
-/// undocumented on-disk detail of another program, and the prose drifts with wording.
-/// Either firing is enough, so both must break before the old defect returns.
-/// `status == "async_launched"` discriminates just as well but lives in the same object
-/// as `isAsync` and would die in the same upstream edit — which is the one thing a
-/// second witness must not do.
+/// Three readings in TWO failure domains, consulted in order of authority rather than
+/// OR-ed together. When `toolUseResult` exists it decides alone — first on `isAsync`, then
+/// on `status` as a same-object backstop; the prose is read only when the object is absent
+/// entirely.
+///
+/// The two domains are what matters: `toolUseResult` is an undocumented on-disk detail of
+/// another program, and the prose drifts with wording. `status` does NOT add a domain —
+/// it shares an object with `isAsync` and dies in the same edit, which is why D1 refused it
+/// as the second *witness*. It is here for the narrower job of surviving a rename of one
+/// key while the object lives, a drift that would otherwise take detection to zero.
 ///
 /// The key is tested for PRESENCE-and-true, never compared against `false`: no observed
 /// log carries `isAsync: false`. A synchronous completion simply omits the field, so a
 /// `== false` test would classify every one of them as a launch by accident of absence.
+///
+/// **Why the ordering, and what it costs.** OR-ing the two let a genuine synchronous answer
+/// that merely OPENED with the receipt sentence be read as a launch, and since no
+/// notification describes a sync completion, that agent would never complete — a permanent
+/// LIVE ghost, which the scoping paragraph below calls the failure D2 exists to refuse.
+/// Measured 2026-08-24: every result the prose alone identifies carries no `toolUseResult`,
+/// and every genuine sync answer carries one — so the gate loses no detection and makes the
+/// false positive unreachable rather than merely rare. The cost is named: if upstream renames
+/// `isAsync` while still writing `toolUseResult`, the prose no longer rescues those results
+/// and the panel degrades to the original defect. That is the direction D2 chose. (As-of
+/// readings of a rolling ~30-day window; the structural split, not the counts, is the claim.)
 ///
 /// Call this ONLY from the `ToolKind::Agent` arm. The scoping is load-bearing rather
 /// than tidy: a shell command that greps for the prose echoes it back into the log as a
 /// `Bash` result, and a prose false positive on a real agent would strand it as a
 /// permanent LIVE ghost — the failure the conservative fallback (D2) exists to refuse.
 fn is_async_launch(line: &Value, it: &Value) -> bool {
-    let key = line
-        .pointer("/toolUseResult/isAsync")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    key || result_text(it).trim_start().starts_with(ASYNC_LAUNCH_PROSE)
+    match line.get("toolUseResult") {
+        // A structured object is present, so it is the authority: it either says
+        // `isAsync: true` or this is not a launch. The prose is not consulted, which is
+        // what makes a false positive unreachable rather than merely unlikely.
+        //
+        // An explicit `null` is deliberately NOT authority. `line.get` returns
+        // `Some(Value::Null)` for it, which would otherwise silence the prose on the
+        // strength of a field carrying no information — the same mistake as reading an
+        // absent `<status>` as a failure.
+        Some(tur) if !tur.is_null() => {
+            tur.get("isAsync").and_then(Value::as_bool).unwrap_or(false)
+                // A second reading INSIDE the object: the one that survives a rename of
+                // the key above. Measured 2026-08-25 — it marks 63 of 63 launches and 0
+                // of 113 synchronous answers, the same separation `isAsync` gives, so an
+                // `isAsync` rename no longer drops detection to nothing.
+                //
+                // D1 rejected this field as the *second witness* because it shares an
+                // object with the first and dies in the same edit. That reasoning stands,
+                // and is exactly why it does not replace the prose: it is a same-object
+                // BACKSTOP, while the prose remains the independent domain covering the
+                // object disappearing entirely.
+                || tur.get("status").and_then(Value::as_str) == Some(ASYNC_LAUNCH_STATUS)
+        }
+        // No structured object — absent, or present-but-null. The only case where the
+        // prose has to carry the decision alone, and the only case where it can.
+        _ => result_text_starts_with(it, ASYNC_LAUNCH_PROSE),
+    }
+}
+
+/// Whether [`result_text`] would begin with `prefix`, without building the whole string.
+///
+/// Intended to be exactly equivalent to `result_text(it).trim_start().starts_with(prefix)`,
+/// including the single-space join between `text` blocks.
+///
+/// **That equivalence is argued, not pinned.** `result_text` is private and this crate keeps
+/// its tests in `tests/`, so nothing compares the two functions directly; the coverage that
+/// exists (`the_prose_witness_reads_array_content_as_a_single_space_joined_whole`) drives them
+/// through the fold and pins the join separator, not the whole equivalence. Said here rather
+/// than claimed away, because "equivalent" is the entire justification for having both.
+///
+/// It exists because the string it avoids building can be enormous: a synchronous agent's
+/// `tool_result` content is its complete final report, tens of kilobytes, and the old form
+/// cloned all of it on every `Agent` result to inspect ~33 leading bytes.
+fn result_text_starts_with(it: &Value, prefix: &str) -> bool {
+    // Accumulate only far enough to decide. Once the trimmed head is at least as long as
+    // the prefix, no later block can change the bytes being compared — while the head is
+    // still all whitespace it can, which is why the test is on the TRIMMED length.
+    let mut head = String::new();
+    match it.get("content") {
+        Some(Value::String(s)) => return s.trim_start().starts_with(prefix),
+        Some(Value::Array(items)) => {
+            for t in items
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+            {
+                if !head.is_empty() {
+                    head.push(' ');
+                }
+                head.push_str(t);
+                if head.trim_start().len() >= prefix.len() {
+                    break;
+                }
+            }
+        }
+        _ => return false,
+    }
+    head.trim_start().starts_with(prefix)
 }
 
 /// A `tool_result`'s content, which is either a bare string or an array of blocks.

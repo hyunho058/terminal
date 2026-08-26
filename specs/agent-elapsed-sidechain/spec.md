@@ -322,9 +322,11 @@ survived a full review cycle:
 
 ### D1: An async launch is detected by `toolUseResult.isAsync` **being present and true**, with a scoped prose marker as a second witness
 - **Status**: resolved
-- **The two witnesses, stated exactly**:
-  1. `toolUseResult` has the key `isAsync` and its value is `true`.
-  2. `result_text(it)` begins with the literal **`Async agent launched successfully.`**
+- **The two witnesses, stated exactly** *(ordering added 2026-08-24 — see the run-3 note below)*:
+  1. If `line` has a `toolUseResult` object, it decides **alone**: a launch iff that object
+     has the key `isAsync` with value `true`.
+  2. **Only if `toolUseResult` is absent entirely**, `result_text(it)` beginning with the
+     literal **`Async agent launched successfully.`** marks a launch.
 - **Both are tested only inside the `ToolKind::Agent` arm** (`telemetry.rs:659`). The
   scoping is load-bearing, not incidental: **77 `tool_result`s in the corpus carry that
   literal and 3 of them are `Bash` results** — shell commands that grepped for the string
@@ -345,6 +347,46 @@ survived a full review cycle:
   upstream edit. The point of a second witness is an independent failure domain, so the
   prose is chosen despite being the weaker signal. Rejected: `isSidechain` (uniformly
   `false` in the parent file).
+- **Amended 2026-08-24 (run 3) — the two witnesses are ORDERED, not OR-ed.** The run-2 review
+  below kept the OR after rejecting two proposals that both lost real detections. A third
+  round proposed a different shape — accept the prose **only when `toolUseResult` is absent** —
+  and the measurement separates the two populations cleanly: every result the prose witness
+  alone identifies carries **no** `toolUseResult`, and every genuine synchronous answer carries
+  one. So the gate keeps every detection the prose was earning and makes the false positive
+  *unreachable* instead of merely unobserved, which is a stronger guarantee than the counts in
+  the run-2 note could ever supply. **The cost, stated plainly:** the prose no longer covers an
+  `isAsync` rename that leaves `toolUseResult` in place, so that drift degrades the panel to the
+  original `0s ◯` defect. D2 chose exactly that direction over the permanent LIVE ghost the OR
+  made possible, and the scoping paragraph above already named that ghost as the failure D2
+  exists to refuse — so this resolves a tension that was latent in D1 as first written, rather
+  than trading one property for an unrelated one.
+  **Corrected 2026-08-25, same round.** This bullet ended "Independence is unchanged in kind:
+  two witnesses in different failure domains, now consulted in order of authority." That
+  overstated it, and the Gate-3 checker caught it. The uncovered drift was not partial but
+  total: **63 of 63** launch receipts also open with the prose, so the OR form had been carrying
+  every one of them under an `isAsync` rename and the ordered form carried none. The repair is
+  the `status` backstop (R1.2c) — measured the same day at 63 of 63 launches and 0 of 113
+  synchronous answers. The final shape is three readings in **two** domains: `isAsync` then
+  `status` inside the object, the prose only when the object is gone. `status` is deliberately
+  not counted as a third domain — the D1 rejection below still stands — so what the ordering
+  buys and what it costs now live in R10.3 per drift, instead of in one sentence that promised
+  more than it delivered. *(As-of readings of a rolling ~30-day window; the structural split is
+  the claim, not the counts.)*
+- **Reviewed 2026-08-23 (run 2, finding 3) — `starts_with` is kept, deliberately.** The review
+  raised the matching rule as a false-positive risk: a genuine synchronous answer that merely
+  *opened* with that sentence would be read as a receipt, and since no notification describes a
+  sync completion, the agent would be stranded as a permanent `● LIVE` ghost — exactly the
+  failure D2 refuses. The risk is real and the scoping paragraph above is what bounds it. Two
+  measurements decided it against tightening: **zero** false positives were found (every result
+  in the corpus opening with the literal was a genuine receipt), and **8** of them were caught
+  by the prose witness *alone*, their `toolUseResult` carrying no `isAsync` — so the second
+  witness is not decoration, and narrowing the literal risks losing detections that only it
+  makes. Rejected: extending the literal to the ~179-character prefix all observed receipts
+  share (it would make an accidental match essentially impossible and keep all 8, but it buys
+  that by binding the witness harder to upstream *wording* — the precise fragility this witness
+  was chosen in spite of, and the opposite direction from `isAsync`'s independence). Rejected:
+  dropping the prose witness for `isAsync` alone (loses the 8, and collapses R10.3's
+  independence requirement). Both counts are as-of readings of a rolling ~30-day window.
 
 ### D2: When neither witness fires, keep today's behaviour
 - **Status**: resolved
@@ -488,11 +530,17 @@ survived a full review cycle:
 ### D13: The end is reduced to a boolean initialised `true`; a failed end keeps `◯` and turns the **accent bar** Rose
 - **Status**: resolved
 - **Rationale**: `Subagent` gains one `bool` — `ended_ok` — **initialised `true` at
-  `on_tool_use`** and set to `status == "completed"` when a notification arrives. `true` is
-  the only safe initial value: the field is written *only* in the notification branch, so
-  the ghosts (D9), every in-flight agent, every sync completion and every D2 fallback
-  completion keep whatever it starts as — initialising `false` would paint all of them as
-  failures. `Subagent` has no `Default` derive, so this value is stated at every literal
+  `on_tool_use`** and written wherever an ending is *observed*: set from the notification's
+  status when one arrives, and from the result's own `is_error` when an `Agent` result
+  completes the entry on the non-launch path. `true` is the only safe initial value: the
+  ghosts (D9) and every in-flight agent keep whatever it starts as, and initialising `false`
+  would paint all of them as failures.
+  *(Corrected 2026-08-23 — see R7.1's amendment. This read "the field is written *only* in the
+  notification branch, so … every sync completion and every D2 fallback completion keep
+  whatever it starts as". The initial-value argument was right and is kept; the "only the
+  notification branch" clause was not. A sync `Agent` result carries `is_error`, which
+  `tally_call` was already folding into `failed_tool_calls` one branch earlier, so withholding
+  it from the card left the panel contradicting its own counter.)* `Subagent` has no `Default` derive, so this value is stated at every literal
   site, whatever their number (see R9.1). A `bool` keeps the contract change minimal and
   classifies future status vocabulary automatically: `failed` and `killed` need no separate
   handling, and a fourth value invented upstream lands on the safe side.
@@ -568,6 +616,46 @@ survived a full review cycle:
   distinction later means widening the boolean.
 - **Upstream format drift is mitigated, not eliminated** (D1/D2). Two witnesses must both
   fail before the defect returns, and the failure is silent.
+- **A LIVE card's timer only advances when something else wakes the panel** (run 3). This is
+  the mirror image of the defect this feature fixed: that one froze a *live* agent's card at
+  `0s ◯`, this one freezes a live agent's *timer* at whatever it read when the panel last
+  refreshed. `overlay.rs:689` snapshots `now_ms()` into `Env` and `agent_elapsed` computes from
+  that snapshot, so the growing timer only grows when a log line arrives. A background agent
+  working quietly for 25 minutes in an otherwise idle session can read `12s` the whole time —
+  and, unlike the fixed defect, the value is *plausible*, which makes it worse to read.
+  **Deliberately not fixed here, and split to its own spec.** The repair is a periodic tick,
+  and a tick collides with three things this project decided on purpose: C6's event-driven loop
+  (`ControlFlow::Wait`, woken by PTY/log events rather than a clock), G1's idle-CPU work (the
+  renderer re-presents cached buffers when the snapshot is unchanged — a timer that ticks every
+  second changes the snapshot every second and re-shapes with it), and the panel's own shaping
+  cache, which is keyed on the model. Getting it right means deciding a tick rate, gating it on
+  a live agent existing, and re-measuring idle CPU — a feature with its own gates, not a line
+  change smuggled into a fold fix. `crates/app/src/overlay.rs` is out of scope for this spec.
+- **An `isAsync` receipt with no `agentId` can never complete** (run 3). The entry is correctly
+  withheld from completion (D3) but has no join key, so no notification can reach it — a
+  permanent LIVE ghost by a different route than D9's. Measured 2026-08-24: **0 of 67** observed
+  `isAsync` receipts lacked an `agentId`, so this is a path the format permits rather than one
+  it exercises; R3.3 already states the id stays `None` and D9 already accounts for ghosts.
+- **A log truncation loses live background agents, and this feature widened that window**
+  (run 2, finding 2). When the watched `.jsonl` shrinks under the tail, `lib.rs` rebuilds the
+  accumulator via `SessionTelemetry::restarted()`, which drops everything folded — the
+  `subagents` ring included. Before this feature an agent was completed ~83ms after its
+  launch, so the exposure was that sliver; now an agent stays live for its whole run, so a
+  truncation mid-run drops a card that will never come back — the notification that would
+  have ended it arrives, finds no entry with that `agent_id`, and returns silently and
+  uncounted (D8). The window went from milliseconds to an agent's full lifetime, and that
+  cost is real.
+  **Kept anyway, because the obvious repair points the wrong way down D2.** A file that
+  shrank is most likely no longer the same session's content, so carrying its live entries
+  into the fresh fold imports agents whose notifications may never arrive — manufacturing
+  precisely the permanent `● LIVE` ghost D2 exists to refuse, and doing it to *every*
+  truncation rather than the rare one. Dropping degrades to a missing card, which is the
+  quieter and more honest of the two failures and matches the direction D2 already chose
+  everywhere else. Rejected for the same reason: carrying only `completed == false` entries
+  (narrower, same ghost risk). Fixing this properly means giving `restarted()` a way to know
+  whether the shrunken file is still the same session — a question this feature does not have
+  the evidence to answer, and one that belongs to `restarted()`'s own feature rather than
+  to a sidechain-elapsed fix.
 
 ## Requirements
 
@@ -601,18 +689,33 @@ survived a full review cycle:
 - **When**: the result is folded
 - **Then**: the entry stays `completed: false` with `end_ms: None`
 
+#### R1.2a: The prose is not consulted when `toolUseResult` exists
+- **Given**: an in-flight `Agent` entry and its `tool_result` whose text **begins with** `Async agent launched successfully.` — a genuine synchronous answer that opens by quoting the sentence — on a line whose `toolUseResult` object is present and marks no launch
+- **When**: the result is folded
+- **Then**: the entry completes at the result's timestamp; the prose is never read, so no synchronous answer can be misread as a receipt and stranded as a permanent `● LIVE` ghost
+
+#### R1.2b: The prefix test reads array content as `result_text` would
+- **Given**: a `tool_result` whose `content` is an **array** of `text` blocks, on a line with no `toolUseResult`
+- **When**: the classifier tests the launch prose
+- **Then**: it decides on the single-space join of those blocks with leading whitespace trimmed — identical to `result_text(it).trim_start()` — so a literal split across the join is found, one padded by a blank leading block is found, and one whose join inserts a second space is not
+
+#### R1.2c: `status` backstops a renamed `isAsync`
+- **Given**: a `tool_result` whose `toolUseResult` object carries **no** `isAsync` key but does carry `status: "async_launched"` — the shape an upstream rename of that key would leave behind
+- **When**: the result is folded
+- **Then**: the entry stays `completed: false` with `end_ms: None`; and a `toolUseResult` carrying `status: "completed"` still completes, so the backstop discriminates rather than merely firing
+
 #### R1.3: The prose witness on a non-`Agent` result changes nothing
 - **Given**: an in-flight `Agent` entry, plus a pending `Bash` call whose `tool_result` text begins with `Async agent launched successfully.` (the shape produced by grepping for that string, which the 08-16 corpus carried 3 times — this spec's own research echoed into the log)
 - **When**: the `Bash` result is folded
 - **Then**: no `Subagent` is created or mutated, and the `Bash` call is tallied as an ordinary completed tool
 
-#### R1.4: A result with neither witness completes the agent, exactly as today
-- **Given**: an in-flight `Agent` entry and a `tool_result` whose `toolUseResult` carries an unrecognised shape (no `isAsync` key) and whose text is an ordinary answer
+#### R1.4: A result with no launch marker completes the agent, exactly as today
+- **Given**: an in-flight `Agent` entry and a `tool_result` whose `toolUseResult` carries an unrecognised shape (no `isAsync` key, and no `status: "async_launched"` — R1.2c) and whose text is an ordinary answer
 - **When**: the result is folded
 - **Then**: the entry is `completed: true` with `end_ms` set to the result's timestamp — the pre-existing behaviour, preserved as the conservative fallback
 
 #### R1.5: Absence of `isAsync` is a completion, not a launch
-- **Given**: a `tool_result` whose `toolUseResult` object exists and has no `isAsync` key — the shape every measured synchronous completion has, in both the 08-16 and 08-17 readings
+- **Given**: a `tool_result` whose `toolUseResult` object exists and has no `isAsync` key — the shape every measured synchronous completion has, in both the 08-16 and 08-17 readings; those all carry `status: "completed"`, so R1.2c's backstop does not fire on them (measured 2026-08-25: 0 of 113)
 - **When**: the result is folded
 - **Then**: the agent completes; and no test fixture anywhere in the repo contains `"isAsync": false`, because that value does not occur upstream (R10.2)
 
@@ -655,6 +758,21 @@ survived a full review cycle:
 - **When**: the result is folded
 - **Then**: `agent_id` is `None`, and a later notification bearing any `<task-id>` never matches that entry (R6.2 governs what happens to it)
 
+#### R3.3a: A captured id is never cleared by a later result
+- **Given**: an `Agent` `tool_result` that supplied an `agentId`, followed by a second `tool_result` bearing the same `tool_use_id` and no `agentId`
+- **When**: both are folded
+- **Then**: the entry keeps the id it captured — the second result is rejected as an orphan (`orphan_tool_results`) before the `Agent` arm runs, because `pending` was consumed by the first, and the id write is additionally guarded to only ever store `Some`
+
+> **Added 2026-08-24 (run 3).** A review raised the unconditional `a.agent_id = agent_id` as a
+> way to sever the notification join by overwriting a good id with `None`. The write is now
+> guarded, but the honest finding is that the scenario **is not reachable today** and the guard
+> pins nothing observable: removing it was measured to fail no test. Two existing mechanisms
+> already prevent it — a repeat result for one `tool_use_id` never reaches the arm (`pending` is
+> consumed), and a duplicate `tool_use` pushes a *fresh* ring entry to the front which the
+> lookup matches instead of the one holding the id. The guard is kept as the local statement of
+> the invariant, and this sub-requirement records the reachability finding so a later reader does
+> not mistake an unpinned guard for an untested one. See `## Lessons` L5.
+
 ### R4: The notification block is recognised without false positives (D12)
 
 #### R4.1: A bare-string content starting with the tag is parsed
@@ -676,6 +794,21 @@ survived a full review cycle:
 - **Given**: a genuine notification whose `<result>` body embeds the text `<command-name>/deploy</command-name>`
 - **When**: the record is folded
 - **Then**: the agent is completed and **no** `SkillEntry` named `deploy` is pushed — the branch returns before `scan_command_name` runs
+
+#### R4.4a: An **unparseable** notification also short-circuits `scan_command_name`
+- **Given**: a bare string that opens with `<task-notification>` but fails to parse — no `<task-id>`, the shape a truncated write leaves — whose body embeds `<command-name>/deploy</command-name>`
+- **When**: the record is folded
+- **Then**: no agent changes and **no** `SkillEntry` named `deploy` is pushed — the branch returns on the **tag**, not on the parse succeeding
+
+> **Added 2026-08-24 (run 3).** R4.4 was written for a *matched* notification and the code
+> matched it exactly: the return sat inside `if let Some(n) = parse_task_notification(s)`, so a
+> notification that failed to parse fell through to `scan_command_name`. The comment two lines
+> above that call already forbade the outcome — "routing it on to `scan_command_name` would let
+> a command wrapper quoted in its free-text body register a phantom skill" — and the failure
+> path was simply outside the guard the comment described. A string that announces itself as a
+> notification is not arbitrary prose whether or not we could read it, so routing is decided by
+> the tag and only the *action* by the parse. Unparseable notifications remain uncounted, per
+> D8's reasoning about residues nobody can act on.
 
 #### R4.5: The first occurrence of each tag wins
 - **Given**: a genuine notification whose `<result>` body quotes a second, inner `<task-id>` naming a different agent
@@ -743,10 +876,25 @@ survived a full review cycle:
 
 ### R7: A failed end is visible without a second glyph vocabulary (D13)
 
-#### R7.1: `ended_ok` starts true
+#### R7.1: `ended_ok` starts true, and is written wherever an ending is observed
 - **Given**: any newly opened ring entry (R6.1)
 - **When**: the snapshot is taken
-- **Then**: `ended_ok` is `true`; it is written **only** by the notification branch, so in-flight agents, sync completions, D2 fallbacks and never-notified ghosts all retain this value
+- **Then**: `ended_ok` is `true`, and it is written by every branch that *observes* an ending — the notification branch, and the non-launch `Agent` result branch, which carries `is_error`. In-flight agents and never-notified ghosts retain the opening value because nothing has observed their end; a synchronous completion retains it only when its result reports no error
+
+> **Amended 2026-08-23 (run 2, finding 1).** This sub-requirement previously read "it is
+> written **only** by the notification branch, so in-flight agents, sync completions, D2
+> fallbacks and never-notified ghosts all retain this value". That was wrong, and D13 carried
+> the same error. The reasoning it came from is sound — `true` must be the initial value, or
+> every un-notified agent reads as a failure — but it over-generalised from "the initial value
+> must be safe" to "nothing but a notification may ever write the field", and a synchronous
+> `Agent` result **does** carry an ending and **does** say whether it succeeded. The fold was
+> already reading that very bit one branch earlier: `ok` is derived at `telemetry.rs:1166` and
+> folded into `failed_tool_calls` by `tally_call`, so the panel counted a failed call while the
+> card for the agent it failed on rendered in the success colour — two readings of one result,
+> disagreeing. The corrected rule keeps the property that mattered (nothing *unobserved* is
+> ever painted a failure) and drops the clause that was merely how it happened to be
+> implemented. Kept visible rather than rewritten away, so the next reader can see this was a
+> claim that got tested and lost.
 
 #### R7.2: A `completed` notification keeps it true
 - **Given**: the fold of R5.1, whose `<status>` is `completed`
@@ -758,15 +906,44 @@ survived a full review cycle:
 - **When**: both are folded
 - **Then**: both entries carry `ended_ok: false` and both carry the notified `end_ms`; a hypothetical fourth upstream status would also land on `false`, which is the safe side
 
+#### R7.3a: An **absent** `<status>` tag is not a failure
+- **Given**: a notification that parses — `parse_task_notification` requires only `<task-id>` — but carries no `<status>` tag at all, so `TaskNotification::status` is `None`
+- **When**: it is folded
+- **Then**: `ended_ok` stays `true` and the agent still completes at the notified `end_ms`; only a status that is **present and not `completed`** sets `false`
+
+> **Added 2026-08-23 (run 2, finding 4).** R7.3's "safe side" rule was written about unknown
+> *values* and silently assumed a value was always there. It was implemented as
+> `n.status.as_deref() == Some("completed")`, under which `None` compares unequal and an agent
+> is painted Rose for the sole reason that its status could not be read. That inverts D2: an
+> absent field is the absence of a reading, never a reading of "it failed" — the same rule the
+> fold already applies to `is_error`, where only an explicit `true` is a failure. The safe side
+> of a *missing* signal and the safe side of an *unrecognised* one point in opposite
+> directions, which is why this needs its own sub-requirement rather than a clause on R7.3.
+> Measured 2026-08-23: of the bare-string task-notifications then on disk, none lacked the tag
+> (`completed`/`failed`/`killed` only) — read as an as-of reading of a rolling ~30-day window;
+> the case is reachable by construction, which is what this rests on, not on its frequency.
+
 #### R7.4: A failed end colours the accent bar, not the glyph
 - **Given**: the snapshot of R7.3
 - **When**: `agents()` renders
 - **Then**: the card's accent is `ColorRole::Rose`, its title still begins with `◯`, and its value is the frozen real duration — a failed run's elapsed is as real as a successful one's
 
-#### R7.5: Nothing else is ever Rose
-- **Given**: a live agent, a synchronously completed agent, and a D2-fallback completion in one snapshot
+#### R7.5: Nothing *unobserved* is ever Rose
+- **Given**: a live agent, a synchronously completed agent whose result reported **no** error, and a D2-fallback completion in one snapshot
 - **When**: `agents()` renders
 - **Then**: their accents are `Amber`, `TextFaint`, `TextFaint` — the Rose rule is gated on `completed && !ended_ok`, so it can never fire on an agent whose elapsed is still growing
+
+#### R7.5a: A **failed** synchronous completion is Rose
+- **Given**: an `Agent` result carrying `is_error: true` and neither launch witness (D1), so it completes on the non-launch path
+- **When**: `agents()` renders
+- **Then**: the card's accent is `ColorRole::Rose`, its title still begins with `◯`, and its value is the frozen real duration — the same treatment R7.4 gives a notified failure, because the fold knows this one failed just as certainly
+
+> **Amended 2026-08-23 (run 2, finding 1).** R7.5 previously listed "a synchronously completed
+> agent" flatly among the things that are never Rose, which read as a rule about *sync
+> completions* when the property it was actually pinning is that `completed` alone must never
+> imply Rose. A sync completion that errored is an observed failure and is coloured like one;
+> what stays exempt is an agent whose end nothing has observed. The gate itself is unchanged —
+> `completed && !ended_ok` — so no in-flight card can go Rose.
 
 #### R7.6: `ended_ok` is last-wins, like `end_ms`
 - **Given**: an agent notified `failed`, then resumed and notified `completed`
@@ -809,10 +986,21 @@ survived a full review cycle:
 - **When**: `grep -r '"isAsync": *false' crates/` runs
 - **Then**: it matches nothing — `isAsync` is only ever present-and-true or absent (R1.5)
 
-#### R10.3: Each witness is pinned by its own test
-- **Given**: R1.1 (key witness) and R1.2 (prose witness) as separate tests
-- **When**: upstream drops `isAsync`, or reworded `Async agent launched successfully.`
-- **Then**: exactly one of the two tests fails, surfacing which witness died while the other still protects the panel — the failure is loud in CI instead of silent on screen (the drift risk recorded in Known Gaps)
+#### R10.3: Each reading is pinned by its own test, and the drift each survives is stated
+- **Given**: R1.1 (`isAsync`), R1.2c (`status` backstop) and R1.2 (prose) as separate tests
+- **When**: each reading is neutralised in turn
+- **Then**: each neutralisation fails at least one test and the three failure sets are **pairwise disjoint**, so CI names which reading died instead of the screen going quietly wrong
+- **And — what the survivors actually cover, stated because the earlier wording overstated it**: they do **not** all protect the panel equally. Measured 2026-08-25: an `isAsync` rename that leaves `toolUseResult` in place is covered by `status` (63 of 63 launches carry `status: "async_launched"`, 0 of 113 synchronous answers do) and **not** by the prose, which is unreachable while the object exists. The whole object disappearing is covered by the prose alone. Both keys being renamed at once is covered by nothing and degrades to the original `0s` defect — the D2-sanctioned direction
+
+> **Amended 2026-08-25 (run 3, third amendment — approved after the Gate-3 checker surfaced it).**
+> This read "exactly one of the two tests fails, surfacing which witness died **while the other
+> still protects the panel**". The D1 ordering made that clause false and this sub-requirement was
+> not amended with it: once the prose is consulted only for an absent `toolUseResult`, an
+> `isAsync` rename left the prose unable to protect anything — measured at the time as 63 of 63
+> launches lost. The `status` backstop (R1.2c) was added in the same round to close exactly that
+> hole, and this GWT now states per-drift coverage rather than a blanket promise. Recorded rather
+> than quietly rewritten, because a spec that promises a guarantee the code removed is worse than
+> one that never promised it.
 
 #### R10.4: Lint and the existing suite hold
 - **Given**: the workspace after this feature
