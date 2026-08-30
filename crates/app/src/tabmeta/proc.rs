@@ -89,6 +89,74 @@ pub(crate) fn exe_path(pid: u32) -> Option<PathBuf> {
     std::str::from_utf8(bytes).ok().map(PathBuf::from)
 }
 
+/// The kernel's **exec-time** name for `pid`, via `proc_pidinfo(PROC_PIDTBSDINFO)`.
+/// `None` when the process is gone, unreadable, or reports an empty name
+/// (`agent-classifier-deleted-binary` D1/D4).
+///
+/// This exists because [`exe_path`] answers a *path* question, and a path is state the
+/// running program's own updater owns. Measured on `agy`: exec'd as `<dir>/agy`, then renamed
+/// in place to `<dir>/agy.<id>.old`, then deleted —
+///
+/// ```text
+/// exec'd     : proc_pidpath rc=150 path=<dir>/agy          pbi_name=[agy]
+/// after mv   : proc_pidpath rc=174 path=<dir>/agy.<id>.old pbi_name=[agy]
+/// after rm   : proc_pidpath rc=0   path=(none)             pbi_name=[agy]
+/// ```
+///
+/// `proc_pidpath` follows the rename (which is why `agent::classify_with_name`'s stage 1a
+/// exists) and then fails outright, taking the whole classifier down with it because every
+/// stage hangs off the path. `pbi_name` is fixed at `exec` and moves for neither — so it is
+/// not merely "something that survives deletion", it is the pre-rename name the agent tables
+/// were written against.
+///
+/// Lives beside [`tty_dev_of_pid`] and [`start_ms_uncounted`], which already read this same
+/// struct — so this adds a field read, not a new syscall surface.
+pub(crate) fn name_of_pid(pid: u32) -> Option<String> {
+    #[cfg(test)]
+    super::probe::PROC_NAME.bump(1);
+
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut c_void,
+            size,
+        )
+    };
+    if n != size {
+        return None; // error or short read — a dead pid lands here, and so does a zombie
+    }
+    decode_name(&info.pbi_name)
+}
+
+/// The pure half of [`name_of_pid`]: `pbi_name`'s fixed byte array → a `String`.
+///
+/// Split out because the one case that matters cannot be produced by a live process on
+/// demand — a name that fills the buffer exactly — and because this function must
+/// **deliberately break the tree's idiom for fixed C arrays**. `cwd_of_pid` (line 49),
+/// `presence_fd::vnode_path`, `session.rs` and `tabsession.rs` all spell it
+/// `position(|&b| b == 0).unwrap_or(0)`, i.e. "no terminator ⇒ absent". That is right for all
+/// four, because each reads a **path** the kernel documents as NUL-terminated, so a missing
+/// terminator means a corrupt read.
+///
+/// This reads a **name**, and `libc` declares it `pbi_name: [c_char; 32]` — XNU copies the
+/// process name into it without reserving a terminator, so a 32-byte name arrives with no
+/// NUL at all. Here "no terminator" means "a maximal name", and rejecting it would drop
+/// exactly the input this function exists to handle. Hence `unwrap_or(bytes.len())`.
+fn decode_name(raw: &[libc::c_char]) -> Option<String> {
+    let bytes = unsafe {
+        std::slice::from_raw_parts(raw.as_ptr() as *const u8, std::mem::size_of_val(raw))
+    };
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    if end == 0 {
+        return None; // an empty name is absence, like every other failure here
+    }
+    std::str::from_utf8(&bytes[..end]).ok().map(str::to_string)
+}
+
 /// "No controlling tty". The kernel reports `NODEV` (`-1`) in `e_tdev` for a process with
 /// no controlling terminal, and libc's Apple bindings do **not** export the constant (only
 /// `ENODEV` / `MNT_NODEV` exist), so it is named here rather than left as a magic `-1 as u32`
@@ -375,6 +443,117 @@ mod tests {
             "exe_path(self) had no file name: {p:?}"
         );
         assert!(p.is_absolute(), "exe path should be absolute: {p:?}");
+    }
+
+    // ---- the exec-time name fallback (agent-classifier-deleted-binary R1) ----
+
+    /// `MAXCOMLEN` — the size of `pbi_comm`, the field D1 rejected. Named here so the
+    /// discrimination test below reads as the argument it is making.
+    const MAXCOMLEN_BYTES: usize = 16;
+
+    /// A `pbi_name`-shaped buffer holding `s`, NUL-padded — the layout the kernel fills.
+    fn name_buf(s: &str) -> [libc::c_char; 32] {
+        let mut buf = [0 as libc::c_char; 32];
+        for (slot, b) in buf.iter_mut().zip(s.bytes()) {
+            *slot = b as libc::c_char;
+        }
+        buf
+    }
+
+    #[test]
+    fn name_of_pid_reports_this_process() {
+        let _g = super::super::probe::serial();
+        // R1.1 — the live half, against the one process a test can be sure about. The name
+        // is the test binary's, whatever cargo called it; asserting it is non-empty and
+        // matches the exe path's basename prefix is as specific as that can honestly be.
+        let name = name_of_pid(std::process::id()).expect("own name");
+        assert!(!name.is_empty(), "a live process must report a name");
+        let exe = exe_path(std::process::id()).expect("own exe path");
+        let base = exe.file_name().and_then(|s| s.to_str()).expect("basename");
+        assert!(
+            base.starts_with(&name) || name.starts_with(base),
+            "name {name:?} and exe basename {base:?} must agree up to the 32-byte cap"
+        );
+        // D1 rejected `pbi_comm` on buffer size — 16 against 32 — and every other assertion
+        // here passes on either field, since `pbi_comm`'s truncation is a prefix and the
+        // check above accepts prefixes. This is the tripwire that tells them apart.
+        assert!(
+            base.len() > MAXCOMLEN_BYTES,
+            "test-binary basename {base:?} is no longer longer than {MAXCOMLEN_BYTES} bytes, \
+             so it can no longer tell `pbi_name` from `pbi_comm` — this check is disarmed"
+        );
+        // 15, not 16: XNU NUL-terminates *inside* the 16-byte field, so a truncated
+        // `pbi_comm` measures `MAXCOMLEN - 1`. The `- 1` is the exact boundary, not slack —
+        // removing it disarms the tripwire.
+        assert!(
+            name.len() > MAXCOMLEN_BYTES - 1,
+            "a {}-char exe name came back as {name:?} ({} chars) — that is `pbi_comm`'s \
+             {}-char truncation, not `pbi_name`'s 32",
+            base.len(),
+            name.len(),
+            MAXCOMLEN_BYTES - 1,
+        );
+    }
+
+    #[test]
+    fn name_of_absent_pid_is_none() {
+        let _g = super::super::probe::serial();
+        // R1.3 — the shapes the walk actually hits: a pid that cannot exist, and one far
+        // outside the table. A zombie takes the same path (`proc_pidinfo` returns 0 for an
+        // unreaped child — measured while writing the spec, not exercised here, since a test
+        // cannot hold a corpse open without leaking one), which is what stops a dead process
+        // being classified as a live agent.
+        assert_eq!(name_of_pid(0), None);
+        assert_eq!(name_of_pid(u32::MAX), None);
+    }
+
+    #[test]
+    fn a_maximal_unterminated_name_decodes_in_full() {
+        // R1.4 — THE case the tree's `unwrap_or(0)` idiom would get wrong, and the reason
+        // `decode_name` is split out: a live process cannot be made to have a 32-byte name
+        // on demand, so this is the only place the boundary can be pinned.
+        let full = "a".repeat(32);
+        assert_eq!(decode_name(&name_buf(&full)), Some(full));
+
+        // The ordinary case: a short name, NUL-terminated, stops at the NUL.
+        assert_eq!(decode_name(&name_buf("agy")), Some("agy".to_string()));
+
+        // 31 bytes — terminated by exactly one NUL, the last length that is.
+        let almost = "b".repeat(31);
+        assert_eq!(decode_name(&name_buf(&almost)), Some(almost));
+
+        // Absence: an all-NUL buffer is an empty name, not an empty string.
+        assert_eq!(decode_name(&[0 as libc::c_char; 32]), None);
+
+        // Invalid UTF-8 is absent rather than lossy — `exe_path` makes the same choice.
+        let mut bad = name_buf("agy");
+        bad[1] = 0xFFu8 as libc::c_char;
+        assert_eq!(decode_name(&bad), None);
+    }
+
+    #[test]
+    fn each_name_read_is_counted_once() {
+        let _g = super::super::probe::serial();
+        // R1.5 — an uncounted read is what lets a cost test pass while the cost grows.
+        super::super::probe::reset_all();
+        let _ = name_of_pid(std::process::id());
+        let _ = name_of_pid(std::process::id());
+        assert_eq!(
+            super::super::probe::PROC_NAME.get(),
+            2,
+            "two calls must count as two"
+        );
+    }
+
+    #[test]
+    fn the_name_counter_resets_with_the_rest() {
+        let _g = super::super::probe::serial();
+        // R1.6 — a counter added to the set but forgotten in `reset_all` would silently
+        // carry state between cost tests. `tmux.rs`'s guard makes this assertion for its
+        // own three counters; this is the same guard for this one.
+        super::super::probe::PROC_NAME.bump(3);
+        super::super::probe::reset_all();
+        assert_eq!(super::super::probe::PROC_NAME.get(), 0);
     }
 
     #[test]
