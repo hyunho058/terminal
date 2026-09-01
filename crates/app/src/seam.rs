@@ -21,7 +21,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use renderer::DrawLayer;
-use winit::keyboard::{Key, ModifiersState};
+use winit::keyboard::{Key, ModifiersState, PhysicalKey};
 
 use crate::session::TabId;
 
@@ -41,7 +41,23 @@ pub struct KeyInput {
     pub key: Key,
     pub text: Option<String>,
     pub mods: ModifiersState,
+    /// The key's position on the keyboard, independent of what it produced.
+    ///
+    /// Carried because a chord over a **digit** cannot be recognised from the logical key
+    /// (ai-monitor-panel-scroll D35): on a US layout `Cmd+Opt+1` arrives as `"¡"`, and
+    /// unlike letters — where `is_sidebar_toggle_chord` gets away with case-folding, as its
+    /// own comment says — digits have no folding to fall back on. Matching the shifted
+    /// characters instead (`!@#$%^`) would work on that one layout and break silently on
+    /// every other.
+    pub physical: PhysicalKey,
 }
+
+/// "No position information" — what a synthetic `KeyInput` carries.
+///
+/// A handler matching on `physical` must read this as *not my key*, never as a wildcard: a
+/// chord that fired on an unknown position would be a chord nobody pressed.
+pub const NO_PHYSICAL: PhysicalKey =
+    PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified);
 
 /// What a handler/overlay may do to the app during `on_key`: write to the active
 /// shell, read tab state, request a redraw. Deliberately narrow (D4).
@@ -225,6 +241,36 @@ pub trait Overlay {
     /// hotkey; everything else it passes through).
     fn visible(&self) -> bool;
     fn on_key(&mut self, input: &KeyInput, ctx: &mut AppCtx) -> Handled;
+    /// One wheel event over the overlay's **own** surface.
+    ///
+    /// Called only after the app's single ordered hit-test has resolved the pointer to this
+    /// overlay's band, so an overlay performs no geometry of its own — the same division
+    /// `sidebar_press` already keeps for the pointer (SD2).
+    ///
+    /// `Consumed` means the overlay moved; `Passthrough` means it did not and the grid
+    /// should get the event instead. That is how the ai-monitor panel's edge fall-through
+    /// (D9) is expressed: at the end of its document, in the direction that pushes further
+    /// into that end, the panel simply declines. **It declines by direction, not by
+    /// position** — an overlay that returned `Passthrough` whenever it sat at an edge would
+    /// never receive the wheel again, since scrolling back up leaves it at that same edge.
+    ///
+    /// Default: not mine.
+    fn on_wheel(&mut self, _delta: crate::input::WheelDelta, _cell_h: f32) -> Handled {
+        Handled::Passthrough
+    }
+    /// One left press on the overlay's **own** surface, in window px.
+    ///
+    /// Called only after the app's single ordered hit-test has put the pointer in this
+    /// overlay's band, so the overlay resolves the point against its own published geometry
+    /// and the app performs none (SD2) — the same division `on_wheel` keeps.
+    ///
+    /// `Consumed` means the overlay acted on it; `Passthrough` means the press landed on
+    /// nothing it owns and the surface below should get it.
+    ///
+    /// Default: not mine.
+    fn on_press(&mut self, _point: [f32; 2]) -> Handled {
+        Handled::Passthrough
+    }
     /// The overlay's draw layer, registered with the renderer.
     ///
     /// Default: a no-op layer, for an overlay that draws through **someone else's**
@@ -359,6 +405,33 @@ impl OverlayHost {
             .sort_by_key(|o| std::cmp::Reverse(o.priority()));
     }
 
+    /// Offer one wheel event to the **visible** overlays, in priority order.
+    ///
+    /// Visibility gates this where it deliberately does not gate `dispatch`: a key can open a
+    /// hidden overlay, but a wheel event over a band that is not on screen belongs to
+    /// whatever *is* — there is nothing there to scroll.
+    pub fn wheel(&mut self, delta: crate::input::WheelDelta, cell_h: f32) -> Handled {
+        for o in &mut self.overlays {
+            if o.visible() && o.on_wheel(delta, cell_h) == Handled::Consumed {
+                return Handled::Consumed;
+            }
+        }
+        Handled::Passthrough
+    }
+
+    /// Offer one left press to the **visible** overlays, in priority order.
+    ///
+    /// Visibility gates this for the reason it gates `wheel`: a band that is not on screen
+    /// owns no pixels, so a press there belongs to whatever is drawn instead.
+    pub fn press(&mut self, point: [f32; 2]) -> Handled {
+        for o in &mut self.overlays {
+            if o.visible() && o.on_press(point) == Handled::Consumed {
+                return Handled::Consumed;
+            }
+        }
+        Handled::Passthrough
+    }
+
     /// Offer the key to every overlay (priority order), visible or not; first
     /// `Consumed` wins (R4.1). All-passthrough → default input proceeds (R4.2).
     /// A hidden overlay is no longer skipped, so it can consume the chord that
@@ -471,6 +544,54 @@ pub enum OverlayCommand {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- ai-monitor-panel-scroll T7 / R5.6: what an overlay's refusal routes to ----
+
+    #[test]
+    fn r5_6_an_overlay_that_declines_the_wheel_leaves_it_for_the_grid() {
+        // D9's fall-through is expressed as a REFUSAL, not as a redirect: the panel answers
+        // `Passthrough` and the caller's ordered hit-test then runs `wheel_grid`, which is
+        // what keeps a `?1000` application's claim on the wheel intact (`alt-screen-scroll`).
+        // Routing the event to the grid from inside the overlay would bypass that.
+        //
+        // What is pinned here is the seam's half — that a decline actually reaches the
+        // caller. The one line that turns it into `wheel_grid` lives in `terminal_app`'s
+        // event arm and needs a window to run.
+        struct Declines(bool);
+        impl Overlay for Declines {
+            fn priority(&self) -> i32 {
+                0
+            }
+            fn visible(&self) -> bool {
+                true
+            }
+            fn on_key(&mut self, _: &KeyInput, _: &mut AppCtx) -> Handled {
+                Handled::Passthrough
+            }
+            fn on_wheel(&mut self, _: crate::input::WheelDelta, _: f32) -> Handled {
+                if self.0 {
+                    Handled::Consumed
+                } else {
+                    Handled::Passthrough
+                }
+            }
+        }
+        let mut host = OverlayHost::default();
+        host.register(Box::new(Declines(false)));
+        assert_eq!(
+            host.wheel(crate::input::WheelDelta::Lines(-1.0), 16.0),
+            Handled::Passthrough,
+            "a decline must reach the caller so the grid path can run"
+        );
+
+        let mut host = OverlayHost::default();
+        host.register(Box::new(Declines(true)));
+        assert_eq!(
+            host.wheel(crate::input::WheelDelta::Lines(-1.0), 16.0),
+            Handled::Consumed,
+            "and a claim must stop there, or the grid scrolls too"
+        );
+    }
     use super::*;
     use winit::keyboard::{Key, ModifiersState, NamedKey};
 
@@ -480,6 +601,7 @@ mod tests {
             key: k,
             text: Some(text.to_string()),
             mods: ModifiersState::empty(),
+            physical: crate::seam::NO_PHYSICAL,
         }
     }
 

@@ -110,6 +110,7 @@ mod tests {
             } else {
                 ModifiersState::empty()
             },
+            physical: crate::seam::NO_PHYSICAL,
         }
     }
 

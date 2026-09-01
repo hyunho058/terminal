@@ -16,6 +16,9 @@ Inferred from `requirements-interview-outputs/mac-terminal/insights.md`.
 | **Ligature** | Multi-char glyph (e.g. `!=`, `=>`). Config `font.ligatures`; handled during swash shaping. |
 | **IME** | Input Method Editor (e.g. Korean 한글). winit delivers composed text via `KeyEvent::text`. |
 | **ai-monitor** | A right-docked, drag-resizable panel (`Cmd+Shift+M`) that watches the active tab's session logs (`~/.claude/projects/**/*.jsonl`). It **reserves** terminal columns rather than covering them. Native, Rust-rewritten. Shipped. |
+| **item ladder** | The ai-monitor panel's scroll coordinate space: one rung per heading, card, row or bar, enumerated once by `monitor_layout::item_ladder`. The scroll offset is a rung **index**, not a pixel offset — the panel has no scissor rect, so a half-drawn row has no representation. |
+| **fold** | A section with more than five entries draws five plus a control rung (`▸ N more` / `▾ collapse`); clicking its heading or that control toggles it. Distinct from the dead `+N more`, which reported rows that had already been thrown away. The state lives in `MonitorModel` because it changes which rungs exist — unlike the scroll offset, which is kept out of the model for the opposite reason. |
+| **sticky slot** | The one heading line reserved at the top of the panel's list area. Content starts *below* it, which is what makes it un-overdrawable: shapes composite under glyphs, so a heading could not otherwise hide rows sliding beneath it. |
 
 ## Invariants
 

@@ -529,6 +529,7 @@ mod tests {
             key: k,
             text: text.map(str::to_string),
             mods,
+            physical: crate::seam::NO_PHYSICAL,
         }
     }
 

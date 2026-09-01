@@ -28,19 +28,185 @@ use ai_monitor::telemetry::{SessionTelemetry, TelemetrySnapshot};
 use ai_monitor::{
     backfill_telemetry, project_dir, resolve_owned_session, LogWatcher, Wanted, Watch,
 };
-use renderer::monitor_panel::{MonitorHandle, MonitorPanel};
+use renderer::monitor_model::MonitorModel;
+use renderer::monitor_panel::{MonitorHandle, MonitorPanel, ScrollState};
 use renderer::DrawLayer;
 use winit::event_loop::EventLoopProxy;
 use winit::keyboard::Key;
 
 use crate::dashboard;
+use crate::input::{self, WheelDelta};
 use crate::seam::{AppCtx, Handled, KeyInput, Overlay, OverlayCommand};
 use crate::tabsession;
 use crate::terminal_app::UserEvent;
 
+/// A rung's identity across snapshots (ai-monitor-panel-scroll D19).
+///
+/// The panel's rows carry **no identifier** — `Card`, `Row` and `Bar` are display strings and
+/// nothing else — so an anchor has to be re-found by what it looks like. Two rejected
+/// alternatives are worth remembering:
+///
+/// * **A stable id from the telemetry crate** would be exact, but the change would reach past
+///   the renderer into `ai-monitor` and shake every snapshot test there. C8 keeps that crate
+///   out of this feature's blast radius.
+/// * **"Nth from the end of the section"** needs no identity at all, because new entries are
+///   prepended — but a ring buffer *removes from the end*, so the invariant breaks precisely
+///   once the ring is full. That is the steady state of a busy session, and RECENT CALLS at
+///   its 32-entry cap is the acceptance criterion itself. The failure would concentrate
+///   exactly where the feature is judged.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum RungKey {
+    /// A section heading. The six labels are fixed and distinct, so no hash and no collision
+    /// rule is needed — and a heading IS a normal anchor position: it is where every jump
+    /// lands and where `max_index` sits.
+    Heading(String),
+    /// A body rung, keyed on everything it displays.
+    Body(u64),
+}
+
+/// Where the view is holding on, if anywhere (D37).
+#[derive(Clone, Debug, Default)]
+enum Anchor {
+    /// Top of the document. **No anchor is armed**, so new entries arriving above simply
+    /// appear — which is what keeps the panel a live monitor for the reader who has not
+    /// scrolled. Deriving this from `top == 0` rather than latching it is what stops the two
+    /// notions disagreeing when the document shrinks under an anchored view.
+    #[default]
+    Following,
+    /// The user scrolled away from the top; hold this rung where it is (D8).
+    Held {
+        key: RungKey,
+        /// Its index in the document this anchor was taken from — the starting point for
+        /// D15's nearest-survivor walk.
+        index: usize,
+    },
+}
+
+/// Everything a rung displays, folded into one number.
+///
+/// Deliberately covers the value colours and the outcome glyph as well as the text: a call
+/// that changes from running to failed is a *different* row to the reader, and an anchor that
+/// silently followed it would be holding onto something that is no longer what was being read.
+fn rung_key(model: &MonitorModel, item: &renderer::monitor_layout::Item) -> RungKey {
+    use renderer::monitor_layout::ItemKind;
+    use renderer::monitor_model::SectionBody;
+    use std::hash::{Hash, Hasher};
+    let Some(section) = model.sections.get(item.section) else {
+        return RungKey::Body(0);
+    };
+    if item.kind == ItemKind::Heading {
+        return RungKey::Heading(section.label.clone());
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    section.label.hash(&mut h);
+    match (&section.body, item.entry) {
+        (SectionBody::Cards(v), Some(i)) => {
+            if let Some(c) = v.get(i) {
+                c.title.hash(&mut h);
+                c.value.hash(&mut h);
+                c.detail.hash(&mut h);
+                format!("{:?}", c.accent).hash(&mut h);
+            }
+        }
+        (SectionBody::Rows(v), Some(i)) => {
+            if let Some(r) = v.get(i) {
+                r.text.hash(&mut h);
+                r.value.hash(&mut h);
+                r.glyph.hash(&mut h);
+                format!("{:?}", r.value_color).hash(&mut h);
+                format!("{:?}", r.label.as_ref().map(|l| (&l.text, l.color))).hash(&mut h);
+            }
+        }
+        (SectionBody::Bars(v), Some(i)) => {
+            if let Some(b) = v.get(i) {
+                b.name.hash(&mut h);
+                b.count.hash(&mut h);
+            }
+        }
+        _ => {}
+    }
+    RungKey::Body(h.finish())
+}
+
+/// How many rungs above `top` are new since the previous document (D11/R7.1).
+///
+/// "New" is set difference, not arithmetic on lengths: entries arrive at the head of a ring
+/// but they also *leave* at its tail, so `new_len - old_len` undercounts on any session long
+/// enough to be evicting — which is exactly the session where the badge matters.
+///
+/// Zero while following (D37): at the top there is nothing above to have missed, and D33
+/// makes reaching index 0 the badge's clear condition for the same reason.
+fn count_new_above(prev: &[RungKey], next: &[RungKey], top: usize) -> u32 {
+    if top == 0 {
+        return 0;
+    }
+    let seen: std::collections::HashSet<&RungKey> = prev.iter().collect();
+    next.iter()
+        .take(top)
+        .filter(|k| !seen.contains(k))
+        .count()
+        .min(u32::MAX as usize) as u32
+}
+
+/// Where `anchor` has ended up in the new document (D8/D15/D19).
+///
+/// Returns the new top index. Three cases, in order:
+///
+/// 1. **Following** — index 0, always. Nothing is held, so nothing has to be found.
+/// 2. **The anchor still exists** — its new index. On duplicate keys (the same tool called
+///    twice looks identical) the candidate nearest the old index wins; without that rule the
+///    view teleports between two identical rows as the list shifts.
+/// 3. **The anchor is gone** (D15) — walk outward from its old position through the *previous*
+///    document and take the first rung that survived. Outward rather than downward so the view
+///    lands next to what was being read instead of at an end.
+fn resolve_anchor(anchor: &Anchor, prev: &[RungKey], next: &[RungKey]) -> usize {
+    let Anchor::Held { key, index } = anchor else {
+        return 0;
+    };
+    let nearest = |k: &RungKey, from: usize| -> Option<usize> {
+        next.iter()
+            .enumerate()
+            .filter(|(_, c)| *c == k)
+            .min_by_key(|(i, _)| i.abs_diff(from))
+            .map(|(i, _)| i)
+    };
+    if let Some(i) = nearest(key, *index) {
+        return i;
+    }
+    // D15: the anchored rung was evicted. Its neighbours in the OLD document are the closest
+    // thing to "where the reader was".
+    for d in 1..prev.len().max(1) {
+        for cand in [index.checked_sub(d), index.checked_add(d)]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(k) = prev.get(cand) {
+                if let Some(i) = nearest(k, *index) {
+                    return i;
+                }
+            }
+        }
+    }
+    0
+}
+
 pub struct AiMonitorOverlay {
     visible: bool,
     handle: MonitorHandle,
+    /// Sub-rung wheel remainder — the panel's own, never shared with the grid's (D23).
+    wheel_residue: f32,
+    /// Which sections are folded shut, by section index.
+    ///
+    /// The app's, not the model's, for the same reason the anchor is: the model is rebuilt
+    /// from telemetry several times a second, so anything the *user* decided has to live
+    /// outside it and be stamped back on. Sized lazily — the section count is the model's to
+    /// state, and a fixed six here would be a second place that number is written down.
+    folds: Vec<bool>,
+    /// What the view is holding on to across snapshots (D8/D37).
+    anchor: Anchor,
+    /// Every rung of the document currently published, in ladder order. The anchor is
+    /// re-found against the next one, and D11's badge is the difference between the two.
+    keys: Vec<RungKey>,
     /// Everything that belongs to **one tab's session**, in one slot (D13/R10.1).
     /// There is exactly one — the panel is per *window*, not per tab — and a re-point
     /// replaces it whole rather than merging into it (R10.3). See [`Session`].
@@ -156,6 +322,10 @@ impl AiMonitorOverlay {
         AiMonitorOverlay {
             visible: false,
             handle: MonitorHandle::default(),
+            wheel_residue: 0.0,
+            folds: Vec::new(),
+            anchor: Anchor::default(),
+            keys: Vec::new(),
             session: Session::default(),
             repoint: Repoint::default(),
             watcher: None,
@@ -533,6 +703,7 @@ impl AiMonitorOverlay {
             );
         }
         self.visible = true;
+        self.reset_scroll();
         self.refresh_model();
     }
 
@@ -684,7 +855,75 @@ impl AiMonitorOverlay {
     /// UTC offset, config, process-tree answer), hand over the snapshot, publish the
     /// result. `visible` is stamped here rather than in the composer because whether the
     /// user is looking is this file's fact, not the snapshot's.
-    fn refresh_model(&self) {
+    /// Take the anchor from wherever the view now sits (D8/D37).
+    ///
+    /// The mode is **derived from the index, never latched**: at 0 there is nothing above to
+    /// miss, so nothing is held. Latching it instead would leave an armed anchor sitting at
+    /// index 0 whenever the document shrank under an anchored view — and then a new entry
+    /// arriving would push the reader down from a position they never chose.
+    fn rearm_anchor(&mut self) {
+        let top = self.handle.scroll().top;
+        self.anchor = match self.keys.get(top) {
+            Some(key) if top > 0 => Anchor::Held {
+                key: key.clone(),
+                index: top,
+            },
+            _ => Anchor::Following,
+        };
+    }
+
+    /// Put section `n`'s heading in the sticky slot (D16/R8.1/R8.2).
+    ///
+    /// The target is the heading's **own** ladder index, not the rung after it: D31 has the
+    /// slot consume a heading, so landing on `index + 1` would show the same frame while
+    /// leaving the scroll state one rung from where every other path puts it.
+    ///
+    /// `Cmd+Opt+1` doubles as "back to the top" (D30) with no new binding, because TASKS is
+    /// the first section — and reaching index 0 clears the badge under D33's one rule.
+    fn jump_to(&mut self, section: usize) {
+        let Some(target) = self.handle.jump_target(section) else {
+            return; // no document laid out yet
+        };
+        let badge = if target == 0 {
+            0
+        } else {
+            self.handle.scroll().badge
+        };
+        self.handle.set_scroll(ScrollState { top: target, badge });
+        self.wheel_residue = 0.0;
+        self.rearm_anchor();
+    }
+
+    /// Flip section `n`'s fold and rebuild the document around it.
+    ///
+    /// The anchor is re-armed from where the view ends up rather than carried: folding a
+    /// section **above** the reader removes rungs from under them, and `resolve_anchor`'s
+    /// content-hash walk already lands them on the nearest survivor — but the rung they
+    /// end on is a new one, and D37 says the mode is a function of that index.
+    fn toggle_fold(&mut self, n: usize) {
+        if self.folds.len() <= n {
+            self.folds.resize(n + 1, true);
+        }
+        self.folds[n] = !self.folds[n];
+        self.wheel_residue = 0.0; // a bank measured against a document that no longer exists
+        self.refresh_model();
+        self.rearm_anchor();
+    }
+
+    /// Back to the top, holding nothing (D25/R11).
+    ///
+    /// Opening the panel re-resolves the log, respawns the watcher and re-runs the backfill,
+    /// so the document is new anyway — carrying a scroll position into it would land the view
+    /// by way of D15's survivor walk at a rung the reader never chose. And the reason to open
+    /// the panel is usually "what is happening now", which is at the top.
+    fn reset_scroll(&mut self) {
+        self.anchor = Anchor::Following;
+        self.wheel_residue = 0.0;
+        self.keys.clear();
+        self.handle.set_scroll(ScrollState { top: 0, badge: 0 });
+    }
+
+    fn refresh_model(&mut self) {
         let env = dashboard::Env {
             now_ms: now_ms(),
             attached: self.session.attach.attached,
@@ -694,7 +933,45 @@ impl AiMonitorOverlay {
         };
         let mut model = dashboard::model(self.session.latest.as_deref(), &env);
         model.visible = self.visible;
+        // Stamp the user's fold decisions back on. A section long enough to fold starts
+        // **shut**: the panel's job is to stay readable at a glance, and RECENT CALLS alone
+        // can run to dozens of rows. Opening one is a click; being unable to see the other
+        // five sections without scrolling past those dozens is not.
+        if self.folds.len() < model.sections.len() {
+            self.folds.resize(model.sections.len(), true);
+        }
+        for (s, &shut) in model.sections.iter_mut().zip(self.folds.iter()) {
+            s.collapsed = shut;
+        }
+
+        // D8/D19/D37 — carry the reading position across the swap.
+        //
+        // The ladder comes from the renderer's own function rather than a second enumeration
+        // here (C11): two counts that drift apart put the view a rung from where the user
+        // asked, and they drift silently. Resolved BEFORE the model is published so the
+        // panel never draws a frame at an index belonging to the previous document.
+        let ladder = renderer::monitor_layout::item_ladder(&model);
+        let keys: Vec<RungKey> = ladder.iter().map(|i| rung_key(&model, i)).collect();
+        let top = resolve_anchor(&self.anchor, &self.keys, &keys);
+        // Re-arm from the new document: the key is unchanged but its index moved, and D15's
+        // outward walk starts from an index, so a stale one would search from the wrong place.
+        self.anchor = match &self.anchor {
+            Anchor::Following => Anchor::Following,
+            Anchor::Held { .. } => match keys.get(top) {
+                Some(key) if top > 0 => Anchor::Held {
+                    key: key.clone(),
+                    index: top,
+                },
+                // The anchor collapsed back to the top — nothing above it survived. That is
+                // `Following` again, by D37's rule that the mode is a function of the index.
+                _ => Anchor::Following,
+            },
+        };
+        // D11/D33 — how much has piled up above the reader while they were away.
+        let badge = count_new_above(&self.keys, &keys, top);
+        self.keys = keys;
         self.handle.set(model);
+        self.handle.set_scroll(ScrollState { top, badge });
     }
 }
 
@@ -1565,10 +1842,92 @@ impl Overlay for AiMonitorOverlay {
             ctx.request_redraw();
             return Handled::Consumed; // R2.1 — never reaches the shell
         }
+        // D12/D13/D16 — jump straight to a section. **This reverses the decision recorded
+        // two lines below**, and the reversal is gated rather than wholesale: the panel takes
+        // these six chords ONLY while it is on screen. That is what preserves the reason the
+        // original decision existed — a panel that is not up captures nothing, so the class
+        // of accident it feared (a key stolen from `vim` or `less`) remains impossible.
+        //
+        // Visibility is checked here and not left to the dispatcher, which deliberately
+        // offers keys to hidden overlays so an overlay can consume the chord that opens it.
+        if self.visible {
+            if let Some(section) = input::monitor_jump(input) {
+                self.jump_to(section);
+                ctx.request_redraw();
+                return Handled::Consumed;
+            }
+        }
         // A monitor doesn't capture other keys (D1/R1.2/R1.3): no `Esc`, no `q`. The
         // panel never takes focus, so an `Esc` handler here would fire while the user is
         // in `vim`'s insert mode, and `q` is the key that quits `less`.
+        //
+        // **That rule is now narrower than it reads, and the narrowing was deliberate**
+        // (ai-monitor-panel-scroll D16): the six jump chords above are an exception, gated on
+        // the panel being visible. What it still forbids — and what made it right — is bare
+        // keys the shell is waiting for. `Esc` and `q` remain untouchable at every panel
+        // state; `Cmd+Shift+<digit>` is a chord no shell reads. Do not "restore" the rule by
+        // deleting the block above without re-reading D16: the panel's only way back to the
+        // top (D30) goes through it.
         Handled::Passthrough
+    }
+
+    /// D7/D9/D10/C12 — the panel takes the wheel while the pointer is over it, and hands it
+    /// back at an edge only in the direction that pushes further into that edge.
+    ///
+    /// The trade this makes is deliberate and was named as a risk when it was made: scrolling
+    /// the terminal's scrollback with the pointer parked over the panel stops working. D9
+    /// recovers it at the two ends, which is a partial recovery, not a full one.
+    ///
+    /// The residue lives here — one accumulator for the panel, strictly apart from the grid's
+    /// `wheel_accum` (D23). A rung and a text line are different units, so carrying leftovers
+    /// between them would make a reversal lurch by whatever the other side had banked.
+    ///
+    /// The geometry is entirely the renderer's: this asks the handle to move by a distance
+    /// and reads back whether it could, rather than rebuilding the ladder from its own copy
+    /// of the model and guessing a viewport height (SD2).
+    fn on_wheel(&mut self, delta: WheelDelta, cell_h: f32) -> Handled {
+        if !self.visible {
+            return Handled::Passthrough;
+        }
+        let px = input::panel_wheel_px(delta, cell_h);
+        if self.handle.wheel_px(px, &mut self.wheel_residue) {
+            self.rearm_anchor();
+            // D33: at the top there is nothing above left unseen, so the badge's own claim
+            // has become false. One rule, and it lines up exactly with what the badge means —
+            // which is why "clear only on the return chord" was rejected: scrolling all the
+            // way up by hand would leave it lying.
+            if self.handle.scroll().top == 0 {
+                let s = self.handle.scroll();
+                self.handle.set_scroll(ScrollState { badge: 0, ..s });
+            }
+            return Handled::Consumed;
+        }
+        // It did not move. Either the gesture is still banking below one rung — in which
+        // case the panel kept the event and there is simply nothing to draw yet — or this is
+        // the edge in this direction, which is D9's hand-off. `scroll_by_px` tells the two
+        // apart by zeroing the residue at an edge and keeping it while banking.
+        if self.wheel_residue == 0.0 {
+            Handled::Passthrough
+        } else {
+            Handled::Consumed
+        }
+    }
+
+    fn on_press(&mut self, point: [f32; 2]) -> Handled {
+        if !self.visible {
+            return Handled::Passthrough;
+        }
+        // The panel resolves the point against its own published bands; this file does no
+        // geometry (SD2). `None` is a press on a row or on dead space — the panel owns the
+        // pixels either way, so it is consumed rather than dropped through onto the grid,
+        // which would put a selection caret under a panel the user was clicking.
+        match self.handle.press(point) {
+            Some(section) => {
+                self.toggle_fold(section);
+                Handled::Consumed
+            }
+            None => Handled::Consumed,
+        }
     }
 
     fn layer(&self) -> Box<dyn DrawLayer> {
@@ -1666,11 +2025,690 @@ impl Overlay for AiMonitorOverlay {
 
 #[cfg(test)]
 mod tests {
+
+    use crate::input::WheelDelta;
+    use renderer::monitor_model::MonitorModel;
+    use renderer::monitor_panel::{MonitorHandle, ScrollState};
+
+    // ---- ai-monitor-panel-scroll T8 / R6.1-R6.7 / R11: anchoring the reading position ----
+
+    fn body_keys(n: usize, tag: &str) -> Vec<RungKey> {
+        use std::hash::{Hash, Hasher};
+        (0..n)
+            .map(|i| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                format!("{tag}{i}").hash(&mut h);
+                RungKey::Body(h.finish())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn r6_4_a_rungs_key_covers_what_it_displays_including_its_outcome() {
+        // D19 keys on appearance because the rows carry no id. That makes *what counts as
+        // appearance* a real decision: a call that turns from running into failed is a
+        // different row to the reader, and an anchor that silently followed it would be
+        // holding onto something that is no longer what was being read. So the outcome glyph
+        // and the value colour are in the key, not just the text.
+        use renderer::monitor_layout::{Item, ItemKind};
+        use renderer::monitor_model::{ColorRole, Row, Section, SectionBody};
+        let row = |glyph, color| Row {
+            glyph: Some(glyph),
+            text: "Bash".into(),
+            value: "1.8s".into(),
+            value_color: color,
+            ..Row::default()
+        };
+        let model = |r: Row| MonitorModel {
+            sections: vec![Section {
+                collapsed: false,
+                label: "RECENT CALLS".into(),
+                total: 1,
+                lost: 0,
+                body: SectionBody::Rows(vec![r]),
+            }],
+            ..MonitorModel::default()
+        };
+        let item = Item {
+            section: 0,
+            kind: ItemKind::Row,
+            entry: Some(0),
+        };
+        let ok = rung_key(&model(row('✓', ColorRole::Teal)), &item);
+        let failed = rung_key(&model(row('✗', ColorRole::Amber)), &item);
+        assert_ne!(
+            ok, failed,
+            "an outcome change must not be followed silently"
+        );
+        assert_eq!(
+            ok,
+            rung_key(&model(row('✓', ColorRole::Teal)), &item),
+            "and an unchanged row must key the same, or the anchor is lost every snapshot"
+        );
+
+        // A heading keys on its label alone — and it must, since jumps land there.
+        let heading = rung_key(
+            &model(row('✓', ColorRole::Teal)),
+            &Item {
+                section: 0,
+                kind: ItemKind::Heading,
+                entry: None,
+            },
+        );
+        assert_eq!(heading, RungKey::Heading("RECENT CALLS".into()));
+    }
+
+    #[test]
+    fn r6_2_an_insertion_above_the_anchor_moves_the_index_and_not_the_reader() {
+        // D8. Three calls arrive at the head of RECENT CALLS while the reader is partway
+        // down it. The row under their eye must stay put — which means the INDEX has to
+        // move, by exactly as many rungs as were inserted above it.
+        let prev = body_keys(10, "row");
+        let anchor = Anchor::Held {
+            key: prev[6].clone(),
+            index: 6,
+        };
+        let mut next = body_keys(3, "new");
+        next.extend(prev.iter().cloned());
+        assert_eq!(
+            resolve_anchor(&anchor, &prev, &next),
+            9,
+            "6 + 3 inserted above"
+        );
+    }
+
+    #[test]
+    fn r6_1_following_ignores_the_anchor_machinery_entirely() {
+        // D37, and the reason it exists: without a Following state the reader who has NOT
+        // scrolled loses live updates on the very first snapshot after opening the panel —
+        // an anchor at index 0 would be pushed down by anything arriving above it, and the
+        // panel would stop being a monitor without anyone touching it.
+        let prev = body_keys(4, "row");
+        let mut next = body_keys(2, "new");
+        next.extend(prev.iter().cloned());
+        assert_eq!(resolve_anchor(&Anchor::Following, &prev, &next), 0);
+    }
+
+    #[test]
+    fn r6_4_a_heading_anchor_is_matched_by_label_not_by_content() {
+        // D32 made headings first-class rungs, so an anchor ON a heading is the normal case:
+        // it is where every jump lands and where `max_index` sits. Their labels are fixed and
+        // distinct, so no hash and no collision rule is needed.
+        let prev = vec![
+            RungKey::Heading("TASKS".into()),
+            RungKey::Heading("RECENT CALLS".into()),
+        ];
+        let anchor = Anchor::Held {
+            key: RungKey::Heading("RECENT CALLS".into()),
+            index: 1,
+        };
+        let mut next = vec![RungKey::Heading("TASKS".into())];
+        next.extend(body_keys(5, "row"));
+        next.push(RungKey::Heading("RECENT CALLS".into()));
+        assert_eq!(resolve_anchor(&anchor, &prev, &next), 6);
+    }
+
+    #[test]
+    fn r6_4_duplicate_rows_resolve_to_the_nearest_candidate() {
+        // The same tool called twice renders identically, so the key genuinely collides.
+        // Without a nearest rule the view teleports between the two as the list shifts —
+        // a jump the user did not ask for, which is what C7 forbids.
+        let dup = body_keys(1, "same")[0].clone();
+        let prev = vec![dup.clone(); 1];
+        let next = vec![dup.clone(), RungKey::Heading("X".into()), dup.clone()];
+        assert_eq!(
+            resolve_anchor(
+                &Anchor::Held {
+                    key: dup.clone(),
+                    index: 2
+                },
+                &prev,
+                &next
+            ),
+            2,
+            "the far copy is nearer to index 2"
+        );
+        assert_eq!(
+            resolve_anchor(&Anchor::Held { key: dup, index: 0 }, &prev, &next),
+            0,
+            "and the near copy to index 0"
+        );
+    }
+
+    #[test]
+    fn r6_6_an_idle_anchored_view_does_not_drift_across_repeated_snapshots() {
+        // D14/C7: the panel is on a live feed, so "the view holds still" has to survive many
+        // updates, not one. A resolver that was off by a rung per snapshot would look correct
+        // in a single-step test and walk the reader down the document over a few minutes —
+        // the failure mode nobody reports because nobody sees it happen.
+        let prev = body_keys(12, "row");
+        let mut anchor = Anchor::Held {
+            key: prev[7].clone(),
+            index: 7,
+        };
+        let mut keys = prev.clone();
+        for _ in 0..50 {
+            // A snapshot that changed nothing at all.
+            let top = resolve_anchor(&anchor, &keys, &keys);
+            assert_eq!(top, 7, "the view drifted on an unchanged document");
+            anchor = Anchor::Held {
+                key: keys[top].clone(),
+                index: top,
+            };
+        }
+        // And with churn that never touches what is above the anchor: rows appended BELOW it
+        // must not move it either.
+        for extra in 1..20 {
+            let mut next = keys.clone();
+            next.extend(body_keys(extra, "tail"));
+            let top = resolve_anchor(&anchor, &keys, &next);
+            assert_eq!(top, 7, "appending below the anchor moved it");
+            keys = next;
+        }
+    }
+
+    #[test]
+    fn r6_5_an_evicted_anchor_lands_on_its_nearest_surviving_neighbour() {
+        // D15. The alternative — snapping to an end — throws away the reader's position at
+        // the exact moment they are least likely to have caused it: a ring eviction is the
+        // panel's doing, not theirs.
+        let prev = body_keys(6, "row");
+        let anchor = Anchor::Held {
+            key: prev[3].clone(),
+            index: 3,
+        };
+        // Rung 3 is gone; its neighbours survive, reindexed by one insertion at the head.
+        let mut next = body_keys(1, "new");
+        next.extend(
+            prev.iter()
+                .enumerate()
+                .filter(|(i, _)| *i != 3)
+                .map(|(_, k)| k.clone()),
+        );
+        let at = resolve_anchor(&anchor, &prev, &next);
+        assert!(
+            at == 3 || at == 4,
+            "must land beside the lost rung (old 2 or old 4), got {at}"
+        );
+        assert_ne!(at, 0, "and never snap to an end");
+    }
+
+    #[test]
+    fn r6_5_an_anchor_with_no_survivors_at_all_returns_to_following() {
+        // Every rung gone — a re-point onto a different session. There is nothing to hold,
+        // and pretending otherwise would strand the view at an arbitrary index.
+        let prev = body_keys(4, "old");
+        let anchor = Anchor::Held {
+            key: prev[2].clone(),
+            index: 2,
+        };
+        assert_eq!(resolve_anchor(&anchor, &prev, &body_keys(4, "new")), 0);
+    }
+
+    #[test]
+    fn r6_3_the_mode_is_a_function_of_the_index_not_a_latch() {
+        // The self-contradiction D37 had to close. If `Following` were latched at the moment
+        // the user returned to the top, a document that SHRANK under an anchored view could
+        // leave the index at 0 with an anchor still armed — and the next arrival would push
+        // the reader down from a position they never chose.
+        let mut o = seeded_overlay(8, 20.0);
+        o.keys = body_keys(8, "row");
+        o.handle.set_scroll(ScrollState { top: 4, badge: 0 });
+        o.rearm_anchor();
+        assert!(matches!(o.anchor, Anchor::Held { index: 4, .. }));
+        o.handle.set_scroll(ScrollState { top: 0, badge: 0 });
+        o.rearm_anchor();
+        assert!(
+            matches!(o.anchor, Anchor::Following),
+            "index 0 IS following — no latch survives it"
+        );
+    }
+
+    #[test]
+    fn r11_1_and_r11_2_opening_or_repointing_starts_at_the_top_holding_nothing() {
+        // D25. The re-open path respawns the watcher and re-runs the backfill, so the
+        // document is new regardless; a carried-over position would land by way of D15's
+        // survivor walk at a rung the reader never picked.
+        //
+        // R11.2 (a tab switch) rides the same path rather than getting its own: `Tick::Reopen`
+        // calls `open()`, and `open()` calls this. Asserting the reset here is asserting it
+        // for both — and a second test that re-implemented the reset would prove nothing
+        // about the shipped one.
+        let mut o = seeded_overlay(8, 20.0);
+        o.keys = body_keys(8, "row");
+        o.handle.set_scroll(ScrollState { top: 5, badge: 0 });
+        o.rearm_anchor();
+        o.wheel_residue = 3.5;
+        assert!(matches!(o.anchor, Anchor::Held { .. }));
+
+        o.reset_scroll();
+        assert_eq!(o.handle.scroll().top, 0);
+        assert!(matches!(o.anchor, Anchor::Following));
+        assert_eq!(
+            o.wheel_residue, 0.0,
+            "a stale bank would lurch the first gesture"
+        );
+    }
+
+    // ---- ai-monitor-panel-scroll T10 / R8.1-R8.6: the six section jumps ----
+
+    fn jump_chord(code: winit::keyboard::KeyCode) -> KeyInput {
+        KeyInput {
+            // What a US layout actually delivers for `Cmd+Opt+1` — the physical code is
+            // what `monitor_jump` reads, and this field being a symbol is the point.
+            key: Key::Character("¡".into()),
+            text: Some("¡".into()),
+            mods: ModifiersState::SUPER | ModifiersState::ALT,
+            physical: winit::keyboard::PhysicalKey::Code(code),
+        }
+    }
+
+    /// A handle whose document is six sections of `n` rows each — the shape the panel ships.
+    fn six_section_handle(n: usize, viewport_h: f32) -> MonitorHandle {
+        use renderer::monitor_layout::{Item, ItemKind};
+        use renderer::monitor_panel::ScrollView;
+        let mut ladder = Vec::new();
+        for section in 0..6 {
+            ladder.push(Item {
+                section,
+                kind: ItemKind::Heading,
+                entry: None,
+            });
+            for e in 0..n {
+                ladder.push(Item {
+                    section,
+                    kind: ItemKind::Row,
+                    entry: Some(e),
+                });
+            }
+        }
+        let heights = vec![10.0; ladder.len()];
+        let h = MonitorHandle::default();
+        h.publish_view(ScrollView {
+            viewport: renderer::monitor_layout::NO_BAND,
+            slot: renderer::monitor_layout::NO_BAND,
+            ladder,
+            heights,
+            viewport_h,
+        });
+        h
+    }
+
+    /// The same six-section handle, but with real bands so a press can be resolved.
+    fn clickable_handle(n: usize, viewport_h: f32) -> MonitorHandle {
+        use renderer::monitor_panel::ScrollView;
+        use renderer::sidebar_layout::Rect;
+        let h = six_section_handle(n, viewport_h);
+        let v = h.view();
+        h.publish_view(ScrollView {
+            // A 200-wide panel at x=800, its slot one 10px line and the content band below.
+            slot: Rect {
+                x: 800.0,
+                y: 100.0,
+                w: 200.0,
+                h: 10.0,
+            },
+            viewport: Rect {
+                x: 800.0,
+                y: 110.0,
+                w: 200.0,
+                h: viewport_h,
+            },
+            ..v
+        });
+        h
+    }
+
+    #[test]
+    fn r13_6_only_a_heading_or_a_fold_control_answers_a_press() {
+        // The panel has exactly two click targets, and rows are not among them. Giving rows
+        // a meaning would make every stray click in a live list change the document.
+        let o = {
+            let mut o = AiMonitorOverlay::detached();
+            o.handle = clickable_handle(4, 100.0);
+            o.visible = true;
+            o
+        };
+        // Rung 0 is section 0's heading; at top=0 the slot shows it and the band starts at
+        // rung 1, so the heading is reachable **only** through the slot.
+        assert_eq!(
+            o.handle.press([850.0, 105.0]),
+            Some(0),
+            "the sticky heading"
+        );
+        // First rung inside the band is a row of section 0 — content, not a control.
+        assert_eq!(
+            o.handle.press([850.0, 115.0]),
+            None,
+            "a row is not a control"
+        );
+        // Section 1's heading sits at rung 5 (4 rows + the next heading): band rungs are
+        // 1,2,3,4 then 5, so y = 110 + 4*10 = 150.
+        assert_eq!(
+            o.handle.press([850.0, 155.0]),
+            Some(1),
+            "a heading in the band"
+        );
+        // Outside the panel entirely.
+        assert_eq!(o.handle.press([100.0, 155.0]), None);
+    }
+
+    #[test]
+    fn r13_7_a_press_on_a_heading_folds_that_section_and_the_next_one_unfolds_it() {
+        // The click contract end to end: the overlay flips exactly the section that was
+        // pressed, leaves its neighbours alone, and the second press is the way back.
+        let mut o = AiMonitorOverlay::detached();
+        o.handle = clickable_handle(4, 100.0);
+        o.visible = true;
+        o.folds = vec![false; 6];
+
+        assert_eq!(o.on_press([850.0, 155.0]), Handled::Consumed);
+        assert!(o.folds[1], "the pressed section folded");
+        assert!(!o.folds[0] && !o.folds[2], "its neighbours did not move");
+
+        assert_eq!(o.on_press([850.0, 155.0]), Handled::Consumed);
+        assert!(!o.folds[1], "the second press is the way back");
+    }
+
+    #[test]
+    fn r13_8_a_press_the_panel_owns_but_no_control_claims_is_still_the_panels() {
+        // Dead space inside the band is consumed rather than passed down: the panel reserves
+        // its columns, so letting the press through would put a selection caret in a grid
+        // the user cannot even see there.
+        let mut o = AiMonitorOverlay::detached();
+        o.handle = clickable_handle(4, 100.0);
+        o.visible = true;
+        assert_eq!(o.on_press([850.0, 115.0]), Handled::Consumed);
+        // and a closed panel claims nothing at all
+        o.visible = false;
+        assert_eq!(o.on_press([850.0, 115.0]), Handled::Passthrough);
+    }
+
+    #[test]
+    fn r8_1_and_r8_5_each_chord_lands_on_its_section_and_sends_no_byte_to_the_shell() {
+        // D16 chose six separate keys over cycling precisely so one press reaches the target.
+        // The landing index is the heading's OWN — not the rung after it — because D31 has
+        // the slot consume a heading, so `index + 1` would draw the identical frame while
+        // leaving the scroll state a rung off from where every other path puts it.
+        let mut o = AiMonitorOverlay::detached();
+        o.handle = six_section_handle(4, 30.0);
+        o.visible = true;
+        let mut ctx_writer = Vec::new();
+        for (i, code) in [
+            winit::keyboard::KeyCode::Digit1,
+            winit::keyboard::KeyCode::Digit2,
+            winit::keyboard::KeyCode::Digit3,
+            winit::keyboard::KeyCode::Digit4,
+            winit::keyboard::KeyCode::Digit5,
+            winit::keyboard::KeyCode::Digit6,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut probe = WriteProbe::new(&mut ctx_writer);
+            let mut ctx = AppCtx::new(&mut probe, 1, 0, None);
+            assert_eq!(
+                o.on_key(&jump_chord(code), &mut ctx),
+                Handled::Consumed,
+                "section {i} chord must be consumed"
+            );
+            // Asserted against the LADDER, not against `jump_target` — the call the code
+            // itself makes. Comparing the two would be a tautology that passes even if the
+            // target were clamped away from the heading it names.
+            let top = o.handle.scroll().top;
+            let rung = o
+                .handle
+                .rung_at(top)
+                .unwrap_or_else(|| panic!("section {i}: index {top} is off the ladder"));
+            assert!(rung.is_heading(), "section {i} landed on a body rung");
+            assert_eq!(
+                rung.section, i,
+                "section {i} landed on section {}",
+                rung.section
+            );
+        }
+        assert!(
+            ctx_writer.is_empty(),
+            "R8.5: not one byte of a jump chord may reach the shell"
+        );
+    }
+
+    #[test]
+    fn r8_2_the_last_section_can_still_reach_the_top() {
+        // The case a sidebar-style clamp gets wrong, end to end: a long document ending in a
+        // short section. If `max_index` stopped before the final heading, `Cmd+Shift+6` would
+        // move the view and STILL not show TOOL USAGE at the top — D12 left unsolved while
+        // looking implemented.
+        let mut o = AiMonitorOverlay::detached();
+        o.handle = six_section_handle(8, 40.0);
+        o.visible = true;
+        let mut w = Vec::new();
+        let mut probe = WriteProbe::new(&mut w);
+        let mut ctx = AppCtx::new(&mut probe, 1, 0, None);
+        o.on_key(&jump_chord(winit::keyboard::KeyCode::Digit6), &mut ctx);
+        assert_eq!(
+            o.handle.scroll().top,
+            o.handle.jump_target(5).unwrap(),
+            "the sixth heading must be reachable, not merely approached"
+        );
+    }
+
+    #[test]
+    fn r8_4_a_closed_panel_leaves_the_chord_alone() {
+        // The gate that makes reversing `overlay.rs`'s "no other keys" decision safe: while
+        // the panel is not on screen the six chords go wherever they went before, so the
+        // accident the original decision feared — a key taken from `vim` or `less` — is still
+        // impossible.
+        let mut o = AiMonitorOverlay::detached();
+        o.handle = six_section_handle(4, 30.0);
+        o.visible = false;
+        let mut w = Vec::new();
+        let mut probe = WriteProbe::new(&mut w);
+        let mut ctx = AppCtx::new(&mut probe, 1, 0, None);
+        assert_eq!(
+            o.on_key(&jump_chord(winit::keyboard::KeyCode::Digit1), &mut ctx),
+            Handled::Passthrough
+        );
+    }
+
+    #[test]
+    fn r8_6_an_open_panel_still_passes_everything_else_through() {
+        // D1/R1.2/R1.3 survive the reversal: the panel gained six chords, not a focus. `Esc`
+        // in `vim` and `q` in `less` must still reach the shell with the panel wide open.
+        let mut o = AiMonitorOverlay::detached();
+        o.handle = six_section_handle(4, 30.0);
+        o.visible = true;
+        let mut w = Vec::new();
+        for k in [
+            chord(Key::Named(NamedKey::Escape), None, ModifiersState::empty()),
+            chord(
+                Key::Character("q".into()),
+                Some("q"),
+                ModifiersState::empty(),
+            ),
+            chord(
+                Key::Character("7".into()),
+                Some("7"),
+                ModifiersState::SUPER | ModifiersState::SHIFT,
+            ),
+        ] {
+            let mut probe = WriteProbe::new(&mut w);
+            let mut ctx = AppCtx::new(&mut probe, 1, 0, None);
+            assert_eq!(o.on_key(&k, &mut ctx), Handled::Passthrough, "{:?}", k.key);
+        }
+    }
+
+    #[test]
+    fn r8_1_and_r7_8_the_first_chord_is_also_the_way_back_and_clears_the_badge() {
+        // D30 invented no binding: TASKS is the first section, so `Cmd+Opt+1` already
+        // means "top". And arriving at index 0 clears the badge under D33's single rule —
+        // which is why the badge can advertise this chord as the way back.
+        let mut o = AiMonitorOverlay::detached();
+        o.handle = six_section_handle(4, 30.0);
+        o.visible = true;
+        o.handle.set_scroll(ScrollState { top: 12, badge: 9 });
+        let mut w = Vec::new();
+        let mut probe = WriteProbe::new(&mut w);
+        let mut ctx = AppCtx::new(&mut probe, 1, 0, None);
+        o.on_key(&jump_chord(winit::keyboard::KeyCode::Digit1), &mut ctx);
+        assert_eq!(o.handle.scroll().top, 0);
+        assert_eq!(o.handle.scroll().badge, 0);
+    }
+
+    // ---- ai-monitor-panel-scroll T9 / R7.1 / R7.7 / R7.8: counting and clearing ----
+
+    #[test]
+    fn r7_1_new_is_a_set_difference_not_a_length_difference() {
+        // Arithmetic on lengths undercounts the moment a ring starts evicting: three arrive
+        // at the head while two fall off the tail and the length has not moved at all. That
+        // is the steady state of a busy session — precisely when the badge matters.
+        let old = body_keys(6, "row");
+        let mut next = body_keys(3, "new");
+        next.extend(old.iter().take(4).cloned()); // 3 arrived, 2 evicted; len 6 -> 7
+        assert_eq!(
+            count_new_above(&old, &next, 5),
+            3,
+            "all three arrivals are above the reader"
+        );
+        assert_eq!(
+            count_new_above(&old, &next, 2),
+            2,
+            "only what is actually above the anchor counts"
+        );
+    }
+
+    #[test]
+    fn r7_1_and_r7_8_following_never_carries_a_badge() {
+        // D33/D37 line up here: at index 0 there is nothing above to have missed, so the
+        // badge's own claim is false. One rule, and it is the same rule that clears it.
+        let old = body_keys(4, "row");
+        let mut next = body_keys(9, "new");
+        next.extend(old.iter().cloned());
+        assert_eq!(count_new_above(&old, &next, 0), 0);
+    }
+
+    #[test]
+    fn r7_8_scrolling_back_to_the_top_clears_the_badge() {
+        // Rejected alternative: clear only on the return chord. Then wheeling all the way up
+        // by hand leaves the badge standing while nothing is unseen — the badge lying is
+        // worse than no badge, because the reader learns to ignore it.
+        let mut o = seeded_overlay(8, 20.0);
+        o.keys = body_keys(9, "row");
+        o.handle.set_scroll(ScrollState { top: 4, badge: 12 });
+        // Wheel up far enough to reach the top.
+        for _ in 0..12 {
+            o.on_wheel(WheelDelta::Lines(1.0), 16.0);
+        }
+        assert_eq!(o.handle.scroll().top, 0, "premise: we got back to the top");
+        assert_eq!(o.handle.scroll().badge, 0, "and the badge went with it");
+    }
+
+    // ---- ai-monitor-panel-scroll T7 / R5.3-R5.5: the panel's side of the wheel ----
+
+    /// A handle whose published view is a document of `n` equal rungs in one section.
+    fn seeded_overlay(n: usize, viewport_h: f32) -> AiMonitorOverlay {
+        let mut o = AiMonitorOverlay::detached();
+        o.handle = seeded_handle(n, viewport_h);
+        o.visible = true;
+        o
+    }
+
+    fn seeded_handle(n: usize, viewport_h: f32) -> MonitorHandle {
+        use renderer::monitor_layout::{Item, ItemKind};
+        use renderer::monitor_panel::ScrollView;
+        let mut ladder = vec![Item {
+            section: 0,
+            kind: ItemKind::Heading,
+            entry: None,
+        }];
+        for e in 0..n {
+            ladder.push(Item {
+                section: 0,
+                kind: ItemKind::Row,
+                entry: Some(e),
+            });
+        }
+        let heights = vec![10.0; ladder.len()];
+        let h = MonitorHandle::default();
+        h.publish_view(ScrollView {
+            viewport: renderer::monitor_layout::NO_BAND,
+            slot: renderer::monitor_layout::NO_BAND,
+            ladder,
+            heights,
+            viewport_h,
+        });
+        h
+    }
+
+    #[test]
+    fn r5_3_the_edge_hands_the_wheel_on_but_only_in_the_direction_that_pushes_into_it() {
+        // C12, at the seam where it actually decides something. Read literally, "at the end,
+        // give the wheel to the grid" means the panel never gets it back — scrolling up
+        // leaves it at that same end, so the condition stays true forever. Direction is what
+        // makes the hand-off temporary.
+        let mut o = seeded_overlay(8, 20.0);
+        let max = o.handle.metrics().max_index;
+        assert!(max > 0, "premise: this document scrolls");
+        o.handle.set_scroll(ScrollState { top: max, badge: 0 });
+
+        assert_eq!(
+            o.on_wheel(WheelDelta::Lines(-1.0), 16.0),
+            Handled::Passthrough,
+            "at the bottom, pushing further down belongs to the grid (D9)"
+        );
+        assert_eq!(
+            o.handle.scroll().top,
+            max,
+            "and the panel did not move to produce that answer"
+        );
+        assert_eq!(
+            o.on_wheel(WheelDelta::Lines(1.0), 16.0),
+            Handled::Consumed,
+            "the same position, pushed up, is still the panel's"
+        );
+        assert!(o.handle.scroll().top < max);
+    }
+
+    #[test]
+    fn r5_5_a_sub_rung_gesture_is_kept_rather_than_leaked_to_the_grid() {
+        // The distinction the `Handled` answer turns on: "did not move because it is still
+        // banking" is the panel's event, "did not move because it is at the edge" is the
+        // grid's. Getting this wrong makes a slow trackpad drag over the panel scroll the
+        // TERMINAL instead — with nothing visibly wrong to point at.
+        let mut o = seeded_overlay(8, 20.0);
+        assert_eq!(
+            o.on_wheel(WheelDelta::Pixels(-4.0), 16.0),
+            Handled::Consumed,
+            "4px of a 10px rung: kept, banked, nothing drawn yet"
+        );
+        assert_eq!(o.handle.scroll().top, 0, "and nothing moved");
+        assert!(o.wheel_residue != 0.0, "the bank holds it");
+        // Completing the rung spends the bank and moves the view.
+        assert_eq!(
+            o.on_wheel(WheelDelta::Pixels(-8.0), 16.0),
+            Handled::Consumed
+        );
+        assert!(o.handle.scroll().top > 0);
+    }
+
+    #[test]
+    fn a_hidden_panel_never_takes_the_wheel() {
+        // `OverlayHost::wheel` gates on visibility too, but the overlay must not depend on
+        // that: a band that is not on screen has nothing to scroll, and claiming the event
+        // would make the terminal stop scrolling for no visible reason.
+        let mut o = seeded_overlay(8, 20.0);
+        o.visible = false;
+        assert_eq!(
+            o.on_wheel(WheelDelta::Lines(-1.0), 16.0),
+            Handled::Passthrough
+        );
+    }
     use super::{
-        agent_pid_moved, apply_rotation, backfill_from_scratch, baseline_from, drain_to_newest,
-        hint_or_pane_cwd, hint_or_pane_cwd_with, pane_cwd_with, proves_ownership, reopen_is_inert,
-        rival_refresh_needed, rival_set_of, session_rotated_with, tick_action, AiMonitorOverlay,
-        Attachment, OpenedOn, Repoint, Rotation, Session, Tick,
+        agent_pid_moved, apply_rotation, backfill_from_scratch, baseline_from, count_new_above,
+        drain_to_newest, hint_or_pane_cwd, hint_or_pane_cwd_with, pane_cwd_with, proves_ownership,
+        reopen_is_inert, resolve_anchor, rival_refresh_needed, rival_set_of, rung_key,
+        session_rotated_with, tick_action, AiMonitorOverlay, Anchor, Attachment, OpenedOn, Repoint,
+        Rotation, RungKey, Session, Tick,
     };
     use crate::seam::{AppCtx, AppRequest, Handled, KeyInput, Overlay, WriteProbe};
     use crate::tabsession;
@@ -1700,6 +2738,7 @@ mod tests {
             key,
             text: text.map(str::to_owned),
             mods,
+            physical: crate::seam::NO_PHYSICAL,
         }
     }
 

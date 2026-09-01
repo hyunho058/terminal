@@ -580,14 +580,28 @@ fn sections(t: &TelemetrySnapshot, env: &Env) -> Vec<Section> {
 /// could not tell "no data" from "not built".
 fn section(label: &str, empty_state: &str, total: usize, body: SectionBody) -> Section {
     Section {
+        collapsed: false,
         label: label.to_string(),
         total,
+        lost: 0,
         body: if body.is_empty() {
             SectionBody::Empty(empty_state.to_string())
         } else {
             body
         },
     }
+}
+
+/// How many entries a ring has dropped: what the session did, minus what is still held.
+///
+/// Only RECENT CALLS can answer this honestly, and only because the crate keeps
+/// `total_tool_calls` as **its own scalar** rather than a sum over the bounded tally — the
+/// comment there says exactly why: *"counting a ring would print a number that LOOKS
+/// cumulative and is not"*. The other rings have no cumulative counter to compare against,
+/// so their loss stays `0`, which reads as "nothing known to be lost" and not as "nothing
+/// lost". Inventing a number for them would be the `+N more` mistake again.
+fn ring_loss(session_total: u64, retained: usize) -> usize {
+    (session_total as usize).saturating_sub(retained)
 }
 
 /// TASKS — newest-*updated* first (B6c), one card each.
@@ -819,12 +833,18 @@ fn recent_calls(t: &TelemetrySnapshot) -> Section {
             ..Row::default()
         })
         .collect();
-    section(
+    let mut s = section(
         "RECENT CALLS",
         "(no other tool calls)",
         t.tools.len(),
         SectionBody::Rows(rows),
-    )
+    );
+    // D20/D6: this is the section the interview named as the acceptance criterion, and the
+    // only one the crate gives a cumulative counter for. On a long session the ring holds
+    // the last `TOOLS_CAP` calls and the rest are gone — the panel says so rather than
+    // letting "everything is reachable now" quietly become a lie.
+    s.lost = ring_loss(t.total_tool_calls, t.tools.len());
+    s
 }
 
 /// Distinct tools TOOL USAGE ranks (D12).
@@ -1136,7 +1156,7 @@ pub fn dur(ms: u64) -> String {
 mod tests {
     use super::*;
     use ai_monitor::telemetry::{CompletedTool, FileActivity, SessionTelemetry, SkillEntry};
-    use renderer::monitor_layout::{layout, PanelDraw};
+    use renderer::monitor_layout::layout;
     use std::fmt::Write as _;
 
     /// A default environment at `now`: attached (so nothing is detached) and no
@@ -1717,64 +1737,225 @@ mod tests {
         }
     }
 
+    // ---- ai-monitor-panel-scroll T11 / R0.3 / R1.5 / R12.3: what did NOT change ----
+
     #[test]
-    fn r8_a_real_model_reaches_the_allocator_with_the_entries_it_actually_holds() {
-        // The end-to-end half of R8: `monitor_layout` tests the allocator against
-        // synthetic metrics, but the metrics it divides are derived from *this* model's
-        // `body.len()`, so a section that sent a body it could not draw — or a `total`
-        // that did not exceed it — would satisfy every allocator test and still produce a
-        // panel with an empty grant or a `+N more` that counted nothing.
+    fn r1_5_the_tool_usage_cap_survives_the_feature_that_removed_every_other_limit() {
+        // D21. D4 deleted the height allocator because its reason — rationing a fixed band —
+        // stopped existing. `TOOL_BARS` looks like the same kind of limit and is not: its
+        // reason is *readability*, that a bar list long enough to include a tool called twice
+        // stops showing proportions at all. Unlimited height does not touch that argument, so
+        // the cap stays and the difference it creates is explicitly NOT a ring loss (C10).
         let (t, now) = full();
-        let mut m = model(Some(&t), &env(now));
-        m.visible = true;
-        let cell = [8.0, 16.0];
+        let m = model(Some(&t), &env(now));
+        let usage = section_of(&m, "TOOL USAGE");
+        assert!(
+            usage.body.len() <= TOOL_BARS,
+            "the readability cap must still bound the bars: {}",
+            usage.body.len()
+        );
+        assert_eq!(usage.lost, 0, "and its cap is not reported as a loss");
+    }
 
-        // A panel tall enough for every heading and a first row each (R8.1): each
-        // section's first entry is drawn, and every heading with it.
-        let tall = layout(&m, [0.0, 0.0, 430.0, 1600.0], 1.0, cell);
-        let drawn = |d: &PanelDraw, s: &str| d.runs.iter().any(|r| r.text == s);
-        for (label, first) in [
-            ("TASKS", "Fold usage per message id"),
-            ("ACTIVE AGENTS", "● general-purpose"),
-            ("SKILLS", "harness-ops:loop"),
-            ("FILE ACTIVITY", "READ"),
-            ("RECENT CALLS", "Bash"),
-            ("TOOL USAGE", "Bash"),
-        ] {
-            assert!(drawn(&tall, label), "{label} heading missing");
-            assert!(drawn(&tall, first), "{label} drew no row");
-        }
+    #[test]
+    fn r0_3_nothing_outside_the_rings_is_ever_recovered() {
+        // D1 drew the scope line here: the panel makes what is IN MEMORY reachable, and does
+        // not resurrect what the rings dropped. The composer has no filesystem, no clock of
+        // its own and no second source — so the guarantee is simply that every section's body
+        // is bounded by the snapshot it was handed.
+        let (mut t, now) = full();
+        t.total_tool_calls = 5_000; // a long session; the ring is far behind
+        let m = model(Some(&t), &env(now));
+        assert_eq!(
+            section_of(&m, "RECENT CALLS").body.len(),
+            t.tools.len(),
+            "RECENT CALLS holds exactly the ring, never more"
+        );
+        assert_eq!(section_of(&m, "SKILLS").body.len(), t.skills.len());
+        assert_eq!(section_of(&m, "FILE ACTIVITY").body.len(), t.files.len());
+        // The loss is *reported*, which is D20 — and reporting is not recovering (C8).
+        assert!(section_of(&m, "RECENT CALLS").lost > 0);
+    }
 
-        // R8.6 end to end: TOOL USAGE holds 11 names and sends 9, so the heading says so
-        // even on a panel with room for every row it was given.
-        assert!(drawn(&tall, "+2 more"), "TOOL USAGE lost its `+2 more`");
+    #[test]
+    fn r12_3_long_text_still_truncates_horizontally_exactly_as_before() {
+        // D28 kept the horizontal axis out of scope. A path too long for the panel is still
+        // clipped with an ellipsis — this feature added vertical reach, not width.
+        let long = "a".repeat(TEXT_CAP * 3);
+        let out = clip(&long);
+        assert_eq!(out.chars().count(), TEXT_CAP);
+        assert!(out.ends_with('…'), "still an ellipsis, not a wrap: {out:?}");
+    }
 
-        // R8.5 end to end: on a panel too short for six headings the survivors are a
-        // prefix of the design order, never a hole in the middle.
-        let short = layout(&m, [0.0, 0.0, 430.0, 260.0], 1.0, cell);
-        let headings: Vec<&str> = [
+    // ---- ai-monitor-panel-scroll T6 / R9.2-R9.5: what the app knows about ring loss ----
+
+    #[test]
+    fn r9_2_recent_calls_reports_what_the_ring_dropped() {
+        // D20 needs a session-cumulative count, and the crate keeps exactly one:
+        // `total_tool_calls`, deliberately its own scalar rather than a sum over the bounded
+        // tally. Without it the panel could not tell "32 calls happened" from "32 are all
+        // that is left of 400", and D4's "everything is reachable" would quietly overclaim.
+        let (mut t, now) = full();
+        t.total_tool_calls = 400;
+        let n = t.tools.len();
+        assert!(
+            n > 0 && (n as u64) < t.total_tool_calls,
+            "premise: the ring is behind"
+        );
+        let m = model(Some(&t), &env(now));
+        let s = section_of(&m, "RECENT CALLS");
+        assert_eq!(s.total, n, "the mark still counts what is held");
+        assert_eq!(s.lost, 400 - n, "and the loss is what is gone");
+    }
+
+    #[test]
+    fn r9_5_only_recent_calls_claims_a_loss_because_only_it_can_know_one() {
+        // C10. TOOL USAGE's `total` (tally names) exceeds its body (`TOOL_BARS` bars) for a
+        // completely different reason — a readability cap D21 keeps, with the data still in
+        // memory. The other rings have no cumulative counter at all, so `0` there means
+        // "not known", not "none". Reporting either as loss re-creates the conflation
+        // `+N more` was retired for.
+        let (mut t, now) = full();
+        t.total_tool_calls = 400;
+        let m = model(Some(&t), &env(now));
+        for label in [
             "TASKS",
             "ACTIVE AGENTS",
             "SKILLS",
             "FILE ACTIVITY",
-            "RECENT CALLS",
             "TOOL USAGE",
-        ]
-        .into_iter()
-        .filter(|l| drawn(&short, l))
-        .collect();
+        ] {
+            assert_eq!(
+                section_of(&m, label).lost,
+                0,
+                "{label} must not claim a loss it cannot measure"
+            );
+        }
+        let usage = section_of(&m, "TOOL USAGE");
         assert!(
-            !headings.is_empty(),
-            "the short panel drew no section at all"
+            usage.total >= usage.body.len(),
+            "premise: the app cap really does hold something back"
         );
-        assert!(
-            headings.len() < 6,
-            "the short panel must actually be short; drew {headings:?}"
-        );
+    }
+
+    #[test]
+    fn r9_3_a_session_shorter_than_the_ring_reports_no_loss() {
+        // The everyday case: nothing has been evicted yet, so the heading must look exactly
+        // as it does today. `saturating_sub` also covers the transient where the counter and
+        // the ring are read a fold apart and the ring momentarily looks longer.
+        let (mut t, now) = full();
+        t.total_tool_calls = t.tools.len() as u64;
         assert_eq!(
-            headings,
-            ["TASKS", "ACTIVE AGENTS", "SKILLS", "FILE ACTIVITY"][..headings.len()],
-            "headings drop from the bottom of the design order"
+            section_of(&model(Some(&t), &env(now)), "RECENT CALLS").lost,
+            0
+        );
+        t.total_tool_calls = 0;
+        assert_eq!(
+            section_of(&model(Some(&t), &env(now)), "RECENT CALLS").lost,
+            0
+        );
+    }
+
+    #[test]
+    fn r1_1_a_real_model_reaches_the_document_with_every_entry_it_holds() {
+        // The end-to-end half of D4. `monitor_layout` proves the document holds everything
+        // for a synthetic model; this proves the app hands over a model that actually has
+        // the entries — the two halves used to be "the allocator rations rows" and "the app
+        // does not cap what it sends", and only the first half changed.
+        //
+        // The panel height is deliberately varied: under the old allocator the drawn set
+        // shrank with the panel, which is the behaviour D4 replaced with "laid out once,
+        // reachable by scrolling". A short panel must lay out exactly as much as a tall one.
+        let (t, now) = full();
+        let mut m = model(Some(&t), &env(now));
+        m.visible = true; // `overlay.rs` stamps this after `model` returns
+        let cell = [8.0, 16.0];
+        let entries: usize = m.sections.iter().map(|s| s.body.len()).sum();
+        assert!(entries >= 6, "premise: the fixture populates the sections");
+
+        let mut sizes = Vec::new();
+        for h in [260.0f32, 1600.0] {
+            let draw = layout(&m, [0.0, 0.0, 430.0, h], 1.0, cell);
+            sizes.push(draw.items.len());
+            let text = |s: &str| {
+                draw.chrome
+                    .runs
+                    .iter()
+                    .chain(draw.content.runs.iter())
+                    .any(|r| r.text == s)
+            };
+            for (label, first) in [
+                ("TASKS", "Fold usage per message id"),
+                ("ACTIVE AGENTS", "● general-purpose"),
+                ("SKILLS", "harness-ops:loop"),
+                ("FILE ACTIVITY", "READ"),
+                ("RECENT CALLS", "Bash"),
+                ("TOOL USAGE", "Bash"),
+            ] {
+                assert!(text(label), "h={h}: {label} heading missing");
+                assert!(text(first), "h={h}: {label} drew no row");
+            }
+            // R9.1: the marker that used to announce the rationing is gone with it. The
+            // test is on the OLD mark's exact shape (`+N more`) rather than on the word,
+            // because the fold control added later reads `▸ N more` — same word, opposite
+            // meaning. The old one reported rows the allocator had discarded and offered no
+            // way to them; the new one is the way to them. Matching the word alone would
+            // make this assertion fire on the fix for the thing it is guarding against.
+            assert!(
+                !draw
+                    .chrome
+                    .runs
+                    .iter()
+                    .chain(draw.content.runs.iter())
+                    .any(|r| r.text.starts_with('+') && r.text.ends_with("more")),
+                "h={h}: `+N more` survived"
+            );
+        }
+        assert_eq!(
+            sizes[0], sizes[1],
+            "the document is the same at every panel height — that is what D4 bought"
+        );
+        // One rung per heading, one per entry, and one per section long enough to offer a
+        // fold. The fold rung exists in both states — a control that vanished when you
+        // opened it would leave no way back — so this count does not depend on `collapsed`.
+        let foldable = m.sections.iter().filter(|s| s.foldable()).count();
+        assert!(
+            foldable > 0,
+            "premise: the fixture has a section worth folding"
+        );
+        assert_eq!(sizes[0], m.sections.len() + entries + foldable);
+    }
+
+    #[test]
+    fn r13_1_a_shut_fold_hides_rows_that_one_toggle_brings_back() {
+        // The fold's whole contract in one place: shutting a section removes rungs from the
+        // document, and re-opening restores exactly what was removed. If these two ever
+        // disagree, the panel has rows that no interaction can reach — which is the defect
+        // `+N more` had and the reason this feature exists.
+        let (t, now) = full();
+        let mut m = model(Some(&t), &env(now));
+        m.visible = true;
+        let open = renderer::monitor_layout::item_ladder(&m).len();
+        let n = m
+            .sections
+            .iter()
+            .position(|s| s.foldable())
+            .expect("the fixture has a foldable section");
+        let hidden = m.sections[n].body.len() - renderer::monitor_model::FOLD_THRESHOLD;
+
+        m.sections[n].collapsed = true;
+        let shut = renderer::monitor_layout::item_ladder(&m).len();
+        assert_eq!(
+            open - shut,
+            hidden,
+            "a shut fold hides exactly what it says"
+        );
+
+        m.sections[n].collapsed = false;
+        assert_eq!(
+            renderer::monitor_layout::item_ladder(&m).len(),
+            open,
+            "re-opening restores the document it was folded from"
         );
     }
 
@@ -3356,6 +3537,12 @@ mod tests {
         };
         // Every state the footer has: attached, detached, and no session at all. A close
         // affordance drawn in only one of them is the easiest version of this to ship.
+        //
+        // NOTE (ai-monitor-panel-scroll): the *layout* half of R1.4 was deliberately
+        // reversed — the footer band now shows a chord hint when the badge is up, because
+        // the panel finally has a binding to promise and D30 makes it the only way back.
+        // See `monitor_layout::tests::r1_4_the_footer_band_carries_one_line_and_no_control_that_lies`.
+        // This half stands unchanged, and gained a second job below.
         for footer in [
             model(Some(&t), &kst).footer,
             model(Some(&t), &unattached(now)).footer,
@@ -3370,6 +3557,18 @@ mod tests {
                 footer.starts_with("Last update "),
                 "the footer is the last-update time and nothing else: {footer:?}"
             );
+            // ai-monitor-panel-scroll R7.7 leans on this half of R1.4 rather than retiring
+            // it. The badge replaces this line ON SCREEN (D34), but it must never be written
+            // INTO the model: the model is stage one's cache key, so a count folded in here
+            // would re-lay-out the whole document every time it changed (C4) — and it would
+            // break this assertion for a reason that has nothing to do with a close
+            // affordance. The composer stays ignorant of the badge; stage two draws it.
+            for digit in ["new above", "⌘⌥1"] {
+                assert!(
+                    !footer.contains(digit),
+                    "the badge leaked into the model footer: {footer:?}"
+                );
+            }
             // The design's keycap and the two other close affordances it draws (the header
             // `✕`, the `Esc` hint). None of them is a key the panel answers to.
             for affordance in ["q", "Q", "esc", "Esc", "ESC", "✕", "×", "close", "quit"] {

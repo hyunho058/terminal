@@ -112,6 +112,34 @@ const _: () = {
 };
 
 impl SidebarShape {
+    /// The same shape moved `dy` px down the screen.
+    ///
+    /// A method rather than a struct literal at the call site because `_pad` is private
+    /// precisely to force construction through the clamping constructors — and a pure
+    /// translation cannot violate what those clamp (a shape's radii, thickness and colours
+    /// are translation-invariant), so moving one is safe in a way rebuilding one is not.
+    ///
+    /// Used by `monitor_layout::compose` to slide the ai-monitor panel's document under its
+    /// scroll offset without re-running the layout (D24/C3).
+    pub fn translated_y(&self, dy: f32) -> SidebarShape {
+        let mut out = *self;
+        out.bbox[1] += dy;
+        out.seg[1] += dy;
+        out.seg[3] += dy;
+        out
+    }
+
+    /// The quad's top edge, for viewport culling.
+    pub fn top(&self) -> f32 {
+        self.bbox[1]
+    }
+
+    /// The quad's bottom edge. Read off `bbox`, not `seg`: a capsule's endpoints are its
+    /// centreline, so a rule would measure as zero-height and cull as if it were not there.
+    pub fn bottom(&self) -> f32 {
+        self.bbox[1] + self.bbox[3]
+    }
+
     /// An axis-aligned rounded box. `None` if `w`/`h` is non-positive or non-finite;
     /// `radius` and `border_w` are each clamped to `min(w,h)/2` so the SDF can't
     /// invert (D9).

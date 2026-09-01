@@ -30,7 +30,7 @@
 //! A docked panel cannot inherit that: it is ten regions instead of a line list, and
 //! `drive_monitor_resize` calls `redraw()` on every `CursorMoved`. See [`Shaped`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use bytemuck::{Pod, Zeroable};
@@ -38,6 +38,7 @@ use wgpu::util::DeviceExt;
 
 use crate::monitor_layout;
 use crate::monitor_model::MonitorModel;
+use crate::monitor_scroll;
 use crate::sidebar_shapes::SidebarShapePipeline;
 use crate::sidebar_theme::linear;
 use crate::tab_bar::layout_line;
@@ -52,11 +53,211 @@ use crate::{DrawLayer, FrameCtx};
 /// `try_borrow` rather than `borrow`, so if that ever stops being true the frame is
 /// skipped instead of the process aborting.
 #[derive(Clone, Default)]
-pub struct MonitorHandle(Rc<RefCell<MonitorModel>>);
+pub struct MonitorHandle {
+    model: Rc<RefCell<MonitorModel>>,
+    /// The scroll position, held **beside** the model rather than in it (D26/C4).
+    ///
+    /// This separation is the single most load-bearing decision in the feature, and it is
+    /// counter-intuitive: `MonitorModel` derives `PartialEq` and is stage one's cache key, so
+    /// putting the offset in there would make cache invalidation free. It would also make
+    /// every wheel notch invalidate the *whole document layout* — reviving the per-frame
+    /// re-layout debt `architecture.md` G1 records as paid off, on a document D4 just made
+    /// much longer. Out here, a scroll changes stage two's key and leaves stage one's alone.
+    ///
+    /// The mirror-image failure is just as quiet: leave it out of stage **two's** key as
+    /// well and the panel hits a stale cache and never repaints. Both halves or neither.
+    scroll: Rc<Cell<ScrollState>>,
+    /// What the last laid-out frame implies about scrolling — published for the app, which
+    /// owns the wheel and the jumps but has no business computing panel geometry (SD2).
+    view: Rc<RefCell<ScrollView>>,
+}
+
+/// The scrolling facts of the last laid-out frame, published to the app.
+///
+/// The app owns the *policy* — which gestures the panel takes, where a jump goes — and the
+/// renderer owns the *geometry*. Without this the app would have to rebuild the ladder from
+/// its own copy of the model and guess a viewport height, which is two ways to disagree with
+/// what is actually on screen.
+#[derive(Clone, Debug)]
+pub struct ScrollView {
+    pub ladder: Vec<monitor_layout::Item>,
+    pub heights: Vec<f32>,
+    pub viewport_h: f32,
+    /// The content band, **window-absolute**. Published so the app can resolve a press
+    /// without doing geometry of its own — the same division `on_wheel` already keeps.
+    pub viewport: crate::sidebar_layout::Rect,
+    /// The sticky slot, window-absolute. A press here means the heading the slot is
+    /// currently showing, which is a different rung from anything inside `viewport`.
+    pub slot: crate::sidebar_layout::Rect,
+}
+
+impl Default for ScrollView {
+    /// Before the panel has laid anything out. `Rect` is deliberately not `Default` — a zero
+    /// rect is a real geometric claim in `sidebar_layout` — so "no band yet" is spelled with
+    /// the name the layout already gives it.
+    fn default() -> ScrollView {
+        ScrollView {
+            ladder: Vec::new(),
+            heights: Vec::new(),
+            viewport_h: 0.0,
+            viewport: monitor_layout::NO_BAND,
+            slot: monitor_layout::NO_BAND,
+        }
+    }
+}
+
+/// Where the view sits. Stage two's cache key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScrollState {
+    /// Ladder index of the first rung below the sticky slot (D17/D31).
+    pub top: usize,
+    /// Entries that arrived **above** the anchor and have not been seen (D11).
+    ///
+    /// Rides in the scroll state rather than in `MonitorModel` for the reason the offset
+    /// does (D26/C4): it changes when the view changes, and stage one must not notice. The
+    /// app counts it — only the app holds the previous document — and stage two renders it.
+    pub badge: u32,
+}
+
+/// What the app needs to bound a scroll it is about to apply.
+///
+/// Published by the renderer because `max_index` needs the viewport height, which only the
+/// layout knows — the app has the model and could rebuild the ladder, but not the band.
+/// Same shape as the sidebar's `SidebarHandle::layout()` publish, for the same reason.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScrollMetrics {
+    /// Rungs in the ladder the last frame was composed from.
+    pub items: usize,
+    /// The furthest `top` may go (D22).
+    pub max_index: usize,
+}
 
 impl MonitorHandle {
     pub fn set(&self, model: MonitorModel) {
-        *self.0.borrow_mut() = model;
+        *self.model.borrow_mut() = model;
+    }
+
+    /// Move the view. Does **not** touch the model, so stage one stays cached (C4/R10.1).
+    pub fn set_scroll(&self, scroll: ScrollState) {
+        self.scroll.set(scroll);
+    }
+
+    pub fn scroll(&self) -> ScrollState {
+        self.scroll.get()
+    }
+
+    /// Publish the scrolling facts of a freshly laid-out frame. The panel's own call; named
+    /// rather than done through a field so the direction of the flow — renderer writes, app
+    /// reads — is visible at both ends.
+    pub fn publish_view(&self, view: ScrollView) {
+        *self.view.borrow_mut() = view;
+    }
+
+    /// What the last laid-out frame implies. `Default` until the panel has drawn once.
+    pub fn metrics(&self) -> ScrollMetrics {
+        let v = self.view.borrow();
+        ScrollMetrics {
+            items: v.ladder.len(),
+            max_index: monitor_scroll::max_index(&v.ladder, &v.heights, v.viewport_h),
+        }
+    }
+
+    /// Where section `n`'s heading sits in the current document (D16), clamped so a jump
+    /// cannot land past the end. `None` before the panel has laid anything out.
+    pub fn jump_target(&self, section: usize) -> Option<usize> {
+        let v = self.view.borrow();
+        let target = monitor_scroll::jump_target(&v.ladder, section)?;
+        Some(monitor_scroll::clamp(
+            &v.ladder,
+            &v.heights,
+            v.viewport_h,
+            target,
+        ))
+    }
+
+    /// The ladder rung at `i` in the current document, for a caller that needs to check what
+    /// an index actually names rather than trusting the call that produced it.
+    pub fn rung_at(&self, i: usize) -> Option<monitor_layout::Item> {
+        self.view.borrow().ladder.get(i).copied()
+    }
+
+    /// A copy of the published view — ladder, heights and both bands.
+    ///
+    /// Clones, so it is not for the hot path: `metrics`, `press` and `wheel_px` all answer
+    /// their own question without handing the vectors out. This exists for a caller that
+    /// needs the whole picture, which in practice means republishing it with one field
+    /// changed.
+    pub fn view(&self) -> ScrollView {
+        self.view.borrow().clone()
+    }
+
+    /// Which section a left press at `point` asks to fold or unfold, or `None`.
+    ///
+    /// Only two rungs answer: a section's **heading** and its **fold control**. A press on a
+    /// row does nothing — rows are content, and giving them a meaning would mean every
+    /// stray click in the panel changed the document.
+    ///
+    /// The sticky slot answers too, for the heading it is showing. It has to: once a section
+    /// is scrolled into, its heading is *only* in the slot, and a control you can reach by
+    /// scrolling away from it but not by looking at it is not a control.
+    pub fn press(&self, point: [f32; 2]) -> Option<usize> {
+        let v = self.view.borrow();
+        let top = self.scroll().top;
+        let [x, y] = point;
+        let inside = |r: &crate::sidebar_layout::Rect| {
+            r.h > 0.0 && x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
+        };
+        let i = if inside(&v.slot) {
+            monitor_scroll::heading_above(&v.ladder, top)?
+        } else if inside(&v.viewport) {
+            monitor_scroll::hit(&v.ladder, &v.heights, v.viewport_h, top, y - v.viewport.y)?
+        } else {
+            return None;
+        };
+        let item = v.ladder.get(i)?;
+        match item.kind {
+            monitor_layout::ItemKind::Heading | monitor_layout::ItemKind::Fold => {
+                Some(item.section)
+            }
+            _ => None,
+        }
+    }
+
+    /// Apply `px` of wheel travel, carrying the sub-rung remainder in `residue`.
+    ///
+    /// Returns whether the view moved — which is **two different facts**, and a caller that
+    /// reads it as one gets D9 wrong:
+    ///
+    /// * the panel is at the edge in this direction, so the event belongs to the grid; or
+    /// * the gesture is still **banking** below one rung, so the event is the panel's and
+    ///   there is simply nothing to draw yet.
+    ///
+    /// `residue` tells them apart — `scroll_by_px` zeroes it at an edge and keeps it while
+    /// banking — and `AiMonitorOverlay::on_wheel` is where that distinction is made. Reading
+    /// `false` as "edge" alone sends every slow trackpad event to the terminal.
+    ///
+    /// Because the edge answer depends on the *direction* of travel and not merely on sitting
+    /// at an edge, scrolling back the other way is still the panel's (C12).
+    ///
+    /// Positive `px` is toward the top of the document, matching winit and `wheel_lines`.
+    pub fn wheel_px(&self, px: f32, residue: &mut f32) -> bool {
+        let v = self.view.borrow();
+        let before = self.scroll();
+        let (top, left) = monitor_scroll::scroll_by_px(
+            &v.ladder,
+            &v.heights,
+            v.viewport_h,
+            before.top,
+            px,
+            *residue,
+        );
+        *residue = left;
+        if top == before.top {
+            return false;
+        }
+        drop(v);
+        self.set_scroll(ScrollState { top, ..before });
+        true
     }
 }
 
@@ -203,7 +404,19 @@ struct Shaped {
     panel: [f32; 4],
     scale: f64,
     cell: [f32; 2],
+    /// The position-independent document. Stage two reads it; it survives every scroll.
     draw: monitor_layout::PanelDraw,
+}
+
+/// **Stage two's** cache: the frame that actually reaches the GPU, plus the scroll state it
+/// was composed for.
+///
+/// Separate from [`Shaped`] because the two go stale for different reasons, and collapsing
+/// them re-creates exactly the defect the split exists to prevent (C4). A scroll must
+/// invalidate this and *not* `Shaped`; a model change must invalidate both.
+struct Composed {
+    scroll: ScrollState,
+    frame: monitor_layout::Primitives,
 }
 
 /// The ai-monitor panel draw layer.
@@ -215,6 +428,8 @@ pub struct MonitorPanel {
     text_buf: Vec<TextInstance>,
     /// Last frame's layout and the inputs that produced it (R7.3).
     shaped: Option<Shaped>,
+    /// Last frame's composed primitives and the scroll they were composed for.
+    composed: Option<Composed>,
     /// The atlas identity `text_buf`'s baked UVs were computed against — `(epoch,
     /// generation)`.
     ///
@@ -229,6 +444,11 @@ pub struct MonitorPanel {
     /// the same answer", and that distinction is the whole requirement.
     #[cfg(test)]
     layouts: u32,
+    /// How many times **stage two** ran. Distinct from `layouts` on purpose: the whole
+    /// claim of D24 is that a scroll moves this counter and leaves `layouts` alone, and only
+    /// two counters can tell that apart from "both re-ran and produced the same answer".
+    #[cfg(test)]
+    composes: u32,
     /// How many times the glyph quads were re-walked through the atlas. Counted
     /// separately from `layouts` because they have different invalidation rules: an
     /// atlas repack invalidates the glyphs and not the layout.
@@ -252,9 +472,12 @@ impl MonitorPanel {
             shapes: None,
             text_buf: Vec::new(),
             shaped: None,
+            composed: None,
             text_atlas: None,
             #[cfg(test)]
             layouts: 0,
+            #[cfg(test)]
+            composes: 0,
             #[cfg(test)]
             text_builds: 0,
         }
@@ -414,7 +637,7 @@ impl DrawLayer for MonitorPanel {
         // Clone the `Rc`, not the model: the borrow then comes off a local and leaves
         // `self` free for the GPU state below, without deep-copying every section each
         // frame.
-        let handle = self.model.0.clone();
+        let handle = self.model.model.clone();
         let Ok(model) = handle.try_borrow() else {
             return;
         };
@@ -427,9 +650,12 @@ impl DrawLayer for MonitorPanel {
             return;
         };
 
-        // R7.3 — re-shape only when an input to the shaping actually moved. See
-        // [`Shaped`] for why each of the four is in the key.
-        let stale = match self.shaped.as_ref() {
+        // ---- stage one (R7.3/R10.1) --------------------------------------------------
+        //
+        // Re-lay-out only when an input to the *layout* moved. See [`Shaped`] for why each
+        // of the four is in the key — and note what is deliberately NOT: the scroll state.
+        // That omission is C4's first half.
+        let layout_stale = match self.shaped.as_ref() {
             Some(s) => {
                 s.panel != panel
                     || s.scale != ctx.scale_factor
@@ -438,7 +664,7 @@ impl DrawLayer for MonitorPanel {
             }
             None => true,
         };
-        if stale {
+        if layout_stale {
             let draw = monitor_layout::layout(&model, panel, ctx.scale_factor, ctx.cell);
             // The model is cloned, not referenced: the handle is the app's to overwrite at
             // any time, so the only way to answer "is this the model I shaped?" next frame
@@ -456,13 +682,98 @@ impl DrawLayer for MonitorPanel {
                 self.layouts += 1;
             }
         }
+
+        // ---- stage two (R10.2/R10.3) -------------------------------------------------
+        //
+        // The scroll IS in this key. C4's second half: leave it out here as well as in
+        // stage one and the panel hits a stale frame and never repaints — the failure the
+        // interview flagged as the top technical risk, and the one that is invisible in
+        // review because nothing errors.
+        let shaped = self
+            .shaped
+            .as_ref()
+            .expect("stage one just ran or was cached");
+        let want = {
+            let s = self.model.scroll.get();
+            let max = monitor_scroll::max_index(
+                &shaped.draw.ladder,
+                &shaped.draw.heights,
+                shaped.draw.viewport.h,
+            );
+            // Clamp defensively: the app can legitimately hold an index from before the
+            // last model swap, and one frame of a stale index must degrade, not panic.
+            let top = monitor_scroll::clamp(
+                &shaped.draw.ladder,
+                &shaped.draw.heights,
+                shaped.draw.viewport.h,
+                s.top.min(max),
+            );
+            ScrollState {
+                badge: if top == 0 { 0 } else { s.badge },
+                top,
+            }
+        };
+        // Reconcile the handle with what will actually be composed.
+        //
+        // Without this the clamp above is a *local* correction: the frame draws at the
+        // clamped index while the app goes on believing the old one. That is reachable —
+        // grow the window until the whole document fits and `max_index` collapses to 0 —
+        // and it makes two of the spec's own invariants lie. `rearm_anchor` reads this
+        // `top`, so the mode stays `Held` at a frame that is showing the document's top
+        // (D37/R6.3); and `count_new_above` keeps counting arrivals above a rung nobody is
+        // looking at, so the footer says "N new above" while all of it is on screen
+        // (D33/R7.8). It self-heals on the next wheel event, which is exactly what would
+        // make it present as intermittent.
+        //
+        // Reaching index 0 clears the badge here for the same reason it does on the wheel
+        // path: at the top there is nothing above left unseen. This is the **fourth** site
+        // D33 is enforced at (`count_new_above`, `on_wheel` and `jump_to` are the others, and
+        // D26/D27 put the rule in the app); it is here as the clamp path's backstop, because
+        // the clamp is the one way the index moves without the app asking.
+        //
+        // Two bounds this reconcile deliberately does NOT reach, so the next reader does not
+        // mistake them for oversights:
+        //
+        // * A clamp to a NON-zero index leaves `AiMonitorOverlay::anchor` naming the old
+        //   rung. The app re-publishes it and this re-clamps it every frame — stable, but the
+        //   badge can still count arrivals that are on screen. Strictly narrower than the bug
+        //   this fixes, which had the badge lying at the very top — D33's own case.
+        // * It does not clear the panel's wheel residue, so the first gesture after a resize
+        //   spends a bank accumulated against the old position. Bounded by one rung.
+        if want != self.model.scroll.get() {
+            self.model.set_scroll(want);
+        }
+        let compose_stale = layout_stale || self.composed.as_ref().map(|c| c.scroll) != Some(want);
+        if compose_stale {
+            let frame = monitor_layout::compose(&shaped.draw, &model, want.top, want.badge);
+            self.composed = Some(Composed {
+                scroll: want,
+                frame,
+            });
+            #[cfg(test)]
+            {
+                self.composes += 1;
+            }
+        }
+        // Publish what the app needs to route a wheel or a jump. Only on a stage-one miss:
+        // the ladder and the band are exactly what stage one produced, so a scroll — which
+        // changes neither — must not pay for a clone of them.
+        if layout_stale {
+            self.model.publish_view(ScrollView {
+                ladder: shaped.draw.ladder.clone(),
+                heights: shaped.draw.heights.clone(),
+                viewport_h: shaped.draw.viewport.h,
+                viewport: shaped.draw.viewport,
+                slot: shaped.draw.slot,
+            });
+        }
         drop(model);
 
         self.ensure_gpu(ctx);
         // Order matters: `ensure_text_bind` builds from the `text_bgl` `ensure_gpu` stores.
         self.ensure_text_bind(ctx);
 
-        let Some(shaped) = self.shaped.as_ref() else {
+        let Some(composed) = self.composed.as_ref() else {
             return;
         };
         // Shapes first, glyphs over them — both are `LoadOp::Load` passes, so the order
@@ -470,15 +781,18 @@ impl DrawLayer for MonitorPanel {
         // borrowed mutably while `self.shaped` is read.)
         {
             let sp = SidebarShapePipeline::ensure(&mut self.shapes, ctx);
-            sp.draw(ctx, &shaped.draw.shapes);
+            sp.draw(ctx, &composed.frame.shapes);
         }
 
         // The glyph quads carry baked atlas UVs, so they survive a frame only while the
         // atlas is byte-for-byte the one they were baked against — a *repack* is enough to
         // invalidate them, which is why `generation` rides with `epoch`.
         let atlas_id = (ctx.atlas.epoch(), ctx.atlas.generation());
-        if stale || self.text_atlas != Some(atlas_id) {
-            build_text(ctx, &shaped.draw.runs, &mut self.text_buf);
+        // Glyph quads follow stage TWO — they are built from the composed frame, so a
+        // scroll must rebuild them even though it re-shaped nothing. Cheap: `compose` moved
+        // already-shaped runs, and `build_text` walks the atlas for glyphs it has seen.
+        if compose_stale || self.text_atlas != Some(atlas_id) {
+            build_text(ctx, &composed.frame.runs, &mut self.text_buf);
             // Re-read afterwards: `layout_line` packs glyphs it has not seen, and a pack
             // that evicts bumps the generation *mid-build*, leaving the quads pushed
             // before it holding pre-repack UVs. Storing `None` in that case costs one
@@ -584,13 +898,354 @@ mod tests {
         }
     }
 
+    /// `filled()` plus a document long enough that the panel must scroll to reach its end.
+    fn scrollable() -> MonitorModel {
+        use crate::monitor_model::{Row, Section, SectionBody};
+        let section = |label: &str, n: usize| Section {
+            collapsed: false,
+            label: label.into(),
+            total: n,
+            lost: 0,
+            body: SectionBody::Rows(
+                (0..n)
+                    .map(|i| Row {
+                        text: format!("{label}/{i}"),
+                        ..Row::default()
+                    })
+                    .collect(),
+            ),
+        };
+        MonitorModel {
+            sections: vec![section("TASKS", 12), section("RECENT CALLS", 20)],
+            ..filled()
+        }
+    }
+
+    // ---- ai-monitor-panel-scroll T4 / R10.1-R10.4 / R2.1: the two-stage split ----
+
+    /// The claim D24 exists to make, and the one that is expensive to be wrong about.
+    ///
+    /// A scroll must move stage two and leave stage one alone. Both halves are asserted
+    /// because each fails in its own silent way: keep the scroll out of stage two's key
+    /// (C4's second half) and the panel hits a stale frame and **never repaints** — no
+    /// error, no warning, just a wheel that does nothing. Put it into stage one's key
+    /// instead (C4's first half) and every wheel notch re-lays-out a document D4 just made
+    /// much longer, reviving the per-frame re-layout debt `architecture.md` G1 records as
+    /// paid off.
+    ///
+    /// The pixel assertion is not decoration: counters alone would pass a `compose` that
+    /// ran and returned the previous frame.
+    #[test]
+    fn r10_1_to_r10_3_a_scroll_recomposes_without_re_laying_out_and_the_pixels_move() {
+        let (Some((device, queue)), Some(fonts)) = (crate::headless(), crate::FontSet::load().ok())
+        else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let mut atlas = crate::atlas::Atlas::new(&device, &fonts, 24.0).expect("atlas");
+        let view = offscreen(&device);
+        let t = term_core::Terminal::new(10, 2, term_core::Color(0xFFFFFF), term_core::Color(0));
+        let snap = t.snapshot();
+        let sidebar_cfg = common::config::SidebarConfig::default();
+        let (mut layer, handle) = MonitorPanel::new();
+        handle.set(scrollable());
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let mut frame = |layer: &mut MonitorPanel, atlas: &mut crate::atlas::Atlas| {
+            let mut ctx = FrameCtx {
+                device: &device,
+                queue: &queue,
+                encoder: &mut encoder,
+                view: &view,
+                viewport: [256.0, 400.0],
+                cell: [12.0, 24.0],
+                top_inset: 0.0,
+                left_inset: 0.0,
+                right_inset: 200.0,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                sidebar: &sidebar_cfg,
+                scale_factor: 1.0,
+                snapshot: &snap,
+                atlas,
+            };
+            layer.record(&mut ctx);
+        };
+
+        frame(&mut layer, &mut atlas);
+        assert_eq!(layer.layouts, 1);
+        assert_eq!(layer.composes, 1);
+        let at_top = layer.text_buf.clone();
+        assert!(!at_top.is_empty(), "premise: the panel drew glyphs");
+
+        // The panel must actually have somewhere to scroll, or every assertion below is
+        // vacuously true.
+        let max = handle.metrics().max_index;
+        assert!(
+            max > 0,
+            "premise: the document must overflow the viewport (max_index {max})"
+        );
+
+        // Idle frames at an unchanged scroll: neither stage re-runs.
+        for _ in 0..20 {
+            frame(&mut layer, &mut atlas);
+        }
+        assert_eq!(layer.layouts, 1, "idle frames must not re-lay-out");
+        assert_eq!(layer.composes, 1, "nor recompose");
+
+        // Now scroll. Stage two only.
+        handle.set_scroll(ScrollState { top: max, badge: 0 });
+        frame(&mut layer, &mut atlas);
+        assert_eq!(
+            layer.layouts, 1,
+            "a scroll must NOT re-lay-out the document (C4 first half / R10.1)"
+        );
+        assert_eq!(
+            layer.composes, 2,
+            "but it must recompose (C4 second half / R10.3)"
+        );
+        assert_ne!(
+            layer.text_buf, at_top,
+            "and the recomposition must reach the pixels — a counter that moved while the \
+             frame did not is exactly the stale-cache failure C4 names"
+        );
+
+        // Scrolling back reproduces the first frame: stage two skips work, it does not
+        // change the answer.
+        handle.set_scroll(ScrollState { top: 0, badge: 0 });
+        frame(&mut layer, &mut atlas);
+        assert_eq!(layer.layouts, 1);
+        assert_eq!(layer.composes, 3);
+        assert_eq!(layer.text_buf, at_top);
+    }
+
+    /// R6.3/R7.8 — the clamp is written back, so the app cannot go on believing an index the
+    /// frame is not drawing.
+    ///
+    /// Found by review, not by the maker's own tests, and worth the words: computing a
+    /// clamped index, composing from it and discarding it is *locally* correct — every pixel
+    /// is right — while leaving the app holding the old value. It is reachable by growing the
+    /// window until the document fits and `max_index` collapses to 0, and it makes two of the
+    /// spec's invariants lie at once: the anchor stays `Held` at a frame showing the top
+    /// (D37), and the footer keeps claiming "N new above" with all of it on screen (D33).
+    /// It self-heals on the next wheel event, which is what would have made it intermittent.
+    #[test]
+    fn r6_3_and_r7_8_a_shrunken_document_reconciles_the_index_instead_of_drifting() {
+        let (Some((device, queue)), Some(fonts)) = (crate::headless(), crate::FontSet::load().ok())
+        else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let mut atlas = crate::atlas::Atlas::new(&device, &fonts, 24.0).expect("atlas");
+        let view = offscreen(&device);
+        let t = term_core::Terminal::new(10, 2, term_core::Color(0xFFFFFF), term_core::Color(0));
+        let snap = t.snapshot();
+        let sidebar_cfg = common::config::SidebarConfig::default();
+        let (mut layer, handle) = MonitorPanel::new();
+        handle.set(scrollable());
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let mut frame = |layer: &mut MonitorPanel, atlas: &mut crate::atlas::Atlas, h: f32| {
+            let mut ctx = FrameCtx {
+                device: &device,
+                queue: &queue,
+                encoder: &mut encoder,
+                view: &view,
+                viewport: [256.0, h],
+                cell: [12.0, 24.0],
+                top_inset: 0.0,
+                left_inset: 0.0,
+                right_inset: 200.0,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                sidebar: &sidebar_cfg,
+                scale_factor: 1.0,
+                snapshot: &snap,
+                atlas,
+            };
+            layer.record(&mut ctx);
+        };
+
+        // A short panel: the document overflows, so scroll away from the top and take a badge.
+        frame(&mut layer, &mut atlas, 400.0);
+        let max = handle.metrics().max_index;
+        assert!(max > 0, "premise: the document overflows a 400px panel");
+        handle.set_scroll(ScrollState { top: max, badge: 5 });
+        frame(&mut layer, &mut atlas, 400.0);
+        assert_eq!(handle.scroll().top, max);
+
+        // Now grow the window until everything fits. `max_index` collapses.
+        frame(&mut layer, &mut atlas, 4000.0);
+        assert_eq!(
+            handle.metrics().max_index,
+            0,
+            "premise: the whole document now fits"
+        );
+        assert_eq!(
+            handle.scroll().top,
+            0,
+            "the app's index must follow the frame, not lag it"
+        );
+        assert_eq!(
+            handle.scroll().badge,
+            0,
+            "and a badge claiming items above the top is a lie once the top is all there is"
+        );
+    }
+
+    /// R10.4 — the scroll state is not part of the model, stated as an executable fact.
+    ///
+    /// `MonitorModel`'s `PartialEq` **is** stage one's cache key, so "the scroll is not a
+    /// field" and "a scroll does not invalidate stage one" are the same sentence. A future
+    /// change that quietly moved `top` into the model would keep every other test in this
+    /// file green — the panel would still be correct, just slow again, which is precisely
+    /// the kind of regression nobody notices.
+    #[test]
+    fn r10_4_and_r7_7_moving_the_scroll_or_badge_leaves_the_model_comparing_equal() {
+        let (_layer, handle) = MonitorPanel::new();
+        handle.set(scrollable());
+        let before = handle.model.borrow().clone();
+        handle.set_scroll(ScrollState { top: 7, badge: 0 });
+        assert_eq!(handle.scroll(), ScrollState { top: 7, badge: 0 });
+        assert_eq!(
+            *handle.model.borrow(),
+            before,
+            "the model — stage one's key — must not notice a scroll"
+        );
+        // R7.7: the badge rides here for the same reason and must not leak into the model
+        // either. `model.footer` is the natural place to put it — the app composes both —
+        // and it is wrong twice over: stage one would re-lay-out the whole document on every
+        // count change, and `dashboard`'s own assertion that the footer begins with
+        // "Last update" would start failing for a reason unrelated to time.
+        handle.set_scroll(ScrollState { top: 7, badge: 12 });
+        assert_eq!(
+            *handle.model.borrow(),
+            before,
+            "nor a badge — stage two renders it, stage one never sees it"
+        );
+    }
+
+    /// R10.9 — stage two's own shaping stays under the atlas-invalidation guard.
+    ///
+    /// D36 lets stage two shape exactly one thing: the badge line. That one line can still
+    /// pack a glyph the atlas has not seen, and a pack that evicts bumps `generation`
+    /// **mid-build** — which invalidates the UVs of everything already copied out of stage
+    /// one in the same frame. The existing guard (`text_atlas = (after == atlas_id)
+    /// .then_some(after)`) covers it only because the badge goes through the *same*
+    /// `build_text` call as the rest of the frame.
+    ///
+    /// So what this pins is the routing: a badge change must move `text_builds`. A future
+    /// change that drew the badge from a side buffer to "save a rebuild" would keep every
+    /// other test green and start sampling the wrong glyphs after an eviction — silently.
+    #[test]
+    fn r10_9_a_badge_change_rebuilds_the_glyphs_under_the_atlas_guard() {
+        let (Some((device, queue)), Some(fonts)) = (crate::headless(), crate::FontSet::load().ok())
+        else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let mut atlas = crate::atlas::Atlas::new(&device, &fonts, 24.0).expect("atlas");
+        let view = offscreen(&device);
+        let t = term_core::Terminal::new(10, 2, term_core::Color(0xFFFFFF), term_core::Color(0));
+        let snap = t.snapshot();
+        let sidebar_cfg = common::config::SidebarConfig::default();
+        let (mut layer, handle) = MonitorPanel::new();
+        handle.set(scrollable());
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let mut frame = |layer: &mut MonitorPanel, atlas: &mut crate::atlas::Atlas| {
+            let mut ctx = FrameCtx {
+                device: &device,
+                queue: &queue,
+                encoder: &mut encoder,
+                view: &view,
+                viewport: [256.0, 400.0],
+                cell: [12.0, 24.0],
+                top_inset: 0.0,
+                left_inset: 0.0,
+                right_inset: 200.0,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                sidebar: &sidebar_cfg,
+                scale_factor: 1.0,
+                snapshot: &snap,
+                atlas,
+            };
+            layer.record(&mut ctx);
+        };
+
+        handle.set_scroll(ScrollState { top: 2, badge: 0 });
+        frame(&mut layer, &mut atlas);
+        let builds = layer.text_builds;
+        let no_badge = layer.text_buf.clone();
+        assert!(!no_badge.is_empty(), "premise: the panel drew glyphs");
+
+        handle.set_scroll(ScrollState { top: 2, badge: 7 });
+        frame(&mut layer, &mut atlas);
+        assert_eq!(
+            layer.layouts, 1,
+            "a badge is scroll state, so stage one must not re-run (C4)"
+        );
+        assert!(
+            layer.text_builds > builds,
+            "but the glyphs must be rebuilt — that is what keeps the badge inside the \
+             atlas-generation guard rather than beside it"
+        );
+        assert_ne!(
+            layer.text_buf, no_badge,
+            "and the rebuild must reach the pixels"
+        );
+    }
+
+    /// R2.1 — the pinned chrome does not move when the document does.
+    ///
+    /// Asserted on stage one's output rather than on pixels because that is where the
+    /// property lives: `compose` copies `chrome` through and translates `content`, so a
+    /// region in the wrong bag would scroll away no matter how careful stage two was.
+    #[test]
+    fn r2_1_and_r10_6_the_chrome_is_identical_at_every_scroll_position() {
+        let m = scrollable();
+        let panel = [0.0, 0.0, 200.0, 400.0];
+        let draw = monitor_layout::layout(&m, panel, 1.0, [12.0, 24.0]);
+        let ladder = monitor_layout::item_ladder(&m);
+        let heights = monitor_layout::item_heights(&m, 1.0, [12.0, 24.0]);
+        let max = monitor_scroll::max_index(&ladder, &heights, draw.viewport.h);
+        assert!(max > 0, "premise: this document scrolls");
+
+        let chrome_runs: Vec<_> = draw.chrome.runs.iter().map(|r| r.rect.y).collect();
+        let mut seen_bodies = std::collections::HashSet::new();
+        for top in 0..=max {
+            let frame = monitor_layout::compose(&draw, &m, top, 0);
+            // Every chrome run is present at its original y, untranslated.
+            for (run, y) in draw.chrome.runs.iter().zip(&chrome_runs) {
+                assert!(
+                    frame
+                        .runs
+                        .iter()
+                        .any(|r| r.text == run.text && r.rect.y == *y),
+                    "top {top}: chrome run {:?} moved or vanished",
+                    run.text
+                );
+            }
+            seen_bodies.insert(
+                frame
+                    .runs
+                    .iter()
+                    .filter(|r| r.text.contains('/'))
+                    .map(|r| r.text.clone())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert!(
+            seen_bodies.len() > 1,
+            "premise: the document really did move under the chrome"
+        );
+    }
+
     #[test]
     fn handle_roundtrips_the_model() {
         let (_layer, h) = MonitorPanel::new();
-        assert!(!h.0.borrow().visible);
+        assert!(!h.model.borrow().visible);
         h.set(filled());
-        assert!(h.0.borrow().visible);
-        assert_eq!(h.0.borrow().footer, "Last update 16:21:18");
+        assert!(h.model.borrow().visible);
+        assert_eq!(h.model.borrow().footer, "Last update 16:21:18");
     }
 
     #[test]
