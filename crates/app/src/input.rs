@@ -5,8 +5,10 @@
 
 use renderer::sidebar_layout::{self, ChromeRegion, SidebarLayoutInput, SidebarRegion};
 use term_core::MouseEncoding;
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::CursorIcon;
+
+use crate::seam::KeyInput;
 
 /// A tab-management action triggered by a Cmd chord (D5). Intercepted before
 /// `encode_key`, so these keys never reach the shell (R3.2).
@@ -27,6 +29,14 @@ pub enum TabAction {
 /// whether or not Shift alters the produced character across layouts.
 pub fn tab_action(key: &Key, mods: &ModifiersState) -> Option<TabAction> {
     if !mods.super_key() {
+        return None;
+    }
+    // `Cmd+Opt+<digit>` belongs to the ai-monitor's section jump (D16), and whether that
+    // chord ALSO arrives here as a bare digit is a keyboard-layout question we must not
+    // depend on: on a US layout Opt+1 is `¡` and this never fires, but a layout where the
+    // option level is the digit itself would silently switch tabs instead. Rejecting alt
+    // makes the split explicit rather than layout-dependent.
+    if mods.alt_key() {
         return None;
     }
     let Key::Character(s) = key else {
@@ -600,6 +610,83 @@ pub fn wheel_scroll(
         WheelDelta::Lines(y) => y * sidebar_layout::row_stride(inp),
     };
     sidebar_layout::clamp_scroll(scroll - delta_px, inp)
+}
+
+/// Which of the ai-monitor panel's six sections a chord asks for (D16/D35/R8.3).
+///
+/// `Cmd+Opt+1` … `Cmd+Opt+6` → `0` … `5`, matched on the key's **position**. On a US layout
+/// those chords arrive as `"¡"`, `"™"`, … , and unlike the letter chords — where
+/// `is_sidebar_toggle_chord` can case-fold, as its own comment explains — digits have no
+/// folding to fall back on. Matching the modified characters instead would work on that one
+/// layout and fail silently everywhere else.
+///
+/// **`Cmd+Shift` was tried first and does not survive macOS** (R12.2's manual check): the
+/// system reserves `Cmd+Shift+3/4/5` for screenshots and takes them before any application
+/// sees the event, so sections 3-5 were unreachable — not a bug this code could fix. `Opt`
+/// is the nearest free modifier that keeps the shape of the existing `Cmd+<digit>` tab
+/// family; `tab_action` rejects alt so the two never contend.
+///
+/// The caller decides whether the panel is entitled to the chord at all; this only reads it.
+pub fn monitor_jump(input: &KeyInput) -> Option<usize> {
+    use winit::keyboard::KeyCode;
+    if !(input.mods.super_key() && input.mods.alt_key()) {
+        return None;
+    }
+    let PhysicalKey::Code(code) = input.physical else {
+        // No position information — a synthetic event. Not a wildcard: a chord that fired on
+        // an unknown key is a chord nobody pressed.
+        return None;
+    };
+    match code {
+        KeyCode::Digit1 => Some(0),
+        KeyCode::Digit2 => Some(1),
+        KeyCode::Digit3 => Some(2),
+        KeyCode::Digit4 => Some(3),
+        KeyCode::Digit5 => Some(4),
+        KeyCode::Digit6 => Some(5),
+        _ => None,
+    }
+}
+
+/// Is the pointer inside the docked ai-monitor panel's band?
+///
+/// D10: the wheel's destination is decided by **pointer position alone** — there is no click
+/// focus to consult, and that absence is what keeps the panel out of the modal-state
+/// business entirely. Always `false` when the panel is closed, because a zero-width band
+/// must never claim the window's right edge.
+pub fn in_monitor_panel(pointer_x: f64, viewport_w: f32, right_inset: f32) -> bool {
+    right_inset > 0.0 && viewport_w.is_finite() && (pointer_x as f32) >= viewport_w - right_inset
+}
+
+/// Physical px of travel one wheel event asks the ai-monitor panel for.
+///
+/// Positive is toward the top of the document — winit's convention, and the same sign
+/// [`wheel_lines`] gives the grid, so neither caller flips it.
+///
+/// A notch moves the panel the **same distance it would move the terminal**
+/// (`LINES_PER_NOTCH` text lines), which is what makes the two feel like one surface even
+/// though the panel then spends that distance in rungs of unequal height. Returning px
+/// rather than a rung count is deliberate: only the renderer knows how tall the next rung
+/// is, and converting up front would make a notch cross two bars or half a card depending on
+/// where the view happened to be.
+///
+/// A non-finite delta or a degenerate cell height yields `0.0` — no travel, and nothing for
+/// the caller to bank.
+pub fn panel_wheel_px(delta: WheelDelta, cell_h: f32) -> f32 {
+    let px = match delta {
+        WheelDelta::Lines(y) => {
+            if !cell_h.is_finite() || cell_h <= 0.0 {
+                return 0.0;
+            }
+            y * LINES_PER_NOTCH * cell_h
+        }
+        WheelDelta::Pixels(y) => y,
+    };
+    if px.is_finite() {
+        px
+    } else {
+        0.0
+    }
 }
 
 /// Grid lines one mouse-wheel notch scrolls (terminal-scroll D2). Three matches
@@ -1520,6 +1607,130 @@ mod tests {
         );
     }
 
+    // ---- ai-monitor-panel-scroll T10 / R8.3: reading the six jump chords ----
+
+    fn chord(code: winit::keyboard::KeyCode, mods: ModifiersState) -> KeyInput {
+        KeyInput {
+            // Deliberately a character the SHIFTED digit produces, not the digit: this is
+            // what winit actually delivers, and a test that used `"1"` would pass while the
+            // shipped path saw `"!"`.
+            key: Key::Character("!".into()),
+            text: Some("!".into()),
+            mods,
+            physical: PhysicalKey::Code(code),
+        }
+    }
+
+    #[test]
+    fn r8_3_the_six_chords_are_read_by_position_not_by_the_character_they_produce() {
+        use winit::keyboard::KeyCode::*;
+        let m = ModifiersState::SUPER | ModifiersState::ALT;
+        for (code, want) in [
+            (Digit1, 0),
+            (Digit2, 1),
+            (Digit3, 2),
+            (Digit4, 3),
+            (Digit5, 4),
+            (Digit6, 5),
+        ] {
+            assert_eq!(monitor_jump(&chord(code, m)), Some(want));
+        }
+        assert_eq!(
+            monitor_jump(&chord(Digit7, m)),
+            None,
+            "only six sections exist"
+        );
+        assert_eq!(monitor_jump(&chord(KeyA, m)), None);
+    }
+
+    #[test]
+    fn r8_3_both_modifiers_are_required() {
+        use winit::keyboard::KeyCode::Digit1;
+        assert_eq!(monitor_jump(&chord(Digit1, ModifiersState::SUPER)), None);
+        assert_eq!(monitor_jump(&chord(Digit1, ModifiersState::ALT)), None);
+        assert_eq!(monitor_jump(&chord(Digit1, ModifiersState::empty())), None);
+        // The chord this replaced. macOS eats `Cmd+Shift+3/4/5` for screenshots, so the
+        // whole family had to move; leaving it live as a second binding would mean three of
+        // the six worked and three did not.
+        assert_eq!(
+            monitor_jump(&chord(
+                Digit1,
+                ModifiersState::SUPER | ModifiersState::SHIFT
+            )),
+            None
+        );
+        // Cmd+1 with no Shift is the tab chord and must stay one — `tab_action` reads the
+        // logical key, so the two paths cannot both claim the same press.
+        assert!(tab_action(&Key::Character("1".into()), &ModifiersState::SUPER).is_some());
+    }
+
+    #[test]
+    fn r8_3_an_event_with_no_position_is_not_a_wildcard() {
+        // A synthetic `KeyInput` carries `NO_PHYSICAL`. Treating that as a match would fire a
+        // jump nobody pressed.
+        let mut k = chord(
+            winit::keyboard::KeyCode::Digit1,
+            ModifiersState::SUPER | ModifiersState::ALT,
+        );
+        k.physical = crate::seam::NO_PHYSICAL;
+        assert_eq!(monitor_jump(&k), None);
+    }
+
+    // ---- ai-monitor-panel-scroll T7 / R5.1-R5.6: routing the wheel to the panel ----
+
+    #[test]
+    fn r5_2_the_panel_band_is_resolved_by_pointer_position_alone() {
+        // D10. There is no click focus to consult, and that absence is the point: without a
+        // focus concept the panel never becomes modal, so no state can get stuck.
+        let (w, inset) = (740.0f32, 300.0f32);
+        assert!(in_monitor_panel(440.0, w, inset), "at the band's left edge");
+        assert!(
+            in_monitor_panel(739.0, w, inset),
+            "and at the window's right"
+        );
+        assert!(
+            !in_monitor_panel(439.0, w, inset),
+            "one px left of it is the grid"
+        );
+    }
+
+    #[test]
+    fn r5_2_a_closed_panel_claims_nothing() {
+        // The guard is load-bearing, not defensive: `viewport_w - 0.0` is the window's right
+        // edge, so an unconditional test would hand the last column of a normal terminal to
+        // a panel that is not on screen.
+        assert!(!in_monitor_panel(739.0, 740.0, 0.0));
+        assert!(!in_monitor_panel(739.0, f32::NAN, 300.0));
+    }
+
+    #[test]
+    fn r5_1_a_notch_asks_the_panel_for_the_same_travel_the_grid_would_make() {
+        // The panel and the terminal are one surface under the pointer, so a notch must move
+        // them the same distance — even though the panel then spends that distance in rungs
+        // of unequal height rather than in equal text lines.
+        let cell_h = 16.0;
+        assert_eq!(
+            panel_wheel_px(WheelDelta::Lines(1.0), cell_h),
+            LINES_PER_NOTCH * cell_h
+        );
+        // A trackpad's px are already px.
+        assert_eq!(panel_wheel_px(WheelDelta::Pixels(7.5), cell_h), 7.5);
+        // Sign follows winit: positive reveals content above, i.e. toward the document top —
+        // the same convention `wheel_lines` gives the grid, so neither caller flips it.
+        assert!(panel_wheel_px(WheelDelta::Lines(1.0), cell_h) > 0.0);
+        assert!(panel_wheel_px(WheelDelta::Lines(-1.0), cell_h) < 0.0);
+    }
+
+    #[test]
+    fn r5_1_a_degenerate_metric_asks_for_no_travel_rather_than_a_nan() {
+        // A NaN would propagate into the panel's residue and freeze it for the session.
+        for bad in [0.0f32, -4.0, f32::NAN] {
+            assert_eq!(panel_wheel_px(WheelDelta::Lines(1.0), bad), 0.0);
+        }
+        assert_eq!(panel_wheel_px(WheelDelta::Pixels(f32::NAN), 16.0), 0.0);
+        assert_eq!(panel_wheel_px(WheelDelta::Pixels(f32::INFINITY), 16.0), 0.0);
+    }
+
     /// R2.1/R2.2 — a notch is three lines; trackpad px divide by the cell height so
     /// the text tracks the finger 1:1.
     #[test]
@@ -2089,6 +2300,23 @@ mod tests {
         remember_write(&mut recent, (340.0, false));
         assert_eq!(recent.len(), before);
         assert_eq!(recent.last(), Some(&(340.0, false)));
+    }
+
+    #[test]
+    fn the_section_jump_and_the_tab_jump_cannot_both_fire() {
+        // The chord moved to `Cmd+Opt` because macOS reserves `Cmd+Shift+3/4/5`; the risk
+        // that replacement introduces is the OTHER direction — `Cmd+Opt+1` reaching
+        // `tab_action` as a bare digit on some layout and switching tabs instead. The alt
+        // rejection makes that impossible without depending on what the layout produces.
+        let cmd_opt = ModifiersState::SUPER | ModifiersState::ALT;
+        for c in ["1", "9", "¡"] {
+            assert_eq!(tab_action(&Key::Character(c.into()), &cmd_opt), None, "{c}");
+        }
+        // and the plain tab chords are untouched by the guard
+        assert_eq!(
+            tab_action(&Key::Character("1".into()), &ModifiersState::SUPER),
+            Some(TabAction::Jump(0))
+        );
     }
 
     #[test]

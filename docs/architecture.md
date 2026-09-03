@@ -48,14 +48,37 @@ zsh ──PTY──> reader thread ──mpsc──> [wake] winit loop
   via `Renderer::right_inset` (the symmetric twin of `left_inset`), so opening it reflows the
   terminal rather than covering it. `Grid::resize` has no rewrap, so that reflow currently
   truncates rows wider than the narrowed grid — non-destructive reflow is specified separately
-  in `specs/grid-reflow/spec.md` and is a declared dependency of the panel.
+  in `specs/grid-reflow/spec.md` and is a declared dependency of the panel. The panel's list
+  area is now a **scroll viewport** (`specs/ai-monitor-panel-scroll`): the six sections are
+  fully expanded into one document, reached by wheel or by `Cmd+Opt+1`..`6`, under a sticky
+  section heading. Two earlier decisions were reversed there deliberately, and each reversal is
+  argued at its site — the panel now consumes keys other than its toggle (`overlay.rs`), and
+  its footer draws a chord hint while the new-items badge is up (`monitor_layout.rs`, R1.4).
+  One limit is recorded rather than fixed: a rung taller than the content band is unreachable,
+  which C1's no-scissor rule forces and which the allocator it replaced shared.
+  A later increment put a **fold** back on top of that document: a section with more than
+  `FOLD_THRESHOLD` (5) entries draws at most five plus an `ItemKind::Fold` control rung, and
+  clicking a heading or that control toggles it. Two things about it are deliberate. It is
+  **not** `+N more` returning — that mark reported rows the allocator had already discarded,
+  with no way to reach them, whereas this hides rows the document still holds and the control
+  is the way back. And the fold state lives **inside** `MonitorModel` precisely where the
+  scroll offset is kept out of it: a fold changes which rungs exist, so it must invalidate
+  stage one, while a wheel notch must not. The click also reverses D10's "no hit-test, no
+  focus" for the panel — the reversal is argued at `MonitorHandle::press`, and is bounded by
+  the panel resolving the point against its own published bands so the app still performs no
+  geometry.
 - **G1** Performance *numbers* still unconfirmed — CI checks build/test, not
   fps/latency; committing the thresholds remains a human decision. (The idle-CPU
   debt from PR #2 — a full re-shape every frame at idle — has since been fixed: the
   renderer skips re-shape on an unchanged snapshot, re-presenting cached buffers. The
-  ai-monitor panel carries its **own** shaping cache — keyed on the model, panel rect, cell
-  metrics and atlas identity — because the terminal's re-shape skip does not cover it and the
-  layer it replaced re-laid-out its text every frame.)
+  ai-monitor panel carries its **own** shaping cache, and since `specs/ai-monitor-panel-scroll`
+  that cache is **two-stage**: stage one lays the whole (now fully expanded) document out
+  position-independently, keyed on the model, panel rect, cell metrics and atlas identity;
+  stage two translates, culls by ladder index, copies the sticky heading and synthesises the
+  footer line, keyed on the scroll state. The split is the contract — the scroll offset is
+  deliberately **outside** `MonitorModel` so a wheel notch cannot invalidate stage one, and
+  equally deliberately **inside** stage two's key so the screen actually updates. Doing only
+  one of the two gives, respectively, this debt back and a panel that never repaints.)
 - **G5** The ai-monitor panel derives its log directory from the chosen `claude` process's own
   cwd, while the sidebar card shows the tab's (or tmux pane's) **shell** cwd. After a `cd` inside
   a pane the two legitimately **disagree** — they answer "where is this session's log" and "where

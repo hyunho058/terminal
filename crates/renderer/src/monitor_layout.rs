@@ -97,104 +97,282 @@ pub struct TextRun {
     pub color: u32,
 }
 
-/// Everything one frame of the panel draws.
+/// A bag of primitives — shapes and the runs drawn over them.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct PanelDraw {
+pub struct Primitives {
     pub shapes: Vec<SidebarShape>,
     pub runs: Vec<TextRun>,
 }
 
-/// What the height allocator needs to know about one section: how many entries it could
-/// draw, and how tall one of its rows is.
-///
-/// `row_h` is per section because a card (title + detail line) is taller than a list row.
-/// A card **reserves its detail line whether or not it has one**: the allocator grants
-/// *rows*, so a section's rows must all be the same height, or the height it was granted
-/// and the height it draws disagree and the footer moves under the content.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SectionMetrics {
-    pub entries: usize,
-    pub row_h: f32,
-}
-
-/// One section's share of the panel's leftover height.
+/// A half-open `[start, end)` slice of one of [`Primitives`]' vectors.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Grant {
-    /// Whether the section's heading is drawn at all. `false` only in D18's last resort,
-    /// where not even the headings fit.
-    pub heading: bool,
-    /// How many entry rows the section draws. May be 0 alongside `heading: true` — D10
-    /// treats a heading-only section as a valid state, not an omission (R8.4).
-    pub rows: usize,
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
 }
 
-/// D18's height allocator: divide `available` px between the sections, in the design's
-/// order, and report what each one may draw.
-///
-/// The order of operations is the decision, and it is not the obvious one:
-///
-/// 1. **Headings are reserved first, for as many sections as fit, from the top.** A
-///    section that renders only its heading still tells the user the section exists (D10),
-///    which is worth more than a row on a neighbour — so R8.5's four-heading height yields
-///    four headings and no rows, not two headings with a row each. When they do not all
-///    fit, the ones that go are the ones at the **bottom** of the design order.
-/// 2. **One row each, in order** (R8.1), skipping empty sections. The grant is splittable:
-///    a section whose heading fit but whose row does not gets the heading alone (R8.4).
-/// 3. **Round-robin, one row per section per pass** (R8.2), each section capped by its own
-///    entry count (R8.3). Greedy would hand a 40-entry TASKS every spare row and leave the
-///    other five at one apiece.
-///
-/// A section with a non-positive or non-finite `row_h` is granted no rows — that also
-/// keeps the round-robin loop from spinning forever on a zero-height row.
-pub fn allocate(sections: &[SectionMetrics], available: f32, heading_h: f32) -> Vec<Grant> {
-    let mut grants = vec![Grant::default(); sections.len()];
-    if !available.is_finite() || !heading_h.is_finite() || available <= 0.0 || heading_h < 0.0 {
-        return grants;
+impl Span {
+    pub fn len(&self) -> usize {
+        self.end.saturating_sub(self.start)
     }
 
-    // 1. Headings, dropping from the bottom of the order when they do not all fit.
-    let mut used = 0.0f32;
-    let mut headed = 0usize;
-    while headed < sections.len() && used + heading_h <= available + FIT_EPS {
-        used += heading_h;
-        headed += 1;
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
-    for g in grants.iter_mut().take(headed) {
-        g.heading = true;
-    }
-    let mut remaining = available - used;
-
-    // 2. The first row of each headed section. `continue`, not `break`: a tall card row
-    //    that does not fit must not veto a later section's shorter one.
-    for (g, sm) in grants.iter_mut().zip(sections).take(headed) {
-        if sm.entries == 0 || !usable_row(sm.row_h) || remaining + FIT_EPS < sm.row_h {
-            continue;
-        }
-        remaining -= sm.row_h;
-        g.rows = 1;
-    }
-
-    // 3. Round-robin passes until one pass grants nothing. Terminates: every grant either
-    //    spends `row_h > 0` of a finite budget or raises `rows` toward a finite entry cap.
-    loop {
-        let mut granted = false;
-        for (g, sm) in grants.iter_mut().zip(sections).take(headed) {
-            if g.rows >= sm.entries || !usable_row(sm.row_h) || remaining + FIT_EPS < sm.row_h {
-                continue;
-            }
-            remaining -= sm.row_h;
-            g.rows += 1;
-            granted = true;
-        }
-        if !granted {
-            break;
-        }
-    }
-    grants
 }
 
-fn usable_row(row_h: f32) -> bool {
-    row_h.is_finite() && row_h > 0.0
+/// Where one ladder rung's primitives live inside [`PanelDraw::content`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ItemSpans {
+    pub shapes: Span,
+    pub runs: Span,
+}
+
+/// Everything one frame of the panel draws — **stage one** of the two-stage shaping
+/// contract (ai-monitor-panel-scroll D24/D38).
+///
+/// The split is not cosmetic. Stage two has to perform three *different* operations on
+/// three *disjoint* subsets — translate-and-cull the document, copy one heading into the
+/// sticky slot, and synthesise the footer line — and a flat `{shapes, runs}` pair cannot
+/// address any of them. In particular a flat bag would make stage two translate the pinned
+/// chrome along with the content, which is C2/D3 head-on.
+///
+/// Two coordinate spaces meet here, deliberately:
+///
+/// * [`chrome`](Self::chrome) is **panel-absolute** and final. Stage two neither moves nor
+///   culls it, which is what makes "the chrome never flows" (R2.1) a property of the type
+///   rather than of a reviewer's attention.
+/// * [`content`](Self::content) is **document-local**: `y = 0` is the top of the first
+///   heading, so the whole document is laid out once at its natural positions and stage two
+///   is a pure `y += viewport.y - offset` plus a cull. Its `x` geometry is already
+///   panel-relative, which is what lets a heading be copied into the slot by translation
+///   alone (D36).
+///
+/// The footer *text* is deliberately absent — see [`PanelDraw::items`] and D38: stage two
+/// always synthesises that one line, because it is the line the badge replaces (D34) and
+/// hunting for it by `y` afterwards is the fragile implementation that structure exists to
+/// prevent. The footer's hairline rule *is* here, in `chrome`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PanelDraw {
+    /// Pinned regions, panel-absolute: background, header band, session row, stat tiles,
+    /// and the footer's hairline.
+    pub chrome: Primitives,
+    /// The scrollable document, laid out document-local from `y = 0`.
+    pub content: Primitives,
+    /// One entry per rung of [`item_ladder`], in the same order.
+    pub items: Vec<ItemSpans>,
+    /// The ladder itself, and each rung's height — carried here rather than recomputed by
+    /// every caller so that `items[i]` and `ladder[i]` are the *same* `i` by construction
+    /// (C11). Two independently derived enumerations that drift apart put the scroll a rung
+    /// away from where the user asked, silently.
+    pub ladder: Vec<Item>,
+    pub heights: Vec<f32>,
+    /// The band the sticky heading is copied into, panel-absolute. Zero-height when even
+    /// one heading line does not fit (D31).
+    pub slot: Rect,
+    /// The band content may occupy, panel-absolute — **below** `slot`. Zero-height when the
+    /// section area cannot take a rung.
+    pub viewport: Rect,
+    /// Where the footer's single line of text goes, panel-absolute. Stage two writes either
+    /// the last-update string or the badge here (D34). Zero-height when the footer band did
+    /// not fit, in which case stage two writes nothing.
+    pub footer_text: Rect,
+    /// How many columns that line has. Carried because the panel is drag-resizable and stage
+    /// two has to choose between a long badge, a short one and nothing at all — a decision
+    /// that needs the width in the same units the truncation uses.
+    pub footer_cols: usize,
+}
+
+impl Default for PanelDraw {
+    fn default() -> PanelDraw {
+        PanelDraw {
+            chrome: Primitives::default(),
+            content: Primitives::default(),
+            items: Vec::new(),
+            ladder: Vec::new(),
+            heights: Vec::new(),
+            slot: NO_BAND,
+            viewport: NO_BAND,
+            footer_text: NO_BAND,
+            footer_cols: 0,
+        }
+    }
+}
+
+/// The empty band. `Rect` is `sidebar_layout`'s and deliberately not `Default` (a zero rect
+/// is a real geometric claim there), so the "no room at all" state is named here instead.
+pub const NO_BAND: Rect = Rect {
+    x: 0.0,
+    y: 0.0,
+    w: 0.0,
+    h: 0.0,
+};
+
+/// What one rung of the **item ladder** is (ai-monitor-panel-scroll D32/R1.3).
+///
+/// The ladder is the coordinate space the whole scroll feature counts in: D17 made the
+/// scroll offset an *item index* rather than a pixel offset, so "what is item `i`" has to
+/// have exactly one answer. C11 makes that answer live here — `app` calls this rather than
+/// enumerating a second time, because two counts that disagree put the scroll somewhere the
+/// user did not ask for, and they disagree *silently*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemKind {
+    /// A section's `LABEL ──── marks` line. **A heading is a rung even for an empty
+    /// section** — the empty-state wording rides the heading (`SectionBody::Empty`), so the
+    /// section is still visible, still jumpable (D16), and still needs an index.
+    Heading,
+    /// One TASKS / ACTIVE AGENTS card. **One rung although it draws two lines** — a card
+    /// reserves its detail line whether or not it has one, so it is a single indivisible
+    /// step of the ladder.
+    Card,
+    /// One SKILLS / FILE ACTIVITY / RECENT CALLS row.
+    Row,
+    /// One TOOL USAGE bar.
+    Bar,
+    /// A section's fold control — `▸ N more` when closed, `▾ collapse` when open.
+    ///
+    /// A rung like any other: it can be scrolled to, landed on and clicked. It exists only
+    /// for a [`Section::foldable`] section, and it exists in **both** fold states — a
+    /// control that vanished once you opened it would leave no way back.
+    ///
+    /// This is not `+N more` returning. That mark was a *report* of rows the height
+    /// allocator had already thrown away, with no way to reach them; this is a *control*,
+    /// and the rows behind it are one click away.
+    Fold,
+}
+
+/// One rung: which section it belongs to, what shape it is, and — for a body item — which
+/// entry of that section's body it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Item {
+    /// Index into [`MonitorModel::sections`].
+    pub section: usize,
+    pub kind: ItemKind,
+    /// Index into the section's body, or `None` for [`ItemKind::Heading`].
+    pub entry: Option<usize>,
+}
+
+impl Item {
+    pub fn is_heading(&self) -> bool {
+        self.kind == ItemKind::Heading
+    }
+
+    /// A section's fold control rather than content.
+    pub fn is_fold(&self) -> bool {
+        self.kind == ItemKind::Fold
+    }
+
+    /// One entry of a section's body — the rungs that carry the data. Heading and fold
+    /// rungs are chrome for the section, and both answer `false`.
+    pub fn is_body(&self) -> bool {
+        self.entry.is_some()
+    }
+}
+
+/// Enumerate every rung of the document, in the model's section order (R1.2/R1.3).
+///
+/// Pure and GPU-free by construction — it reads the model and nothing else, which is what
+/// lets both the scroll math and the app's anchor bookkeeping share one definition without
+/// either of them needing a frame.
+///
+/// Deliberately **not** height-aware: heights need `scale`/`cell` and change on a DPI or
+/// font change, while the identity of item `i` does not. Splitting them keeps the identity
+/// stable across a resize — which is exactly what an anchor (D8/D19) needs.
+pub fn item_ladder(model: &MonitorModel) -> Vec<Item> {
+    let mut out = Vec::new();
+    for (section, s) in model.sections.iter().enumerate() {
+        out.push(Item {
+            section,
+            kind: ItemKind::Heading,
+            entry: None,
+        });
+        let kind = match &s.body {
+            // An empty section contributes its heading and nothing else. `len()` is 0 for
+            // `Empty`, so the loop below would not run anyway — the match arm is here to
+            // make that a stated fact rather than an accident of `len()`.
+            SectionBody::Empty(_) => continue,
+            SectionBody::Cards(_) => ItemKind::Card,
+            SectionBody::Rows(_) => ItemKind::Row,
+            SectionBody::Bars(_) => ItemKind::Bar,
+        };
+        // `shown()`, not `len()`: a closed fold makes the hidden entries not merely
+        // undrawn but **absent from the coordinate space**. That is the whole reason the
+        // fold state lives in the model — the ladder is the document, and a folded
+        // document is a shorter one.
+        for entry in 0..s.shown() {
+            out.push(Item {
+                section,
+                kind,
+                entry: Some(entry),
+            });
+        }
+        if s.foldable() {
+            out.push(Item {
+                section,
+                kind: ItemKind::Fold,
+                entry: None,
+            });
+        }
+    }
+    out
+}
+
+/// Heights of every rung, parallel to [`item_ladder`] — what `monitor_scroll` measures with.
+///
+/// A separate pass rather than a field on [`Item`] because heights depend on `scale`/`cell`
+/// and rung *identity* does not: an anchor (D8/D19) has to survive a DPI or font change, and
+/// it does exactly because the thing it names carries no pixels.
+pub fn item_heights(model: &MonitorModel, scale: f64, cell: [f32; 2]) -> Vec<f32> {
+    let Some(m) = Metrics::new([0.0, 0.0, 1.0, 1.0], scale, cell) else {
+        return vec![0.0; item_ladder(model).len()];
+    };
+    item_ladder(model)
+        .iter()
+        .map(|item| match model.sections.get(item.section) {
+            None => 0.0,
+            Some(section) => match item.kind {
+                ItemKind::Heading => m.heading_h(),
+                // One text line, like a row — never the body's own row height, because a
+                // `Cards` body's rung is two lines tall and the control is not a card.
+                ItemKind::Fold => m.fold_h(),
+                _ => m.row_h(&section.body),
+            },
+        })
+        .collect()
+}
+
+/// The height of the **sticky slot** — one heading line (D31).
+///
+/// The content viewport starts *below* this, which is what makes the slot un-overdrawable
+/// without a scissor rect: shapes are composited under glyphs in `monitor_panel`, so a
+/// heading background could never hide a row's glyphs passing beneath it. Reserving the
+/// band instead means nothing ever passes beneath it.
+///
+/// Returns `0.0` for degenerate metrics rather than a NaN that would poison every later
+/// comparison.
+pub fn slot_h(scale: f64, cell: [f32; 2]) -> f32 {
+    match Metrics::new([0.0, 0.0, 1.0, 1.0], scale, cell) {
+        Some(m) => m.heading_h(),
+        None => 0.0,
+    }
+}
+
+/// The height of one rung, in physical px (R1.3).
+///
+/// `0.0` for a rung that names a section the model no longer has, and for degenerate
+/// metrics — the scroll math treats a non-positive height as "cannot be a stop", so a stale
+/// index degrades into an unreachable rung instead of a panic.
+pub fn item_h(item: &Item, model: &MonitorModel, scale: f64, cell: [f32; 2]) -> f32 {
+    let Some(m) = Metrics::new([0.0, 0.0, 1.0, 1.0], scale, cell) else {
+        return 0.0;
+    };
+    let Some(section) = model.sections.get(item.section) else {
+        return 0.0;
+    };
+    match item.kind {
+        ItemKind::Heading => m.heading_h(),
+        _ => m.row_h(&section.body),
+    }
 }
 
 /// Lay the panel out inside `panel` (`[x, y, w, h]`, physical px, top-left origin).
@@ -212,6 +390,7 @@ pub fn layout(model: &MonitorModel, panel: [f32; 4], scale: f64, cell: [f32; 2])
     let mut p = Painter {
         m,
         out: PanelDraw::default(),
+        to_content: false,
     };
     p.panel_bg();
     // D18 step 1: the pinned chrome is laid out before anything elastic, so the sections
@@ -239,8 +418,243 @@ pub fn layout(model: &MonitorModel, panel: [f32; 4], scale: f64, cell: [f32; 2])
     };
     let y = p.tiles(model, y, footer_top);
     p.footer(model);
-    p.sections(model, y, footer_top);
+
+    // D31: the content viewport starts BELOW a one-heading-line slot. Reserving the band is
+    // what makes the sticky heading drawable at all — shapes composite *under* glyphs
+    // (`monitor_panel::record` runs the shape pass then the glyph pass), so a heading's
+    // background could never hide a row's glyphs sliding beneath it, and C1 forbids the
+    // scissor rect that would. Nothing passes beneath it because nothing is allowed there.
+    let area_top = y + m.s(GAP);
+    let area_bottom = footer_top - m.s(GAP);
+    let slot_h = m.heading_h();
+    let (slot, viewport) = if area_bottom - area_top + FIT_EPS >= slot_h {
+        (
+            Rect {
+                x: m.panel[0],
+                y: area_top,
+                w: m.panel[2],
+                h: slot_h,
+            },
+            Rect {
+                x: m.panel[0],
+                y: area_top + slot_h,
+                w: m.panel[2],
+                h: (area_bottom - area_top - slot_h).max(0.0),
+            },
+        )
+    } else {
+        // Shorter than one heading line. R3.7: draw no section area at all rather than a
+        // partial slot — the pinned chrome still stands, which is what C2 protects.
+        (NO_BAND, NO_BAND)
+    };
+    p.out.slot = slot;
+    p.out.viewport = viewport;
+    p.out.ladder = item_ladder(model);
+    p.out.heights = item_heights(model, scale, cell);
+    // Unconditional, even when the bands above came out empty. `items` must stay parallel
+    // to `item_ladder(model)` at *every* panel size or the app and the renderer disagree
+    // about what item `i` is — the silent mismatch C11 exists to prevent. Whether anything
+    // is drawn is stage two's call, and it makes it from `viewport.h`.
+    p.document(model);
     p.out
+}
+
+/// **Stage two** (D24): turn stage one's document into the primitives one frame draws, for a
+/// given scroll position.
+///
+/// Three distinct operations on three disjoint subsets, which is precisely why
+/// [`PanelDraw`] is structured rather than flat:
+///
+/// 1. **Chrome** is copied through untouched — not translated, not culled (C2/R2.1/R10.6).
+/// 2. **Content** is translated by `viewport.y - document_y(top)` and culled to whole rungs
+///    that fit the viewport. The unit of culling is the **rung**, walked in ladder order —
+///    a rung is copied entire or not at all, so D17's snap holds by construction. (Where the
+///    range *ends* is still a pixel test: the first rung whose bottom passes the viewport
+///    stops the walk.)
+/// 3. **The footer line** is synthesised here, because stage one deliberately does not emit
+///    it (D38) — this is the line the badge replaces (D34).
+///
+/// Cheap on purpose: it moves `y` on already-shaped primitives and re-shapes nothing
+/// (C3/R10.2). `TextRun` carries its own rect, and glyph UVs are independent of it.
+///
+/// `top` is a ladder index; out-of-range values clamp rather than panic, because the app can
+/// legitimately hold a stale index for the frame between a model swap and its re-clamp.
+pub fn compose(draw: &PanelDraw, model: &MonitorModel, top: usize, badge: u32) -> Primitives {
+    let mut out = draw.chrome.clone();
+
+    if draw.slot.h > 0.0 && !draw.items.is_empty() {
+        let top = top.min(draw.items.len() - 1);
+
+        // --- the sticky slot (D5/D18/D31/R4.1-R4.4) --------------------------------------
+        //
+        // The heading of whatever section `top` is inside, copied into the reserved band by
+        // **translation alone** — never re-laid-out and never re-shaped (D36/R4.3). That
+        // works because a heading's `x` geometry is entirely panel-relative: the label sits
+        // at `inner_x`, the marks are right-aligned to `right()`, and the hairline fills
+        // between them. Only `y` ever needed to change.
+        //
+        // Both the glyph runs and the rule *shape* are copied. Forgetting the shape is an
+        // easy and invisible mistake — the heading would still read correctly, just without
+        // its rule, on the one line the eye returns to most.
+        let heading = heading_above(draw, top);
+        if let Some(h) = heading {
+            let spans = draw.items[h];
+            let dy = draw.slot.y - item_top(draw, h);
+            copy_rung(draw, &spans, dy, &mut out);
+        }
+
+        // --- the content, below the slot ------------------------------------------------
+        //
+        // D31's consumption rule: when `top` names a heading the slot has already drawn it,
+        // so content starts at `top + 1`. Without this the same heading appears twice —
+        // once in the slot and once flush beneath it — at index 0, at all six jump targets
+        // and at `max_index`. That is the default state, not an edge case.
+        let start = if is_heading_rung(draw, top) {
+            top + 1
+        } else {
+            top
+        };
+        if draw.viewport.h > 0.0 && start < draw.items.len() {
+            let dy = draw.viewport.y - item_top(draw, start);
+            // `item_top` folds `min` over the rung's own primitives, so a rung that emitted
+            // NONE — every column budget collapsed to zero on a sub-padding panel width —
+            // answers `+inf` and makes `dy` `-inf`. Every later `rung_fits` would then be
+            // trivially true and the whole document would be copied at `y = -inf`. Nothing
+            // is visible at that width either way; the point is not to depend on that.
+            if !dy.is_finite() {
+                return out;
+            }
+            let bottom = draw.viewport.y + draw.viewport.h;
+            for spans in &draw.items[start..] {
+                // Whole rungs only: a rung whose bottom passes the viewport is not drawn at
+                // all (C1 — there is no scissor rect, so a partial rung would paint outside
+                // the band, and D17 exists so that never has to be represented).
+                if !rung_fits(draw, spans, dy, bottom) {
+                    break;
+                }
+                copy_rung(draw, spans, dy, &mut out);
+            }
+        }
+    }
+
+    // The footer line, synthesised here because stage one deliberately emits none (D38).
+    //
+    // When entries have arrived above the reader's anchor, this line becomes the badge
+    // instead of the last-update time (D34). It is a REPLACEMENT, not a second run: the
+    // footer is drawn with `text()`, which truncates silently, so two things sharing the line
+    // would quietly lose the tail of whichever came last.
+    //
+    // The footer is the only pinned region that survives to the panel's minimum height
+    // (`monitor_model`'s R5.1 note: below 64.8px the header and session row are gone and the
+    // footer is not), which is exactly why the badge lives here — a warning that disappears
+    // on a short panel is not a warning.
+    if draw.footer_text.h > 0.0 {
+        if let Some(text) = footer_line(draw, model, badge) {
+            out.runs.push(TextRun {
+                rect: draw.footer_text,
+                text,
+                color: if badge > 0 {
+                    ColorRole::Amber.packed()
+                } else {
+                    ColorRole::TextFaint.packed()
+                },
+            });
+        }
+    }
+    out
+}
+
+/// What the footer line says this frame, or `None` when nothing fits (D34/R7.5/R7.6).
+///
+/// The fallback order is the decision. The badge's first job is telling the reader they are
+/// missing things — Inversion named "badge ignored" as the failure most likely to make this
+/// whole feature a mistake — and its second is saying how to get back. So the key hint goes
+/// first when the width runs out.
+///
+/// **The count itself is never truncated.** The footer is drawn with `text()`, which clips
+/// silently, so stopping the fallback rule at "drop the hint" would leave `12 new · Cmd…`
+/// becoming `12 ne…` — the same species of half-truth D20 refuses to draw on a heading. The
+/// short form is the last honest thing that fits; below that, nothing.
+fn footer_line(draw: &PanelDraw, model: &MonitorModel, badge: u32) -> Option<String> {
+    let cols = draw.footer_cols;
+    if badge == 0 {
+        return (!model.footer.is_empty() && text_cols(&model.footer) <= cols)
+            .then(|| model.footer.clone());
+    }
+    // Longest first: each fallback is a true statement, just a shorter one.
+    [
+        format!("{badge} new above · {RETURN_HINT}"),
+        format!("{badge} new above"),
+        format!("+{badge}"),
+    ]
+    .into_iter()
+    .find(|c| text_cols(c) <= cols)
+}
+
+/// The chord that returns to the top (D30). TASKS is the document's first section, so D16's
+/// first jump already IS "back to the top" — no new binding was invented for this.
+const RETURN_HINT: &str = "⌘⌥1";
+
+/// The heading whose section rung `top` belongs to — what the slot shows (R4.1).
+///
+/// Walks back to the section's own heading rather than reading `top`'s section index and
+/// searching forward, so a rung naming a section the ladder no longer has degrades into
+/// "no slot heading" instead of an out-of-bounds.
+fn heading_above(draw: &PanelDraw, top: usize) -> Option<usize> {
+    // Delegates rather than repeating the walk: `MonitorHandle::press` needs the same answer
+    // from the ladder alone, and two walks that disagree would put the slot's heading and
+    // the click's target on different sections (C11).
+    crate::monitor_scroll::heading_above(&draw.ladder, top)
+}
+
+fn is_heading_rung(draw: &PanelDraw, i: usize) -> bool {
+    draw.ladder.get(i).is_some_and(Item::is_heading)
+}
+
+/// Copy one rung's primitives, moved `dy` down. The single funnel for both the slot and the
+/// content, so the two cannot drift apart about what "a rung" includes.
+fn copy_rung(draw: &PanelDraw, spans: &ItemSpans, dy: f32, out: &mut Primitives) {
+    out.shapes.extend(
+        draw.content.shapes[spans.shapes.start..spans.shapes.end]
+            .iter()
+            .map(|s| s.translated_y(dy)),
+    );
+    out.runs.extend(
+        draw.content.runs[spans.runs.start..spans.runs.end]
+            .iter()
+            .map(|r| TextRun {
+                rect: Rect {
+                    y: r.rect.y + dy,
+                    ..r.rect
+                },
+                ..r.clone()
+            }),
+    );
+}
+
+/// Document-local `y` of rung `i`'s top edge, measured from the primitives it emitted.
+fn item_top(draw: &PanelDraw, i: usize) -> f32 {
+    let spans = draw.items[i];
+    let runs = draw.content.runs[spans.runs.start..spans.runs.end]
+        .iter()
+        .map(|r| r.rect.y);
+    let shapes = draw.content.shapes[spans.shapes.start..spans.shapes.end]
+        .iter()
+        .map(SidebarShape::top);
+    runs.chain(shapes).fold(f32::INFINITY, f32::min)
+}
+
+fn rung_fits(draw: &PanelDraw, spans: &ItemSpans, dy: f32, bottom: f32) -> bool {
+    let runs = draw.content.runs[spans.runs.start..spans.runs.end]
+        .iter()
+        .map(|r| r.rect.y + r.rect.h);
+    let shapes = draw.content.shapes[spans.shapes.start..spans.shapes.end]
+        .iter()
+        .map(SidebarShape::bottom);
+    let low = runs.chain(shapes).fold(f32::NEG_INFINITY, f32::max);
+    // A rung that emitted nothing at all (an empty section's body draws none) never blocks
+    // the ones after it.
+    low == f32::NEG_INFINITY || low + dy <= bottom + FIT_EPS
 }
 
 /// Resolved per-frame geometry. All physical px except `scale`.
@@ -307,8 +721,13 @@ impl Metrics {
         (px / self.cell_w).floor().max(0.0) as usize
     }
 
-    /// One row's height for a body kind. See [`SectionMetrics::row_h`] for why a card
-    /// reserves its detail line unconditionally.
+    /// One row's height for a body kind.
+    ///
+    /// A card **reserves its detail line whether or not it has one**, so every card in a
+    /// section is the same height. That used to matter because the allocator granted whole
+    /// rows; under D4 it matters for a different reason — it is what makes a card exactly
+    /// one rung of the ladder (R1.3) instead of a variable-height blob the scroll snap
+    /// could land inside.
     fn row_h(&self, body: &SectionBody) -> f32 {
         match body {
             SectionBody::Cards(_) => 2.0 * self.line + self.s(2.0 * CARD_PAD + ROW_GAP),
@@ -317,6 +736,10 @@ impl Metrics {
     }
 
     fn heading_h(&self) -> f32 {
+        self.line + self.s(ROW_GAP)
+    }
+
+    fn fold_h(&self) -> f32 {
         self.line + self.s(ROW_GAP)
     }
 }
@@ -344,6 +767,10 @@ fn solid(role: ColorRole) -> Fill {
 struct Painter {
     m: Metrics,
     out: PanelDraw,
+    /// Where `shape`/`text` currently write. `false` = the pinned chrome (panel-absolute,
+    /// clipped by `fits`); `true` = the document (document-local `y`, never clipped —
+    /// stage two culls by ladder index instead, D38/R10.8).
+    to_content: bool,
 }
 
 impl Painter {
@@ -351,13 +778,28 @@ impl Painter {
     /// vector with zero or one element, so rejected geometry (D9) is dropped here rather
     /// than unwrapped into a panic.
     fn shape(&mut self, s: Option<SidebarShape>) {
-        self.out.shapes.extend(s);
+        self.buf().shapes.extend(s);
+    }
+
+    /// The buffer the current region writes into. One switch, read by every emit site, so
+    /// a region cannot land in the wrong coordinate space by forgetting a parameter.
+    fn buf(&mut self) -> &mut Primitives {
+        if self.to_content {
+            &mut self.out.content
+        } else {
+            &mut self.out.chrome
+        }
     }
 
     /// Is a region `h` tall, starting at `y`, wholly inside the panel band? Nothing may
-    /// paint outside it — there is no scissor rect.
+    /// paint outside it — there is no scissor rect (C1).
+    ///
+    /// **Always true while laying out the document.** Content is emitted document-local and
+    /// most of it is legitimately far outside the panel band; stage two is what decides which
+    /// rungs reach the GPU, and it decides a rung at a time in ladder order (D38/R10.8).
+    /// Clipping here instead would drop rungs stage two still needs.
     fn fits(&self, y: f32, h: f32) -> bool {
-        y + FIT_EPS >= self.m.panel[1] && y + h <= self.m.bottom() + FIT_EPS
+        self.to_content || (y + FIT_EPS >= self.m.panel[1] && y + h <= self.m.bottom() + FIT_EPS)
     }
 
     fn fill_rect(&mut self, r: Rect, role: ColorRole) {
@@ -399,7 +841,7 @@ impl Painter {
             return 0.0;
         }
         let w = text_w(&fitted, m.cell_w);
-        self.out.runs.push(TextRun {
+        self.buf().runs.push(TextRun {
             rect: Rect { x, y, w, h: m.line },
             text: fitted,
             color: role.packed(),
@@ -417,7 +859,7 @@ impl Painter {
         }
         let w = text_w(&fitted, m.cell_w);
         let x = right - w;
-        self.out.runs.push(TextRun {
+        self.buf().runs.push(TextRun {
             rect: Rect { x, y, w, h: m.line },
             text: fitted,
             color: role.packed(),
@@ -610,7 +1052,7 @@ impl Painter {
             dot,
             solid(role),
         ));
-        self.out.runs.push(TextRun {
+        self.buf().runs.push(TextRun {
             rect: Rect {
                 x: dot_x + dot * 0.5 + m.s(DOT_GAP),
                 y: cy - m.line * 0.5,
@@ -757,6 +1199,13 @@ impl Painter {
     /// The design's `q` keycap is deliberately absent (D1/R1.4): the panel consumes no
     /// keystroke but the chord, so drawing a keycap would promise a binding that does not
     /// exist and would cost a terminal user their `less` quit key if it did.
+    ///
+    /// **Both premises of that decision have since changed** (ai-monitor-panel-scroll D30),
+    /// so stage two now writes a chord hint onto this line while the new-items badge is up:
+    /// the panel *does* answer to `Cmd+Opt+1` now (D16), and that chord is not a key any
+    /// shell is waiting for. The keycap **box** is still absent, and that part has not
+    /// changed — a drawn control invites a click the panel has no answer for (D10 keeps it
+    /// click-free), so the hint is text and may only ever be text.
     fn footer(&mut self, model: &MonitorModel) {
         let m = self.m;
         let top = self.footer_top();
@@ -769,40 +1218,85 @@ impl Painter {
             top,
             ColorRole::Hairline,
         );
-        self.text(
-            m.inner_x,
-            top + m.s(GAP) * 0.5,
-            m.inner_w,
-            &model.footer,
-            ColorRole::TextFaint,
-        );
+        // The footer *text* is not emitted here, and that absence is the decision (D38).
+        // Stage two synthesises this one line every frame because it is the line the badge
+        // replaces (D34) — and because the alternative, letting stage one draw it and then
+        // having stage two hunt for it by `y` to suppress it, is exactly the fragile
+        // addressing the structured output exists to abolish. What stage two needs is the
+        // geometry, which is recorded here.
+        let _ = model;
+        self.out.footer_text = Rect {
+            x: m.inner_x,
+            y: top + m.s(GAP) * 0.5,
+            w: m.inner_w,
+            h: m.line,
+        };
+        self.out.footer_cols = m.cols(m.inner_w);
     }
 
-    /// The six content sections, sharing everything the pinned chrome left.
-    fn sections(&mut self, model: &MonitorModel, y_top: f32, footer_top: f32) {
-        let m = self.m;
-        if m.inner_w <= 0.0 || model.sections.is_empty() {
-            return;
-        }
-        let mut y = y_top + m.s(GAP);
-        let available = footer_top - m.s(GAP) - y;
-        let sm: Vec<SectionMetrics> = model
-            .sections
-            .iter()
-            .map(|s| SectionMetrics {
-                entries: s.body.len(),
-                row_h: m.row_h(&s.body),
-            })
-            .collect();
-        let grants = allocate(&sm, available, m.heading_h());
-        for (section, grant) in model.sections.iter().zip(grants) {
-            if !grant.heading {
-                continue;
+    /// The whole document: every rung of every section, in order, laid out **document-local**
+    /// from `y = 0` (D4/R1.1).
+    ///
+    /// This replaced D18's height allocator rather than wrapping it. The allocator existed to
+    /// answer "which rows fit?", and D4 deleted that question — the panel now promises
+    /// *reachability*, not simultaneous visibility, so there is nothing left to ration. What
+    /// this owes instead is a **span per rung**, because that is the only handle stage two has
+    /// on "draw items 12..19 and nothing else".
+    ///
+    /// The spans are recorded around each rung's emit, so they stay correct no matter how many
+    /// primitives a rung happens to produce — a card with no detail line emits fewer runs than
+    /// one with a detail line, and neither the ladder nor stage two should have to know that.
+    fn document(&mut self, model: &MonitorModel) {
+        self.to_content = true;
+        let mut y = 0.0f32;
+        for section in &model.sections {
+            y = self.rung(y, |p, y| p.heading(section, y));
+            // `take(shown())` is the single point the fold is applied to the drawing, and it
+            // matches `item_ladder`'s own `shown()` by construction. C11's rule: two counts
+            // of the same document that are derived separately drift apart silently.
+            let shown = section.shown();
+            match &section.body {
+                SectionBody::Empty(_) => {}
+                SectionBody::Cards(v) => {
+                    for c in v.iter().take(shown) {
+                        y = self.rung(y, |p, y| p.card(c, y));
+                    }
+                }
+                SectionBody::Rows(v) => {
+                    for r in v.iter().take(shown) {
+                        y = self.rung(y, |p, y| p.row(r, y));
+                    }
+                }
+                SectionBody::Bars(v) => {
+                    for b in v.iter().take(shown) {
+                        y = self.rung(y, |p, y| p.usage_bar(b, y));
+                    }
+                }
             }
-            self.heading(section, y, grant.rows);
-            y += m.heading_h();
-            y = self.body(section, y, grant.rows);
+            if section.foldable() {
+                y = self.rung(y, |p, y| p.fold(section, y));
+            }
         }
+        self.to_content = false;
+    }
+
+    /// Emit one rung, bracketing it with the span bookkeeping. Returns the `y` the next rung
+    /// starts at.
+    fn rung(&mut self, y: f32, draw: impl FnOnce(&mut Painter, f32) -> f32) -> f32 {
+        let s0 = self.out.content.shapes.len();
+        let r0 = self.out.content.runs.len();
+        let next = draw(self, y);
+        self.out.items.push(ItemSpans {
+            shapes: Span {
+                start: s0,
+                end: self.out.content.shapes.len(),
+            },
+            runs: Span {
+                start: r0,
+                end: self.out.content.runs.len(),
+            },
+        });
+        next
     }
 
     /// `LABEL ──────── +N more  12` — label left, hairline filling, marks right.
@@ -811,7 +1305,30 @@ impl Painter {
     /// rather than taking a row. A marker that occupied a row would compete with the data
     /// it is announcing for the single row D18 guarantees the section — which is the same
     /// reason the current dashboard already places it there.
-    fn heading(&mut self, section: &Section, y: f32, shown: usize) {
+    /// The fold control (`▸ 13 more` / `▾ collapse`), indented to the body's own column.
+    ///
+    /// Wording is derived from `folded()` rather than branched on the flag twice: a closed
+    /// fold hides a positive number, an open one hides none, and there is no third state to
+    /// get out of step.
+    fn fold(&mut self, section: &Section, y: f32) -> f32 {
+        let m = self.m;
+        let advance = m.line + m.s(ROW_GAP);
+        if !self.fits(y, m.line) {
+            return y + advance;
+        }
+        let hidden = section.folded();
+        let text = if hidden > 0 {
+            format!("▸ {hidden} more")
+        } else {
+            "▾ collapse".to_string()
+        };
+        // Faint, not muted: the control is an affordance, and it must not compete with the
+        // rows it sits under for the eye that is reading them.
+        self.text(m.inner_x, y, m.inner_w, &text, ColorRole::TextFaint);
+        y + advance
+    }
+
+    fn heading(&mut self, section: &Section, y: f32) -> f32 {
         let m = self.m;
         let mut edge = m.right();
         match &section.body {
@@ -819,16 +1336,25 @@ impl Painter {
                 edge = self.text_right(edge, y, state, ColorRole::TextFaint);
             }
             _ => {
-                edge = self.mark_right(edge, y, &section.total.to_string(), ColorRole::TextMuted);
-                let hidden = section.total.saturating_sub(shown.min(section.body.len()));
-                if hidden > 0 {
-                    edge = self.mark_right(
-                        edge - m.cell_w,
-                        y,
-                        &format!("+{hidden} more"),
-                        ColorRole::TextFaint,
-                    );
-                }
+                // D20: when the ring has dropped entries, the count mark says so — and it
+                // REPLACES the bare total rather than sitting beside it. Two marks would
+                // print the same session number twice and eat the width the label needs.
+                //
+                // `mark_right` draws a mark whole or not at all (a truncated `32 of 400`
+                // would state a falsehood), so a refusal is detectable by the edge not
+                // moving. On a panel too narrow for the long form we fall back to the bare
+                // total — today's behaviour — never to a half-truth.
+                let mark = if section.lost > 0 {
+                    format!("{} of {}", section.total, section.total + section.lost)
+                } else {
+                    section.total.to_string()
+                };
+                let after = self.mark_right(edge, y, &mark, ColorRole::TextMuted);
+                edge = if after == edge && section.lost > 0 {
+                    self.mark_right(edge, y, &section.total.to_string(), ColorRole::TextMuted)
+                } else {
+                    after
+                };
             }
         }
         let label_w = self.text(
@@ -844,31 +1370,7 @@ impl Painter {
             y + m.line * 0.5,
             ColorRole::Hairline,
         );
-    }
-
-    fn body(&mut self, section: &Section, y: f32, rows: usize) -> f32 {
-        let mut y = y;
-        match &section.body {
-            SectionBody::Empty(_) => y,
-            SectionBody::Cards(v) => {
-                for c in v.iter().take(rows) {
-                    y = self.card(c, y);
-                }
-                y
-            }
-            SectionBody::Rows(v) => {
-                for r in v.iter().take(rows) {
-                    y = self.row(r, y);
-                }
-                y
-            }
-            SectionBody::Bars(v) => {
-                for b in v.iter().take(rows) {
-                    y = self.usage_bar(b, y);
-                }
-                y
-            }
-        }
+        y + m.heading_h()
     }
 
     fn card(&mut self, card: &Card, y: f32) -> f32 {
@@ -995,17 +1497,23 @@ mod tests {
 
     const CELL: [f32; 2] = [8.0, 16.0];
 
-    fn uniform(entries: &[usize], row_h: f32) -> Vec<SectionMetrics> {
-        entries
-            .iter()
-            .map(|&entries| SectionMetrics { entries, row_h })
-            .collect()
+    /// What the frame actually draws: stage one, then stage two at the top of the document.
+    ///
+    /// Almost every assertion below is about *drawn output*, and after D24 that is stage
+    /// two's job — stage one alone emits the document in its own coordinate space and no
+    /// footer text at all. Routing the old assertions through both stages keeps them
+    /// testing what they always tested.
+    fn frame(m: &MonitorModel, panel: [f32; 4], scale: f64, cell: [f32; 2]) -> Primitives {
+        let draw = layout(m, panel, scale, cell);
+        compose(&draw, m, 0, 0)
     }
 
     fn rows_section(label: &str, n: usize, total: usize) -> Section {
         Section {
+            collapsed: false,
             label: label.into(),
             total,
+            lost: 0,
             body: SectionBody::Rows(
                 (0..n)
                     .map(|i| Row {
@@ -1015,6 +1523,219 @@ mod tests {
                     .collect(),
             ),
         }
+    }
+
+    fn cards_section(label: &str, n: usize) -> Section {
+        Section {
+            collapsed: false,
+            label: label.into(),
+            total: n,
+            lost: 0,
+            body: SectionBody::Cards(
+                (0..n)
+                    .map(|i| Card {
+                        title: format!("card{i}"),
+                        ..Card::default()
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    fn empty_section(label: &str) -> Section {
+        Section {
+            collapsed: false,
+            label: label.into(),
+            total: 0,
+            lost: 0,
+            body: SectionBody::Empty("(none)".into()),
+        }
+    }
+
+    // ---- ai-monitor-panel-scroll T1 / R1.2 / R1.3: the item ladder ----
+
+    #[test]
+    fn r1_3_a_heading_is_a_rung_even_when_its_section_is_empty() {
+        // The empty-state wording rides the heading, so an empty section is still on
+        // screen, still jumpable (D16), and therefore still needs an index. If it were
+        // skipped, `Cmd+Shift+N` for that section would have no target and the six jumps
+        // would silently renumber themselves as sections filled up.
+        let m = model(vec![empty_section("TASKS"), rows_section("SKILLS", 2, 2)]);
+        let ladder = item_ladder(&m);
+        assert_eq!(
+            ladder,
+            vec![
+                Item {
+                    section: 0,
+                    kind: ItemKind::Heading,
+                    entry: None
+                },
+                Item {
+                    section: 1,
+                    kind: ItemKind::Heading,
+                    entry: None
+                },
+                Item {
+                    section: 1,
+                    kind: ItemKind::Row,
+                    entry: Some(0)
+                },
+                Item {
+                    section: 1,
+                    kind: ItemKind::Row,
+                    entry: Some(1)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn r1_3_a_card_is_one_rung_although_it_draws_two_lines() {
+        // A card reserves its detail line whether or not it has one. Counting it as two
+        // rungs would make the ladder's index space disagree with what the anchor sees,
+        // and D17's snap would land between a card's two lines — which C1 forbids drawing.
+        let m = model(vec![cards_section("TASKS", 3)]);
+        let ladder = item_ladder(&m);
+        assert_eq!(ladder.len(), 4, "one heading + three cards");
+        assert!(ladder[1..].iter().all(|i| i.kind == ItemKind::Card));
+
+        // And its height is the card height, not the row height — one rung, two lines.
+        let card_h = item_h(&ladder[1], &m, 1.0, CELL);
+        let heading_h = item_h(&ladder[0], &m, 1.0, CELL);
+        assert!(
+            card_h > heading_h,
+            "a card rung ({card_h}) must be taller than a heading rung ({heading_h})"
+        );
+    }
+
+    #[test]
+    fn r1_2_the_ladder_follows_the_models_section_order() {
+        // The order is the app's (the design's six, fixed). The ladder must not sort,
+        // filter or reorder — D4 replaced "everything visible at once" with "everything
+        // reachable in a known order", and the order is half of that promise.
+        let m = model(vec![
+            cards_section("TASKS", 1),
+            cards_section("ACTIVE AGENTS", 1),
+            rows_section("SKILLS", 1, 1),
+            rows_section("FILE ACTIVITY", 1, 1),
+            rows_section("RECENT CALLS", 1, 1),
+            empty_section("TOOL USAGE"),
+        ]);
+        let ladder = item_ladder(&m);
+        let headings: Vec<usize> = ladder
+            .iter()
+            .filter(|i| i.is_heading())
+            .map(|i| i.section)
+            .collect();
+        assert_eq!(headings, vec![0, 1, 2, 3, 4, 5]);
+        // 6 headings + 5 bodies of one entry each.
+        assert_eq!(ladder.len(), 11);
+    }
+
+    #[test]
+    fn r13_2_the_fold_control_says_what_it_will_do_in_both_states() {
+        // The wording is derived from `folded()`, so the two states cannot get out of step:
+        // shut names the number it is hiding, open offers the way back.
+        let mut m = model(vec![rows_section("RECENT CALLS", 32, 32)]);
+        let text_of = |m: &MonitorModel| {
+            let draw = layout(m, [0.0, 0.0, 430.0, 2000.0], 1.0, CELL);
+            draw.content
+                .runs
+                .iter()
+                .map(|r| r.text.clone())
+                .find(|t| t.starts_with('▸') || t.starts_with('▾'))
+        };
+        m.sections[0].collapsed = true;
+        assert_eq!(text_of(&m).as_deref(), Some("▸ 27 more"));
+        m.sections[0].collapsed = false;
+        assert_eq!(text_of(&m).as_deref(), Some("▾ collapse"));
+
+        // A section too short to fold offers no control at all — one that hid nothing would
+        // cost a rung to answer a question nobody asked.
+        let short = model(vec![rows_section(
+            "SKILLS",
+            crate::monitor_model::FOLD_THRESHOLD,
+            5,
+        )]);
+        assert_eq!(text_of(&short), None);
+        assert!(!short.sections[0].foldable());
+    }
+
+    #[test]
+    fn r13_3_a_shut_fold_draws_the_threshold_and_the_control_and_nothing_else() {
+        // The drawn set and the ladder must agree about what a fold hid, or the scroll math
+        // is measuring a document the eye is not looking at (C11).
+        let mut m = model(vec![rows_section("RECENT CALLS", 32, 32)]);
+        m.sections[0].collapsed = true;
+        let draw = layout(&m, [0.0, 0.0, 430.0, 2000.0], 1.0, CELL);
+        let shown = crate::monitor_model::FOLD_THRESHOLD;
+        assert_eq!(draw.ladder.iter().filter(|i| i.is_body()).count(), shown);
+        assert_eq!(draw.ladder.iter().filter(|i| i.is_fold()).count(), 1);
+        assert_eq!(
+            draw.items.len(),
+            draw.ladder.len(),
+            "spans stay parallel (C11)"
+        );
+        // Row 6 exists in the model and must NOT have been drawn.
+        assert!(
+            !draw.content.runs.iter().any(|r| r.text.contains("/5")),
+            "a shut fold drew an entry it claims to be hiding"
+        );
+    }
+
+    #[test]
+    fn r1_3_every_body_entry_gets_exactly_one_rung() {
+        // The whole point of D4: nothing is dropped for height. The ladder is the record
+        // of that, so it must equal heading-count + total body entries for any model.
+        let m = model(vec![
+            cards_section("TASKS", 7),
+            rows_section("RECENT CALLS", 32, 400),
+            empty_section("TOOL USAGE"),
+        ]);
+        let ladder = item_ladder(&m);
+        let entries: usize = m.sections.iter().map(|s| s.body.len()).sum();
+        // Every entry is a rung, and no entry is two rungs. The fold controls are counted
+        // separately and asserted separately, so this stays a statement about *entries*.
+        assert_eq!(ladder.iter().filter(|i| i.is_body()).count(), entries);
+        let foldable = m.sections.iter().filter(|s| s.foldable()).count();
+        assert_eq!(ladder.len(), m.sections.len() + entries + foldable);
+        assert_eq!(
+            ladder.iter().filter(|i| i.is_fold()).count(),
+            foldable,
+            "one control per foldable section, and none for the others"
+        );
+        assert_eq!(entries, 39, "7 cards + 32 rows + 0 for the empty section");
+    }
+
+    #[test]
+    fn r1_3_a_stale_or_degenerate_rung_measures_zero_rather_than_panicking() {
+        // `item_h` is called from the app across model swaps, so a rung naming a section
+        // that has since gone away is a normal transient, not a bug to unwrap on. The
+        // scroll math reads a non-positive height as "not a stop".
+        let m = model(vec![rows_section("SKILLS", 1, 1)]);
+        let stale = Item {
+            section: 9,
+            kind: ItemKind::Row,
+            entry: Some(0),
+        };
+        assert_eq!(item_h(&stale, &m, 1.0, CELL), 0.0);
+
+        let real = item_ladder(&m)[0];
+        assert_eq!(item_h(&real, &m, 1.0, [0.0, 0.0]), 0.0, "degenerate cell");
+        assert_eq!(slot_h(1.0, [0.0, 0.0]), 0.0);
+        assert!(slot_h(1.0, CELL) > 0.0);
+    }
+
+    #[test]
+    fn r1_3_the_slot_is_exactly_one_heading_line() {
+        // D31 reserves the slot out of the content viewport. If the slot were taller or
+        // shorter than the heading it hosts, the copied heading (D36) would not sit flush
+        // and the first content rung would either overlap it or leave a gap.
+        let m = model(vec![rows_section("SKILLS", 1, 1)]);
+        let heading = item_ladder(&m)[0];
+        assert_eq!(slot_h(1.0, CELL), item_h(&heading, &m, 1.0, CELL));
+        // And it scales with DPI, or a hidpi panel would reserve a band sized for 1x.
+        assert!(slot_h(2.0, CELL) > slot_h(1.0, CELL));
     }
 
     fn model(sections: Vec<Section>) -> MonitorModel {
@@ -1035,109 +1756,806 @@ mod tests {
         }
     }
 
-    fn run_texts(draw: &PanelDraw) -> Vec<String> {
-        draw.runs.iter().map(|r| r.text.clone()).collect()
-    }
-
-    // ---- R8: the height allocator ----
+    // ---- ai-monitor-panel-scroll T2 / R1.1 / R9.1 / R10.5-R10.7: the structured document ----
 
     #[test]
-    fn r8_1_every_section_gets_a_heading_and_a_row() {
-        // Chrome plus exactly 12 section lines, six populated sections: six headings and
-        // six first rows, with nothing left over.
-        let sm = uniform(&[4, 4, 4, 4, 4, 4], 10.0);
-        let grants = allocate(&sm, 12.0 * 10.0, 10.0);
-        assert!(grants.iter().all(|g| g.heading && g.rows >= 1));
-        assert_eq!(grants.iter().map(|g| g.rows).sum::<usize>(), 6);
+    fn r1_1_every_entry_is_laid_out_however_short_the_panel_is() {
+        // The heart of D4. The old allocator handed out rows until the height ran out and
+        // announced the rest as `+N more`; the document now contains all of them at every
+        // height, and it is stage two that decides how many reach the screen. A regression
+        // here is invisible on screen — the panel looks fine, it just cannot be scrolled to
+        // content that was never laid out.
+        let m = six_sections([9, 7, 5, 11, 32, 4]);
+        let entries: usize = m.sections.iter().map(|s| s.body.len()).sum();
+        // Including heights too short to show a single rung: the document is laid out
+        // anyway, because `items` must stay parallel to the ladder at every size (C11).
+        // What a short panel changes is `viewport.h`, which is stage two's business.
+        for h in [40.0f32, 120.0, 240.0, 400.0, 4000.0] {
+            let draw = layout(&m, [0.0, 0.0, 430.0, h], 1.0, CELL);
+            let foldable = m.sections.iter().filter(|s| s.foldable()).count();
+            assert_eq!(
+                draw.items.len(),
+                6 + entries + foldable,
+                "panel height {h}: the document must hold six headings, all {entries} entries \
+                 and {foldable} fold controls"
+            );
+            assert_eq!(
+                draw.items.len(),
+                item_ladder(&m).len(),
+                "panel height {h}: spans and ladder must stay parallel (C11)"
+            );
+        }
     }
 
     #[test]
-    fn r8_2_leftover_rows_go_round_robin_not_to_the_first_section() {
-        // Six leftover rows, TASKS holding 40 and TOOL USAGE 11: one row per section per
-        // pass, so every section reaches 2 — greedy would have given TASKS all six.
-        let sm = uniform(&[40, 4, 4, 4, 4, 11], 10.0);
-        let grants = allocate(&sm, (6 + 6 + 6) as f32 * 10.0, 10.0);
-        assert_eq!(
-            grants.iter().map(|g| g.rows).collect::<Vec<_>>(),
-            vec![2, 2, 2, 2, 2, 2]
-        );
-    }
-
-    #[test]
-    fn r8_3_a_section_is_capped_by_its_own_entries() {
-        // Ten leftover rows and a 2-entry SKILLS (index 2): it stops at 2 and the surplus
-        // reaches the sections after it.
-        let sm = uniform(&[40, 40, 2, 40, 40, 40], 10.0);
-        let grants = allocate(&sm, (6 + 6 + 10) as f32 * 10.0, 10.0);
-        assert_eq!(grants[2].rows, 2, "capped by its entry count");
-        // Nothing is wasted: all 16 rows the height affords are handed out even though
-        // one section stopped taking them.
-        assert_eq!(grants.iter().map(|g| g.rows).sum::<usize>(), 16);
-        // The surplus reached the sections *after* the capped one — every later section
-        // is past the single row phase 2 guaranteed it.
+    fn r9_1_the_more_marker_is_gone() {
+        // R8.6 used to pin `+N more` onto the heading. D4 deleted the condition it reported
+        // (height-starved rows), so the string must not survive anywhere — including in the
+        // one section where a difference between `total` and `body.len()` still exists,
+        // which is the ring-buffer loss T6 reports differently.
+        let m = six_sections([9, 7, 5, 11, 32, 4]);
+        let draw = layout(&m, [0.0, 0.0, 430.0, 200.0], 1.0, CELL);
+        let all: Vec<&str> = draw
+            .chrome
+            .runs
+            .iter()
+            .chain(draw.content.runs.iter())
+            .map(|r| r.text.as_str())
+            .collect();
         assert!(
-            grants[3..].iter().all(|g| g.rows > 1),
-            "surplus stopped short: {grants:?}"
+            !all.iter().any(|t| t.contains("more")),
+            "no `+N more` anywhere: {all:?}"
         );
     }
 
     #[test]
-    fn r8_4_a_heading_may_be_granted_without_a_row() {
-        // Six headings but only five first rows fit: the sixth renders its heading alone.
-        let sm = uniform(&[4, 4, 4, 4, 4, 4], 10.0);
-        let grants = allocate(&sm, (6 + 5) as f32 * 10.0, 10.0);
-        assert!(grants.iter().all(|g| g.heading));
+    fn r10_6_the_pinned_chrome_is_not_in_the_scrollable_document() {
+        // The type is what enforces C2: stage two translates `content` and never `chrome`,
+        // so a region that ended up in the wrong bag would scroll away and no amount of
+        // care in `compose` would save it. Assert the separation at the source.
+        let m = six_sections([2, 2, 2, 2, 2, 2]);
+        let draw = layout(&m, [0.0, 0.0, 430.0, 400.0], 1.0, CELL);
+        let chrome: Vec<&str> = draw.chrome.runs.iter().map(|r| r.text.as_str()).collect();
+        assert!(
+            chrome.contains(&"ai-monitor"),
+            "the header title is chrome: {chrome:?}"
+        );
+        let content: Vec<&str> = draw.content.runs.iter().map(|r| r.text.as_str()).collect();
+        assert!(
+            content.contains(&"TASKS"),
+            "section headings are content: {content:?}"
+        );
+        assert!(
+            !chrome.contains(&"TASKS"),
+            "a section heading must never land in the chrome bag"
+        );
+    }
+
+    #[test]
+    fn r10_7_stage_one_emits_no_footer_text_but_names_where_it_goes() {
+        // D38: stage two owns that line because the badge replaces it (D34). If stage one
+        // drew it, stage two would have to find and suppress it by `y` — the fragile
+        // addressing the structured output exists to abolish.
+        let m = six_sections([2, 2, 2, 2, 2, 2]);
+        let draw = layout(&m, [0.0, 0.0, 430.0, 400.0], 1.0, CELL);
+        assert!(
+            !draw
+                .chrome
+                .runs
+                .iter()
+                .chain(draw.content.runs.iter())
+                .any(|r| r.text == m.footer),
+            "stage one must not emit the footer string"
+        );
+        assert!(draw.footer_text.h > 0.0, "but it must name the band");
+        // And stage two puts it back, in that exact band.
+        let out = compose(&draw, &m, 0, 0);
+        let footer = out
+            .runs
+            .iter()
+            .find(|r| r.text == m.footer)
+            .expect("stage two synthesises the footer line");
+        assert_eq!(footer.rect.y, draw.footer_text.y);
+    }
+
+    #[test]
+    fn r10_5_every_rung_is_addressable_without_hunting_by_pixel() {
+        // The span per rung is the handle stage two needs for "draw items 12..19". Ranges
+        // must be non-overlapping and in document order, or a cull would drop or duplicate
+        // a neighbour's primitives.
+        let m = six_sections([3, 3, 3, 3, 3, 3]);
+        let draw = layout(&m, [0.0, 0.0, 430.0, 400.0], 1.0, CELL);
+        let mut runs_end = 0usize;
+        let mut shapes_end = 0usize;
+        for (i, spans) in draw.items.iter().enumerate() {
+            assert!(spans.runs.start >= runs_end, "rung {i} runs overlap");
+            assert!(spans.shapes.start >= shapes_end, "rung {i} shapes overlap");
+            runs_end = spans.runs.end;
+            shapes_end = spans.shapes.end;
+        }
+        assert_eq!(runs_end, draw.content.runs.len(), "no run is unclaimed");
         assert_eq!(
-            grants.iter().map(|g| g.rows).collect::<Vec<_>>(),
-            vec![1, 1, 1, 1, 1, 0]
+            shapes_end,
+            draw.content.shapes.len(),
+            "no shape is unclaimed"
         );
     }
 
+    // ---- ai-monitor-panel-scroll T9 / R7.2-R7.6 / R2.2: the badge on the footer ----
+
+    /// The one text run in the footer band, if any.
+    fn footer_run(m: &MonitorModel, panel: [f32; 4], badge: u32) -> Option<String> {
+        let draw = layout(m, panel, 1.0, CELL);
+        let f = compose(&draw, m, 0, badge);
+        let band = draw.footer_text;
+        let runs: Vec<String> = f
+            .runs
+            .iter()
+            .filter(|r| r.rect.y >= band.y - FIT_EPS && r.rect.y < band.y + band.h + FIT_EPS)
+            .map(|r| r.text.clone())
+            .collect();
+        assert!(
+            runs.len() <= 1,
+            "the footer band must hold one line: {runs:?}"
+        );
+        runs.into_iter().next()
+    }
+
     #[test]
-    fn r8_5_headings_drop_from_the_bottom_only_when_even_they_do_not_fit() {
-        // Height for four headings: the first four in design order keep theirs, the last
-        // two are dropped, and nobody gets a row. Reserving headings before rows is what
-        // produces this — spending the height on "heading + row" in order would leave two
-        // sections announced and four invisible.
-        let sm = uniform(&[4, 4, 4, 4, 4, 4], 10.0);
-        let grants = allocate(&sm, 4.0 * 10.0, 10.0);
+    fn r7_2_the_badge_replaces_the_last_update_line_rather_than_joining_it() {
+        // D34. The footer is drawn with `text()`, which truncates silently — two things
+        // sharing the line would quietly lose the tail of whichever came second, and on a
+        // drag-narrowed panel that is the common case, not the corner.
+        let m = model(vec![rows_section("TASKS", 2, 2)]);
+        let wide = [0.0, 0.0, 430.0, 900.0];
         assert_eq!(
-            grants.iter().map(|g| g.heading).collect::<Vec<_>>(),
-            vec![true, true, true, true, false, false]
+            footer_run(&m, wide, 0).as_deref(),
+            Some("Last update 16:21:18")
         );
-        assert!(grants.iter().all(|g| g.rows == 0));
+        let badged = footer_run(&m, wide, 12).expect("a badge line");
+        assert!(badged.contains("12"), "the count is there: {badged}");
+        assert!(
+            !badged.contains("Last update"),
+            "and the time is gone, not squeezed: {badged}"
+        );
     }
 
     #[test]
-    fn allocator_survives_degenerate_metrics() {
-        // A zero-height row would spin the round-robin loop forever; a non-finite budget
-        // would hand every section an unbounded grant.
-        let sm = uniform(&[10, 10], 0.0);
-        assert!(allocate(&sm, 100.0, 10.0).iter().all(|g| g.rows == 0));
-        let sm = uniform(&[10, 10], f32::NAN);
-        assert!(allocate(&sm, 100.0, 10.0).iter().all(|g| g.rows == 0));
-        assert!(allocate(&uniform(&[10], 10.0), f32::INFINITY, 10.0)[0].rows == 0);
-        assert!(allocate(&uniform(&[10], 10.0), -5.0, 10.0)[0] == Grant::default());
-        assert!(allocate(&[], 100.0, 10.0).is_empty());
+    fn r7_4_the_badge_names_the_chord_that_gets_back_to_the_top() {
+        // D30 has no new binding — TASKS is the first section, so D16's first jump already
+        // IS "back to the top". But a return path nobody can discover is not a return path,
+        // which is why the badge has to say it. This is the second decision this feature
+        // deliberately reverses: the footer was specified to draw NO keycap, precisely
+        // because the panel had no binding to promise. It has one now.
+        let m = model(vec![rows_section("TASKS", 2, 2)]);
+        let line = footer_run(&m, [0.0, 0.0, 430.0, 900.0], 3).expect("a badge line");
+        assert!(
+            line.contains(RETURN_HINT),
+            "no way back is advertised: {line}"
+        );
     }
 
     #[test]
-    fn allocator_mixes_row_heights_without_starving_the_short_rows() {
-        // A tall card row that does not fit must not veto the shorter rows after it.
-        let sm = vec![
-            SectionMetrics {
-                entries: 4,
-                row_h: 40.0,
-            },
-            SectionMetrics {
-                entries: 4,
-                row_h: 10.0,
-            },
-        ];
-        let grants = allocate(&sm, 2.0 * 10.0 + 20.0, 10.0);
-        assert!(grants.iter().all(|g| g.heading));
-        assert_eq!(grants[0].rows, 0, "the 40px card row never fit");
-        assert_eq!(grants[1].rows, 2, "the short rows still got the space");
+    fn r7_5_and_r7_6_narrowing_drops_the_hint_first_and_never_truncates_the_count() {
+        // The fallback ORDER is the decision. The badge's first job is telling the reader
+        // they are missing things — Inversion named "badge ignored" as the failure most
+        // likely to make this whole feature a mistake — and its second is saying how to get
+        // back. So the hint goes first.
+        //
+        // And the count itself is never clipped: `text()` truncates silently, so a rule that
+        // stopped at "drop the hint" would render `12 ne…`, the same half-truth D20 refuses
+        // to draw on a heading.
+        let m = model(vec![rows_section("TASKS", 2, 2)]);
+        let mut saw_full = false;
+        let mut saw_short = false;
+        let mut saw_tiny = false;
+        let mut saw_none = false;
+        for w in (40..440).step_by(4) {
+            let line = footer_run(&m, [0.0, 0.0, w as f32, 900.0], 12);
+            match line.as_deref() {
+                Some(t) if t.contains(RETURN_HINT) => saw_full = true,
+                Some("12 new above") => saw_short = true,
+                Some("+12") => saw_tiny = true,
+                None => saw_none = true,
+                Some(other) => panic!("width {w}: a truncated badge reached the footer: {other:?}"),
+            }
+        }
+        assert!(saw_full, "some width shows the whole thing");
+        assert!(saw_short, "some width drops the hint and keeps the count");
+        assert!(saw_tiny, "some width falls back to the short count");
+        assert!(saw_none, "and some width draws nothing rather than a lie");
+    }
+
+    #[test]
+    fn r7_3_and_r2_2_the_badge_holds_its_place_at_every_height_and_scroll_position() {
+        // The badge is the only defence against the failure Inversion ranked first — the
+        // reader who scrolls down, gets distracted, and silently stops seeing live activity.
+        // A defence that vanishes on a short panel or once you scroll is not a defence, and
+        // both are real: the pinned chrome yields from the bottom of its order as the panel
+        // shrinks, and the footer is the ONLY region that survives to the floor.
+        let m = six_sections([9, 7, 5, 11, 32, 4]);
+        for h in [100.0f32, 200.0, 400.0, 900.0] {
+            let panel = [0.0, 0.0, 430.0, h];
+            let draw = layout(&m, panel, 1.0, CELL);
+            if draw.footer_text.h <= 0.0 {
+                continue; // below the floor there is no panel to speak of
+            }
+            let max =
+                crate::monitor_scroll::max_index(&draw.ladder, &draw.heights, draw.viewport.h);
+            for top in [0, max / 2, max] {
+                let f = compose(&draw, &m, top, 7);
+                let band = draw.footer_text;
+                let line = f
+                    .runs
+                    .iter()
+                    .find(|r| r.rect.y >= band.y - FIT_EPS && r.rect.y < band.y + band.h + FIT_EPS)
+                    .map(|r| r.text.clone());
+                assert!(
+                    line.as_deref().is_some_and(|t| t.contains('7')),
+                    "h={h} top={top}: the badge went missing ({line:?})"
+                );
+            }
+        }
+    }
+
+    // ---- ai-monitor-panel-scroll T6 / R9.2-R9.5: the ring-buffer loss mark ----
+
+    fn lossy_section(label: &str, retained: usize, lost: usize) -> Section {
+        Section {
+            collapsed: false,
+            lost,
+            ..rows_section(label, retained, retained)
+        }
+    }
+
+    /// The marks drawn on `label`'s heading, right to left.
+    fn heading_marks(m: &MonitorModel, panel: [f32; 4], label: &str) -> Vec<String> {
+        let draw = layout(m, panel, 1.0, CELL);
+        let h = draw
+            .ladder
+            .iter()
+            .position(|i| i.is_heading() && m.sections[i.section].label == label)
+            .expect("the section exists");
+        let spans = draw.items[h];
+        let runs = &draw.content.runs[spans.runs.start..spans.runs.end];
+        // The label is the leftmost run; the marks are right-aligned after it. Comparing
+        // text would miss a label the panel truncated, which is exactly the width band this
+        // helper is used to probe.
+        let label_x = runs.iter().map(|r| r.rect.x).fold(f32::INFINITY, f32::min);
+        let _ = label;
+        runs.iter()
+            .filter(|r| r.rect.x > label_x)
+            .map(|r| r.text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn r9_2_a_ring_that_dropped_entries_says_so_instead_of_showing_a_bare_count() {
+        // D20. `+N more` summed two unrelated differences; this reports exactly one — the
+        // entries that are GONE, which D1 puts permanently out of reach. Saying "32" alone
+        // would let "everything is reachable now" quietly become a lie on any long session.
+        let m = model(vec![lossy_section("RECENT CALLS", 32, 368)]);
+        let marks = heading_marks(&m, [0.0, 0.0, 430.0, 900.0], "RECENT CALLS");
+        assert_eq!(marks, vec!["32 of 400"]);
+        assert!(
+            !marks.iter().any(|t| t.contains("more")),
+            "and it is not the old marker wearing a new number"
+        );
+    }
+
+    #[test]
+    fn r9_3_a_section_that_lost_nothing_looks_exactly_as_it_did() {
+        // The common case must not grow a new phrase. `lost == 0` reads as "nothing known to
+        // be lost", which is the honest answer for every ring the crate gives no cumulative
+        // counter for — inventing a number for those would be `+N more` all over again.
+        let m = model(vec![lossy_section("SKILLS", 5, 0)]);
+        assert_eq!(heading_marks(&m, [0.0, 0.0, 430.0, 900.0], "SKILLS"), ["5"]);
+    }
+
+    #[test]
+    fn r9_4_a_panel_too_narrow_for_the_long_mark_falls_back_to_the_bare_total() {
+        // `mark_right` draws a mark whole or not at all — a truncated `32 of 400` states a
+        // falsehood. So the narrow case must degrade to the short true thing, never to a
+        // clipped one, and never to nothing while a shorter true mark would have fit.
+        let m = model(vec![lossy_section("RECENT CALLS", 32, 368)]);
+        let long = heading_marks(&m, [0.0, 0.0, 430.0, 900.0], "RECENT CALLS");
+        assert_eq!(long, ["32 of 400"], "premise: it fits at full width");
+
+        let mut widths_with_short = 0;
+        for w in (60..430).step_by(10) {
+            let marks = heading_marks(&m, [0.0, 0.0, w as f32, 900.0], "RECENT CALLS");
+            for mark in &marks {
+                assert!(
+                    mark == "32 of 400" || mark == "32",
+                    "width {w}: a half-truth reached the heading: {mark:?}"
+                );
+                if mark == "32" {
+                    widths_with_short += 1;
+                }
+            }
+        }
+        assert!(
+            widths_with_short > 0,
+            "premise: some width must actually exercise the fallback"
+        );
+    }
+
+    #[test]
+    fn r9_5_an_app_display_cap_is_not_reported_as_a_loss() {
+        // C10, and the trap D20 walked into on its first draft. TOOL USAGE's `total` is the
+        // tally's 11 names while its body holds 9 bars — that gap is `TOOL_BARS`, a
+        // readability cap D21 keeps. The data is not gone; the app chose not to send it.
+        // Reporting it as loss would re-create the exact conflation `+N more` was retired for.
+        let m = model(vec![Section {
+            collapsed: false,
+            label: "TOOL USAGE".into(),
+            total: 11,
+            lost: 0,
+            body: SectionBody::Bars((0..9).map(|i| Bar::new(format!("t{i}"), 1, 1.0)).collect()),
+        }]);
+        let marks = heading_marks(&m, [0.0, 0.0, 430.0, 900.0], "TOOL USAGE");
+        assert_eq!(marks, ["11"], "the cap must not produce an `of` phrase");
+    }
+
+    // ---- ai-monitor-panel-scroll T5 / R4.1-R4.4 / R0.1-R0.2: the sticky slot ----
+
+    /// Every stop of a document, as `(what the slot shows, what the body shows)`.
+    fn walk(m: &MonitorModel, panel: [f32; 4]) -> Vec<(String, Vec<String>)> {
+        let draw = layout(m, panel, 1.0, CELL);
+        let max = crate::monitor_scroll::max_index(&draw.ladder, &draw.heights, draw.viewport.h);
+        let labels: Vec<&str> = m.sections.iter().map(|s| s.label.as_str()).collect();
+        (0..=max)
+            .filter(|&i| crate::monitor_scroll::is_stop(&draw.ladder, i))
+            .map(|top| {
+                let f = compose(&draw, m, top, 0);
+                let in_slot: Vec<String> = f
+                    .runs
+                    .iter()
+                    .filter(|r| r.rect.y >= draw.slot.y && r.rect.y < draw.slot.y + draw.slot.h)
+                    .filter(|r| labels.contains(&r.text.as_str()))
+                    .map(|r| r.text.clone())
+                    .collect();
+                let body: Vec<String> = f
+                    .runs
+                    .iter()
+                    .filter(|r| r.rect.y >= draw.viewport.y)
+                    .filter(|r| r.rect.y < draw.viewport.y + draw.viewport.h)
+                    .map(|r| r.text.clone())
+                    .collect();
+                (in_slot.join("+"), body)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn r3_1_and_r10_8_content_stays_inside_the_viewport_as_whole_rungs_at_every_stop() {
+        // C1's real consequence, asserted where it can actually fail. There is no scissor
+        // rect, so a rung that half-fits would paint across the footer — D17's snap exists so
+        // that state cannot arise, and this is the check that it does not.
+        //
+        // R10.8 rides along: the drawn set must be a CONTIGUOUS ladder range starting at
+        // `content_start`. A cull that skipped a too-tall rung and kept going would leave the
+        // document with a hole the scroll can never fill, and every "is it inside the band"
+        // assertion would still pass.
+        let m = six_sections([9, 7, 5, 11, 32, 4]);
+        for h in [300.0f32, 420.0, 700.0] {
+            let panel = [0.0, 0.0, 430.0, h];
+            let draw = layout(&m, panel, 1.0, CELL);
+            if draw.viewport.h <= 0.0 {
+                continue;
+            }
+            let max =
+                crate::monitor_scroll::max_index(&draw.ladder, &draw.heights, draw.viewport.h);
+            let bottom = draw.viewport.y + draw.viewport.h;
+            for top in 0..=max {
+                let f = compose(&draw, &m, top, 0);
+                // Nothing the DOCUMENT drew may cross the viewport's bottom edge.
+                //
+                // "Begins inside the band", not "begins at or after its top": the pinned
+                // chrome below the band includes the footer's own hairline rule, which sits
+                // between the band's bottom and the footer text. Anything starting below the
+                // band is chrome by construction. What C1 makes dangerous — and what this
+                // asserts — is a rung that begins inside the band and does not end there.
+                let is_content = |y: f32| y >= draw.viewport.y - FIT_EPS && y < bottom - FIT_EPS;
+                for r in &f.runs {
+                    if is_content(r.rect.y) {
+                        assert!(
+                            r.rect.y + r.rect.h <= bottom + FIT_EPS,
+                            "h={h} top={top}: run {:?} crosses the viewport bottom",
+                            r.text
+                        );
+                    }
+                }
+                for sh in &f.shapes {
+                    if is_content(sh.top()) {
+                        assert!(
+                            sh.bottom() <= bottom + FIT_EPS,
+                            "h={h} top={top}: a shape spanning {}..{} crosses the viewport \
+                             bottom {bottom}",
+                            sh.top(),
+                            sh.bottom()
+                        );
+                    }
+                }
+                // Contiguity: the body texts drawn are a prefix of the ladder from
+                // `content_start`, with no gap.
+                let start = crate::monitor_scroll::content_start(&draw.ladder, top);
+                let drawn: Vec<String> = f
+                    .runs
+                    .iter()
+                    .filter(|r| is_content(r.rect.y))
+                    .filter(|r| r.text.contains('/'))
+                    .map(|r| r.text.clone())
+                    .collect();
+                let expected_order: Vec<String> = draw.ladder[start..]
+                    .iter()
+                    // Body rungs only: a heading draws its label and a fold control draws
+                    // its own wording, and neither is in the `label/entry` form this walk
+                    // matches on.
+                    .filter(|i| i.is_body())
+                    .map(|i| {
+                        format!(
+                            "{}/{}",
+                            m.sections[i.section].label,
+                            i.entry.expect("is_body")
+                        )
+                    })
+                    .collect();
+                for (k, got) in drawn.iter().enumerate() {
+                    assert_eq!(
+                        Some(got),
+                        expected_order.get(k),
+                        "h={h} top={top}: the drawn rungs are not a contiguous run from {start}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r6_7_the_layout_is_pure_so_it_can_hold_no_frame_to_frame_state() {
+        // Why the anchor and the badge live in the app (D27): `layout` must stay a function
+        // of its arguments, or the GPU-free testability every assertion in this file depends
+        // on goes with it. Stated executably — same inputs, byte-identical output, no matter
+        // how many times or in what order.
+        let m = six_sections([4, 0, 3, 5, 9, 2]);
+        let panel = [0.0, 0.0, 430.0, 500.0];
+        let a = layout(&m, panel, 1.0, CELL);
+        let other = layout(&six_sections([1, 1, 1, 1, 1, 1]), panel, 1.0, CELL);
+        let b = layout(&m, panel, 1.0, CELL);
+        assert_eq!(a, b, "layout kept state between calls");
+        assert_ne!(a, other, "premise: the two models really do differ");
+        // And composing does not mutate what it composed from.
+        let before = a.clone();
+        let _ = compose(&a, &m, 3, 7);
+        assert_eq!(a, before, "compose mutated stage one's output");
+    }
+
+    #[test]
+    fn r3_2_the_top_rung_sits_flush_on_the_viewports_upper_edge() {
+        // R3.2 is a *geometry* claim — "항목 `i`가 슬롯의 아래 모서리에 놓인다" — and it was
+        // for a while carried only by an id on a test that asserts the consumption RULE
+        // (`content_start`) instead. They are different facts: the rule could be right while
+        // the translation put the rung a gap-height too low, and every "inside the band"
+        // assertion would still pass while a sliver of the previous rung showed above it.
+        let m = six_sections([4, 4, 4, 4, 4, 4]);
+        let draw = layout(&m, [0.0, 0.0, 430.0, 500.0], 1.0, CELL);
+        let tallest = draw.heights.iter().copied().fold(0.0f32, f32::max);
+        assert!(
+            draw.viewport.h >= tallest,
+            "premise: the band must hold the tallest rung, or this fails confusingly \
+             instead of skipping"
+        );
+        let max = crate::monitor_scroll::max_index(&draw.ladder, &draw.heights, draw.viewport.h);
+        for top in (0..=max).filter(|&i| crate::monitor_scroll::is_stop(&draw.ladder, i)) {
+            let start = crate::monitor_scroll::content_start(&draw.ladder, top);
+            if start >= draw.items.len() {
+                continue;
+            }
+            let f = compose(&draw, &m, top, 0);
+            // The highest thing the document drew inside the band is the top rung's own edge,
+            // and it must land flush on the band's top rather than a gap below it. (The
+            // symmetric "never ABOVE" half is not visible to this filter; it is carried by
+            // `r3_1_and_r10_8`'s contiguity check, which would see a wrong first rung.)
+            let highest = f
+                .runs
+                .iter()
+                .map(|r| r.rect.y)
+                .chain(f.shapes.iter().map(|s| s.top()))
+                .filter(|y| *y >= draw.viewport.y - FIT_EPS && *y < draw.footer_text.y)
+                .fold(f32::INFINITY, f32::min);
+            assert!(
+                (highest - draw.viewport.y).abs() <= FIT_EPS,
+                "top {top}: the first rung starts at {highest}, not flush on {}",
+                draw.viewport.y
+            );
+        }
+    }
+
+    #[test]
+    fn r4_1_the_current_sections_heading_is_in_the_slot_even_when_it_has_scrolled_off() {
+        // The reason D5 exists: the six sections' rows look alike, so without the heading a
+        // reader deep in RECENT CALLS cannot tell which list they are in.
+        let m = six_sections([1, 1, 1, 1, 20, 1]);
+        let stops = walk(&m, [0.0, 0.0, 430.0, 300.0]);
+        assert!(stops.len() > 6, "premise: this document scrolls");
+        for (slot, body) in &stops {
+            assert!(
+                !slot.is_empty(),
+                "a stop with no heading in the slot: {body:?}"
+            );
+        }
+        // And deep in the long section it is still RECENT CALLS — the heading rung itself is
+        // long gone from the viewport by then.
+        let deep = stops.last().expect("a last stop");
+        assert_eq!(deep.0, "TOOL USAGE");
+    }
+
+    #[test]
+    fn r4_2_exactly_one_heading_occupies_the_slot_at_every_stop() {
+        // D18 chose push-off over stacking: six stacked headings would eat the viewport D4
+        // just fought to fill. Under D17's snap "push-off" is realised as replacement at the
+        // boundary, so what must hold at every observable frame is simply "exactly one".
+        let m = six_sections([2, 0, 3, 1, 4, 2]);
+        for h in [200.0f32, 300.0, 900.0] {
+            for (slot, body) in walk(&m, [0.0, 0.0, 430.0, h]) {
+                assert!(
+                    !slot.contains('+'),
+                    "h={h}: two headings shared the slot ({slot}) over {body:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r4_2_the_slot_heading_never_repeats_itself_in_the_body() {
+        // D31's consumption rule. Without it the same heading is drawn twice — in the slot
+        // and flush beneath it — and that is the DEFAULT state, not an edge case: it happens
+        // at index 0, at all six jump targets, and at `max_index`.
+        let m = six_sections([3, 0, 3, 3, 3, 3]);
+        for h in [200.0f32, 300.0, 900.0] {
+            for (slot, body) in walk(&m, [0.0, 0.0, 430.0, h]) {
+                assert!(
+                    !body.contains(&slot),
+                    "h={h}: {slot:?} appears in the slot AND in the body {body:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r4_4_nothing_but_the_heading_is_drawn_in_the_slot_band() {
+        // C1: shapes composite UNDER glyphs (`monitor_panel::record` runs the shape pass
+        // then the glyph pass), so a heading background could never hide a row's glyphs
+        // sliding beneath it, and there is no scissor rect to clip them. D31 answers by
+        // reserving the band — so the invariant to hold is that nothing else is ever in it.
+        let m = six_sections([4, 4, 4, 4, 4, 4]);
+        let panel = [0.0, 0.0, 430.0, 300.0];
+        let draw = layout(&m, panel, 1.0, CELL);
+        let max = crate::monitor_scroll::max_index(&draw.ladder, &draw.heights, draw.viewport.h);
+        let slot_lo = draw.slot.y;
+        let slot_hi = draw.slot.y + draw.slot.h;
+        let overlaps =
+            |top: f32, bottom: f32| bottom > slot_lo + FIT_EPS && top < slot_hi - FIT_EPS;
+        for top in 0..=max {
+            let f = compose(&draw, &m, top, 0);
+
+            // The slot legitimately holds the WHOLE heading — its label, its right-aligned
+            // marks and its rule. What must never be in the band is a *body* rung.
+            let intruding_runs: Vec<&str> = f
+                .runs
+                .iter()
+                .filter(|r| overlaps(r.rect.y, r.rect.y + r.rect.h))
+                .map(|r| r.text.as_str())
+                .filter(|t| t.contains('/'))
+                .collect();
+            assert!(
+                intruding_runs.is_empty(),
+                "top {top}: body text in the slot band: {intruding_runs:?}"
+            );
+
+            // And its SHAPES. Checking only the glyphs was the weaker half: a card's box or
+            // a bar's track sliding under the heading is precisely the overdraw C1 cannot
+            // clip, and it carries no text to be caught by the filter above. Counted against
+            // what the slot's own heading emits, so the heading's rule is not an intruder.
+            let slot_shapes = compose(&draw, &m, 0, 0)
+                .shapes
+                .iter()
+                .filter(|sh| overlaps(sh.top(), sh.bottom()))
+                .count();
+            let in_band = f
+                .shapes
+                .iter()
+                .filter(|sh| overlaps(sh.top(), sh.bottom()))
+                .count();
+            assert_eq!(
+                in_band, slot_shapes,
+                "top {top}: {} shape(s) in the slot band, but a heading alone emits \
+                 {slot_shapes} — a body rung is drawing under the sticky heading",
+                in_band
+            );
+        }
+    }
+
+    #[test]
+    fn r4_3_the_slot_heading_is_a_translated_copy_not_a_reshape() {
+        // D36: the copy carries the glyph runs AND the hairline rule shape. Dropping the
+        // shape is easy and invisible in a diff — the heading still reads, it just loses its
+        // rule on the one line the eye returns to most.
+        let m = six_sections([6, 1, 1, 1, 1, 1]);
+        let panel = [0.0, 0.0, 430.0, 300.0];
+        let draw = layout(&m, panel, 1.0, CELL);
+
+        let at_heading = compose(&draw, &m, 0, 0);
+        let scrolled = compose(&draw, &m, 3, 0); // inside TASKS, heading off-screen
+        let label_run = |f: &Primitives| {
+            f.runs
+                .iter()
+                .find(|r| r.text == "TASKS")
+                .expect("TASKS is drawn")
+                .clone()
+        };
+        let a = label_run(&at_heading);
+        let b = label_run(&scrolled);
+        assert_eq!(a.rect.y, b.rect.y, "the slot holds it at the same y");
+        assert_eq!(
+            a.rect.x, b.rect.x,
+            "x geometry is panel-relative, untouched"
+        );
+        assert_eq!(a.rect.w, b.rect.w);
+        assert_eq!(a.color, b.color);
+
+        // The rule travels with it: the slot band carries a shape in both frames.
+        let in_slot = |f: &Primitives| {
+            f.shapes
+                .iter()
+                .filter(|s| {
+                    s.top() >= draw.slot.y - FIT_EPS
+                        && s.bottom() <= draw.slot.y + draw.slot.h + FIT_EPS
+                })
+                .count()
+        };
+        assert!(in_slot(&at_heading) > 0, "premise: a heading has a rule");
+        assert_eq!(
+            in_slot(&scrolled),
+            in_slot(&at_heading),
+            "the copied heading kept its rule"
+        );
+    }
+
+    /// The one precondition R0 carries, stated so it cannot be discovered by accident.
+    ///
+    /// A rung taller than the content band is unreachable: whole-rung culling is forced by
+    /// C1 (there is no scissor rect, so a partial rung would paint over the footer), and a
+    /// card is 51.8px against a band that is 25.8px on a 280px-tall panel. **This is not a
+    /// regression** — the allocator this replaced had the identical property, from the
+    /// identical cause: `Painter::card` skipped a card that did not fit, and `allocate`
+    /// granted a row only when `remaining >= row_h`. What changed is that the panel now says
+    /// so by simply not drawing, where before it said `+N more`.
+    ///
+    /// The window is narrow (roughly 276-328px of panel height at this width) and inside it
+    /// the panel shows one row at a time, so it is a degenerate regime either way. Recorded
+    /// rather than fixed because every fix costs something the spec bought deliberately:
+    /// clipping breaks C1, dropping the slot breaks D5, and overflowing the band breaks C2.
+    #[test]
+    fn r3_7_the_real_height_sweep_never_offers_a_scroll_that_changes_nothing() {
+        // D22's degenerate clause, driven through the REAL `layout` rather than through
+        // hand-passed viewport heights. The distinction matters: passing `0.0`/NaN exercises
+        // only the "no band at all" branch, and the branch that was actually wrong is the
+        // other one — a band that exists and cannot hold a single rung whole. At 430px wide
+        // with a 16px cell there is a window of panel heights that produces exactly that.
+        let m = six_sections([9, 7, 5, 11, 32, 4]);
+        let mut saw_degenerate_band = false;
+        for h in 2..500 {
+            let draw = layout(&m, [0.0, 0.0, 430.0, h as f32], 1.0, CELL);
+            let max =
+                crate::monitor_scroll::max_index(&draw.ladder, &draw.heights, draw.viewport.h);
+            let smallest = draw
+                .heights
+                .iter()
+                .copied()
+                .filter(|x| *x > 0.0)
+                .fold(f32::INFINITY, f32::min);
+            if draw.viewport.h > 0.0 && draw.viewport.h < smallest {
+                saw_degenerate_band = true;
+                assert_eq!(
+                    max, 0,
+                    "h={h}: a band too small for any rung must offer no scroll, got max={max}"
+                );
+            }
+            // And where a scroll range is claimed, its two ENDS must actually differ. The
+            // first version of this asserted `compose(top=0)` was non-empty — which
+            // `panel_bg` alone guarantees at every height, so it could not fail, and it hid a
+            // real regression in `max_index` for a whole round.
+            if max > 0 {
+                assert_ne!(
+                    compose(&draw, &m, 0, 0),
+                    compose(&draw, &m, max, 0),
+                    "h={h}: claims a scroll range 0..={max} whose ends render identically"
+                );
+            }
+        }
+        assert!(
+            saw_degenerate_band,
+            "premise: the sweep must actually visit a band-too-small-for-a-rung height"
+        );
+    }
+
+    #[test]
+    fn a_rung_taller_than_the_viewport_is_unreachable_and_always_was() {
+        let m = six_sections([9, 7, 5, 11, 32, 4]);
+        let draw = layout(&m, [0.0, 0.0, 430.0, 280.0], 1.0, CELL);
+        let card_h = draw.heights[1];
+        assert!(
+            draw.viewport.h > 0.0 && draw.viewport.h < card_h,
+            "premise: a band that exists but cannot hold a card ({} < {card_h})",
+            draw.viewport.h
+        );
+        let shown: Vec<String> = (0..draw.items.len())
+            .flat_map(|top| compose(&draw, &m, top, 0).runs)
+            .map(|r| r.text)
+            .collect();
+        assert!(
+            !shown.iter().any(|t| t == "TASKS/0"),
+            "a card that cannot fit is not drawn — the honest outcome, not a silent clip"
+        );
+        // The rows, which do fit, are still reachable — the limit is per-rung, not global.
+        assert!(shown.iter().any(|t| t == "SKILLS/0"));
+    }
+
+    #[test]
+    fn r0_1_and_r0_2_every_retained_row_is_reachable() {
+        // **The completion criterion** (D6): RECENT CALLS' retained rows — the ring's cap is
+        // 32 — must all be readable by scrolling, and no rung of any section may be
+        // unreachable. Asserted on drawn output, not on the ladder, so it covers the whole
+        // path: full expansion, the stop rule, `max_index`, the consumption rule and the
+        // whole-rung cull together.
+        let m = six_sections([9, 7, 5, 11, 32, 4]);
+        // Every height at which the content band can hold the tallest rung. Below that the
+        // panel cannot show a card at all — see
+        // `a_rung_taller_than_the_viewport_is_unreachable_and_always_was`.
+        for h in [340.0f32, 400.0, 700.0] {
+            let panel = [0.0, 0.0, 430.0, h];
+            let draw = layout(&m, panel, 1.0, CELL);
+            let tallest = draw.heights.iter().copied().fold(0.0f32, f32::max);
+            assert!(
+                draw.viewport.h >= tallest,
+                "premise: h={h} must hold the tallest rung ({tallest}), got {}",
+                draw.viewport.h
+            );
+            let max =
+                crate::monitor_scroll::max_index(&draw.ladder, &draw.heights, draw.viewport.h);
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for top in 0..=max {
+                if !crate::monitor_scroll::is_stop(&draw.ladder, top) {
+                    continue;
+                }
+                for r in compose(&draw, &m, top, 0).runs {
+                    seen.insert(r.text);
+                }
+            }
+            // Every RECENT CALLS row, by name.
+            let missing: Vec<String> = (0..32)
+                .map(|i| format!("RECENT CALLS/{i}"))
+                .filter(|t| !seen.contains(t))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "h={h}: unreachable RECENT CALLS rows: {missing:?}"
+            );
+            // …and every other section's, plus all six headings.
+            for (s, n) in m.sections.iter().zip([9, 7, 5, 11, 32, 4]) {
+                assert!(seen.contains(&s.label), "h={h}: {} never shown", s.label);
+                for i in 0..n {
+                    let t = format!("{}/{i}", s.label);
+                    assert!(seen.contains(&t), "h={h}: {t} unreachable");
+                }
+            }
+        }
+    }
+
+    fn run_texts(draw: &Primitives) -> Vec<String> {
+        draw.runs.iter().map(|r| r.text.clone()).collect()
     }
 
     /// A six-section model shaped like the one the app actually sends: the design's order,
@@ -1187,8 +2605,10 @@ mod tests {
                 // `total` deliberately exceeds what is sent, so every populated section is
                 // a `+N more` candidate at every height.
                 Section {
+                    collapsed: false,
                     label: (*label).into(),
                     total: n + 3,
+                    lost: 0,
                     body,
                 }
             })
@@ -1196,125 +2616,6 @@ mod tests {
         let mut m = model(sections);
         m.tiles = vec![StatTile::new("UPTIME", "1h 12m", ColorRole::TextPrimary); 6];
         m
-    }
-
-    #[test]
-    fn r8_1_to_r8_6_hold_at_every_height_a_real_panel_can_take() {
-        // The allocator's own unit tests above feed it synthetic metrics. This one runs
-        // the whole path — model → `SectionMetrics` → `allocate` → drawn primitives — at
-        // every height in a wide sweep, and asserts D18's invariants on what actually
-        // reached the glass. A rule that held for uniform 10px rows and broke for a
-        // 2-line card beside a 1-line bar would pass there and fail here.
-        let labels = [
-            "TASKS",
-            "ACTIVE AGENTS",
-            "SKILLS",
-            "FILE ACTIVITY",
-            "RECENT CALLS",
-            "TOOL USAGE",
-        ];
-        let entries = [40, 4, 2, 6, 12, 9];
-        let m = six_sections(entries);
-        let mut saw_heading_without_a_row = false;
-        let mut saw_a_dropped_heading = false;
-        let mut saw_every_section_fed = false;
-
-        for h in (120..1800).step_by(7) {
-            let draw = layout(&m, [0.0, 0.0, 430.0, h as f32], 1.0, CELL);
-            let texts = run_texts(&draw);
-            let headed: Vec<bool> = labels
-                .iter()
-                .map(|l| texts.iter().any(|t| t == l))
-                .collect();
-            let rows: Vec<usize> = labels
-                .iter()
-                .map(|l| {
-                    texts
-                        .iter()
-                        .filter(|t| t.starts_with(&format!("{l}/")))
-                        .count()
-                })
-                .collect();
-
-            // R8.5 — the headings that survive are a prefix of the design order. A hole in
-            // the middle would mean a section vanished while a lower-priority one stayed.
-            let kept = headed.iter().filter(|h| **h).count();
-            assert_eq!(
-                headed,
-                (0..6).map(|i| i < kept).collect::<Vec<_>>(),
-                "h={h}: headings must drop from the bottom, got {headed:?}"
-            );
-            saw_a_dropped_heading |= kept < 6;
-            saw_every_section_fed |= kept == 6 && rows.iter().all(|r| *r >= 1);
-
-            for i in 0..6 {
-                // Nothing may draw a row it was not given a heading for...
-                assert!(
-                    headed[i] || rows[i] == 0,
-                    "h={h}: {} drew a headless row",
-                    labels[i]
-                );
-                // ... and R8.3: no section exceeds what it actually holds.
-                assert!(
-                    rows[i] <= entries[i],
-                    "h={h}: {} drew {} of {} entries",
-                    labels[i],
-                    rows[i],
-                    entries[i]
-                );
-                // R8.4 — a heading with no row is a valid state, and it happens.
-                saw_heading_without_a_row |= headed[i] && rows[i] == 0;
-
-                // R8.6 — a section showing fewer than its total says so ON the heading.
-                if headed[i] && rows[i] < entries[i] + 3 {
-                    let marker = format!("+{} more", entries[i] + 3 - rows[i]);
-                    let heading_y = draw
-                        .runs
-                        .iter()
-                        .find(|r| r.text == labels[i])
-                        .map(|r| r.rect.y)
-                        .unwrap_or_else(|| panic!("h={h}: {} heading not drawn", labels[i]));
-                    // Matched on the heading's own line, never merely somewhere in the
-                    // draw: two sections hiding the same number emit the same marker
-                    // text, so a global search would let one section's marker vouch for
-                    // another's. The marker is dropped rather than clipped on a panel too
-                    // narrow for it — but this one is 430px, so it is always drawn.
-                    assert!(
-                        draw.runs
-                            .iter()
-                            .any(|r| r.text == marker && (r.rect.y - heading_y).abs() < FIT_EPS),
-                        "h={h}: {} lost `{marker}` off its heading",
-                        labels[i]
-                    );
-                }
-            }
-
-            // R8.2 — one row per section per pass, so among sections still taking rows the
-            // counts differ by at most one. Greedy would put every spare row in the
-            // 40-entry TASKS and leave the other five at one apiece.
-            //
-            // Grouped by row height, because the comparison is only meaningful within a
-            // group: a card is two lines and a list row is one, and the allocator
-            // deliberately lets a short row through in a pass where the tall one no
-            // longer fits (`continue`, not `break`). Comparing across the two would read
-            // that as starvation when it is the tall section running out of room.
-            for tall in [true, false] {
-                let live: Vec<usize> = (0..6)
-                    .filter(|&i| (i < 2) == tall && headed[i] && rows[i] < entries[i])
-                    .map(|i| rows[i])
-                    .collect();
-                if let (Some(lo), Some(hi)) = (live.iter().min(), live.iter().max()) {
-                    assert!(
-                        hi - lo <= 1,
-                        "h={h}: rows {rows:?} are not round-robin among the unexhausted"
-                    );
-                }
-            }
-        }
-
-        assert!(saw_heading_without_a_row, "R8.4 was never exercised");
-        assert!(saw_a_dropped_heading, "R8.5 was never exercised");
-        assert!(saw_every_section_fed, "R8.1 was never exercised");
     }
 
     // ---- R0.5 / D15: the left sidebar gained no ai-monitor affordance ----
@@ -1369,89 +2670,67 @@ mod tests {
     // ---- R1.4: the design's `q` keycap is not drawn ----
 
     #[test]
-    fn r1_4_the_footer_band_draws_the_footer_string_and_nothing_else() {
-        // D1 dropped the design's `q` keycap. The keycap is a *claim* — it says pressing
-        // `q` closes the panel — and the panel does not answer to `q`: it goes to the
-        // shell, where it quits `less` (R1.3). A control that looks like a control and is
-        // not is worse than no control.
+    fn r1_4_the_footer_band_carries_one_line_and_no_control_that_lies() {
+        // **This test was rewritten, and the rewrite is the record of a deliberate reversal.**
         //
-        // `dashboard.rs` pins the model's footer string as free of any close affordance.
-        // This is the other half: that the *layout* adds none of its own. It is the half
-        // that can go wrong independently, because a keycap is a shape plus a glyph and
-        // the layout is the only place either can be emitted.
+        // R1.4 said the footer draws the last-update time ALONE, and gave a reason: the
+        // design's `q` keycap is a *claim* — it says pressing `q` closes the panel — and the
+        // panel did not answer to `q`, which went to the shell and quit `less`. A control
+        // that looks like a control and is not is worse than no control.
+        //
+        // Both halves of that reason have changed under ai-monitor-panel-scroll:
+        //
+        // * The panel now HAS a binding to promise. D16 gave it `Cmd+Opt+1`..`6`, and D30
+        //   makes the first of those the way back to the top — the only way, since D14
+        //   forbids returning on its own.
+        // * The hint is a modifier chord the panel consumes only while it is on screen, not
+        //   a bare letter the shell is waiting for. `less` never sees `Cmd+Opt+1`.
+        //
+        // What survives untouched is the part that was really being protected: the band
+        // carries **one line**, never a second run competing with it, and never a keycap box
+        // — a drawn control the user could click, which the panel still has no answer for.
         let m = model(vec![rows_section("TASKS", 3, 3)]);
         let panel = [0.0, 0.0, 430.0, 400.0];
         let draw = layout(&m, panel, 1.0, CELL);
+        let band_top = draw.footer_text.y;
 
-        // The footer band: the bottom line box of the panel. Everything drawn at or below
-        // its top belongs to the footer.
-        let footer_run = draw
-            .runs
-            .iter()
-            .find(|r| r.text == m.footer)
-            .expect("premise: the footer is drawn at all");
-        let band_top = footer_run.rect.y;
-        let in_band: Vec<&str> = draw
-            .runs
-            .iter()
-            .filter(|r| r.rect.y >= band_top)
-            .map(|r| r.text.as_str())
-            .collect();
-        assert_eq!(
-            in_band,
-            vec![m.footer.as_str()],
-            "the footer band must carry the last-update time alone — a keycap glyph, an \
-             `Esc` hint or a `✕` would show up here as a second run"
-        );
-        // And no keycap *box* either: a `q` in a rounded rect is a shape before it is a
-        // glyph, so counting runs alone would miss an empty keycap. Nothing starts inside
-        // the footer's line box — the hairline rule sits above it and the panel background
-        // starts at the panel's top.
-        let shapes_in_band: Vec<[f32; 4]> = draw
-            .shapes
-            .iter()
-            .filter(|s| s.bbox[1] >= band_top)
-            .map(|s| s.bbox)
-            .collect();
-        assert!(
-            shapes_in_band.is_empty(),
-            "a shape begins inside the footer's line box: {shapes_in_band:?} — the only \
-             thing the design puts there is the `q` keycap D1 dropped"
-        );
-    }
+        for badge in [0u32, 12] {
+            let f = compose(&draw, &m, 0, badge);
+            let in_band: Vec<&str> = f
+                .runs
+                .iter()
+                .filter(|r| r.rect.y >= band_top)
+                .map(|r| r.text.as_str())
+                .collect();
+            assert_eq!(
+                in_band.len(),
+                1,
+                "badge={badge}: the band must carry exactly one line, got {in_band:?}"
+            );
+            if badge == 0 {
+                assert_eq!(in_band[0], m.footer, "with no badge it is still the time");
+            } else {
+                assert!(
+                    in_band[0].contains("12"),
+                    "with a badge it is the badge, replacing the time: {in_band:?}"
+                );
+            }
 
-    // ---- R8.6: `+N more` rides the heading ----
-
-    #[test]
-    fn r8_6_more_marker_is_drawn_on_the_heading_not_as_a_row() {
-        // A short panel so the section cannot draw all five entries.
-        let m = model(vec![rows_section("TASKS", 5, 5)]);
-        let draw = layout(&m, [0.0, 0.0, 430.0, 190.0], 1.0, CELL);
-        let texts = run_texts(&draw);
-        let drawn = (0..5)
-            .filter(|i| texts.iter().any(|t| t == &format!("row{i}")))
-            .count();
-        assert!(
-            (1..5).contains(&drawn),
-            "the test panel must clip some rows; drew {drawn}"
-        );
-        let marker = format!("+{} more", 5 - drawn);
-        let marker_run = draw
-            .runs
-            .iter()
-            .find(|r| r.text == marker)
-            .unwrap_or_else(|| panic!("expected `{marker}` among {texts:?}"));
-        let heading = draw
-            .runs
-            .iter()
-            .find(|r| r.text == "TASKS")
-            .expect("heading label drawn");
-        assert_eq!(
-            marker_run.rect.y, heading.rect.y,
-            "the marker shares the heading's line, never a data row's"
-        );
-        // And it is right of the label, filling toward the count.
-        assert!(marker_run.rect.x > heading.rect.x + heading.rect.w);
+            // And no keycap *box* in either state: a `q` in a rounded rect is a shape before
+            // it is a glyph, so counting runs alone would miss an empty keycap. The chord
+            // hint is text, and text is all it may ever be — a drawn control would invite a
+            // click the panel has no answer for (D10 keeps it click-free).
+            let shapes_in_band: Vec<[f32; 4]> = f
+                .shapes
+                .iter()
+                .filter(|s| s.top() >= band_top)
+                .map(|s| s.bbox)
+                .collect();
+            assert!(
+                shapes_in_band.is_empty(),
+                "badge={badge}: a shape begins inside the footer's line box: {shapes_in_band:?}"
+            );
+        }
     }
 
     #[test]
@@ -1459,11 +2738,13 @@ mod tests {
         // Same placement rule: an empty state must not spend the row a populated
         // neighbour was guaranteed.
         let m = model(vec![Section {
+            collapsed: false,
             label: "SKILLS".into(),
             total: 0,
+            lost: 0,
             body: SectionBody::Empty("none yet".into()),
         }]);
-        let draw = layout(&m, [0.0, 0.0, 430.0, 400.0], 1.0, CELL);
+        let draw = frame(&m, [0.0, 0.0, 430.0, 400.0], 1.0, CELL);
         let state = draw
             .runs
             .iter()
@@ -1488,7 +2769,7 @@ mod tests {
             [0.0, 0.0, -430.0, 400.0],
             [0.0, 0.0, f32::NAN, 400.0],
         ] {
-            let draw = layout(&m, panel, 1.0, CELL);
+            let draw = frame(&m, panel, 1.0, CELL);
             assert!(
                 draw.shapes.is_empty() && draw.runs.is_empty(),
                 "panel {panel:?} drew something"
@@ -1496,8 +2777,8 @@ mod tests {
         }
         // A zero cell width would divide by zero in every column budget.
         assert_eq!(
-            layout(&m, [0.0, 0.0, 430.0, 400.0], 1.0, [0.0, 16.0]),
-            PanelDraw::default()
+            frame(&m, [0.0, 0.0, 430.0, 400.0], 1.0, [0.0, 16.0]),
+            Primitives::default()
         );
         // An invisible model draws nothing at all — not even the background.
         let hidden = MonitorModel {
@@ -1505,8 +2786,8 @@ mod tests {
             ..m.clone()
         };
         assert_eq!(
-            layout(&hidden, [0.0, 0.0, 430.0, 400.0], 1.0, CELL),
-            PanelDraw::default()
+            frame(&hidden, [0.0, 0.0, 430.0, 400.0], 1.0, CELL),
+            Primitives::default()
         );
     }
 
@@ -1515,7 +2796,7 @@ mod tests {
         // inner_w ≤ 0: the chrome has nowhere to go, but the band must still be filled or
         // the terminal shows through the reserved columns.
         let m = model(vec![rows_section("TASKS", 3, 3)]);
-        let draw = layout(&m, [0.0, 0.0, 12.0, 400.0], 1.0, CELL);
+        let draw = frame(&m, [0.0, 0.0, 12.0, 400.0], 1.0, CELL);
         assert!(!draw.shapes.is_empty(), "background and border still drawn");
         assert!(draw.runs.is_empty(), "no text fits");
     }
@@ -1600,7 +2881,7 @@ mod tests {
         // so each `h >= …` below is unambiguous.
         let mut h = 2.0f32;
         while h <= 900.0 {
-            let draw = layout(&m, [0.0, 0.0, 430.0, h], 1.0, CELL);
+            let draw = frame(&m, [0.0, 0.0, 430.0, h], 1.0, CELL);
             let texts = run_texts(&draw);
             for (pinned, min) in [(TITLE, HEADER_MIN), (SESSION, FLOOR), (FOOTER, FOOTER_MIN)] {
                 assert_eq!(
@@ -1614,6 +2895,32 @@ mod tests {
                 .iter()
                 .filter(|b| **b)
                 .count()] = true;
+
+            // C2/R2.2 — the same sweep with the badge up. This is the whole reason C2 named
+            // this test: the badge is the only defence against the failure Inversion ranked
+            // first, the footer is the ONLY pinned region that survives to the floor, and the
+            // band between FOOTER_MIN and HEADER_MIN is where every other region has already
+            // yielded. A badge that vanished exactly there would be a warning that disappears
+            // when the panel is at its least readable.
+            let d = layout(&m, [0.0, 0.0, 430.0, h], 1.0, CELL);
+            let badged = compose(&d, &m, 0, 9);
+            let footer_line = badged
+                .runs
+                .iter()
+                .find(|r| d.footer_text.h > 0.0 && r.rect.y >= d.footer_text.y - FIT_EPS);
+            assert_eq!(
+                footer_line.is_some(),
+                h >= FOOTER_MIN,
+                "at height {h}, a badged footer line should be drawn: {}",
+                h >= FOOTER_MIN
+            );
+            if let Some(line) = footer_line {
+                assert!(
+                    line.text.contains('9') && line.text != FOOTER,
+                    "at height {h}, the badge must REPLACE the stamp, not sit beside it: {:?}",
+                    line.text
+                );
+            }
 
             // Presence is not legibility. Three runs can each be emitted and still land on
             // top of one another, which is what the `any(...)` checks above cannot see —
@@ -1725,7 +3032,7 @@ mod tests {
                 color: ColorRole::Teal,
                 gauge,
             }];
-            layout(&m, [0.0, 0.0, 430.0, 400.0], 1.0, CELL).shapes.len()
+            frame(&m, [0.0, 0.0, 430.0, 400.0], 1.0, CELL).shapes.len()
         };
         let none = tile(None);
         let zero = tile(Some(0.0));
@@ -1753,7 +3060,7 @@ mod tests {
         let gauge = |f: f32| -> (f32, f32) {
             let mut m = model(Vec::new());
             m.tiles = vec![StatTile::new("CONTEXT", "45%", ColorRole::Teal).with_gauge(f)];
-            let draw = layout(&m, [0.0, 0.0, 430.0, 400.0], 1.0, CELL);
+            let draw = frame(&m, [0.0, 0.0, 430.0, 400.0], 1.0, CELL);
             // The gauge is the only pair of horizontal capsules at half the gauge
             // thickness (the header accent shares the thickness but runs vertically; the
             // rules are thinner).
@@ -1805,14 +3112,16 @@ mod tests {
         // would reserve 6 and overlap every glyph with the value beside it.
         let title = "한글한글한글";
         let m = model(vec![Section {
+            collapsed: false,
             label: "TASKS".into(),
             total: 1,
+            lost: 0,
             body: SectionBody::Rows(vec![Row {
                 text: title.into(),
                 ..Row::default()
             }]),
         }]);
-        let draw = layout(&m, [0.0, 0.0, 430.0, 400.0], 1.0, CELL);
+        let draw = frame(&m, [0.0, 0.0, 430.0, 400.0], 1.0, CELL);
         let run = draw
             .runs
             .iter()
@@ -1822,7 +3131,7 @@ mod tests {
 
         // Narrow it until the row's budget clips: the prefix is cut on a column budget,
         // so it holds half as many chars as columns and never splits a codepoint.
-        let narrow = layout(&m, [0.0, 0.0, 90.0, 400.0], 1.0, CELL);
+        let narrow = frame(&m, [0.0, 0.0, 90.0, 400.0], 1.0, CELL);
         let clipped = narrow
             .runs
             .iter()
@@ -1844,8 +3153,10 @@ mod tests {
         let mut m = model(vec![
             rows_section("TASKS", 6, 20),
             Section {
+                collapsed: false,
                 label: "AGENTS".into(),
                 total: 2,
+                lost: 0,
                 body: SectionBody::Cards(vec![
                     Card {
                         accent: Some(ColorRole::Amber),
@@ -1857,8 +3168,10 @@ mod tests {
                 ]),
             },
             Section {
+                collapsed: false,
                 label: "TOOL USAGE".into(),
                 total: 3,
+                lost: 0,
                 body: SectionBody::Bars(vec![
                     Bar::new("bash", 76, 1.0),
                     Bar::new("read", 27, 27.0 / 76.0),
@@ -1876,7 +3189,7 @@ mod tests {
             StatTile::new("CONTEXT", "45%", ColorRole::Teal).with_gauge(0.45),
         ];
         let panel = [1370.0, 0.0, 430.0, 900.0];
-        let draw = layout(&m, panel, 2.0, [17.0, 34.0]);
+        let draw = frame(&m, panel, 2.0, [17.0, 34.0]);
         let (l, t, r, b) = (panel[0], panel[1], panel[0] + panel[2], panel[1] + panel[3]);
         for run in &draw.runs {
             assert!(
@@ -1946,11 +3259,13 @@ mod tests {
             },
         ];
         let m = model(vec![Section {
+            collapsed: false,
             label: "FILE ACTIVITY".into(),
             total: 2,
+            lost: 0,
             body: SectionBody::Rows(rows),
         }]);
-        let draw = layout(&m, [0.0, 0.0, 430.0, 400.0], 1.0, CELL);
+        let draw = frame(&m, [0.0, 0.0, 430.0, 400.0], 1.0, CELL);
         let x_of = |t: &str| {
             draw.runs
                 .iter()
@@ -1982,7 +3297,7 @@ mod tests {
         ] {
             let mut m = model(Vec::new());
             m.status = status;
-            let draw = layout(&m, [0.0, 0.0, 430.0, 400.0], 1.0, CELL);
+            let draw = frame(&m, [0.0, 0.0, 430.0, 400.0], 1.0, CELL);
             let run = draw
                 .runs
                 .iter()

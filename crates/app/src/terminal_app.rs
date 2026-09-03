@@ -2428,6 +2428,23 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
+                // The ai-monitor panel resolves FIRST, by pointer position alone — the same
+                // order and the same reason as the wheel above (D7/D10). The panel reserves
+                // its columns rather than covering them, so a press inside its band was
+                // never the grid's to begin with.
+                if input::in_monitor_panel(
+                    inner.last_cursor.0,
+                    inner.viewport_w(),
+                    inner.renderer.right_inset(),
+                ) {
+                    let p = [inner.last_cursor.0 as f32, inner.last_cursor.1 as f32];
+                    if inner.overlays.press(p) == Handled::Consumed {
+                        // A fold changes the document, so the panel must re-lay out; the
+                        // grid did not move, so the cheap request is the right one.
+                        inner.window.request_redraw();
+                        return;
+                    }
+                }
                 // Resolve the press through the sibling's ONE ordered hit_test (D1) — the
                 // app performs no geometry (SD2). Cards + new-tab route through the same
                 // path as chords (D2); hide/restore toggle; inert regions are swallowed.
@@ -2603,7 +2620,22 @@ impl ApplicationHandler<UserEvent> for App {
                 // (`cursor_cell` would reject it, making a visible strip inert for no
                 // visible reason) and the whole window when the sidebar is collapsed.
                 let p = [inner.last_cursor.0 as f32, inner.last_cursor.1 as f32];
-                if sidebar_layout::hit_test(p, inner.scroll, &inp, collapsed).is_some() {
+                // The ai-monitor panel resolves FIRST, and only by where the pointer is
+                // (D7/D10). This is a trade, not an addition: wheeling the scrollback with
+                // the pointer parked over the panel stops working, and D9 gives it back only
+                // at the panel's two ends. `Passthrough` is the panel declining — it is at
+                // that end and the gesture pushes further into it — so the event falls
+                // through to the grid below.
+                if input::in_monitor_panel(
+                    inner.last_cursor.0,
+                    inner.viewport_w(),
+                    inner.renderer.right_inset(),
+                ) && inner.overlays.wheel(wd, inner.renderer.cell_size().1) == Handled::Consumed
+                {
+                    // Panel-only change: the grid's snapshot did not move, so the cheap
+                    // request is right — `redraw()` would mark it dirty for nothing.
+                    inner.window.request_redraw();
+                } else if sidebar_layout::hit_test(p, inner.scroll, &inp, collapsed).is_some() {
                     let new_scroll =
                         wheel_scroll(wd, inner.last_cursor, inner.scroll, &inp, collapsed);
                     if new_scroll != inner.scroll {
@@ -2677,6 +2709,7 @@ impl ApplicationHandler<UserEvent> for App {
                     key: key_event.logical_key.clone(),
                     text: key_event.text.as_ref().map(|t| t.to_string()),
                     mods: inner.mods,
+                    physical: key_event.physical_key,
                 };
                 if !inner.on_key(input) {
                     event_loop.exit();

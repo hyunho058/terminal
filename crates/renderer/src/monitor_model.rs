@@ -281,11 +281,64 @@ impl SectionBody {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Section {
     pub label: String,
-    /// The session total, which may exceed `body.len()` — the app caps what it sends, and
-    /// the difference between this and the rows actually drawn is what `+N more` reports
-    /// (R8.6).
+    /// The count the heading shows. May exceed `body.len()` when the app caps what it sends
+    /// — `TOOL_BARS` is the one place that happens.
     pub total: usize,
+    /// Entries this section once held that are **gone from memory** — evicted past a
+    /// telemetry ring's cap (ai-monitor-panel-scroll D20).
+    ///
+    /// Separate from `total - body.len()` because those two differences have different
+    /// causes and must not be reported as one. `total > body.len()` is an app *display* cap:
+    /// the data exists and the app chose not to send it. `lost > 0` means the data is gone
+    /// and only a JSONL re-parse could bring it back — which D1 puts out of scope. Conflating
+    /// them is exactly the defect `+N more` had: it summed height-starved rows and evicted
+    /// ones into a single number that meant neither.
+    ///
+    /// Only the app can tell them apart, so only the app fills this in. `0` means "nothing
+    /// known to be lost", which is also the honest answer for the sections whose rings have
+    /// no cumulative counter to compare against.
+    pub lost: usize,
+    /// Whether the fold is closed — the body shows at most [`FOLD_THRESHOLD`] entries and a
+    /// [`ItemKind::Fold`](crate::monitor_layout::ItemKind::Fold) rung offers the rest.
+    ///
+    /// The app owns this, the way it owns every other field here: the panel is told what to
+    /// draw, it does not remember. Unlike the scroll offset — which is deliberately kept
+    /// OUT of this model so a wheel notch cannot invalidate the document layout (C4) — a
+    /// fold genuinely changes which rungs exist, so it belongs in the layout's cache key,
+    /// which is to say here.
+    ///
+    /// Meaningless for a section with [`Section::foldable`] false; the layout ignores it.
+    pub collapsed: bool,
     pub body: SectionBody,
+}
+
+/// How many entries a closed fold shows before the rest go behind the control.
+pub const FOLD_THRESHOLD: usize = 5;
+
+impl Section {
+    /// Does this section have enough entries for the fold to mean anything?
+    ///
+    /// Strictly greater: a section with exactly [`FOLD_THRESHOLD`] entries would draw a
+    /// control that hides nothing, which is worse than no control — it costs a rung and
+    /// answers a question nobody asked.
+    pub fn foldable(&self) -> bool {
+        self.body.len() > FOLD_THRESHOLD
+    }
+
+    /// How many body entries are actually drawn.
+    pub fn shown(&self) -> usize {
+        if self.collapsed && self.foldable() {
+            FOLD_THRESHOLD
+        } else {
+            self.body.len()
+        }
+    }
+
+    /// How many the closed fold is holding back. `0` whenever the fold is open, which is
+    /// what lets the control's own wording be derived rather than branched on twice.
+    pub fn folded(&self) -> usize {
+        self.body.len() - self.shown()
+    }
 }
 
 /// Everything the panel draws (D10's ten regions).

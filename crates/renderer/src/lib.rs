@@ -20,6 +20,7 @@ pub mod link_layer;
 pub mod monitor_layout;
 pub mod monitor_model;
 pub mod monitor_panel;
+pub mod monitor_scroll;
 pub mod preedit_layer;
 pub mod selection_layer;
 pub mod sidebar_header;
