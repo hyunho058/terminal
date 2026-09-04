@@ -47,4 +47,16 @@ correctly and (2) recognizes the native versioned `claude` install.
 - scope: change confined to `tabmeta/{proc,agent}.rs`; rendering/mapping untouched.
 
 ## Lessons
-(none yet)
+- context (2026-08-30, `specs/agent-classifier-deleted-binary`): this spec taught that a
+  *native installer* can make `proc_pidpath`'s basename useless (`versions/<ver>` is a version
+  string, not an agent name); the Antigravity side later showed the sharper form — an
+  *auto-updater* can make the path **disappear**. Once the running binary is unlinked
+  `proc_pidpath` returns 0, `exe_path` is `None`, and a classifier that opens with
+  `let path = exe_path?;` reports "not an agent" while the agent is plainly running. The rule
+  both instalments arrive at: **do not read an agent's identity from a path that the agent's
+  own installer or updater owns.** The kernel's exec-time name (`PROC_PIDTBSDINFO.pbi_name`)
+  is the one identity neither of them rewrites.
+- process: this fix, like `specs/antigravity-agy-detection`, was closed on a *manual* live
+  probe with no test that could fail on the old code — and the deletion bug then shipped
+  through exactly that gap. A detection fix needs a regression test that is **proven to fail
+  before the fix**, not a green suite that was green beforehand too.
