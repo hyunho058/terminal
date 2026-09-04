@@ -3,7 +3,7 @@
 ## Meta
 - **Created**: 2026-08-29
 - **Type**: dev
-- **Status**: approved (L4) — plan only; implementation not started
+- **Status**: implemented, verified, manual gate passed 2026-09-03
 - **Approved by**: user
 - **Approved at**: 2026-08-29
 - **Line references**: as of `e99ad7a` (the commit this work was rebased onto).
@@ -669,11 +669,29 @@ conditions, so no parallel edge is claimed.
   four gates on `macos-14`, and every measurement this spec rests on is already taken.
 
 ### Post-work
-- **The manual gate this bug earned.** Automated tests prove the mechanism; they cannot prove
-  the product. With a real `agy` session running, delete the running binary
-  (`rm ~/.local/bin/agy.*.old`, or wait for the updater to do it), then confirm the ai-monitor
-  panel still shows that session **and** the sidebar card keeps its Antigravity skin. Both
-  symptoms, because both consumers read the same detector.
+- **The manual gate this bug earned — PASSED 2026-09-03.** Automated tests prove the
+  mechanism; they cannot prove the product. With a real `agy` session running, delete the
+  running binary (`rm ~/.local/bin/agy.*.old`, or wait for the updater to do it), then confirm
+  the ai-monitor panel still shows that session **and** the sidebar card keeps its Antigravity
+  skin. Both symptoms, because both consumers read the same detector.
+
+  **Nothing had to be deleted by hand: the updater reproduced the condition on its own**,
+  which is the most direct evidence available that the reported failure is this one. It
+  replaced `~/.local/bin/agy` at 18:45 leaving no `.old` behind, so every `agy` started before
+  that moment was left running from an unlinked inode. Measured at gate time:
+
+  | `agy` | window's build | tab | `proc_pidpath` | `pbi_name` |
+  |---|---|---|---|---|
+  | 89588 | this branch (release) | `terminal` | `rc=0` — **deleted** | `[agy]` |
+  | 92543 | this branch (release) | `anki` | `rc=31` — readable | `[agy]` |
+  | 54973 | `terminal/target/debug/app`, running since 2026-08-27 — **pre-fix** | `terminal` | `rc=0` — **deleted** | `[agy]` |
+
+  Confirmed on screen by the human: the deleted-binary tab under the fixed build shows its
+  session and keeps its skin. The third row is the control the gate was never expected to
+  get — the same machine, the same deleted-binary condition, an older build, still displaying
+  the original defect. Its `agy` started 14:42:33 on 2026-08-27, which is the "second `agy` +
+  updater 54980 at 14:42:37" from the incident timeline in `## Research`: the window that
+  reported this bug was still open, still wrong, beside the window that is right.
 - Record the lesson beside the two it continues (`specs/antigravity-agy-detection/loop.md`,
   `specs/agent-skin-detection-fix/loop.md`): an agent CLI's identity must not be read from a
   path that its own updater owns — `proc_pidpath` follows a rename and dies on a delete, while
