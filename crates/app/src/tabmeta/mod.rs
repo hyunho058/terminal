@@ -434,6 +434,19 @@ pub(crate) mod probe {
     /// (The `PROC_EXE` note in `worker.rs` reaches the same remedy from a different cause —
     /// there the nondeterminism is a varying live *child count*, not an uncoordinated caller.)
     pub(crate) static PROC_START: Counter = Counter::new();
+    /// proc.rs (agent-classifier-deleted-binary) — `name_of_pid`, the exec-time process name
+    /// the classifier falls back to when `proc_pidpath` reports nothing.
+    ///
+    /// Counted because it is per-pid-per-walk and, like every other read here, uncounted I/O
+    /// is what lets a cost test keep passing while the real cost grows. An **absolute**
+    /// assertion on it is sound only where the pid population is fixed by the test: the
+    /// classifier reaches this read solely on the `exe_path == None` branch, and the count of
+    /// pids in that state under a live walk is exactly as nondeterministic as the live-child
+    /// count that forced `worker.rs`'s `PROC_EXE` assertion to a floor. Note also that
+    /// `tabsession::agent_for` — outside `tabmeta` — reaches `classify_pid`; no default-suite
+    /// test drives it today (`presence_fd`'s live gate is `#[ignore]`d, and the overlay paths
+    /// need a winit loop), but that is a weaker guarantee than sole ownership.
+    pub(crate) static PROC_NAME: Counter = Counter::new();
     /// activity.rs (tabmeta-session-keying) — one `~/.claude/sessions/<pid>.json` read.
     /// Counted because it is per-Claude-tab-per-refresh and uncounted I/O is exactly what
     /// lets a cost test keep passing while the real cost grows.
@@ -463,6 +476,7 @@ pub(crate) mod probe {
             &PROC_EXE,
             &PROC_ARGS,
             &PROC_START,
+            &PROC_NAME,
             &SESSION_REG,
             &PROC_TTY,
             &TTY_STAT,

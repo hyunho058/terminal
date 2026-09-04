@@ -48,3 +48,13 @@ auto-updater's in-place binary rename.
 - context: agent CLIs identify by argv[0], but their on-disk exe basename is unreliable —
   claude runs a `versions/<ver>` binary, agy an auto-renamed `<name>.<id>.old`. Detection
   must not assume `proc_pidpath` basename == the command name.
+- context (2026-08-30, `specs/agent-classifier-deleted-binary`): the same updater's **next**
+  step is worse than the rename this spec fixed. It later *deletes* the `<name>.<id>.old`
+  file, and `proc_pidpath` then returns 0 — so an `exe_path`-only classifier does not merely
+  misread the name, it loses the process entirely and every stage below it becomes
+  unreachable. A live `agy` session went undetected mid-run, taking both the ai-monitor panel
+  and the sidebar skin with it. The generalisation: **do not read an agent's identity from a
+  path that the agent's own updater owns.** The fix is the kernel's exec-time name
+  (`PROC_PIDTBSDINFO.pbi_name`), which is fixed at `exec` and moves for neither event —
+  measured across the real sequence, `proc_pidpath` went rc=150 → 174 → 0 while `pbi_name`
+  read `agy` at all three steps.
