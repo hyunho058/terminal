@@ -11,3 +11,7 @@
 # insta pending snapshots
 **/*.snap.new
 specs/*/progress.md
+
+# cargo-mutants working output (see .cargo/mutants.toml)
+/mutants.out/
+/mutants.out.old/

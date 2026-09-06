@@ -1,0 +1,40 @@
+# cargo-mutants configuration.
+#
+# Mutation testing answers the question the test *count* cannot: which functions
+# can be broken without any test noticing. Run it scoped, never whole — the
+# workspace generates ~6300 mutants and each costs a rebuild plus a test run, so
+# a full pass is measured in days. Scope to what you changed:
+#
+#   cargo mutants -f crates/app/src/session.rs      # one file
+#   cargo mutants --in-diff <(git diff origin/main) # just this branch's changes
+#
+# `-j 4` roughly quarters the wall time on this machine.
+
+# REQUIRED, not a preference. cargo-mutants tests each mutant in a *copy* of the
+# tree, and without the VCS directory two tabmeta tests
+# (`steady_state_repo_derivation_does_no_git_read`,
+# `disabling_git_clears_branch_and_stops_git_work`) fail in the copy because they
+# assert the working directory is a git repo. That aborts the whole run at the
+# baseline with "cargo test failed in an unmutated tree".
+copy_vcs = true
+
+# The tests that can catch a mutant in this workspace all live in `app`,
+# `renderer` or `term-core`, and running the other packages' suites per mutant
+# buys nothing. Narrow further with --cargo-test-arg when scoping to one crate.
+additional_cargo_test_args = []
+
+# Mutants that are *equivalent* — they change the source without changing
+# behaviour, so no test can kill them and leaving them reported would train
+# everyone to ignore the report.
+exclude_re = [
+    # `cwd_of_pid`'s short-read guard, `if n < size { return None }`, with `<`
+    # flipped to `>`. On success `n == size`, so both forms fall through; on
+    # failure `proc_pidinfo` returns 0 or -1 and leaves the struct zeroed, so the
+    # `>` form falls through to a NUL path and returns `None` anyway — the same
+    # answer by a different route. Distinguishing them needs a *partial* kernel
+    # read (`0 < n < size`), which `PROC_PIDVNODEPATHINFO` does not produce.
+    #
+    # Not a blanket amnesty for that line: the neighbouring `<` → `<=` and
+    # `<` → `==` mutants are both caught, and they stay in scope.
+    "replace < with > in cwd_of_pid",
+]

@@ -2147,6 +2147,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "common",
+ "insta",
  "memmap2",
  "pollster",
  "raw-window-handle",

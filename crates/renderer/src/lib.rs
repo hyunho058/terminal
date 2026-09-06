@@ -1092,6 +1092,177 @@ impl Renderer {
 
         self.queue.submit(std::iter::once(encoder.finish()));
     }
+
+    /// Draw `snapshot` into a fresh offscreen target and read the pixels back.
+    ///
+    /// This is the only way to observe what a frame **actually contains**. Every
+    /// other observable the renderer exposes reports a *decision* — `reshape_count`
+    /// says the instance builders ran, `Atlas::generation` says a glyph was packed —
+    /// and each of those stays perfectly correct while the frame it describes comes
+    /// out blank. A regression that zeroes `glyph_count`, mis-derives the insets, or
+    /// swaps a pipeline is invisible to all of them and visible here.
+    ///
+    /// Costs a texture, a buffer and a device stall per call, so it belongs in tests
+    /// and benches, not on the frame path — `draw_to` is that path, and this wraps it
+    /// rather than reimplementing it, so the two can never drift.
+    pub fn capture(&mut self, snapshot: &GridSnapshot) -> CapturedFrame {
+        let (width, height) = (self.config.width, self.config.height);
+        let target = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("capture-target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        self.draw_to(&view, snapshot);
+
+        // `copy_texture_to_buffer` requires a 256-byte-aligned row pitch, so the
+        // readback rows are padded and the padding is stripped below.
+        let unpadded = width * 4;
+        let padded = unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("capture-readback"),
+            size: padded as u64 * height as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("capture-copy"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        // Submitted after `draw_to`'s encoder on the same queue, so the copy sees
+        // the finished frame.
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let mapped = slice.get_mapped_range().expect("capture buffer mapped");
+
+        // Normalise to RGBA so callers never branch on the target's channel order
+        // (the headless target is BGRA; a surface may be either).
+        let bgra = matches!(
+            self.config.format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+        let mut pixels = Vec::with_capacity((unpadded * height) as usize);
+        for row in 0..height {
+            let start = (row * padded) as usize;
+            let bytes = &mapped[start..start + unpadded as usize];
+            for px in bytes.chunks_exact(4) {
+                if bgra {
+                    pixels.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                } else {
+                    pixels.extend_from_slice(px);
+                }
+            }
+        }
+        drop(mapped);
+        readback.unmap();
+
+        CapturedFrame {
+            width,
+            height,
+            pixels,
+        }
+    }
+}
+
+/// One rendered frame read back from the GPU, in tightly packed RGBA8.
+///
+/// Produced by [`Renderer::capture`]. Row-major, `width * height * 4` bytes, with
+/// the readback row padding already stripped and the channel order normalised, so
+/// a caller indexes it without knowing anything about the target's format.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CapturedFrame {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+impl CapturedFrame {
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// The raw RGBA8 bytes, row-major and tightly packed.
+    pub fn pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    /// RGBA at `(x, y)`. Panics out of bounds — a test that reads outside the
+    /// frame has a bug in its geometry, which is exactly what these frames exist
+    /// to catch, so it must not read as a silent black pixel.
+    pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
+        assert!(
+            x < self.width && y < self.height,
+            "pixel({x}, {y}) is outside the {}x{} frame",
+            self.width,
+            self.height
+        );
+        let i = ((y * self.width + x) * 4) as usize;
+        [
+            self.pixels[i],
+            self.pixels[i + 1],
+            self.pixels[i + 2],
+            self.pixels[i + 3],
+        ]
+    }
+
+    /// The most common pixel value in the frame — the painted background, derived
+    /// from the frame itself rather than from the config.
+    ///
+    /// Deriving it here is deliberate: the clear color goes through
+    /// `to_wgpu_color` and an sRGB target before it becomes a byte, so a test that
+    /// compared against `cfg.theme.background` would be asserting that conversion
+    /// chain, not the thing it came to check. Every terminal frame is
+    /// overwhelmingly background, so the mode is that background by construction.
+    pub fn modal_pixel(&self) -> [u8; 4] {
+        let mut counts: std::collections::HashMap<[u8; 4], u32> = std::collections::HashMap::new();
+        for px in self.pixels.chunks_exact(4) {
+            *counts.entry([px[0], px[1], px[2], px[3]]).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .max_by_key(|&(_, n)| n)
+            .map(|(px, _)| px)
+            .unwrap_or([0, 0, 0, 0])
+    }
 }
 
 /// Upload `data` into a resident vertex buffer (D6), reusing it across frames and

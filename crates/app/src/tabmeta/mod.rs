@@ -290,6 +290,23 @@ pub struct TabMetaSnapshot {
 // Read by sidebar-row-redesign's DrawLayer; landed ahead of it.
 #[allow(dead_code)]
 impl TabMetaSnapshot {
+    /// A snapshot standing in for one the worker published, for tests in sibling
+    /// modules.
+    ///
+    /// `tabs` is private to this module, so without this the only reachable snapshot
+    /// is the empty `default()` — and against an empty one every consumer correctly
+    /// answers `None`, which makes "always answer `None`" indistinguishable from the
+    /// real implementation. Mutation testing found exactly that: `Tabs::active_cwd`
+    /// and `Tabs::active_agent_pid` could both be replaced by `None` with the whole
+    /// suite green.
+    #[cfg(test)]
+    pub(crate) fn from_entries(entries: Vec<(TabId, TabMeta)>) -> TabMetaSnapshot {
+        TabMetaSnapshot {
+            generation: 1,
+            tabs: entries,
+        }
+    }
+
     /// This tab's metadata, if present in the last publish.
     pub fn get(&self, id: TabId) -> Option<&TabMeta> {
         self.tabs.iter().find(|(i, _)| *i == id).map(|(_, m)| m)

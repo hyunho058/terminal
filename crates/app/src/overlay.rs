@@ -230,10 +230,10 @@ pub struct AiMonitorOverlay {
     /// `Overlay::on_key` itself answers `Passthrough` for `Esc` and `q`. A re-implemented
     /// copy of that rule in a test body would assert nothing about the shipped one.
     ///
-    /// Production always holds `Some`: [`AiMonitorOverlay::new`] still takes the proxy by
-    /// value, and the only constructor that produces `None` is `#[cfg(test)]`. A `None`
-    /// waker means a watcher's wake never reaches the loop, which is why that constructor
-    /// is documented as being for the decision paths only.
+    /// Production always holds `Some`: `main` passes the real proxy through
+    /// [`crate::feature_overlays`]. A `None` waker means a watcher's wake never reaches
+    /// the loop, which is why the constructors that produce one are documented as being
+    /// for the decision paths only.
     proxy: Option<EventLoopProxy<UserEvent>>,
     /// This window's start time. A log whose last event precedes it stopped being
     /// written before the window existed, so it belongs to some other session.
@@ -303,10 +303,6 @@ pub struct AiMonitorOverlay {
 }
 
 impl AiMonitorOverlay {
-    pub fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
-        Self::with_waker(Some(proxy))
-    }
-
     /// An overlay with **no** event-loop waker, for asserting the decisions that are not
     /// the watcher — D1's keystroke contract (R1.1/R1.2/R1.3).
     ///
@@ -318,7 +314,12 @@ impl AiMonitorOverlay {
         Self::with_waker(None)
     }
 
-    fn with_waker(proxy: Option<EventLoopProxy<UserEvent>>) -> Self {
+    /// Build the overlay over an optional event-loop waker.
+    ///
+    /// Public, and taking an `Option`, so [`crate::feature_overlays`] can hand back
+    /// the registration set without an `EventLoop` — which on macOS exists only on
+    /// the main thread, and so never inside a test.
+    pub fn with_waker(proxy: Option<EventLoopProxy<UserEvent>>) -> Self {
         AiMonitorOverlay {
             visible: false,
             handle: MonitorHandle::default(),

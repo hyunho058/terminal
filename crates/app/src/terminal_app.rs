@@ -62,7 +62,7 @@ use crate::seam::{
     AppCtx, AppRequest, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayCommand,
     OverlayHost, WriteProbe,
 };
-use crate::session::{Session, TabId};
+use crate::session::{Session, TabId, WakeSource};
 use crate::tabmeta::{AgentState, TabMetaSnapshot};
 use crate::tabs::Tabs;
 use crate::waiting::{WaitingKind, WaitingState};
@@ -403,8 +403,21 @@ impl App {
         let fg = Color(self.cfg.theme.foreground);
         let bg = Color(self.cfg.theme.background);
 
-        let first = Session::spawn(TabId(0), cols, rows, fg, bg, self.proxy.clone())?;
-        let tabs = Tabs::new(first, fg, bg, self.proxy.clone());
+        // The one place the winit proxy is turned into the event-loop-free `Wake`
+        // the session layer takes. Everything below this line — sessions, tabs,
+        // the whole input→shell→grid path — is constructible without an event
+        // loop, which is what lets `crates/app/tests/` drive it.
+        let wake: WakeSource = {
+            let proxy = self.proxy.clone();
+            std::rc::Rc::new(move || {
+                let proxy = proxy.clone();
+                Box::new(move |id| {
+                    let _ = proxy.send_event(UserEvent::PtyOutput(id));
+                })
+            })
+        };
+        let first = Session::spawn(TabId(0), cols, rows, fg, bg, (wake)())?;
+        let tabs = Tabs::new(first, fg, bg, wake);
 
         // Live-config watcher (settings feature): on a valid change it sends the
         // fresh Config and wakes the loop with UserEvent::ConfigReloaded.

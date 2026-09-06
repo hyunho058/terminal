@@ -11,7 +11,7 @@ crates/
   common/     # config (TOML+serde), error, logging — no GPU/UI deps
   term-core/  # PTY, vte parsing, cell grid, scrollback, GridSnapshot — GPU-free
   renderer/   # wgpu/Metal cell renderer + swash glyph path — window-agnostic
-  app/        # winit event loop; wires the three together (the binary)
+  app/        # winit event loop; wires the three together (lib + thin bin)
 docs/         # loaded on demand (below)
 ```
 
@@ -27,6 +27,14 @@ GPU surface → spawn zsh → PTY reader thread → channel → `EventLoopProxy`
 adding features. `crates/term-core/tests/grid_snapshot.rs` is the test exemplar
 (insta snapshots of the `vte → grid` pipeline, no GPU).
 
+`crates/renderer/tests/golden_frame.rs` is the exemplar for the **other** half —
+the one the snapshot tests structurally cannot reach. It renders through
+`Renderer::capture` and asserts the pixels that came back, because every other
+renderer observable reports a *decision* (`reshape_count`, `Atlas::generation`)
+and stays correct while the frame it describes is blank: zeroing the glyph
+instance count left the whole suite at 1460 passed / 0 failed. A change to the
+render path is not covered until something asserts what reached the screen.
+
 ## Context (loaded on demand)
 @docs/domain.md        # terminal vocabulary + invariants
 @docs/architecture.md  # the L2 decisions, boundaries, and what's deferred
@@ -35,6 +43,15 @@ adding features. `crates/term-core/tests/grid_snapshot.rs` is the test exemplar
 
 - **Build/test/lint:** `cargo build`, `cargo test --workspace`, `cargo clippy
   --workspace --all-targets -- -D warnings`. Toolchain pinned in `rust-toolchain.toml`.
+- **Coverage is judged by mutation, not by count.** `cargo mutants -f <file> -j 4`
+  reports which functions can be broken with the suite still green — the only
+  check that a test *protects* rather than merely executes. Config and the
+  scoping rules are in `.cargo/mutants.toml`; run it scoped (the workspace has
+  ~6300 mutants), and treat a survivor as a missing test unless it is provably
+  equivalent. Precedent, with 1460 tests passing: `session.rs` scored 20/36 —
+  the survivors were the whole tab-title precedence machine — and `tabs.rs`
+  30/71, where `next`, `prev`, `jump` and `resize_all` could each be replaced by
+  a no-op. Both are at 0 survivors now.
 - **Errors:** per-crate `Error` enums via `thiserror`; no `unwrap()` outside tests.
 - **Rendering scope:** the renderer draws real glyphs via the swash atlas
   (`renderer/src/glyph.rs` + `renderer/src/atlas.rs`), with per-cell fg/bg,

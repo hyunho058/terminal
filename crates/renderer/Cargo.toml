@@ -22,3 +22,9 @@ tracing = "0.1.44"
 # the three path deps.
 unicode-width = "0.2.0"
 wgpu = "30.0.0"
+
+[dev-dependencies]
+# The golden-frame tests pin a readable per-cell ink map of a real rendered
+# frame. Same version the other crates declare, so cargo unifies it and
+# `/insta-review` works on these snapshots too.
+insta = "1.48.0"
