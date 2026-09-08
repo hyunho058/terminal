@@ -298,7 +298,10 @@ mod tests {
     // file's header promised: "the index arithmetic is factored into pure free
     // functions so it is unit-tested without spawning a shell." True — and it left
     // `Tabs` with no test at all, because building one used to need an
-    // `EventLoopProxy`. A `cargo mutants` run over this file scored 30/71: `next`,
+    // `EventLoopProxy`. A `cargo mutants` run over this file left 41 survivors
+    // (a count, not a ratio — see CLAUDE.md; a file's mutant total moves with
+    // every edit to it, which is how the same run for `session.rs` came to be
+    // written down three different ways): `next`,
     // `prev`, `jump` and `resize_all` could each be replaced with a **no-op** —
     // tab switching does nothing, background tabs never resize — and the suite
     // stayed green, because the helpers were tested and nothing checked that

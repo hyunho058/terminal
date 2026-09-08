@@ -32,26 +32,22 @@ fn main() {
     // Capture the sidebar display toggles before `cfg` is moved into the app (T5/D12).
     let (show_git_branch, show_agent_status) =
         (cfg.sidebar.show_git_branch, cfg.sidebar.show_agent_status);
-    // Feature extensions arrive through the SD4 seam (no terminal_app edits). The
-    // set *and its assembly* live in the library so a test can drive both; nothing
-    // about which features the app has is decided in this file.
-    let mut app = App::new(
-        cfg,
-        proxy.clone(),
-        feature_registrations(Some(proxy.clone())),
-    );
-
     // tab-metadata: an off-thread worker derives each tab's git branch + AI-agent
-    // status and wakes the loop via OverlayPending; a headless pump turns that wake
-    // into a redraw. Installed as a locator so `Tabs` can push the roster/active tab.
+    // status and wakes the loop via OverlayPending. Started *before* the app,
+    // because only the process-global half belongs in this file.
     //
-    // Stays here rather than in `feature_overlays`: unlike the others this installs
-    // *process-global* state (`tabmeta::install`, `TabModelHandle::shared`) and
-    // spawns a worker, so a test that built it would leak that state into every
-    // other test in the binary.
-    if let Some(handle) = tabmeta::TabMetaHandle::spawn(move || {
-        let _ = proxy.send_event(UserEvent::OverlayPending);
-    }) {
+    // What stays here is what a library genuinely cannot own: `tabmeta::install`
+    // and `TabModelHandle::shared` install singletons, so a test that ran this
+    // would leak them into every other test in the binary. What does *not* stay
+    // here is the pump's registration — that is an ordinary decision, it now
+    // travels in the value below, and `crates/app/tests/wiring.rs` asserts it.
+    let meta = tabmeta::TabMetaHandle::spawn({
+        let proxy = proxy.clone();
+        move || {
+            let _ = proxy.send_event(UserEvent::OverlayPending);
+        }
+    });
+    if let Some(handle) = &meta {
         tabmeta::install(handle.clone());
         // Push the display toggles to the worker (D12 of tab-metadata), and install the
         // metadata pull adapter into the shared sidebar model (D10) so the sidebar shows
@@ -60,8 +56,13 @@ fn main() {
         renderer::sidebar_row::TabModelHandle::shared().set_meta_source(std::rc::Rc::new(
             sidebar_model::SidebarMetaSource::new(handle.clone()),
         ));
-        app.register_overlay(Box::new(tabmeta::TabMetaPump::new(handle)));
     }
+
+    // Feature extensions arrive through the SD4 seam (no terminal_app edits), as
+    // one value assembled in the library. `App::new` is the only way in, so there
+    // is no second registration path for a feature to go missing down: nothing
+    // about which extensions the app has is decided in this file.
+    let mut app = App::new(cfg, proxy.clone(), feature_registrations(Some(proxy), meta));
 
     if let Err(e) = event_loop.run_app(&mut app) {
         tracing::error!("event loop exited with error: {e}");

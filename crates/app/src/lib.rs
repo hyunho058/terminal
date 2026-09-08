@@ -77,15 +77,32 @@ use terminal_app::UserEvent;
 /// every feature from the running app with the whole suite still green.
 ///
 /// As a function it is an ordinary value, and `crates/app/tests/wiring.rs` drives
-/// it through [`Registrations::install`] to the live registries. What is left in
-/// `main` is one call plus the `tabmeta` worker, which cannot be a value because
-/// it installs process-global state.
+/// it through [`Registrations::install`] to the live registries.
+///
+/// `tabmeta` is the metadata worker's handle, when the worker started. It arrives
+/// as a **parameter** rather than being spawned here because starting the worker
+/// installs process-global state (`tabmeta::install`,
+/// `sidebar_row::TabModelHandle::shared`) that a test must not touch. Whether its
+/// pump joins the overlay set, and at what priority, is not global — it is an
+/// ordinary decision, and keeping it in `main` is what left the app with a fifth
+/// overlay that no test could see: deleting that one line stopped the sidebar's
+/// git branch and agent status from ever refreshing, with the suite green and
+/// this file's own tests asserting a set of four.
 ///
 /// `proxy` is `None` only in tests; see [`feature_overlays`].
-pub fn feature_registrations(proxy: Option<EventLoopProxy<UserEvent>>) -> Registrations {
+pub fn feature_registrations(
+    proxy: Option<EventLoopProxy<UserEvent>>,
+    tabmeta: Option<tabmeta::TabMetaHandle>,
+) -> Registrations {
     let mut set = Registrations::default();
     for overlay in feature_overlays(proxy) {
         set.overlay(overlay);
+    }
+    // tab-metadata's pump, at `i32::MIN`: headless, invisible, consumes no key.
+    // It exists to turn the worker's wake into a repaint, so losing it is silent
+    // by construction — which is exactly why it belongs in the asserted set.
+    if let Some(handle) = tabmeta {
+        set.overlay(Box::new(tabmeta::TabMetaPump::new(handle)));
     }
     for handler in feature_handlers() {
         set.handler(handler);

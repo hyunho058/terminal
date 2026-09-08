@@ -59,8 +59,8 @@ use crate::input::{
     ResizeEdge, SidebarAction, TabAction, WheelDelta,
 };
 use crate::seam::{
-    AppCtx, AppRequest, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayCommand,
-    OverlayHost, Registrations, WriteProbe,
+    AppCtx, AppRequest, Handled, InputRouter, KeyInput, OverlayCommand, OverlayHost, Registrations,
+    WriteProbe,
 };
 use crate::session::{Session, TabId, WakeSource};
 use crate::tabmeta::{AgentState, TabMetaSnapshot};
@@ -135,9 +135,14 @@ pub struct App {
 
 impl App {
     /// `registrations` is the set `main` assembled — see [`crate::feature_registrations`].
-    /// Taken by value rather than accumulated through the methods below so that
-    /// what the app installs is decided in one testable place; the methods remain
-    /// for what can only be registered after the app exists.
+    ///
+    /// The **only** way extensions enter the app. There were once
+    /// `register_handler` / `register_overlay` methods beside this for registering
+    /// after construction, and they were the problem rather than a convenience:
+    /// a second path meant part of the set was assembled where nothing could
+    /// assert it, and the one feature that used it — the `tabmeta` pump — could be
+    /// dropped from `main` with every test still green. Taking the whole set by
+    /// value leaves one place to look and one value to assert.
     pub fn new(
         cfg: Config,
         proxy: EventLoopProxy<UserEvent>,
@@ -149,18 +154,6 @@ impl App {
             inner: None,
             pending: registrations,
         }
-    }
-
-    /// Register an input handler (SD4/R3.3) after construction.
-    pub fn register_handler(&mut self, handler: Box<dyn InputHandler>) {
-        self.pending.handler(handler);
-    }
-
-    /// Register an overlay (SD4/R4) after construction — its `on_key` runs before
-    /// default input and its `DrawLayer` is drawn above the grid. `main` uses this
-    /// for the `tabmeta` pump, which only exists once its worker has spawned.
-    pub fn register_overlay(&mut self, overlay: Box<dyn Overlay>) {
-        self.pending.overlay(overlay);
     }
 }
 

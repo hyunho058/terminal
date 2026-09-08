@@ -455,11 +455,6 @@ impl OverlayHost {
         Handled::Passthrough
     }
 
-    /// The draw layers of every registered overlay (for renderer registration).
-    pub fn layers(&self) -> Vec<Box<dyn DrawLayer>> {
-        self.overlays.iter().map(|o| o.layer()).collect()
-    }
-
     /// The registered overlays' priorities, in the order [`Self::dispatch`]
     /// offers keys to them.
     ///
@@ -886,7 +881,8 @@ mod tests {
             vis: true,
             verdict: Handled::Passthrough,
         }));
-        assert_eq!(host.layers().len(), 2);
+        // Priority order, not registration order: the 100 was registered second.
+        assert_eq!(host.priorities(), vec![100, 1]);
         // Named import kept meaningful; ensures NamedKey path compiles for callers.
         let _named: Key = Key::Named(NamedKey::Escape);
     }

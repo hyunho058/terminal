@@ -8,10 +8,19 @@
 //!
 //! `main` cannot be tested here: it builds a winit `EventLoop`, which on macOS
 //! exists only on the process's main thread, and the harness runs tests on
-//! spawned ones. So the part worth pinning was moved *out* of it. `main` now
-//! contains no registration logic at all — it passes `feature_registrations(..)`
-//! to `App::new` — and what remains inline there is only what genuinely cannot be
-//! a value: the event loop and the process-global `tabmeta` worker.
+//! spawned ones. So the part worth pinning was moved *out* of it. Every extension
+//! the app has now arrives through `feature_registrations(..)` into `App::new`,
+//! which is the only entry; what remains inline in `main` is what genuinely
+//! cannot be a value, and it is smaller than it reads: the event loop, and the
+//! two `tabmeta` calls that install *singletons*.
+//!
+//! An earlier draft of this file claimed `main` contained no registration logic
+//! at all. It was not true, and the exception was the whole problem: `main` also
+//! registered the `tabmeta` pump, the tests here asserted a set of four, and
+//! deleting that one line stopped the sidebar's git branch and agent status from
+//! ever refreshing with the entire suite green. The pump now travels in the value
+//! (`feature_registrations` takes the worker's handle), and the five-overlay shape
+//! is asserted below.
 //!
 //! These tests run the set all the way into the **live registries**, not just to
 //! the `Vec` that feeds them. That distinction is the point: asserting the list
@@ -24,6 +33,7 @@
 //! needs an `EventLoopProxy`, which no test on this platform can obtain.
 
 use app::seam::Overlay;
+use app::tabmeta::TabMetaHandle;
 use app::{feature_handlers, feature_overlays, feature_registrations};
 
 /// Priorities as the registered set actually reports them, highest first.
@@ -59,7 +69,7 @@ fn every_feature_extension_is_registered() {
 /// in the other.
 #[test]
 fn the_registered_set_reaches_the_live_registries() {
-    let mut set = feature_registrations(None);
+    let mut set = feature_registrations(None, None);
     assert_eq!(
         set.counts(),
         (2, 4),
@@ -88,6 +98,40 @@ fn the_registered_set_reaches_the_live_registries() {
         (0, 0),
         "install left items pending; a second resumed would register them twice"
     );
+}
+
+/// The shape the app actually runs: the metadata pump joins the set.
+///
+/// This is the assertion whose absence let `main` own a fifth overlay in silence.
+/// The pump is headless — priority `i32::MIN`, never visible, consumes no key,
+/// draws a no-op layer — so nothing about a running app looks wrong when it is
+/// missing; the sidebar's git branch and agent status simply stop refreshing,
+/// because its `poll` is what turns the worker's wake into a repaint.
+///
+/// `TabMetaHandle::spawn` is safe to call here: it creates a channel and a thread
+/// that blocks on an empty roster, and installs none of the singletons `main`
+/// installs beside it (`tabmeta::install`, `TabModelHandle::shared`). Dropping the
+/// handle disconnects the channel and the worker returns.
+#[test]
+fn the_metadata_pump_joins_the_set_the_app_runs() {
+    let Some(handle) = TabMetaHandle::spawn(|| {}) else {
+        panic!("could not start the metadata worker, so its registration is untestable");
+    };
+    let mut set = feature_registrations(None, Some(handle));
+    assert_eq!(
+        set.counts(),
+        (2, 5),
+        "the pump did not join the assembled set"
+    );
+
+    let (_, host, layers) = set.install();
+    assert_eq!(
+        host.priorities(),
+        vec![200, 100, 0, 0, i32::MIN],
+        "the pump must reach the host, and must sit behind every real overlay so \
+         it can never take a key from one"
+    );
+    assert_eq!(layers.len(), 5, "the pump's no-op layer went missing");
 }
 
 /// D8a.1: an open rename field owns the keyboard, so it must sit ahead of the
