@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use app::input::encode_key;
 use app::session::{Session, TabId, Wake};
 use common::config::Config;
-use renderer::Renderer;
+use renderer::{Renderer, RendererError};
 use term_core::Color;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
@@ -79,6 +79,51 @@ fn type_text(session: &mut Session, text: &str) {
         let bytes = encode_key(&key, Some(&s), ModifiersState::empty(), false)
             .unwrap_or_else(|| panic!("no shell encoding for {ch:?}"));
         session.write(&bytes).expect("write to the shell");
+    }
+}
+
+/// Frame size for the pixel leg. Large enough that the default cell metrics give
+/// a grid worth asserting over.
+const FRAME_W: u32 = 1200;
+const FRAME_H: u32 = 800;
+
+/// The headless renderer, or `None` when GPU tests are opted out of.
+///
+/// Mirrors `renderer/tests/golden_frame.rs::headless`, and for the reason stated
+/// there: a helper that turns "the renderer would not start" into a **passing**
+/// test reproduces in the harness the exact failure these tests exist to detect.
+/// This function had precisely that shape — every `RendererError` was a bare
+/// `return` with a line to stderr — and no environment variable gated it, so the
+/// skip was nobody's decision.
+///
+/// The two failures are split because they are not the same kind of fact.
+/// `Renderer::new_headless` calls `FontSet::load()` *before* it requests an
+/// adapter, so `NoFont` arrives on every machine, GPU or not: it means the
+/// Menlo / SF Mono / AppleSDGothicNeo chain stopped resolving, which is a
+/// regression in the code under test. Break it and the renderer crate's golden
+/// frames go red while this test — the only one spanning keystroke → shell → grid
+/// → GPU — reported ok. That case therefore fails unconditionally, and
+/// `SKIP_GPU_TESTS` does not cover it, because a machine without a GPU still has
+/// fonts.
+fn headless_renderer(cfg: &Config) -> Option<Renderer> {
+    match Renderer::new_headless(FRAME_W, FRAME_H, 1.0, cfg) {
+        Ok(r) => Some(r),
+        Err(RendererError::NoFont(tried)) => panic!(
+            "no usable monospace font (tried {tried}). This is the font pipeline \
+             failing, not a missing GPU — it is decided before any adapter is \
+             requested — so SKIP_GPU_TESTS deliberately does not opt out of it."
+        ),
+        Err(e) => {
+            if std::env::var_os("SKIP_GPU_TESTS").is_some() {
+                eprintln!("SKIP_GPU_TESTS set; skipping the pixel leg: {e}");
+                return None;
+            }
+            panic!(
+                "headless renderer unavailable ({e}). This is the only test that \
+                 spans keystroke → shell → grid → GPU, so it fails rather than \
+                 skipping. Set SKIP_GPU_TESTS=1 to opt out deliberately."
+            );
+        }
     }
 }
 
@@ -165,10 +210,7 @@ fn shell_output_reaches_actual_pixels() {
         return;
     };
     let cfg = Config::default();
-    let Ok(mut r) = Renderer::new_headless(1200, 800, 1.0, &cfg) else {
-        // Unlike the shell, a GPU genuinely may be absent; the pixel contract is
-        // owned by `renderer/tests/golden_frame.rs`, which fails loudly there.
-        eprintln!("skipping pixel leg: no headless renderer");
+    let Some(mut r) = headless_renderer(&cfg) else {
         return;
     };
 
