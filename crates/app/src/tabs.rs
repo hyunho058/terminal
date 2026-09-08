@@ -335,14 +335,20 @@ mod tests {
     const BG: Color = Color(0x101010);
 
     /// A tab set with `n` real sessions, active on the last one (as `open` leaves it).
-    fn tabs_with(n: usize) -> Tabs {
+    /// `None` when shell tests are opted out of (`SKIP_SHELL_TESTS=1`). Each tab
+    /// here is a real zsh, which is what these tests are buying — the lifecycle,
+    /// not the arithmetic — so there is nothing to run without one.
+    fn tabs_with(n: usize) -> Option<Tabs> {
+        if !crate::session::shell_tests_enabled() {
+            return None;
+        }
         let wake = silent_wake();
         let first = Session::spawn(TabId(0), 80, 24, FG, BG, (wake)()).expect("spawn first");
         let mut tabs = Tabs::new(first, FG, BG, wake);
         for _ in 1..n {
             tabs.open(80, 24).expect("open");
         }
-        tabs
+        Some(tabs)
     }
 
     fn ids(tabs: &Tabs) -> Vec<TabId> {
@@ -351,7 +357,9 @@ mod tests {
 
     #[test]
     fn opening_a_tab_appends_it_and_makes_it_active() {
-        let mut tabs = tabs_with(1);
+        let Some(mut tabs) = tabs_with(1) else {
+            return;
+        };
         assert_eq!(tabs.len(), 1);
         assert_eq!(tabs.active_index(), 0);
 
@@ -369,7 +377,9 @@ mod tests {
     fn tab_ids_are_monotonic_and_never_reused() {
         // D2 — the id is what a queued PTY wake, the sidebar and the panel all key
         // on. A reused id routes one tab's output into another's grid.
-        let mut tabs = tabs_with(3);
+        let Some(mut tabs) = tabs_with(3) else {
+            return;
+        };
         let before = ids(&tabs);
         assert_eq!(before.len(), 3);
         assert!(
@@ -390,7 +400,9 @@ mod tests {
 
     #[test]
     fn lookup_by_id_finds_that_tab_and_only_that_tab() {
-        let mut tabs = tabs_with(3);
+        let Some(mut tabs) = tabs_with(3) else {
+            return;
+        };
         let all = ids(&tabs);
         for want in &all {
             assert_eq!(tabs.by_id(*want).map(|s| s.id), Some(*want));
@@ -408,7 +420,9 @@ mod tests {
     fn is_active_names_the_active_tab_and_rejects_the_rest() {
         // R1.2 — background output skips the redraw on the strength of this, so a
         // constant answer either repaints for every background tab or never repaints.
-        let tabs = tabs_with(3);
+        let Some(tabs) = tabs_with(3) else {
+            return;
+        };
         let all = ids(&tabs);
         let active = tabs.active().id;
         assert!(tabs.is_active(active));
@@ -421,7 +435,9 @@ mod tests {
     #[test]
     fn next_and_prev_actually_move_the_active_tab() {
         // The helpers below are already tested; this asserts `Tabs` *calls* them.
-        let mut tabs = tabs_with(3);
+        let Some(mut tabs) = tabs_with(3) else {
+            return;
+        };
         assert_eq!(tabs.active_index(), 2);
         tabs.next();
         assert_eq!(tabs.active_index(), 0, "next wraps off the end (R3.2)");
@@ -435,7 +451,9 @@ mod tests {
 
     #[test]
     fn jump_reaches_existing_tabs_and_ignores_the_rest() {
-        let mut tabs = tabs_with(3);
+        let Some(mut tabs) = tabs_with(3) else {
+            return;
+        };
         tabs.jump(0);
         assert_eq!(tabs.active_index(), 0);
         tabs.jump(2);
@@ -455,7 +473,9 @@ mod tests {
         // `is_empty` has no production caller yet (it exists to pair with `len` for
         // clippy), which is exactly why nothing was asserting it: a constant `true`
         // or `false` here is invisible until the first consumer trusts it.
-        let mut tabs = tabs_with(2);
+        let Some(mut tabs) = tabs_with(2) else {
+            return;
+        };
         assert_eq!(tabs.len(), 2);
         assert!(!tabs.is_empty());
         assert!(tabs.close_active());
@@ -467,7 +487,9 @@ mod tests {
 
     #[test]
     fn closing_the_active_tab_reports_whether_any_remain() {
-        let mut tabs = tabs_with(2);
+        let Some(mut tabs) = tabs_with(2) else {
+            return;
+        };
         assert!(tabs.close_active(), "one tab still open, so keep running");
         assert_eq!(tabs.len(), 1);
         assert!(
@@ -482,7 +504,9 @@ mod tests {
         // R3.7 — the active tab keeps its *identity*, only its index shifts, and
         // only when the closed tab sat before it. Getting this wrong silently
         // switches the tab under the user.
-        let mut tabs = tabs_with(3);
+        let Some(mut tabs) = tabs_with(3) else {
+            return;
+        };
         let all = ids(&tabs);
         tabs.jump(1);
         let active = tabs.active().id;
@@ -493,7 +517,9 @@ mod tests {
         assert_eq!(tabs.active_index(), 0, "but its index shifts down by one");
 
         // Closing a tab *after* the active one does not move it at all.
-        let mut tabs = tabs_with(3);
+        let Some(mut tabs) = tabs_with(3) else {
+            return;
+        };
         let all = ids(&tabs);
         tabs.jump(0);
         assert!(tabs.close(all[2]));
@@ -504,7 +530,9 @@ mod tests {
     #[test]
     fn closing_an_unknown_id_changes_nothing_and_keeps_running() {
         // The tab may have exited between the click and the apply (R3.6).
-        let mut tabs = tabs_with(2);
+        let Some(mut tabs) = tabs_with(2) else {
+            return;
+        };
         let before = ids(&tabs);
         let active = tabs.active().id;
         assert!(tabs.close(TabId(9_999)));
@@ -514,7 +542,9 @@ mod tests {
 
     #[test]
     fn closing_the_last_tab_by_id_also_reports_the_exit() {
-        let mut tabs = tabs_with(1);
+        let Some(mut tabs) = tabs_with(1) else {
+            return;
+        };
         let only = tabs.active().id;
         assert!(!tabs.close(only), "the same contract as close_active (D4)");
         assert_eq!(tabs.len(), 0);
@@ -525,7 +555,9 @@ mod tests {
         // R5.1 — the whole point of `resize_all` over resizing the active tab: a
         // background tab that kept the old size reflows wrongly the moment you
         // switch to it.
-        let mut tabs = tabs_with(3);
+        let Some(mut tabs) = tabs_with(3) else {
+            return;
+        };
         for s in &tabs.sessions {
             assert_eq!(s.terminal.dimensions(), (80, 24));
         }
@@ -544,7 +576,9 @@ mod tests {
     fn set_default_colors_all_rethemes_background_tabs_too() {
         // R3.3 (settings) — a live theme change must reach every tab, not just the
         // one on screen.
-        let mut tabs = tabs_with(3);
+        let Some(mut tabs) = tabs_with(3) else {
+            return;
+        };
         let (fg2, bg2) = (Color(0x00FF00), Color(0x123456));
         tabs.set_default_colors_all(fg2, bg2);
         for s in &tabs.sessions {
@@ -567,7 +601,9 @@ mod tests {
         // the drift surfaces only on the *next* Cmd+T. Reported as a real defect:
         // edit `theme.background`, watch every open tab re-theme, press Cmd+T, and
         // the new tab comes up on the old background.
-        let mut tabs = tabs_with(1);
+        let Some(mut tabs) = tabs_with(1) else {
+            return;
+        };
         let (fg2, bg2) = (Color(0x00FF00), Color(0x123456));
         tabs.set_default_colors_all(fg2, bg2);
 
@@ -590,7 +626,9 @@ mod tests {
     fn the_active_tabs_shell_pid_is_that_tabs_own_live_shell() {
         // The root the ai-monitor walks. A constant here binds the panel to the
         // wrong process without failing anything.
-        let mut tabs = tabs_with(2);
+        let Some(mut tabs) = tabs_with(2) else {
+            return;
+        };
         let first = tabs.active().shell_pid().expect("shell");
         assert!(first > 1, "pid {first} is not a real process");
         assert_eq!(tabs.active_shell_pid(), Some(first));
@@ -607,7 +645,9 @@ mod tests {
         // Both read the snapshot keyed by the *active* tab's id. Against an empty
         // snapshot every honest implementation answers `None`, so the fixture has
         // to carry entries for the answer to mean anything.
-        let mut tabs = tabs_with(2);
+        let Some(mut tabs) = tabs_with(2) else {
+            return;
+        };
         let all = ids(&tabs);
         let meta_for = |cwd: &str, agent_pid: u32| crate::tabmeta::TabMeta {
             cwd: Some(PathBuf::from(cwd)),
@@ -637,7 +677,9 @@ mod tests {
         // D9/R1.1 — the program channel travels separately from the user's, and an
         // empty program title is *absent*, not an empty string the sidebar would
         // render as a blank line.
-        let mut tabs = tabs_with(2);
+        let Some(mut tabs) = tabs_with(2) else {
+            return;
+        };
         let all = ids(&tabs);
         let snap = crate::tabmeta::TabMetaSnapshot::default();
 

@@ -34,6 +34,29 @@ pub struct TabId(pub u64);
 /// place in the app that makes one. A test passes a recorder.
 pub type Wake = Box<dyn Fn(TabId) + Send + 'static>;
 
+/// Whether tests that need a real `/bin/zsh` may run.
+///
+/// `crates/app/tests/vertical_slice.rs` has documented `SKIP_SHELL_TESTS=1` as
+/// the way to run this workspace on a machine with no usable shell since it was
+/// written. It was only ever honoured by that file: the unit tests in this module
+/// and in `tabs.rs` open a shell per fixture and did so unconditionally, so
+/// setting the variable still left `cargo test -p app` panicking in the lib
+/// target. The opt-out is a contract or it is nothing, so it lives here, where
+/// both modules can reach it.
+///
+/// Note what this deliberately does **not** do: it never turns a *failed* spawn
+/// into a skip. A machine that has zsh and cannot start it is reporting a defect,
+/// and the helpers below still panic on it. Only an explicit variable skips, so
+/// skipping is always someone's decision.
+#[cfg(test)]
+pub(crate) fn shell_tests_enabled() -> bool {
+    if std::env::var_os("SKIP_SHELL_TESTS").is_some() {
+        eprintln!("SKIP_SHELL_TESTS set; skipping a test that needs a real shell");
+        return false;
+    }
+    true
+}
+
 /// Mints a fresh [`Wake`] per session.
 ///
 /// [`Tabs`](crate::tabs::Tabs) spawns sessions on demand and so needs to produce
@@ -364,7 +387,13 @@ mod tests {
     /// a no-op — fine for the cwd tests it was written for, useless for anything that
     /// arrives *from* the shell. Everything the OSC channels do (titles, command-end)
     /// is only reachable through here.
-    fn session_with_feed() -> (Session, mpsc::Sender<Vec<u8>>) {
+    /// `None` when shell tests are opted out of — see [`shell_tests_enabled`].
+    /// Returning an `Option` rather than gating inside each test is the point: a
+    /// new test that needs a shell cannot compile without handling the skip.
+    fn session_with_feed() -> Option<(Session, mpsc::Sender<Vec<u8>>)> {
+        if !shell_tests_enabled() {
+            return None;
+        }
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let pty = Pty::spawn(80, 24).expect("pty");
         let writer = pty.writer().expect("writer");
@@ -380,7 +409,7 @@ mod tests {
             command_end: None,
             _reader: std::thread::spawn(|| {}),
         };
-        (session, tx)
+        Some((session, tx))
     }
 
     /// Push bytes the way the reader thread would, then advance the grid over them.
@@ -406,7 +435,9 @@ mod tests {
 
     #[test]
     fn a_fresh_session_carries_neither_title_and_is_not_dirty() {
-        let (mut s, _tx) = session_with_feed();
+        let Some((mut s, _tx)) = session_with_feed() else {
+            return;
+        };
         assert_eq!(s.user_title(), None, "a new tab is not named");
         assert_eq!(s.program_title(), "", "no program has set a title yet");
         assert!(
@@ -417,7 +448,9 @@ mod tests {
 
     #[test]
     fn naming_a_tab_reports_the_change_and_asks_for_one_redraw() {
-        let (mut s, _tx) = session_with_feed();
+        let Some((mut s, _tx)) = session_with_feed() else {
+            return;
+        };
         assert!(
             s.set_user_title(Some("build".into())),
             "a new name is a change"
@@ -434,7 +467,9 @@ mod tests {
         // The `==` guard (R2.2). Flipped to `!=` this still *looks* right — the tab
         // keeps its name — but every no-op rename reports a change and drags a
         // resync + redraw behind it.
-        let (mut s, _tx) = session_with_feed();
+        let Some((mut s, _tx)) = session_with_feed() else {
+            return;
+        };
         assert!(s.set_user_title(Some("build".into())));
         assert!(s.take_title_dirty());
         assert!(
@@ -452,7 +487,9 @@ mod tests {
     fn a_blank_name_resets_the_tab_to_its_auto_label() {
         // R2.3 — whitespace-only is the user clearing the name, not naming the tab
         // "   ". Normalized at the setter so no caller has to know the rule.
-        let (mut s, _tx) = session_with_feed();
+        let Some((mut s, _tx)) = session_with_feed() else {
+            return;
+        };
         assert!(s.set_user_title(Some("build".into())));
         assert!(
             s.set_user_title(Some("   ".into())),
@@ -468,7 +505,9 @@ mod tests {
     #[test]
     fn a_program_title_lands_in_the_program_channel_and_shows() {
         // R1.1/D3 — OSC 2 is any program's channel, kept separate from the user's.
-        let (mut s, tx) = session_with_feed();
+        let Some((mut s, tx)) = session_with_feed() else {
+            return;
+        };
         feed(&mut s, &tx, b"\x1b]2;vim README.md\x07");
         assert_eq!(s.program_title(), "vim README.md");
         assert_eq!(s.user_title(), None, "a program cannot name the tab");
@@ -482,7 +521,9 @@ mod tests {
     fn a_program_title_hidden_under_a_user_title_is_recorded_but_costs_no_redraw() {
         // R1.3 — recorded so the channel keeps working if the user clears their
         // name, but invisible now, and redrawing for an invisible change is waste.
-        let (mut s, tx) = session_with_feed();
+        let Some((mut s, tx)) = session_with_feed() else {
+            return;
+        };
         assert!(s.set_user_title(Some("mine".into())));
         assert!(s.take_title_dirty());
 
@@ -503,7 +544,9 @@ mod tests {
     fn a_command_end_is_delivered_once_and_then_is_gone() {
         // T3 — the waiting model polls this. Delivered twice it raises a phantom
         // second completion; never cleared it raises one every tick.
-        let (mut s, tx) = session_with_feed();
+        let Some((mut s, tx)) = session_with_feed() else {
+            return;
+        };
         assert_eq!(s.take_command_end(), None, "nothing has run yet");
 
         feed(&mut s, &tx, b"\x1b]133;D;7;1234\x07");
@@ -521,7 +564,9 @@ mod tests {
     fn resize_refits_the_grid_and_not_only_the_pty() {
         // R5 — both halves. A resize that moved the PTY but left the grid would
         // reflow the shell's output into a grid that is still the old size.
-        let (mut s, _tx) = session_with_feed();
+        let Some((mut s, _tx)) = session_with_feed() else {
+            return;
+        };
         assert_eq!(s.terminal.dimensions(), (80, 24));
         s.resize(40, 10).expect("resize");
         assert_eq!(
@@ -535,7 +580,9 @@ mod tests {
     fn shell_pid_names_this_sessions_own_live_child() {
         // The root the ai-monitor walks to find *this tab's* agent. A wrong pid does
         // not fail loudly — it silently binds the panel to another tab's session.
-        let (s, _tx) = session_with_feed();
+        let Some((s, _tx)) = session_with_feed() else {
+            return;
+        };
         let pid = s.shell_pid().expect("a spawned session has a shell");
         assert!(pid > 1, "pid {pid} is not a real child process");
         // A live process has a cwd; this is the session's own child, so the check is
@@ -566,11 +613,14 @@ mod tests {
     /// `Tabs` genuinely is out of reach — it holds an `EventLoopProxy` as a field — but its
     /// `active_cwd`/`titles` are thin wrappers whose only cwd cost is the `Session::cwd` call
     /// measured here.
-    fn live_session() -> Session {
+    fn live_session() -> Option<Session> {
+        if !shell_tests_enabled() {
+            return None;
+        }
         let (_tx, rx) = mpsc::channel::<Vec<u8>>();
         let pty = Pty::spawn(80, 24).expect("pty");
         let writer = pty.writer().expect("writer");
-        Session {
+        Some(Session {
             id: TabId(1),
             terminal: Terminal::new(80, 24, Color::rgb(200, 200, 200), Color::rgb(0, 0, 0)),
             pty,
@@ -581,7 +631,7 @@ mod tests {
             title_dirty: false,
             command_end: None,
             _reader: std::thread::spawn(|| {}),
-        }
+        })
     }
 
     #[test]
@@ -590,7 +640,9 @@ mod tests {
         // about whether a closure ran. This is the path evaluated twice per key press
         // (`terminal_app.rs`) and once per tab per sidebar resync (`tabs.rs`), where it used to
         // cost a `proc_pidinfo` every single time.
-        let s = live_session();
+        let Some(s) = live_session() else {
+            return;
+        };
         let meta = meta_with(Some("/published"));
 
         // Published: zero syscalls, however many times it is called.

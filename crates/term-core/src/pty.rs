@@ -760,9 +760,15 @@ mod tests {
     /// assertion fails while the first passes.
     ///
     /// One real shell, deliberately not `#[ignore]`d: the whole point is that the
-    /// leak is invisible to every test that does not spawn one.
+    /// leak is invisible to every test that does not spawn one. `SKIP_SHELL_TESTS=1`
+    /// is the opt-out, the same one `app`'s shell tests honour — a variable someone
+    /// sets, never a failed spawn, which stays a failure.
     #[test]
     fn dropping_a_pty_reaps_its_shell() {
+        if std::env::var_os("SKIP_SHELL_TESTS").is_some() {
+            eprintln!("SKIP_SHELL_TESTS set; skipping the reaping check");
+            return;
+        }
         let pty = Pty::spawn(80, 24).expect("spawn a shell");
         let pid = pty.child_pid().expect("a live shell has a pid") as libc::pid_t;
         assert_eq!(
