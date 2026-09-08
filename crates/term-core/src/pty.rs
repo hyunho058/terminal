@@ -10,6 +10,7 @@
 
 use std::io::{Read, Write};
 use std::sync::Once;
+use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
@@ -246,10 +247,18 @@ fn child_command() -> CommandBuilder {
     cmd
 }
 
+/// How long [`Pty::drop`] waits for a signalled shell before escalating.
+///
+/// Covers scheduling, not the shell's own work: zsh answers `SIGHUP` by exiting
+/// at once, and anything still alive after this has trapped the signal.
+const REAP_TIMEOUT: Duration = Duration::from_millis(500);
+/// Poll interval inside that budget.
+const REAP_POLL: Duration = Duration::from_millis(5);
+
 /// A spawned zsh session behind a pseudo-terminal.
 ///
-/// Keep this alive for the lifetime of the session: dropping it closes the
-/// master and signals the child.
+/// Keep this alive for the lifetime of the session: dropping it signals the
+/// child and reaps it.
 pub struct Pty {
     master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -308,6 +317,62 @@ impl Pty {
                 pixel_height: 0,
             })
             .map_err(Error::pty)
+    }
+}
+
+/// Signal the shell **and reap it**.
+///
+/// Dropping a `Pty` used to do neither directly. The child noticed only
+/// indirectly, when the last owner of the master fd went away, and nothing ever
+/// called `wait`, so every shell that exited stayed a zombie for the life of the
+/// process. Measured on the `app` lib tests, whose fixtures open a real shell per
+/// tab: **55** zombie children at peak, every one of them a shell that had
+/// already exited. The app leaks the same way, one per closed tab, for the whole
+/// session.
+///
+/// Two details decide the shape of this.
+///
+/// The signal is not redundant with the fd closing. `Session` declares `pty`
+/// before `writer`, and the reader thread holds its own clone, so at this point
+/// the master is still open and the shell has had no reason to exit yet. An
+/// unbounded `wait()` here would deadlock against a fd that only closes after
+/// this function returns.
+///
+/// And the budget is not belt-and-braces. `portable_pty`'s `kill` sends
+/// `SIGHUP`, not `SIGKILL`, and `SIGHUP` is catchable — the spawned zsh chains
+/// the user's own `.zshrc` (D13), so a `trap '' HUP` in it would hang whoever
+/// dropped this, which on a tab close is the UI thread. After the budget the
+/// escalation is `SIGKILL`, which cannot be trapped, so the final `wait` is
+/// bounded by the kernel rather than by the shell.
+impl Drop for Pty {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+
+        let deadline = Instant::now() + REAP_TIMEOUT;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Err(e) => {
+                    tracing::warn!("could not reap the shell: {e}");
+                    return;
+                }
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(REAP_POLL);
+        }
+
+        if let Some(pid) = self.child.process_id() {
+            // SAFETY: `kill(2)` against a pid this process spawned and has not
+            // yet reaped, so the pid cannot have been recycled. The only error is
+            // `ESRCH` for one that just exited, which is the outcome we want.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        let _ = self.child.wait();
     }
 }
 
@@ -683,5 +748,41 @@ mod tests {
         let line = drift_trace(&stripped, &survey_agent_passthrough(&cmd)).expect("a line is due");
         // "MAC_TERMINAL_USER_ZDOTDIR" contains "ZDOTDIR", so one check covers both.
         assert!(!line.contains("ZDOTDIR"), "{line}");
+    }
+
+    /// Dropping a `Pty` leaves no zombie.
+    ///
+    /// Signal 0 delivers nothing and only asks whether the pid exists, which is
+    /// precisely the right question: a zombie still *answers* it, because the pid
+    /// stays valid until someone waits on it. So this distinguishes "the shell
+    /// exited" — which was always true — from "the shell was reaped", which was
+    /// not, and which nothing observed. Before the `Drop` impl the second
+    /// assertion fails while the first passes.
+    ///
+    /// One real shell, deliberately not `#[ignore]`d: the whole point is that the
+    /// leak is invisible to every test that does not spawn one.
+    #[test]
+    fn dropping_a_pty_reaps_its_shell() {
+        let pty = Pty::spawn(80, 24).expect("spawn a shell");
+        let pid = pty.child_pid().expect("a live shell has a pid") as libc::pid_t;
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "pid {pid} is not running before the drop, so this proves nothing"
+        );
+
+        drop(pty);
+
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "pid {pid} still exists after the drop — the shell was signalled but \
+             never reaped, and stays a zombie for the life of the process"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "the pid should be gone, not merely unreachable"
+        );
     }
 }

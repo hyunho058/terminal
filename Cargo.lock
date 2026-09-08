@@ -2497,6 +2497,7 @@ dependencies = [
  "common",
  "image",
  "insta",
+ "libc",
  "portable-pty",
  "thiserror 2.0.18",
  "tracing",
