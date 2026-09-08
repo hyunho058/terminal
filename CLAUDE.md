@@ -48,10 +48,18 @@ render path is not covered until something asserts what reached the screen.
   check that a test *protects* rather than merely executes. Config and the
   scoping rules are in `.cargo/mutants.toml`; run it scoped (the workspace has
   ~6300 mutants), and treat a survivor as a missing test unless it is provably
-  equivalent. Precedent, with 1460 tests passing: `session.rs` scored 20/36 —
-  the survivors were the whole tab-title precedence machine — and `tabs.rs`
-  30/71, where `next`, `prev`, `jump` and `resize_all` could each be replaced by
-  a no-op. Both are at 0 survivors now.
+  equivalent. Precedent, with 1460 tests passing: `session.rs` left **16
+  survivors** — the whole tab-title precedence machine — and `tabs.rs` **41**,
+  where `next`, `prev`, `jump` and `resize_all` could each be replaced by a
+  no-op. Both are at 0 now. Record the survivor count, not a ratio: a file's
+  mutant *total* moves with every edit to it, so a ratio written down here is
+  stale by the next commit — which is how three different totals for the same
+  `session.rs` run (36, 39, 35) came to sit in this repo at once. Run
+  `cargo mutants --list -f <file>` for the total as it stands today.
+  An *equivalent* survivor is usually a sign the condition says less than it
+  means — prefer rewriting it (`n < size` → `n != size`) over adding an
+  `exclude_re` entry, which is unanchored by default and silences every
+  same-named function in the workspace.
 - **Errors:** per-crate `Error` enums via `thiserror`; no `unwrap()` outside tests.
 - **Rendering scope:** the renderer draws real glyphs via the swash atlas
   (`renderer/src/glyph.rs` + `renderer/src/atlas.rs`), with per-cell fg/bg,

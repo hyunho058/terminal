@@ -12,7 +12,7 @@
 use winit::event_loop::{ControlFlow, EventLoop};
 
 use app::terminal_app::{App, UserEvent};
-use app::{feature_handlers, feature_overlays, sidebar_model, tabmeta};
+use app::{feature_registrations, sidebar_model, tabmeta};
 
 fn main() {
     common::logging::init();
@@ -32,17 +32,14 @@ fn main() {
     // Capture the sidebar display toggles before `cfg` is moved into the app (T5/D12).
     let (show_git_branch, show_agent_status) =
         (cfg.sidebar.show_git_branch, cfg.sidebar.show_agent_status);
-    let mut app = App::new(cfg, proxy.clone());
-
-    // Register feature extensions through the SD4 seam (no terminal_app edits).
-    // The set itself lives in the library so a test can assert it; this loop is
-    // only the installation.
-    for overlay in feature_overlays(Some(proxy.clone())) {
-        app.register_overlay(overlay);
-    }
-    for handler in feature_handlers() {
-        app.register_handler(handler);
-    }
+    // Feature extensions arrive through the SD4 seam (no terminal_app edits). The
+    // set *and its assembly* live in the library so a test can drive both; nothing
+    // about which features the app has is decided in this file.
+    let mut app = App::new(
+        cfg,
+        proxy.clone(),
+        feature_registrations(Some(proxy.clone())),
+    );
 
     // tab-metadata: an off-thread worker derives each tab's git branch + AI-agent
     // status and wakes the loop via OverlayPending; a headless pump turns that wake

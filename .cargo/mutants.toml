@@ -26,15 +26,23 @@ additional_cargo_test_args = []
 # Mutants that are *equivalent* — they change the source without changing
 # behaviour, so no test can kill them and leaving them reported would train
 # everyone to ignore the report.
-exclude_re = [
-    # `cwd_of_pid`'s short-read guard, `if n < size { return None }`, with `<`
-    # flipped to `>`. On success `n == size`, so both forms fall through; on
-    # failure `proc_pidinfo` returns 0 or -1 and leaves the struct zeroed, so the
-    # `>` form falls through to a NUL path and returns `None` anyway — the same
-    # answer by a different route. Distinguishing them needs a *partial* kernel
-    # read (`0 < n < size`), which `PROC_PIDVNODEPATHINFO` does not produce.
-    #
-    # Not a blanket amnesty for that line: the neighbouring `<` → `<=` and
-    # `<` → `==` mutants are both caught, and they stay in scope.
-    "replace < with > in cwd_of_pid",
-]
+#
+# Empty, and worth keeping empty. The one entry this list ever held silenced
+# "replace < with > in cwd_of_pid": `proc_pidinfo`'s short-read guard, where the
+# success value is exactly `size`, so `<` and `>` accept the same inputs and no
+# test can tell them apart. Two things were wrong with excluding it.
+#
+# `exclude_re` is matched against a mutant's *full* name including its path
+# (cargo-mutants `options.rs`), and that pattern was neither anchored nor
+# path-qualified — so it silenced the mutant in all three `cwd_of_pid` copies
+# (`session.rs`, `tabsession.rs`, `tabmeta/proc.rs`), not the one site its
+# comment described. If any copy later diverged, its real survivor would have
+# been hidden.
+#
+# And the exclusion was treating a symptom. The guard was rewritten as
+# `if n != size`, which has no `<`/`>` flip family at all, so the equivalent
+# mutant no longer exists to exclude. Prefer that: an equivalent mutant is
+# usually a sign the condition says less than it means. Reach for this list only
+# when the source genuinely cannot be written so the mutant disappears — and
+# then anchor the pattern to one path.
+exclude_re = []

@@ -81,6 +81,14 @@ impl Geometry {
     }
 
     /// Half-open pixel bounds of one cell, clamped to the frame.
+    ///
+    /// `floor` on **both** edges, so consecutive cells tile exactly: this cell's
+    /// `x1` is the next one's `x0`. With `ceil` on the far edge — as this had —
+    /// neighbouring rects overlap by a pixel whenever the cell size is
+    /// fractional, and one glyph's outermost column reads as ink in two cells.
+    /// `crates/app/tests/vertical_slice.rs` derives the same rect the same way;
+    /// the two definitions have to agree or the "does this cell hold ink"
+    /// question means something different on each side.
     fn cell_rect(&self, col: u16, row: u16, frame: &CapturedFrame) -> (u32, u32, u32, u32) {
         let x0 = self.origin.0 + col as f32 * self.cell.0;
         let y0 = self.origin.1 + row as f32 * self.cell.1;
@@ -89,8 +97,8 @@ impl Geometry {
         (
             x0.max(0.0).floor() as u32,
             y0.max(0.0).floor() as u32,
-            x1.max(0.0).ceil() as u32,
-            y1.max(0.0).ceil() as u32,
+            x1.max(0.0).floor() as u32,
+            y1.max(0.0).floor() as u32,
         )
     }
 }
@@ -136,7 +144,7 @@ fn render(r: &mut Renderer, feed: &[u8]) -> (GridSnapshot, CapturedFrame) {
     );
     t.advance(feed);
     let snap = t.snapshot();
-    let frame = r.capture(&snap);
+    let frame = r.capture(&snap).expect("read the rendered frame back");
     (snap, frame)
 }
 
@@ -170,10 +178,28 @@ fn a_frame_of_text_is_not_blank() {
     );
 }
 
-/// The geometric contract: ink appears in exactly the cells that hold a
-/// printable character. Catches a dropped row, an off-by-one inset, a wrong cell
-/// size, and a glyph pipeline that draws into the wrong place — none of which
-/// change any counter the other tests read.
+/// The geometric contract: ink appears in the cells that hold a printable
+/// character, and nowhere near the ones that do not.
+///
+/// Deliberately asymmetric, because the two directions are not equally true.
+///
+/// **Every printable cell carries ink** is exact, and it is the half that catches
+/// a dropped row, an off-by-one inset, a wrong cell size, and a glyph pipeline
+/// drawing into the wrong place — none of which move any counter the other tests
+/// read.
+///
+/// **Every blank cell is empty** is *not* exact, and asserting it was a latent
+/// false failure. A glyph may put antialiasing past its own advance width into
+/// the cell beside it; `crates/app/tests/vertical_slice.rs` records that same
+/// measurement from the other side, where the `%` in a real zsh prompt inks the
+/// empty cells on both of its sides. That is correct rendering, not a defect.
+/// This feed ("hello world", "second line") happens to contain no overhanging
+/// glyph, which is the only reason the exact form passed — measured, not assumed:
+/// re-run with `hello% w%o%r%l%d %W%M%@ 100%` and the exact form reports three
+/// blank cells as regressions. So the reverse direction carries a one-cell
+/// tolerance: a blank cell **none of whose neighbours holds text** must be empty.
+/// A smear, an uncleared target and a wholesale misplacement all still fail here,
+/// because none of them is confined to one cell of slack.
 #[test]
 fn ink_lands_exactly_in_the_cells_that_hold_text() {
     let cfg = Config::default();
@@ -184,15 +210,33 @@ fn ink_lands_exactly_in_the_cells_that_hold_text() {
     let geo = Geometry::of(&r);
     let bg = frame.modal_pixel();
 
+    let printable = |col: u16, row: u16| {
+        let ch = snap.cell(col, row).map(|c| c.ch).unwrap_or(' ');
+        !ch.is_whitespace() && ch != '\0'
+    };
+    // Does (col, row) or any of its eight neighbours hold a printable character?
+    let touches_text = |col: u16, row: u16| {
+        (-1i32..=1).any(|dy| {
+            (-1i32..=1).any(|dx| {
+                let (c, r) = (col as i32 + dx, row as i32 + dy);
+                (0..geo.cols as i32).contains(&c)
+                    && (0..geo.rows as i32).contains(&r)
+                    && printable(c as u16, r as u16)
+            })
+        })
+    };
+
     let mut wrong = Vec::new();
     for row in 0..geo.rows {
         for col in 0..geo.cols {
-            let ch = snap.cell(col, row).map(|c| c.ch).unwrap_or(' ');
-            let expected = !ch.is_whitespace() && ch != '\0';
-            let actual = cell_has_ink(&frame, &geo, bg, col, row);
-            if expected != actual {
+            let has_ink = cell_has_ink(&frame, &geo, bg, col, row);
+            if printable(col, row) {
+                if !has_ink {
+                    wrong.push(format!("({col},{row}) holds text but drew nothing"));
+                }
+            } else if has_ink && !touches_text(col, row) {
                 wrong.push(format!(
-                    "({col},{row}) holds {ch:?}: expected ink={expected}, got {actual}"
+                    "({col},{row}) drew ink, and neither it nor any cell touching it holds text"
                 ));
             }
         }
@@ -230,8 +274,14 @@ fn a_red_background_cell_paints_red_pixels() {
 
     let (x0, y0, x1, y1) = geo.cell_rect(1, 0, &frame);
     let mid = frame.pixel((x0 + x1) / 2, (y0 + y1) / 2);
+    // Widened to i32 before the comparison. `mid[1] + 32` is `u8` arithmetic and
+    // panics with "attempt to add with overflow" as soon as green or blue exceeds
+    // 223 — which is precisely a light or white readback, one of the regressions
+    // this test exists to name. An overflow panic there would replace the
+    // diagnostic below with a message about the test's own arithmetic.
+    let [r_ch, g_ch, b_ch] = [mid[0] as i32, mid[1] as i32, mid[2] as i32];
     assert!(
-        mid[0] > mid[1] + 32 && mid[0] > mid[2] + 32,
+        r_ch > g_ch + 32 && r_ch > b_ch + 32,
         "cell (1,0) has a red background but read back as {mid:?} (RGBA)"
     );
 }

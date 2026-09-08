@@ -37,8 +37,10 @@ The full derivation lives in `scaffold-spec.md`. This is the working summary.
   Consequently `Session::spawn` takes a `session::Wake` callback rather than an
   `EventLoopProxy` — the same move the renderer makes with `raw-window-handle`,
   one layer up: it keeps the whole input→shell→grid path constructible without an
-  event loop, which is what `crates/app/tests/vertical_slice.rs` needs. `main` is
-  the single place the proxy becomes a `Wake`.
+  event loop, which is what `crates/app/tests/vertical_slice.rs` needs. The proxy
+  becomes a `Wake` in exactly one place, `App::start` (`terminal_app.rs`), because
+  that is the first moment a window exists and so the first moment there is a grid
+  size to spawn a session against. `main` only creates the proxy and hands it over.
 
 ## Runtime model (C6)
 

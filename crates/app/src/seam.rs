@@ -9,13 +9,13 @@
 //! trivially constructible in tests. (D4 was marked *provisional*; this is the
 //! refinement its first consumer — `tabs` — settles.)
 //!
-//! Much of this module is an extension surface with no in-tree caller yet: the
-//! registration entry points (`InputRouter::register`, `OverlayHost::register`,
-//! `Overlay`, the `AppCtx` accessors) are consumed by image-paste / ai-monitor /
-//! settings when they land. In a binary crate `pub` doesn't suppress dead-code,
-//! so the seam API is allowed dead here; the dispatch paths + tests exercise the
-//! behavior. Remove this allow once a sibling consumes the seam.
-#![allow(dead_code)]
+//! This module used to carry a blanket `#![allow(dead_code)]`, on the grounds
+//! that a *binary* crate does not let `pub` suppress the lint and the seam had no
+//! in-tree caller yet. Both halves have since expired: `app` is a library, and
+//! image-paste, ai-monitor, rename and copy all consume the seam. In a library,
+//! `pub` in a `pub mod` makes an item reachable from outside the crate, so the
+//! lint would not fire here whatever the allow said — keeping it would only have
+//! implied a guard that is not there.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -376,6 +376,15 @@ impl InputRouter {
         self.handlers.push(handler);
     }
 
+    /// How many handlers are registered.
+    ///
+    /// The registries are otherwise write-only: nothing can ask a router whether
+    /// anything reached it, which is exactly why an installer that dropped every
+    /// handler left the whole suite green. This is the read side of that.
+    pub fn handler_count(&self) -> usize {
+        self.handlers.len()
+    }
+
     /// Run each handler in registration order; the first `Consumed` stops
     /// dispatch and signals the caller to skip default input (R3.3).
     pub fn dispatch(&mut self, input: &KeyInput, ctx: &mut AppCtx) -> Handled {
@@ -451,6 +460,17 @@ impl OverlayHost {
         self.overlays.iter().map(|o| o.layer()).collect()
     }
 
+    /// The registered overlays' priorities, in the order [`Self::dispatch`]
+    /// offers keys to them.
+    ///
+    /// Registration is otherwise unobservable — an overlay that never arrived,
+    /// or arrived behind one that eats its keys, raises no error anywhere and the
+    /// chord simply does nothing. This lets a test state what the live registry
+    /// holds instead of what the list handed to it did.
+    pub fn priorities(&self) -> Vec<i32> {
+        self.overlays.iter().map(|o| o.priority()).collect()
+    }
+
     /// Drain background work for every overlay; returns true if any changed (R1.3).
     pub fn poll_all(&mut self) -> bool {
         let mut changed = false;
@@ -501,6 +521,69 @@ impl OverlayHost {
             }
         }
         handled
+    }
+}
+
+/// The seam's registrations, held as a value until there is a window to install
+/// them into.
+///
+/// Features register before `resumed` — there is no renderer to hand a
+/// [`DrawLayer`] to yet — so the set has to be carried. It is a named type rather
+/// than two `Vec` fields on `App` for one reason: `App` cannot be constructed in
+/// a test. It needs an `EventLoopProxy`, which needs an `EventLoop`, which macOS
+/// builds only on the process's main thread while the harness runs every test on
+/// a spawned one. So as long as the registration→registry step lived inside
+/// `App`, no test could reach it, and replacing it with a no-op left the entire
+/// suite green while every feature silently vanished from the running app.
+///
+/// Pulled out here it is an ordinary value transformation, and
+/// `crates/app/tests/wiring.rs` asserts it. What remains outside any test's reach
+/// is the two lines that store this on `App` and call [`Self::install`] from
+/// `resumed` — a named limit, not a hidden one.
+#[derive(Default)]
+pub struct Registrations {
+    handlers: Vec<Box<dyn InputHandler>>,
+    overlays: Vec<Box<dyn Overlay>>,
+}
+
+impl Registrations {
+    /// Add an input handler (SD4/R3.3) — the seam entry a sibling feature calls
+    /// instead of editing the event loop.
+    pub fn handler(&mut self, handler: Box<dyn InputHandler>) {
+        self.handlers.push(handler);
+    }
+
+    /// Add an overlay (SD4/R4): its `on_key` runs before default input and its
+    /// [`DrawLayer`] is drawn above the grid.
+    pub fn overlay(&mut self, overlay: Box<dyn Overlay>) {
+        self.overlays.push(overlay);
+    }
+
+    /// How many handlers and overlays are pending, in that order.
+    pub fn counts(&self) -> (usize, usize) {
+        (self.handlers.len(), self.overlays.len())
+    }
+
+    /// Drain the pending set into live registries, plus the draw layers for the
+    /// renderer to stack.
+    ///
+    /// The layers come back in **registration** order, not the priority order
+    /// [`OverlayHost`] sorts itself into: priority decides who is offered a key
+    /// first, stacking decides who is painted over whom, and the two are
+    /// unrelated. Registration order is what the previous inline loop produced,
+    /// and changing it would silently restack the screen.
+    pub fn install(&mut self) -> (InputRouter, OverlayHost, Vec<Box<dyn DrawLayer>>) {
+        let mut router = InputRouter::default();
+        for h in self.handlers.drain(..) {
+            router.register(h);
+        }
+        let mut host = OverlayHost::default();
+        let mut layers = Vec::with_capacity(self.overlays.len());
+        for o in self.overlays.drain(..) {
+            layers.push(o.layer());
+            host.register(o);
+        }
+        (router, host, layers)
     }
 }
 

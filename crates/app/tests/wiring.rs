@@ -8,13 +8,23 @@
 //!
 //! `main` cannot be tested here: it builds a winit `EventLoop`, which on macOS
 //! exists only on the process's main thread, and the harness runs tests on
-//! spawned ones. So the part worth pinning was moved *out* of it — `main` now
-//! installs whatever `feature_overlays`/`feature_handlers` return, and what
-//! remains inline there is only what genuinely cannot be a value: the event loop
-//! and the process-global `tabmeta` worker.
+//! spawned ones. So the part worth pinning was moved *out* of it. `main` now
+//! contains no registration logic at all — it passes `feature_registrations(..)`
+//! to `App::new` — and what remains inline there is only what genuinely cannot be
+//! a value: the event loop and the process-global `tabmeta` worker.
+//!
+//! These tests run the set all the way into the **live registries**, not just to
+//! the `Vec` that feeds them. That distinction is the point: asserting the list
+//! alone left `Registrations::install` — the step that decides whether anything
+//! reaches `OverlayHost`/`InputRouter` at all — coverable by nothing, and it
+//! could be replaced with a no-op while the whole suite stayed green.
+//!
+//! Two lines are still beyond reach, and are named rather than implied: `App`
+//! storing the set, and `resumed` calling `install()`. Both need an `App`, which
+//! needs an `EventLoopProxy`, which no test on this platform can obtain.
 
 use app::seam::Overlay;
-use app::{feature_handlers, feature_overlays};
+use app::{feature_handlers, feature_overlays, feature_registrations};
 
 /// Priorities as the registered set actually reports them, highest first.
 fn priorities(overlays: &[Box<dyn Overlay>]) -> Vec<i32> {
@@ -34,6 +44,50 @@ fn every_feature_extension_is_registered() {
          was removed, say so here."
     );
     assert_eq!(feature_handlers().len(), 2, "Cmd+V paste and Cmd+C copy");
+}
+
+/// The set survives the trip into the live registries.
+///
+/// The gap this closes: every other test here reads the `Vec` that *feeds*
+/// registration, and a `Registrations::install` that dropped its input — or an
+/// `App` that never called it — would leave all of them passing while the running
+/// app had no rename field, no ai-monitor, no Cmd+V and no Cmd+C. Nothing else in
+/// the workspace looks at what a registry actually holds.
+///
+/// The layer count is asserted alongside, because an overlay contributes two
+/// separate things (keys and a `DrawLayer`) and losing one of them is invisible
+/// in the other.
+#[test]
+fn the_registered_set_reaches_the_live_registries() {
+    let mut set = feature_registrations(None);
+    assert_eq!(
+        set.counts(),
+        (2, 4),
+        "the assembled set changed — 2 handlers (Cmd+V, Cmd+C), 4 overlays"
+    );
+
+    let (router, host, layers) = set.install();
+    assert_eq!(
+        host.priorities(),
+        vec![200, 100, 0, 0],
+        "the overlays that reached the host, in the order it offers keys to them"
+    );
+    assert_eq!(
+        router.handler_count(),
+        2,
+        "handlers were assembled but did not reach the router"
+    );
+    assert_eq!(
+        layers.len(),
+        4,
+        "every overlay contributes a DrawLayer; one that reaches the host without \
+         its layer eats keys and draws nothing"
+    );
+    assert_eq!(
+        set.counts(),
+        (0, 0),
+        "install left items pending; a second resumed would register them twice"
+    );
 }
 
 /// D8a.1: an open rename field owns the keyboard, so it must sit ahead of the

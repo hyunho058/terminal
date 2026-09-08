@@ -14,37 +14,84 @@
 //! what lets them run.
 //!
 //! The wiring `main` performs is likewise extracted here ([`feature_overlays`],
-//! [`feature_handlers`]) rather than written inline, so the registration set is a
-//! value a test can inspect instead of a sequence of statements only a running
-//! app can observe.
+//! [`feature_handlers`], [`feature_registrations`]) rather than written inline, so
+//! the registration set is a value a test can inspect instead of a sequence of
+//! statements only a running app can observe. `crates/app/tests/wiring.rs` drives
+//! it through [`seam::Registrations::install`] into the live registries, which is
+//! the step that actually decides whether a feature exists in the running app.
 
-pub mod card_menu;
-pub mod clipboard;
-pub mod copy;
-pub mod dashboard;
-pub mod hyperlink;
+// Visibility here is load-bearing, and `pub` is not the safe default.
+//
+// rustc's dead-code analysis is reachability-based: an unused item inside a `pub
+// mod` of a *library* is reachable from outside the crate, so it is not dead and
+// nothing warns. This crate became a library for `crates/app/tests/`, and marking
+// every module `pub` in the move silently switched that lint off for the whole
+// crate — taking with it the ~20 `#[allow(dead_code)]` markers whose comments
+// promise removal "once a consumer lands", which had nothing left to suppress.
+// Measured: an unreferenced `pub fn` added to `tabs.rs` passed
+// `cargo clippy -p app -- -D warnings` clean.
+//
+// So a module is `pub` only where something outside the crate genuinely names it
+// — `main.rs` or a test — and `pub(crate)` otherwise, which puts the lint back.
+pub(crate) mod card_menu;
+pub(crate) mod clipboard;
+pub(crate) mod copy;
+pub(crate) mod dashboard;
+pub(crate) mod hyperlink;
+/// `crates/app/tests/vertical_slice.rs` types through the real `encode_key`.
 pub mod input;
-pub mod overlay;
-pub mod presence_fd;
-pub mod prompt;
-pub mod rename;
+pub(crate) mod overlay;
+pub(crate) mod presence_fd;
+pub(crate) mod prompt;
+pub(crate) mod rename;
+/// The SD4 seam. Named in `terminal_app`'s and this module's public signatures,
+/// and asserted by `crates/app/tests/wiring.rs`.
 pub mod seam;
+/// `crates/app/tests/vertical_slice.rs` drives a real shell through it.
 pub mod session;
-pub mod settings;
+pub(crate) mod settings;
+/// `main.rs` installs `SidebarMetaSource` into the shared sidebar model.
 pub mod sidebar_model;
+/// `main.rs` spawns and installs the process-global metadata worker.
 pub mod tabmeta;
-pub mod tabs;
-pub mod tabsession;
+pub(crate) mod tabs;
+pub(crate) mod tabsession;
+/// `main.rs` builds and runs the `App`.
 pub mod terminal_app;
-pub mod waiting;
+pub(crate) mod waiting;
 
 use winit::event_loop::EventLoopProxy;
 
 use clipboard::{ClipboardHandler, ImagePresenter};
 use copy::{CopyHandler, SelectionPresenter};
 use overlay::AiMonitorOverlay;
-use seam::{InputHandler, Overlay};
+use seam::{InputHandler, Overlay, Registrations};
 use terminal_app::UserEvent;
+
+/// Everything `main` hands to [`terminal_app::App::new`], assembled.
+///
+/// The installation loops used to live inline in `main`, where no test could run
+/// them: `main` builds a winit `EventLoop`, which macOS creates only on the
+/// process's main thread while the harness runs every test on a spawned one. A
+/// loop that dropped its items — or was deleted outright — would have removed
+/// every feature from the running app with the whole suite still green.
+///
+/// As a function it is an ordinary value, and `crates/app/tests/wiring.rs` drives
+/// it through [`Registrations::install`] to the live registries. What is left in
+/// `main` is one call plus the `tabmeta` worker, which cannot be a value because
+/// it installs process-global state.
+///
+/// `proxy` is `None` only in tests; see [`feature_overlays`].
+pub fn feature_registrations(proxy: Option<EventLoopProxy<UserEvent>>) -> Registrations {
+    let mut set = Registrations::default();
+    for overlay in feature_overlays(proxy) {
+        set.overlay(overlay);
+    }
+    for handler in feature_handlers() {
+        set.handler(handler);
+    }
+    set
+}
 
 /// The feature extensions the app registers through the SD4 seam, in
 /// registration order.

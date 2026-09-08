@@ -38,7 +38,10 @@ pub(crate) fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
             size,
         )
     };
-    if n < size {
+    // `!=`, matching the three `proc_pidinfo` guards below: the success value is
+    // exactly `size`, so `<` and `!=` accept the same inputs, but `<` also admits
+    // a `>` mutant that is equivalent and therefore unkillable by any test.
+    if n != size {
         return None; // error or short read
     }
     // pvi_cdir.vip_path is a fixed NUL-terminated C path (1024 bytes).
@@ -161,10 +164,6 @@ fn decode_name(raw: &[libc::c_char]) -> Option<String> {
 /// no controlling terminal, and libc's Apple bindings do **not** export the constant (only
 /// `ENODEV` / `MNT_NODEV` exist), so it is named here rather than left as a magic `-1 as u32`
 /// at the comparison site — where it would read as a bug later.
-// Consumed via `tmux::effective_root`, whose own consumers (worker.rs, tabsession.rs) land
-// after this feature — so the whole chain reads as dead until then. Same disposition as
-// `mod.rs`'s `global()`.
-#[allow(dead_code)]
 const NODEV: u32 = u32::MAX;
 
 /// The controlling-tty **device number** of `pid`, via `proc_pidinfo(PROC_PIDTBSDINFO)`.
@@ -177,7 +176,6 @@ const NODEV: u32 = u32::MAX;
 /// `dev_t` (and so `stat.st_rdev`) is `i32` on Apple. Normalising on `u32` puts the single
 /// conversion on the `stat` side ([`rdev_of_path`]) instead of scattering `as` casts through
 /// the comparison.
-#[allow(dead_code)] // consumed by tmux::effective_root once its consumers land
 pub(crate) fn tty_dev_of_pid(pid: u32) -> Option<u32> {
     #[cfg(test)]
     super::probe::PROC_TTY.bump(1);
@@ -277,7 +275,6 @@ pub(crate) fn start_ms_uncounted(pid: u32) -> Option<u64> {
 /// thread-safe, and this module is reached from the metadata worker thread *and* the UI
 /// thread) and on a cache miss it synthesises a `"#major/minor"` string that would silently
 /// never match a real tty name.
-#[allow(dead_code)] // consumed by tmux::resolve_rdevs once its consumers land
 pub(crate) fn rdev_of_path(path: &Path) -> Option<u32> {
     #[cfg(test)]
     super::probe::TTY_STAT.bump(1);

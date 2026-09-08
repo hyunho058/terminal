@@ -32,6 +32,11 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(15);
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
 
+/// A pixel counts as ink when any channel differs from the background by more
+/// than this. Same margin, and same reasoning, as `renderer/tests/golden_frame.rs`:
+/// well above antialiasing noise, well below the contrast of a legible glyph.
+const INK_THRESHOLD: i32 = 24;
+
 fn fg_bg() -> (Color, Color) {
     let cfg = Config::default();
     (Color(cfg.theme.foreground), Color(cfg.theme.background))
@@ -167,68 +172,102 @@ fn shell_output_reaches_actual_pixels() {
         return;
     };
 
+    const MARKER: &str = "PIXEL<ok>";
+
     type_text(&mut session, "m=PIXEL; printf '%s<ok>\\n' \"$m\"");
     press_enter(&mut session);
-    let text = grid_until(&mut session, "PIXEL<ok>");
+    let text = grid_until(&mut session, MARKER);
     assert!(
-        text.contains("PIXEL<ok>"),
+        text.contains(MARKER),
         "shell output never reached the grid; the pixel leg is untestable. Grid:\n{text}"
     );
 
     let snapshot = session.terminal.snapshot();
-    let frame = r.capture(&snapshot);
+    let frame = r.capture(&snapshot).expect("read the rendered frame back");
     let bg = frame.modal_pixel();
 
-    // Every cell the shell filled with a printable character must carry ink.
-    //
-    // The converse is deliberately not asserted. A glyph may bleed a pixel of
-    // antialiasing past its advance width into the blank cell beside it —
-    // measured, not assumed: the `%` in this prompt inks the empty cells on both
-    // sides of it, four cells over two rows. That is correct rendering. What must
-    // never happen is a printable cell with nothing in it.
     let (cw, ch) = r.cell_size();
     let (ox, oy) = (r.left_inset(), r.top_inset());
     let (cols, rows) = r.grid_size();
-    let mut inked = 0usize;
-    let mut missing = Vec::new();
     let (cols, rows) = (cols.min(snapshot.cols), rows.min(snapshot.rows));
-    for row in 0..rows {
-        for col in 0..cols {
-            // floor on both edges, so adjacent cells tile without overlapping and
-            // a neighbour's pixel is never counted twice.
-            let x0 = (ox + col as f32 * cw).max(0.0) as u32;
-            let y0 = (oy + row as f32 * ch).max(0.0) as u32;
-            let x1 = ((ox + (col + 1) as f32 * cw).max(0.0) as u32).min(frame.width());
-            let y1 = ((oy + (row + 1) as f32 * ch).max(0.0) as u32).min(frame.height());
-            let has_ink = (y0..y1).any(|y| {
-                (x0..x1).any(|x| {
-                    let px = frame.pixel(x, y);
-                    (0..3).any(|i| (px[i] as i32 - bg[i] as i32).abs() > 24)
-                })
-            });
-            if has_ink {
-                inked += 1;
-            }
-            let c = snapshot.cell(col, row).map(|c| c.ch).unwrap_or(' ');
-            if !c.is_whitespace() && c != '\0' && !has_ink {
-                missing.push(format!("({col},{row}) holds {c:?} but drew nothing"));
-            }
-        }
-    }
 
+    // floor on both edges, so adjacent cells tile without overlapping and a
+    // neighbour's pixel is never counted twice. `renderer/tests/golden_frame.rs`
+    // derives its cell rect the same way, and the two have to stay that way — a
+    // disagreement would make "this cell holds ink" mean something different on
+    // each side of the same contract.
+    let cell_has_ink = |col: u16, row: u16| {
+        let x0 = (ox + col as f32 * cw).max(0.0) as u32;
+        let y0 = (oy + row as f32 * ch).max(0.0) as u32;
+        let x1 = ((ox + (col + 1) as f32 * cw).max(0.0) as u32).min(frame.width());
+        let y1 = ((oy + (row + 1) as f32 * ch).max(0.0) as u32).min(frame.height());
+        (y0..y1).any(|y| {
+            (x0..x1).any(|x| {
+                let px = frame.pixel(x, y);
+                (0..3).any(|i| (px[i] as i32 - bg[i] as i32).abs() > INK_THRESHOLD)
+            })
+        })
+    };
+    let char_at = |col: u16, row: u16| snapshot.cell(col, row).map(|c| c.ch).unwrap_or(' ');
+
+    // Every printable cell **of the marker row** must carry ink.
+    //
+    // Scoped to that row deliberately, and the scope is the assertion's whole
+    // correctness. Everything else on this screen is the developer's *real* zsh
+    // prompt: `Pty::spawn` chains the user's own `.zshrc` on purpose
+    // (shell-integration D13), so p10k, starship and a Nerd Font are supported
+    // configurations rather than accidents. The renderer, equally deliberately,
+    // emits no glyph instance for a codepoint no loaded face covers (`atlas.rs`),
+    // and the loaded set is Menlo / SF Mono / AppleSDGothicNeo — no Powerline
+    // separators, no private-use glyphs, no emoji. Asserted over the whole grid
+    // this test would therefore fail on any machine whose prompt uses one, while
+    // the terminal renders exactly as designed, and the failure would be neither
+    // reproducible elsewhere nor fixable in this crate.
+    //
+    // The marker row carries none of that ambiguity: this test produced it, it is
+    // plain ASCII, and it is the thing the test's name claims — output from a real
+    // shell that reached real pixels.
+    //
+    // The converse is not asserted at all. A glyph may bleed a pixel of
+    // antialiasing past its advance width into the blank cell beside it —
+    // measured, not assumed: the `%` in this prompt inks the empty cells on both
+    // sides of it. That is correct rendering. `golden_frame.rs` states the same
+    // asymmetry from the constructed-snapshot side.
+    let row_text = |row: u16| (0..cols).map(|c| char_at(c, row)).collect::<String>();
+    let marker_row = (0..rows)
+        .find(|&row| row_text(row).contains(MARKER))
+        .unwrap_or_else(|| panic!("{MARKER:?} is in the grid text but on no row of the snapshot"));
+
+    let missing: Vec<String> = (0..cols)
+        .filter(|&col| {
+            let c = char_at(col, marker_row);
+            !c.is_whitespace() && c != '\0' && !cell_has_ink(col, marker_row)
+        })
+        .map(|col| {
+            format!(
+                "({col},{marker_row}) holds {:?} but drew nothing",
+                char_at(col, marker_row)
+            )
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} cells of the shell's own output reached the grid and not the GPU:\n{}",
+        missing.len(),
+        missing.join("\n")
+    );
+
+    let inked = (0..rows)
+        .flat_map(|row| (0..cols).map(move |col| (col, row)))
+        .filter(|&(col, row)| cell_has_ink(col, row))
+        .count();
     assert!(
         inked > 0,
         "the frame is a solid field of {bg:?}: the shell produced output that \
          reached the grid, and none of it reached the GPU"
     );
-    assert!(
-        missing.is_empty(),
-        "{} cells hold text that was never drawn:\n{}",
-        missing.len(),
-        missing.join("\n")
-    );
     // Guards the metric itself: a frame where every cell reads as ink — an
-    // uncleared target, say — would satisfy the assertion above trivially.
+    // uncleared target, say — would satisfy the assertions above trivially.
     let total = cols as usize * rows as usize;
     assert!(
         inked < total,

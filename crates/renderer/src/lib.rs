@@ -57,6 +57,13 @@ pub enum RendererError {
     NoFont(String),
     #[error("could not acquire next frame ({0})")]
     Frame(&'static str),
+    /// A GPU readback in [`Renderer::capture`] failed. Carries a `String` rather
+    /// than a `&'static str` because every cause here — a device poll timeout, a
+    /// failed buffer map, an unavailable mapped range — reports its own detail,
+    /// and folding that into a fixed message would leave the caller with nothing
+    /// to act on.
+    #[error("could not read back the rendered frame: {0}")]
+    Capture(String),
 }
 
 pub type Result<T> = std::result::Result<T, RendererError>;
@@ -1105,7 +1112,14 @@ impl Renderer {
     /// Costs a texture, a buffer and a device stall per call, so it belongs in tests
     /// and benches, not on the frame path — `draw_to` is that path, and this wraps it
     /// rather than reimplementing it, so the two can never drift.
-    pub fn capture(&mut self, snapshot: &GridSnapshot) -> CapturedFrame {
+    ///
+    /// Returns [`RendererError::Capture`] rather than panicking. Its callers are all
+    /// tests today, which makes an `unwrap` tempting, but this is `pub` library code
+    /// on a path with real runtime failures — a lost device, a rejected map — and the
+    /// crate's rule is a `thiserror` enum, with `unwrap` confined to tests. A test
+    /// that wants a panic writes `.expect(..)` at the call site and gets the cause in
+    /// the message; the reverse cannot be recovered.
+    pub fn capture(&mut self, snapshot: &GridSnapshot) -> Result<CapturedFrame> {
         let (width, height) = (self.config.width, self.config.height);
         let target = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("capture-target"),
@@ -1165,10 +1179,26 @@ impl Renderer {
         // the finished frame.
         self.queue.submit(std::iter::once(encoder.finish()));
 
+        // Three results, all of which have to be read. `poll` returning `Ok` says
+        // the queue drained, not that the mapping succeeded, and the map's own
+        // outcome is reported *only* through the callback — so discarding either
+        // (the `|_| {}` and `let _ =` this replaces) turned a device loss into an
+        // unexplained panic on the `get_mapped_range` line below.
         let slice = readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-        let mapped = slice.get_mapped_range().expect("capture buffer mapped");
+        let (map_tx, map_rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = map_tx.send(res);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| RendererError::Capture(format!("device poll failed: {e}")))?;
+        map_rx
+            .recv()
+            .map_err(|_| RendererError::Capture("map callback never ran (device lost?)".into()))?
+            .map_err(|e| RendererError::Capture(format!("buffer map failed: {e}")))?;
+        let mapped = slice
+            .get_mapped_range()
+            .map_err(|e| RendererError::Capture(format!("mapped range unavailable: {e}")))?;
 
         // Normalise to RGBA so callers never branch on the target's channel order
         // (the headless target is BGRA; a surface may be either).
@@ -1191,11 +1221,11 @@ impl Renderer {
         drop(mapped);
         readback.unmap();
 
-        CapturedFrame {
+        Ok(CapturedFrame {
             width,
             height,
             pixels,
-        }
+        })
     }
 }
 

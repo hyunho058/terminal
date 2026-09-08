@@ -30,7 +30,8 @@ pub struct TabId(pub u64);
 /// [`Session::write`] (a terminal that types nothing) left the workspace suite at
 /// 1460 passed / 0 failed.
 ///
-/// `main` passes a closure over the real proxy; a test passes a recorder.
+/// `App::start` passes a closure over the real `EventLoopProxy` — it is the one
+/// place in the app that makes one. A test passes a recorder.
 pub type Wake = Box<dyn Fn(TabId) + Send + 'static>;
 
 /// Mints a fresh [`Wake`] per session.
@@ -225,9 +226,6 @@ impl Session {
     ///
     /// Flags the tab dirty on a real change so the event loop resyncs + redraws at once,
     /// including for a background tab. Returns whether anything changed.
-    // Allowed dead until the rename field (T4) and the card menu (T6) call it — the same
-    // convention `seam.rs` uses for a seam landed one task ahead of its first consumer.
-    #[allow(dead_code)]
     pub fn set_user_title(&mut self, title: Option<String>) -> bool {
         let next = normalize_user_title(title);
         if next == self.user_title {
@@ -294,7 +292,12 @@ pub(crate) fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
             size,
         )
     };
-    if n < size {
+    // `!=`, not `<`: `proc_pidinfo` answers exactly `size` on success and 0 or -1
+    // on failure, so the two forms are equivalent — but `<` also admits a `>`
+    // mutant that no test can kill, and an equivalent mutant in the report costs
+    // more than the character it saves. Same shape as `tabmeta::proc`'s other
+    // three `proc_pidinfo` guards.
+    if n != size {
         return None; // error or short read
     }
     // pvi_cdir.vip_path is a fixed 1024-byte, NUL-terminated C path.
@@ -389,8 +392,10 @@ mod tests {
     // ---------------------------------------------------------------------
     // The title channels (sticky-tab-title D3/D5, R1.1/R1.3/R2.2/R2.3).
     //
-    // Added after a `cargo mutants` run over this file: of 39 mutants, 16
-    // survived, and all but two of those were in this precedence machinery.
+    // Added after a `cargo mutants` run over this file: 16 mutants survived, and
+    // all but two of those were in this precedence machinery. (Survivors, not a
+    // ratio — the total moves with every edit to the file, and three different
+    // ones for this same run were recorded in three places. See CLAUDE.md.)
     // `set_user_title` could be made to return a constant `true` or `false`, its
     // `==` could be flipped to `!=`, `user_title` could answer `Some("xyzzy")`,
     // `program_title` could answer `""` — and the whole workspace suite stayed

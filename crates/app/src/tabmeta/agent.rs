@@ -121,7 +121,8 @@ fn classify_install_path(path: &Path) -> Option<AgentKind> {
 ///
 /// `#[allow(dead_code)]` rather than `#[cfg(test)]`: `tmux.rs`'s doc comment carries an
 /// intra-doc link to this function, which a `cfg(test)` gate would break in every non-test
-/// build. The same disposition `presence_fd.rs` takes for `conversation_of_pid`.
+/// build. This is one of the three allows in the crate that rustc still enforces — see the
+/// visibility note in `lib.rs` for why the others were removed rather than kept.
 ///
 /// Do **not** "simplify" this away by pointing `classify_pid` back here — that is precisely
 /// the change that reintroduces `agent-classifier-deleted-binary`.
