@@ -159,7 +159,20 @@ impl Tabs {
     }
 
     /// Re-theme every tab's default cell colors live (settings feature, R3.3).
+    ///
+    /// Updates the set's **own** defaults as well as the open tabs. Those are one
+    /// fact held in two places — the colors each live `Terminal` paints a blank
+    /// cell in, and the colors [`Tabs::open`] hands the next `Session::spawn` —
+    /// and letting them drift is invisible right up until someone opens a tab:
+    /// every tab on screen re-themes correctly, and then the next Cmd+T produces
+    /// one wearing the *previous* theme, on a path no later re-theme revisits.
+    ///
+    /// Iterating `self.sessions` alone is the shape a test that also only iterates
+    /// `self.sessions` cannot fail on, which is why this went unnoticed through a
+    /// mutation sweep of this file.
     pub fn set_default_colors_all(&mut self, fg: Color, bg: Color) {
+        self.fg = fg;
+        self.bg = bg;
         for s in &mut self.sessions {
             s.terminal.set_default_colors(fg, bg);
         }
@@ -544,6 +557,33 @@ mod tests {
             assert_eq!(cell.bg, bg2, "tab {} kept the old background", s.id.0);
             assert_eq!(cell.fg, fg2, "tab {} kept the old foreground", s.id.0);
         }
+    }
+
+    #[test]
+    fn a_tab_opened_after_a_re_theme_wears_the_new_theme() {
+        // The half the test above structurally cannot see. It iterates the tabs
+        // that already exist, so a setter that re-themes them and forgets the set's
+        // own `fg`/`bg` passes it — and `Tabs::open` spawns from exactly those, so
+        // the drift surfaces only on the *next* Cmd+T. Reported as a real defect:
+        // edit `theme.background`, watch every open tab re-theme, press Cmd+T, and
+        // the new tab comes up on the old background.
+        let mut tabs = tabs_with(1);
+        let (fg2, bg2) = (Color(0x00FF00), Color(0x123456));
+        tabs.set_default_colors_all(fg2, bg2);
+
+        tabs.open(80, 24).expect("open a tab after the re-theme");
+        let snap = tabs.active().terminal.snapshot();
+        let cell = snap
+            .cell(snap.cols - 1, snap.rows - 1)
+            .expect("corner cell");
+        assert_eq!(
+            cell.bg, bg2,
+            "a tab opened after the re-theme was spawned with the old background"
+        );
+        assert_eq!(
+            cell.fg, fg2,
+            "a tab opened after the re-theme was spawned with the old foreground"
+        );
     }
 
     #[test]
