@@ -1120,6 +1120,17 @@ impl Renderer {
     /// that wants a panic writes `.expect(..)` at the call site and gets the cause in
     /// the message; the reverse cannot be recovered.
     pub fn capture(&mut self, snapshot: &GridSnapshot) -> Result<CapturedFrame> {
+        // Refused here, before a texture, a buffer and a device stall are spent on
+        // a frame that could not be decoded anyway.
+        let Some(bgra) = capture_channel_order(self.config.format) else {
+            return Err(RendererError::Capture(format!(
+                "target format {:?} is not an 8-bit, four-channel layout, so the \
+                 readback cannot be decoded. Widening this means teaching \
+                 `capture_channel_order` and the normalisation loop the new \
+                 layout, not relaxing the check.",
+                self.config.format
+            )));
+        };
         let (width, height) = (self.config.width, self.config.height);
         let target = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("capture-target"),
@@ -1200,12 +1211,7 @@ impl Renderer {
             .get_mapped_range()
             .map_err(|e| RendererError::Capture(format!("mapped range unavailable: {e}")))?;
 
-        // Normalise to RGBA so callers never branch on the target's channel order
-        // (the headless target is BGRA; a surface may be either).
-        let bgra = matches!(
-            self.config.format,
-            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
-        );
+        // Normalise to RGBA so callers never branch on the target's channel order.
         let mut pixels = Vec::with_capacity((unpadded * height) as usize);
         for row in 0..height {
             let start = (row * padded) as usize;
@@ -1226,6 +1232,34 @@ impl Renderer {
             height,
             pixels,
         })
+    }
+}
+
+/// Whether [`Renderer::capture`] can decode `format`, and if so whether its
+/// channels arrive as BGRA rather than RGBA.
+///
+/// `Some(true)` = BGRA, `Some(false)` = RGBA, `None` = refuse.
+///
+/// The readback is not format-agnostic and never was. Its row pitch is
+/// `width * 4` and its normalisation walks `chunks_exact(4)`, so every step
+/// assumes four bytes per pixel with one byte per channel. What used to stand in
+/// for this check was a bare `matches!` on the two BGRA variants, whose `false`
+/// arm meant "RGBA" rather than "unknown" — so any other format was decoded as
+/// RGBA and returned as `Ok`.
+///
+/// That is reachable. `new_headless` pins `Bgra8UnormSrgb`, but `capture` is
+/// `pub` and reads `self.config.format`, which on the windowed path comes from
+/// `surface.get_default_config`, and on macOS that can be `Rgba16Float` for an
+/// EDR display or `Rgb10a2Unorm`. At eight bytes per pixel every `pixel(x, y)`
+/// would be half of one channel pair: `modal_pixel`, `is_ink` and every golden
+/// assertion would go on measuring noise, with nothing to act on. A method whose
+/// whole purpose is to report what a frame contains must not answer confidently
+/// when it cannot read it.
+fn capture_channel_order(format: wgpu::TextureFormat) -> Option<bool> {
+    match format {
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => Some(true),
+        wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => Some(false),
+        _ => None,
     }
 }
 
@@ -1896,6 +1930,35 @@ mod tests {
         }))
         .ok()?;
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+    }
+
+    /// `capture` decodes the two 8-bit layouts and refuses everything else.
+    ///
+    /// A pure decision, so it is asserted without a GPU — which matters, because
+    /// the formats that used to be mis-decoded are exactly the ones this machine
+    /// cannot easily produce. The old code was a `matches!` on the BGRA pair whose
+    /// `false` arm meant "RGBA" rather than "unknown", so the two macOS surface
+    /// formats below were read as BGRA at half their real stride and returned as
+    /// `Ok`.
+    #[test]
+    fn capture_decodes_8_bit_layouts_and_refuses_the_rest() {
+        use wgpu::TextureFormat as F;
+        assert_eq!(capture_channel_order(F::Bgra8UnormSrgb), Some(true));
+        assert_eq!(capture_channel_order(F::Bgra8Unorm), Some(true));
+        assert_eq!(capture_channel_order(F::Rgba8UnormSrgb), Some(false));
+        assert_eq!(capture_channel_order(F::Rgba8Unorm), Some(false));
+
+        // What `surface.get_default_config` can actually hand us on macOS: an EDR
+        // display's float surface, and a 10-bit one. Both are wider than four
+        // bytes per pixel or not byte-aligned per channel.
+        assert_eq!(
+            capture_channel_order(F::Rgba16Float),
+            None,
+            "an EDR surface is 8 bytes per pixel; decoding it as RGBA8 reads half \
+             of one channel pair per 'pixel'"
+        );
+        assert_eq!(capture_channel_order(F::Rgb10a2Unorm), None);
+        assert_eq!(capture_channel_order(F::Rgba32Float), None);
     }
 
     /// The primary face of the loaded chain (T2). `None` when no system font is
