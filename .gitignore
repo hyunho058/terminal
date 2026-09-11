@@ -15,3 +15,9 @@ specs/*/progress.md
 # cargo-mutants working output (see .cargo/mutants.toml)
 /mutants.out/
 /mutants.out.old/
+
+# Ad-hoc raw PTY captures kept at the repo root while debugging the vte parser
+# (escape sequences dumped straight off the master fd). Local scratch, not a
+# fixture: a capture the tests depend on belongs in a crate's tests/ directory
+# and tracked. Anchored to the root so it cannot hide one that does.
+/agy_raw.bin
