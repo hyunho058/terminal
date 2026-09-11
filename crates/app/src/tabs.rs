@@ -339,7 +339,7 @@ mod tests {
     /// here is a real zsh, which is what these tests are buying — the lifecycle,
     /// not the arithmetic — so there is nothing to run without one.
     fn tabs_with(n: usize) -> Option<Tabs> {
-        if !crate::session::shell_tests_enabled() {
+        if !term_core::testing::shell_tests_enabled() {
             return None;
         }
         let wake = silent_wake();

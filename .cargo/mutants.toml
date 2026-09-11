@@ -18,10 +18,22 @@
 # baseline with "cargo test failed in an unmutated tree".
 copy_vcs = true
 
-# The tests that can catch a mutant in this workspace all live in `app`,
-# `renderer` or `term-core`, and running the other packages' suites per mutant
-# buys nothing. Narrow further with --cargo-test-arg when scoping to one crate.
-additional_cargo_test_args = []
+# There is deliberately no `additional_cargo_test_args` here. The key held `[]`,
+# which is the default and therefore changed nothing, under a comment claiming it
+# narrowed each mutant's test run to `app`/`renderer`/`term-core` — so a reader
+# following the comment paid for the full workspace suite on every one of ~6300
+# mutants and believed otherwise.
+#
+# Encoding that narrowing would have been worse than the no-op: the claim behind it
+# is false. `common` has 39 tests and `ai-monitor` 204, and `-p app -p renderer
+# -p term-core` would make every mutant in those two crates survive for the sole
+# reason that nothing ran to kill them — false survivors, in a report whose only
+# value is that a survivor means something.
+#
+# Narrowing belongs at the call site, where the scope is known, and it composes
+# with the `-f` above:
+#
+#   cargo mutants -f crates/renderer/src/atlas.rs --cargo-test-arg -p --cargo-test-arg renderer
 
 # Mutants that are *equivalent* — they change the source without changing
 # behaviour, so no test can kill them and leaving them reported would train

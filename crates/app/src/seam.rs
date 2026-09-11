@@ -56,6 +56,13 @@ pub struct KeyInput {
 ///
 /// A handler matching on `physical` must read this as *not my key*, never as a wildcard: a
 /// chord that fired on an unknown position would be a chord nobody pressed.
+///
+/// `#[cfg(test)]` because only a test ever builds a `KeyInput` without a position:
+/// the one production site (`terminal_app`'s `KeyboardInput` arm) copies
+/// `key_event.physical_key` straight from winit. Restoring it to production is
+/// deleting this attribute — which is a decision someone makes when a real caller
+/// appears, rather than an `#[allow(dead_code)]` promising one indefinitely.
+#[cfg(test)]
 pub const NO_PHYSICAL: PhysicalKey =
     PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified);
 

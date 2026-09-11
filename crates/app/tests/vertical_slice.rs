@@ -17,10 +17,11 @@
 
 use std::time::{Duration, Instant};
 
-use app::input::encode_key;
-use app::session::{Session, TabId, Wake};
+use app::encode_key;
+use app::{Session, TabId, Wake};
 use common::config::Config;
-use renderer::{Renderer, RendererError};
+use renderer::testing::{holds_text, CellGeometry};
+use renderer::Renderer;
 use term_core::Color;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
@@ -31,11 +32,6 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(15);
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
-
-/// A pixel counts as ink when any channel differs from the background by more
-/// than this. Same margin, and same reasoning, as `renderer/tests/golden_frame.rs`:
-/// well above antialiasing noise, well below the contrast of a legible glyph.
-const INK_THRESHOLD: i32 = 24;
 
 fn fg_bg() -> (Color, Color) {
     let cfg = Config::default();
@@ -50,8 +46,11 @@ fn fg_bg() -> (Color, Color) {
 /// a spawned one, so a session that demanded a proxy would be permanently
 /// unreachable from here.
 fn live_session() -> Option<Session> {
-    if std::env::var_os("SKIP_SHELL_TESTS").is_some() {
-        eprintln!("SKIP_SHELL_TESTS set; skipping the vertical slice");
+    // `term_core::testing`, not a copy of the check: this file wrote the
+    // `SKIP_SHELL_TESTS` contract down first and then three more copies of it
+    // appeared, because the version extracted into `app::session` was
+    // `#[cfg(test)]` and an integration test is a separate crate.
+    if !term_core::testing::shell_tests_enabled() {
         return None;
     }
     let (fg, bg) = fg_bg();
@@ -89,42 +88,12 @@ const FRAME_H: u32 = 800;
 
 /// The headless renderer, or `None` when GPU tests are opted out of.
 ///
-/// Mirrors `renderer/tests/golden_frame.rs::headless`, and for the reason stated
-/// there: a helper that turns "the renderer would not start" into a **passing**
-/// test reproduces in the harness the exact failure these tests exist to detect.
-/// This function had precisely that shape — every `RendererError` was a bare
-/// `return` with a line to stderr — and no environment variable gated it, so the
-/// skip was nobody's decision.
-///
-/// The two failures are split because they are not the same kind of fact.
-/// `Renderer::new_headless` calls `FontSet::load()` *before* it requests an
-/// adapter, so `NoFont` arrives on every machine, GPU or not: it means the
-/// Menlo / SF Mono / AppleSDGothicNeo chain stopped resolving, which is a
-/// regression in the code under test. Break it and the renderer crate's golden
-/// frames go red while this test — the only one spanning keystroke → shell → grid
-/// → GPU — reported ok. That case therefore fails unconditionally, and
-/// `SKIP_GPU_TESTS` does not cover it, because a machine without a GPU still has
-/// fonts.
+/// `renderer::testing`, not a copy. The `NoFont`-is-never-skipped rule this
+/// function's own comment used to justify was stated *here* and not honoured in
+/// `golden_frame.rs`, which is the file it delegates the font pipeline to — so on
+/// the headless runner that sets `SKIP_GPU_TESTS`, the rule protected nothing.
 fn headless_renderer(cfg: &Config) -> Option<Renderer> {
-    match Renderer::new_headless(FRAME_W, FRAME_H, 1.0, cfg) {
-        Ok(r) => Some(r),
-        Err(RendererError::NoFont(tried)) => panic!(
-            "no usable monospace font (tried {tried}). This is the font pipeline \
-             failing, not a missing GPU — it is decided before any adapter is \
-             requested — so SKIP_GPU_TESTS deliberately does not opt out of it."
-        ),
-        Err(e) => {
-            if std::env::var_os("SKIP_GPU_TESTS").is_some() {
-                eprintln!("SKIP_GPU_TESTS set; skipping the pixel leg: {e}");
-                return None;
-            }
-            panic!(
-                "headless renderer unavailable ({e}). This is the only test that \
-                 spans keystroke → shell → grid → GPU, so it fails rather than \
-                 skipping. Set SKIP_GPU_TESTS=1 to opt out deliberately."
-            );
-        }
-    }
+    renderer::testing::headless(FRAME_W, FRAME_H, cfg, "the pixel leg")
 }
 
 /// Press Return, through the same encoder.
@@ -228,28 +197,14 @@ fn shell_output_reaches_actual_pixels() {
     let frame = r.capture(&snapshot).expect("read the rendered frame back");
     let bg = frame.modal_pixel();
 
-    let (cw, ch) = r.cell_size();
-    let (ox, oy) = (r.left_inset(), r.top_inset());
-    let (cols, rows) = r.grid_size();
-    let (cols, rows) = (cols.min(snapshot.cols), rows.min(snapshot.rows));
-
-    // floor on both edges, so adjacent cells tile without overlapping and a
-    // neighbour's pixel is never counted twice. `renderer/tests/golden_frame.rs`
-    // derives its cell rect the same way, and the two have to stay that way — a
-    // disagreement would make "this cell holds ink" mean something different on
-    // each side of the same contract.
-    let cell_has_ink = |col: u16, row: u16| {
-        let x0 = (ox + col as f32 * cw).max(0.0) as u32;
-        let y0 = (oy + row as f32 * ch).max(0.0) as u32;
-        let x1 = ((ox + (col + 1) as f32 * cw).max(0.0) as u32).min(frame.width());
-        let y1 = ((oy + (row + 1) as f32 * ch).max(0.0) as u32).min(frame.height());
-        (y0..y1).any(|y| {
-            (x0..x1).any(|x| {
-                let px = frame.pixel(x, y);
-                (0..3).any(|i| (px[i] as i32 - bg[i] as i32).abs() > INK_THRESHOLD)
-            })
-        })
-    };
+    // The cell rect and the ink threshold come from `renderer::testing`, shared with
+    // `renderer/tests/golden_frame.rs`. Both files derived them by hand, each under
+    // a comment saying the two "have to agree" — and they did not: this side
+    // truncated the far edge of the rect where the other floored it after clamping,
+    // so "this cell holds ink" already meant two things.
+    let geo = CellGeometry::of(&r);
+    let (cols, rows) = (geo.cols().min(snapshot.cols), geo.rows().min(snapshot.rows));
+    let cell_has_ink = |col: u16, row: u16| geo.cell_has_ink(&frame, bg, col, row);
     let char_at = |col: u16, row: u16| snapshot.cell(col, row).map(|c| c.ch).unwrap_or(' ');
 
     // Every printable cell **of the marker row** must carry ink.
@@ -281,10 +236,7 @@ fn shell_output_reaches_actual_pixels() {
         .unwrap_or_else(|| panic!("{MARKER:?} is in the grid text but on no row of the snapshot"));
 
     let missing: Vec<String> = (0..cols)
-        .filter(|&col| {
-            let c = char_at(col, marker_row);
-            !c.is_whitespace() && c != '\0' && !cell_has_ink(col, marker_row)
-        })
+        .filter(|&col| holds_text(&snapshot, col, marker_row) && !cell_has_ink(col, marker_row))
         .map(|col| {
             format!(
                 "({col},{marker_row}) holds {:?} but drew nothing",

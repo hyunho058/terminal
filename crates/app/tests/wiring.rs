@@ -32,8 +32,8 @@
 //! storing the set, and `resumed` calling `install()`. Both need an `App`, which
 //! needs an `EventLoopProxy`, which no test on this platform can obtain.
 
-use app::seam::Overlay;
-use app::tabmeta::TabMetaHandle;
+use app::Overlay;
+use app::TabMetaHandle;
 use app::{feature_handlers, feature_overlays, feature_registrations};
 
 /// Priorities as the registered set actually reports them, highest first.

@@ -31,42 +31,59 @@
 // Measured: an unreferenced `pub fn` added to `tabs.rs` passed
 // `cargo clippy -p app -- -D warnings` clean.
 //
-// So a module is `pub` only where something outside the crate genuinely names it
-// — `main.rs` or a test — and `pub(crate)` otherwise, which puts the lint back.
+// Narrowing the *modules* was not enough, and the first attempt at this comment
+// claimed it was. Reachability does not stop at the module: every `pub` item
+// inside a `pub mod` of a library is still reachable, so the six modules left
+// `pub` below — `input` alone carries 105 tests' worth of helpers — kept the whole
+// crate's largest files exempt. Measured again after that change, with the same
+// probe: an unreferenced `pub fn` added to `input.rs` still passed
+// `cargo clippy -p app -- -D warnings` clean.
+//
+// So no module is `pub`. Each is `pub(crate)`, and the handful of items something
+// outside the crate genuinely names are re-exported by name below. That list is
+// the crate's real public surface, written down in one place, and everything not
+// on it is back under the lint.
 pub(crate) mod card_menu;
 pub(crate) mod clipboard;
 pub(crate) mod copy;
 pub(crate) mod dashboard;
 pub(crate) mod hyperlink;
-/// `crates/app/tests/vertical_slice.rs` types through the real `encode_key`.
-pub mod input;
+pub(crate) mod input;
 pub(crate) mod overlay;
 pub(crate) mod presence_fd;
 pub(crate) mod prompt;
 pub(crate) mod rename;
-/// The SD4 seam. Named in `terminal_app`'s and this module's public signatures,
-/// and asserted by `crates/app/tests/wiring.rs`.
-pub mod seam;
-/// `crates/app/tests/vertical_slice.rs` drives a real shell through it.
-pub mod session;
+pub(crate) mod seam;
+pub(crate) mod session;
 pub(crate) mod settings;
-/// `main.rs` installs `SidebarMetaSource` into the shared sidebar model.
-pub mod sidebar_model;
-/// `main.rs` spawns and installs the process-global metadata worker.
-pub mod tabmeta;
+pub(crate) mod sidebar_model;
+pub(crate) mod tabmeta;
 pub(crate) mod tabs;
 pub(crate) mod tabsession;
-/// `main.rs` builds and runs the `App`.
-pub mod terminal_app;
+pub(crate) mod terminal_app;
 pub(crate) mod waiting;
+
+// The crate's entire public surface. Each line names its one consumer, because
+// that consumer is the only thing keeping the item out of the dead-code lint.
+/// `crates/app/tests/vertical_slice.rs` types through the real encoder.
+pub use input::encode_key;
+/// The SD4 seam: named in the signatures below and asserted by
+/// `crates/app/tests/wiring.rs`.
+pub use seam::{InputHandler, Overlay, Registrations};
+/// `crates/app/tests/vertical_slice.rs` drives a real shell through a session.
+pub use session::{Session, TabId, Wake};
+/// `main.rs` installs the sidebar's metadata source.
+pub use sidebar_model::SidebarMetaSource;
+/// `main.rs` spawns the process-global metadata worker and installs its handle.
+pub use tabmeta::{install as install_tabmeta, TabMetaHandle};
+/// `main.rs` builds and runs the app.
+pub use terminal_app::{App, UserEvent};
 
 use winit::event_loop::EventLoopProxy;
 
 use clipboard::{ClipboardHandler, ImagePresenter};
 use copy::{CopyHandler, SelectionPresenter};
 use overlay::AiMonitorOverlay;
-use seam::{InputHandler, Overlay, Registrations};
-use terminal_app::UserEvent;
 
 /// Everything `main` hands to [`terminal_app::App::new`], assembled.
 ///

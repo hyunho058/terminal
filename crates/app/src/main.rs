@@ -11,8 +11,7 @@
 
 use winit::event_loop::{ControlFlow, EventLoop};
 
-use app::terminal_app::{App, UserEvent};
-use app::{feature_registrations, sidebar_model, tabmeta};
+use app::{feature_registrations, App, SidebarMetaSource, TabMetaHandle, UserEvent};
 
 fn main() {
     common::logging::init();
@@ -36,26 +35,25 @@ fn main() {
     // status and wakes the loop via OverlayPending. Started *before* the app,
     // because only the process-global half belongs in this file.
     //
-    // What stays here is what a library genuinely cannot own: `tabmeta::install`
+    // What stays here is what a library genuinely cannot own: `install_tabmeta`
     // and `TabModelHandle::shared` install singletons, so a test that ran this
     // would leak them into every other test in the binary. What does *not* stay
     // here is the pump's registration — that is an ordinary decision, it now
     // travels in the value below, and `crates/app/tests/wiring.rs` asserts it.
-    let meta = tabmeta::TabMetaHandle::spawn({
+    let meta = TabMetaHandle::spawn({
         let proxy = proxy.clone();
         move || {
             let _ = proxy.send_event(UserEvent::OverlayPending);
         }
     });
     if let Some(handle) = &meta {
-        tabmeta::install(handle.clone());
+        app::install_tabmeta(handle.clone());
         // Push the display toggles to the worker (D12 of tab-metadata), and install the
         // metadata pull adapter into the shared sidebar model (D10) so the sidebar shows
         // each tab's git branch + agent state.
         handle.set_enabled(show_git_branch, show_agent_status);
-        renderer::sidebar_row::TabModelHandle::shared().set_meta_source(std::rc::Rc::new(
-            sidebar_model::SidebarMetaSource::new(handle.clone()),
-        ));
+        renderer::sidebar_row::TabModelHandle::shared()
+            .set_meta_source(std::rc::Rc::new(SidebarMetaSource::new(handle.clone())));
     }
 
     // Feature extensions arrive through the SD4 seam (no terminal_app edits), as

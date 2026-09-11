@@ -34,29 +34,6 @@ pub struct TabId(pub u64);
 /// place in the app that makes one. A test passes a recorder.
 pub type Wake = Box<dyn Fn(TabId) + Send + 'static>;
 
-/// Whether tests that need a real `/bin/zsh` may run.
-///
-/// `crates/app/tests/vertical_slice.rs` has documented `SKIP_SHELL_TESTS=1` as
-/// the way to run this workspace on a machine with no usable shell since it was
-/// written. It was only ever honoured by that file: the unit tests in this module
-/// and in `tabs.rs` open a shell per fixture and did so unconditionally, so
-/// setting the variable still left `cargo test -p app` panicking in the lib
-/// target. The opt-out is a contract or it is nothing, so it lives here, where
-/// both modules can reach it.
-///
-/// Note what this deliberately does **not** do: it never turns a *failed* spawn
-/// into a skip. A machine that has zsh and cannot start it is reporting a defect,
-/// and the helpers below still panic on it. Only an explicit variable skips, so
-/// skipping is always someone's decision.
-#[cfg(test)]
-pub(crate) fn shell_tests_enabled() -> bool {
-    if std::env::var_os("SKIP_SHELL_TESTS").is_some() {
-        eprintln!("SKIP_SHELL_TESTS set; skipping a test that needs a real shell");
-        return false;
-    }
-    true
-}
-
 /// Mints a fresh [`Wake`] per session.
 ///
 /// [`Tabs`](crate::tabs::Tabs) spawns sessions on demand and so needs to produce
@@ -387,11 +364,12 @@ mod tests {
     /// a no-op — fine for the cwd tests it was written for, useless for anything that
     /// arrives *from* the shell. Everything the OSC channels do (titles, command-end)
     /// is only reachable through here.
-    /// `None` when shell tests are opted out of — see [`shell_tests_enabled`].
-    /// Returning an `Option` rather than gating inside each test is the point: a
-    /// new test that needs a shell cannot compile without handling the skip.
+    /// `None` when shell tests are opted out of — see
+    /// [`term_core::testing::shell_tests_enabled`]. Returning an `Option` rather than
+    /// gating inside each test is the point: a new test that needs a shell cannot
+    /// compile without handling the skip.
     fn session_with_feed() -> Option<(Session, mpsc::Sender<Vec<u8>>)> {
-        if !shell_tests_enabled() {
+        if !term_core::testing::shell_tests_enabled() {
             return None;
         }
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -602,36 +580,28 @@ mod tests {
         assert_eq!(got, Some(PathBuf::from("/a/b")));
     }
 
-    /// A real `Session` with no winit event loop.
+    /// A real `Session` with no winit event loop, and no sender for its reader
+    /// channel.
     ///
-    /// `EventLoopProxy` is a parameter of [`Session::spawn`], **not a field of `Session`** — so
-    /// the struct is constructible directly here, and `Session::cwd` (the actual subject of
-    /// R6.1) is measurable rather than merely arguable. Spawns a real `/bin/zsh` via
-    /// `Pty::spawn`, which is consistent with existing practice in this crate (`tabsession`
-    /// shells out to `/bin/ps`) and with the macOS-only rule.
+    /// No `EventLoopProxy` anywhere: [`Session::spawn`] takes a [`Wake`] callback and
+    /// `Session` holds no proxy, so the struct is constructible directly here and
+    /// `Session::cwd` (the actual subject of R6.1) is measurable rather than merely
+    /// arguable. Spawns a real `/bin/zsh` via `Pty::spawn`, which is consistent with
+    /// existing practice in this crate (`tabsession` shells out to `/bin/ps`) and with
+    /// the macOS-only rule.
     ///
-    /// `Tabs` genuinely is out of reach — it holds an `EventLoopProxy` as a field — but its
-    /// `active_cwd`/`titles` are thin wrappers whose only cwd cost is the `Session::cwd` call
-    /// measured here.
+    /// [`crate::tabs::Tabs`] is reachable the same way and for the same reason — it
+    /// holds a [`WakeSource`], not a proxy — and `tabs.rs` constructs one directly in
+    /// its own tests. An earlier version of this comment said the opposite ("`Tabs`
+    /// genuinely is out of reach — it holds an `EventLoopProxy` as a field"), which
+    /// would send a reader looking for a workaround that is no longer needed.
+    ///
+    /// Dropping `session_with_feed`'s sender is the entire difference between the two
+    /// fixtures: it leaves `rx` disconnected, so `drain` is a no-op. Building the
+    /// `Session` twice instead meant two copies of a twelve-field literal that had to
+    /// be edited in lockstep, 220 lines apart.
     fn live_session() -> Option<Session> {
-        if !shell_tests_enabled() {
-            return None;
-        }
-        let (_tx, rx) = mpsc::channel::<Vec<u8>>();
-        let pty = Pty::spawn(80, 24).expect("pty");
-        let writer = pty.writer().expect("writer");
-        Some(Session {
-            id: TabId(1),
-            terminal: Terminal::new(80, 24, Color::rgb(200, 200, 200), Color::rgb(0, 0, 0)),
-            pty,
-            writer,
-            rx,
-            user_title: None,
-            program_title: String::new(),
-            title_dirty: false,
-            command_end: None,
-            _reader: std::thread::spawn(|| {}),
-        })
+        session_with_feed().map(|(s, _tx)| s)
     }
 
     #[test]
