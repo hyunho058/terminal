@@ -631,6 +631,9 @@ mod tests {
 
     // ---- the live end-to-end gate (agent-classifier-deleted-binary R0.1, R3, R4.1) ----
 
+    /// Where the child writes its readiness marker; the parent puts the path here.
+    const READY_MARKER_VAR: &str = "AGENT_DEL_READY_MARKER";
+
     /// The child of `a_live_agent_survives_its_binary_being_deleted` — not a test of
     /// anything itself.
     ///
@@ -647,6 +650,12 @@ mod tests {
     #[test]
     #[ignore = "helper: spawned by a_live_agent_survives_its_binary_being_deleted"]
     fn deleted_binary_child_sleeper() {
+        // Reaching this line is the only thing that proves the child is *started* — dyld
+        // done, libtest up, this body entered — as opposed to merely exec'd. The parent
+        // cannot observe that from outside (see its readiness poll), so the child says so.
+        if let Some(marker) = std::env::var_os(READY_MARKER_VAR) {
+            std::fs::write(&marker, b"ready").expect("write the readiness marker");
+        }
         // Strictly longer than the parent's readiness budget (10s) plus its assertions, so a
         // slow runner cannot hand those assertions a child that is already on its way out —
         // which would surface as a confusing liveness failure rather than a timeout.
@@ -693,7 +702,9 @@ mod tests {
 
         // Spawn ONE named ignored test. With no arguments this would run the entire suite —
         // including this test, which spawns another copy, recursively.
+        let marker = dir.join("ready");
         let child = std::process::Command::new(&exe)
+            .env(READY_MARKER_VAR, &marker)
             .args([
                 "--exact",
                 "tabmeta::agent::tests::deleted_binary_child_sleeper",
@@ -707,20 +718,49 @@ mod tests {
         let mut guard = ChildGuard(child);
         let pid = guard.0.id();
 
-        // `spawn` returns once fork/exec is INITIATED. Unlinking before the child's `execve`
-        // lands would leave it never starting — rarely here, more often on a loaded runner.
+        // Wait for the child to be *started*, which is not the same as exec'd — and the
+        // difference was a 15%-per-run flake (23 failures in 150 standalone runs).
+        //
+        // The gate here used to be `exe_path(pid) == Some(exe)` alone, on the stated reasoning
+        // that "a process that exits at once never reports an exe path". That reasoning is
+        // false on macOS: `Command::spawn` goes through `posix_spawn`, which performs the exec
+        // *inside* the syscall, so the path is readable the instant `spawn` returns —
+        // **measured at 22µs**, against the ~700-850ms the child actually needs to finish dyld,
+        // start libtest and enter its own body. The gate proved the exec had landed and
+        // nothing more, and the rename + unlink below then ran while the child was still
+        // paging itself in.
+        //
+        // On Apple Silicon that is fatal, because every executable page is validated against
+        // the code signature as it faults in: a page whose file has been unlinked cannot be
+        // validated and the kernel SIGKILLs the process. That is the whole flake, and all
+        // three of its faces are one event seen at different moments —
+        // `try_wait` reporting `unix_wait_status(9)`, `name_of_pid` going `None`, and
+        // `classify_pid` going `None` with every input empty. It failed *more* standalone than
+        // under `cargo test --workspace`, which is backwards for a load-sensitive race and is
+        // the tell: a busy machine deschedules the parent and so hands the child more
+        // wall-clock to finish starting before the unlink.
+        //
+        // So the child now says when it is up ([`deleted_binary_child_sleeper`] writes
+        // `marker`), and this waits for that as well. It also makes the diagnostic below
+        // honest: a filter naming no test used to sail *past* this poll, because the exec had
+        // still happened.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            if super::super::proc::exe_path(pid).as_deref() == Some(exe.as_path()) {
+            if super::super::proc::exe_path(pid).as_deref() == Some(exe.as_path())
+                && marker.exists()
+            {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "child {pid} never exec'd {}; exe_path reads {:?}. This is the readiness \
-                 step failing, not the classifier — the likeliest cause is the `--exact` \
-                 filter naming no test, which makes libtest exit 0 immediately.",
+                "child {pid} never started {}; exe_path reads {:?}, marker written: {}. This \
+                 is the readiness step failing, not the classifier — the likeliest cause is \
+                 the `--exact` filter naming no test, which makes libtest exit 0 without ever \
+                 entering the child body, and which shows here as an exec that landed with no \
+                 marker behind it. Budget is 10s against a measured ~850ms worst case.",
                 exe.display(),
                 super::super::proc::exe_path(pid),
+                marker.exists(),
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
