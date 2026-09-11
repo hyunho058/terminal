@@ -30,6 +30,7 @@ pub mod sidebar_row;
 pub mod sidebar_shapes;
 pub mod sidebar_theme;
 pub mod tab_bar;
+pub mod testing;
 
 use atlas::{Atlas, GlyphKey};
 use bytemuck::{Pod, Zeroable};
@@ -1132,6 +1133,19 @@ impl Renderer {
             )));
         };
         let (width, height) = (self.config.width, self.config.height);
+        // Also refused before any GPU work. `new_headless` cannot produce a
+        // zero-sized config, but `capture` is `pub` and reads `self.config`, which
+        // on the windowed path follows the surface: a minimised or zero-sized
+        // window configures 0×0, and `create_texture` answers that with a wgpu
+        // validation *panic*, not an error this method could report. The same
+        // argument that made this return `Result` covers it.
+        if width == 0 || height == 0 {
+            return Err(RendererError::Capture(format!(
+                "the target is {width}x{height}; there is no frame to read back. \
+                 The surface is configured to a zero-sized window, so this is a \
+                 caller's timing question rather than a GPU failure."
+            )));
+        }
         let target = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("capture-target"),
             size: wgpu::Extent3d {
@@ -1212,9 +1226,14 @@ impl Renderer {
             .map_err(|e| RendererError::Capture(format!("mapped range unavailable: {e}")))?;
 
         // Normalise to RGBA so callers never branch on the target's channel order.
-        let mut pixels = Vec::with_capacity((unpadded * height) as usize);
-        for row in 0..height {
-            let start = (row * padded) as usize;
+        //
+        // Every product here widens to `usize` before multiplying. In `u32` a
+        // 4K-by-4K target already puts `row * padded` within a factor of four of
+        // wrapping, and the failure is silent in release: the offset wraps to a
+        // small number and the frame is assembled from the wrong rows.
+        let mut pixels = Vec::with_capacity(unpadded as usize * height as usize);
+        for row in 0..height as usize {
+            let start = row * padded as usize;
             let bytes = &mapped[start..start + unpadded as usize];
             for px in bytes.chunks_exact(4) {
                 if bgra {
@@ -1299,7 +1318,10 @@ impl CapturedFrame {
             self.width,
             self.height
         );
-        let i = ((y * self.width + x) * 4) as usize;
+        // Widened before the multiply: `(y * self.width + x) * 4` in `u32`
+        // overflows on a large frame, which debug-panics inside the accessor and
+        // in release wraps into a wrong — but in-bounds — pixel.
+        let i = (y as usize * self.width as usize + x as usize) * 4;
         [
             self.pixels[i],
             self.pixels[i + 1],

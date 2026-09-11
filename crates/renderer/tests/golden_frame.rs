@@ -12,22 +12,23 @@
 //! wraps `draw_to`, it does not re-implement it) and reading the result back. The
 //! contract they pin is deliberately font-independent: *which cells carry ink*,
 //! not what the ink looks like. A cell holding a printable character must contain
-//! pixels that differ from the background; an empty cell must not. That survives a
-//! font substitution or an OS antialiasing change, and still fails the instant the
-//! grid stops reaching the screen, the insets mis-place it, or a pipeline is
-//! dropped.
+//! pixels that differ from the background; a cell with no text anywhere near it
+//! must not. That survives a font substitution or an OS antialiasing change, and
+//! still fails the instant the grid stops reaching the screen, the insets mis-place
+//! it, or a pipeline is dropped.
+//!
+//! "Anywhere near" is the whole of the imprecision, and it is deliberate: a glyph
+//! may bleed antialiasing into the cell beside it, so the blank cell *next to* text
+//! is the one place these tests assert nothing. `renderer::testing::touches_text`
+//! is that rule, shared with `crates/app/tests/vertical_slice.rs` and applied by
+//! both the geometric test and the golden map below.
 //!
 //! Update the ink-map snapshot with `cargo insta review` (see `/insta-review`).
 
 use common::config::Config;
+use renderer::testing::{holds_text, is_ink, touches_text, CellGeometry};
 use renderer::{CapturedFrame, Renderer};
 use term_core::{Color, GridSnapshot, Terminal};
-
-/// A pixel counts as ink when any channel differs from the background by more
-/// than this. Well above antialiasing noise on the background side, well below
-/// the contrast of any legible glyph — the same margin the ai-monitor panel's
-/// readback test uses for "a glyph landed here".
-const INK_THRESHOLD: i32 = 24;
 
 /// Frame size. Large enough that the default cell metrics yield a grid worth
 /// asserting over, and a multiple of 4 in both axes so nothing depends on how a
@@ -35,97 +36,58 @@ const INK_THRESHOLD: i32 = 24;
 const FRAME_W: u32 = 1200;
 const FRAME_H: u32 = 800;
 
-/// Build the headless renderer, or fail loudly.
+/// The headless renderer, or `None` when GPU tests are opted out of.
 ///
-/// The crate's older GPU tests `return` when `new_headless` fails, which turns a
-/// missing adapter or a missing font into a **passing** test — the failure mode
-/// these tests exist to detect, reproduced in the harness. So this panics
-/// instead. `SKIP_GPU_TESTS=1` opts out explicitly for an environment that
-/// genuinely has no GPU; the point is that skipping has to be someone's decision
-/// rather than a silent default.
+/// The threshold, the cell rect, the ink predicate and this constructor all live
+/// in `renderer::testing`, shared with `crates/app/tests/vertical_slice.rs`. They
+/// were duplicated here, under comments in both files asserting the two copies
+/// "have to agree" — and they had already drifted in two ways. See that module.
 fn headless(cfg: &Config) -> Option<Renderer> {
-    match Renderer::new_headless(FRAME_W, FRAME_H, 1.0, cfg) {
-        Ok(r) => Some(r),
-        Err(e) => {
-            if std::env::var_os("SKIP_GPU_TESTS").is_some() {
-                eprintln!("SKIP_GPU_TESTS set; skipping golden frame: {e}");
-                return None;
-            }
-            panic!(
-                "headless renderer unavailable ({e}). The golden-frame tests are the \
-                 only check that anything reaches the screen, so this fails rather \
-                 than skipping. Set SKIP_GPU_TESTS=1 to opt out deliberately."
-            );
-        }
-    }
+    renderer::testing::headless(FRAME_W, FRAME_H, cfg, "the golden frames")
 }
 
-/// The grid's pixel geometry as the shader lays it out: origin at the insets,
-/// cells of `cell_size`.
-struct Geometry {
-    origin: (f32, f32),
-    cell: (f32, f32),
+/// A human-readable map of the rendered frame. This is what makes a golden frame
+/// reviewable — a byte hash would fail just as reliably and tell you nothing about
+/// *how*.
+///
+/// Three symbols, not two:
+///
+/// - `#` the cell carries ink
+/// - `.` the cell carries none
+/// - `~` the cell holds no text but touches text, so **either** is correct and the
+///   map records neither
+///
+/// The `~` is the same one-cell tolerance
+/// [`ink_lands_exactly_in_the_cells_that_hold_text`] argues for and the same
+/// [`touches_text`] predicate, and it is here because a snapshot that pins those
+/// cells pins a fact that is not one. This map used to read `#####.#####` for row
+/// 0: col 5 is the space in "hello world", and cols 4 and 6 hold `o` and `w`. The
+/// sibling test in this very file declares that exact cell untrustworthy — a glyph
+/// may bleed antialiasing past its advance width — so a font substitution (Menlo
+/// for SF Mono) or an OS antialiasing change would turn correct rendering into a
+/// red snapshot. What the map still pins exactly is every cell that holds text and
+/// every cell far from any, which is what catches a dropped row, a mis-derived
+/// pitch, an off-by-one inset and a smear.
+fn ink_map(
+    frame: &CapturedFrame,
+    geo: &CellGeometry,
+    snap: &GridSnapshot,
     cols: u16,
     rows: u16,
-}
-
-impl Geometry {
-    fn of(r: &Renderer) -> Geometry {
-        let (cols, rows) = r.grid_size();
-        Geometry {
-            origin: (r.left_inset(), r.top_inset()),
-            cell: r.cell_size(),
-            cols,
-            rows,
-        }
-    }
-
-    /// Half-open pixel bounds of one cell, clamped to the frame.
-    ///
-    /// `floor` on **both** edges, so consecutive cells tile exactly: this cell's
-    /// `x1` is the next one's `x0`. With `ceil` on the far edge — as this had —
-    /// neighbouring rects overlap by a pixel whenever the cell size is
-    /// fractional, and one glyph's outermost column reads as ink in two cells.
-    /// `crates/app/tests/vertical_slice.rs` derives the same rect the same way;
-    /// the two definitions have to agree or the "does this cell hold ink"
-    /// question means something different on each side.
-    fn cell_rect(&self, col: u16, row: u16, frame: &CapturedFrame) -> (u32, u32, u32, u32) {
-        let x0 = self.origin.0 + col as f32 * self.cell.0;
-        let y0 = self.origin.1 + row as f32 * self.cell.1;
-        let x1 = (x0 + self.cell.0).min(frame.width() as f32);
-        let y1 = (y0 + self.cell.1).min(frame.height() as f32);
-        (
-            x0.max(0.0).floor() as u32,
-            y0.max(0.0).floor() as u32,
-            x1.max(0.0).floor() as u32,
-            y1.max(0.0).floor() as u32,
-        )
-    }
-}
-
-fn is_ink(px: [u8; 4], bg: [u8; 4]) -> bool {
-    (0..3).any(|c| (px[c] as i32 - bg[c] as i32).abs() > INK_THRESHOLD)
-}
-
-/// Does this cell contain any pixel that is not the background?
-fn cell_has_ink(frame: &CapturedFrame, geo: &Geometry, bg: [u8; 4], col: u16, row: u16) -> bool {
-    let (x0, y0, x1, y1) = geo.cell_rect(col, row, frame);
-    (y0..y1).any(|y| (x0..x1).any(|x| is_ink(frame.pixel(x, y), bg)))
-}
-
-/// A human-readable map of the rendered frame: `#` where a cell carries ink,
-/// `.` where it does not. This is what makes a golden frame reviewable — a byte
-/// hash would fail just as reliably and tell you nothing about *how*.
-fn ink_map(frame: &CapturedFrame, geo: &Geometry, cols: u16, rows: u16) -> String {
+) -> String {
     let bg = frame.modal_pixel();
     let mut out = String::new();
-    for row in 0..rows.min(geo.rows) {
-        for col in 0..cols.min(geo.cols) {
-            out.push(if cell_has_ink(frame, geo, bg, col, row) {
-                '#'
-            } else {
-                '.'
-            });
+    for row in 0..rows.min(geo.rows()) {
+        for col in 0..cols.min(geo.cols()) {
+            out.push(
+                if !holds_text(snap, col, row) && touches_text(snap, col, row) {
+                    '~'
+                } else if geo.cell_has_ink(frame, bg, col, row) {
+                    '#'
+                } else {
+                    '.'
+                },
+            );
         }
         out.push('\n');
     }
@@ -207,34 +169,18 @@ fn ink_lands_exactly_in_the_cells_that_hold_text() {
     // Row 0 and row 2 carry text; row 1 is deliberately blank, so a renderer that
     // smears rows or mis-derives the row pitch fails here rather than looking fine.
     let (snap, frame) = render(&mut r, b"hello world\r\n\r\nsecond line");
-    let geo = Geometry::of(&r);
+    let geo = CellGeometry::of(&r);
     let bg = frame.modal_pixel();
 
-    let printable = |col: u16, row: u16| {
-        let ch = snap.cell(col, row).map(|c| c.ch).unwrap_or(' ');
-        !ch.is_whitespace() && ch != '\0'
-    };
-    // Does (col, row) or any of its eight neighbours hold a printable character?
-    let touches_text = |col: u16, row: u16| {
-        (-1i32..=1).any(|dy| {
-            (-1i32..=1).any(|dx| {
-                let (c, r) = (col as i32 + dx, row as i32 + dy);
-                (0..geo.cols as i32).contains(&c)
-                    && (0..geo.rows as i32).contains(&r)
-                    && printable(c as u16, r as u16)
-            })
-        })
-    };
-
     let mut wrong = Vec::new();
-    for row in 0..geo.rows {
-        for col in 0..geo.cols {
-            let has_ink = cell_has_ink(&frame, &geo, bg, col, row);
-            if printable(col, row) {
+    for row in 0..geo.rows() {
+        for col in 0..geo.cols() {
+            let has_ink = geo.cell_has_ink(&frame, bg, col, row);
+            if holds_text(&snap, col, row) {
                 if !has_ink {
                     wrong.push(format!("({col},{row}) holds text but drew nothing"));
                 }
-            } else if has_ink && !touches_text(col, row) {
+            } else if has_ink && !touches_text(&snap, col, row) {
                 wrong.push(format!(
                     "({col},{row}) drew ink, and neither it nor any cell touching it holds text"
                 ));
@@ -254,9 +200,9 @@ fn ink_lands_exactly_in_the_cells_that_hold_text() {
 fn the_rendered_frame_matches_its_golden_ink_map() {
     let cfg = Config::default();
     let Some(mut r) = headless(&cfg) else { return };
-    let (_, frame) = render(&mut r, b"hello world\r\n\r\nsecond line\r\n  indented");
-    let geo = Geometry::of(&r);
-    insta::assert_snapshot!(ink_map(&frame, &geo, 24, 5));
+    let (snap, frame) = render(&mut r, b"hello world\r\n\r\nsecond line\r\n  indented");
+    let geo = CellGeometry::of(&r);
+    insta::assert_snapshot!(ink_map(&frame, &geo, &snap, 24, 5));
 }
 
 /// The background pipeline, and the channel order [`Renderer::capture`]
@@ -270,7 +216,7 @@ fn a_red_background_cell_paints_red_pixels() {
     // SGR 41 (red bg) on a run of spaces: background quads only, no glyph ink to
     // confuse the sample.
     let (_, frame) = render(&mut r, b"\x1b[41m    \x1b[0m");
-    let geo = Geometry::of(&r);
+    let geo = CellGeometry::of(&r);
 
     let (x0, y0, x1, y1) = geo.cell_rect(1, 0, &frame);
     let mid = frame.pixel((x0 + x1) / 2, (y0 + y1) / 2);
@@ -293,8 +239,8 @@ fn a_red_background_cell_paints_red_pixels() {
 fn an_empty_grid_paints_no_ink_at_all() {
     let cfg = Config::default();
     let Some(mut r) = headless(&cfg) else { return };
-    let (_, frame) = render(&mut r, b"");
-    let geo = Geometry::of(&r);
+    let (snap, frame) = render(&mut r, b"");
+    let geo = CellGeometry::of(&r);
     let bg = frame.modal_pixel();
 
     let inked = frame
@@ -308,7 +254,7 @@ fn an_empty_grid_paints_no_ink_at_all() {
          the ink metric is measuring something other than drawn content"
     );
     assert_eq!(
-        ink_map(&frame, &geo, 8, 3),
+        ink_map(&frame, &geo, &snap, 8, 3),
         "........\n........\n........\n",
         "an empty grid must map to no ink"
     );
