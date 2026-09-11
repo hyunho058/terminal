@@ -10,7 +10,6 @@
 
 use std::io::{Read, Write};
 use std::sync::Once;
-use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
@@ -247,14 +246,6 @@ fn child_command() -> CommandBuilder {
     cmd
 }
 
-/// How long [`Pty::drop`] waits for a signalled shell before escalating.
-///
-/// Covers scheduling, not the shell's own work: zsh answers `SIGHUP` by exiting
-/// at once, and anything still alive after this has trapped the signal.
-const REAP_TIMEOUT: Duration = Duration::from_millis(500);
-/// Poll interval inside that budget.
-const REAP_POLL: Duration = Duration::from_millis(5);
-
 /// A spawned zsh session behind a pseudo-terminal.
 ///
 /// Keep this alive for the lifetime of the session: dropping it signals the
@@ -334,45 +325,27 @@ impl Pty {
 ///
 /// The signal is not redundant with the fd closing. `Session` declares `pty`
 /// before `writer`, and the reader thread holds its own clone, so at this point
-/// the master is still open and the shell has had no reason to exit yet. An
-/// unbounded `wait()` here would deadlock against a fd that only closes after
+/// the master is still open and the shell has had no reason to exit yet. Waiting
+/// without signalling first would deadlock against a fd that only closes after
 /// this function returns.
 ///
-/// And the budget is not belt-and-braces. `portable_pty`'s `kill` sends
-/// `SIGHUP`, not `SIGKILL`, and `SIGHUP` is catchable — the spawned zsh chains
-/// the user's own `.zshrc` (D13), so a `trap '' HUP` in it would hang whoever
-/// dropped this, which on a tab close is the UI thread. After the budget the
-/// escalation is `SIGKILL`, which cannot be trapped, so the final `wait` is
-/// bounded by the kernel rather than by the shell.
+/// And the `wait` needs no timeout, because `kill` already carries one. Our
+/// `child` is a `Box<std::process::Child>` (`portable_pty`'s `unix.rs` spawns
+/// one and boxes it), so `kill` is `impl ChildKiller for std::process::Child`:
+/// it sends `SIGHUP`, polls `try_wait` five times over 200ms — reaping the child
+/// itself if it goes — and only then sends `SIGKILL`. `SIGHUP` being catchable
+/// is therefore already handled upstream: the spawned zsh chains the user's own
+/// `.zshrc` (D13), and a `trap '' HUP` in it costs that grace period and then
+/// dies to a signal it cannot trap. So by the time `kill` returns the child is
+/// dead or `SIGKILL`ed, and `wait` is bounded by the kernel rather than by the
+/// shell. Escalating a second time here bought nothing and made a tab close pay
+/// the grace period twice.
 impl Drop for Pty {
     fn drop(&mut self) {
         let _ = self.child.kill();
-
-        let deadline = Instant::now() + REAP_TIMEOUT;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Err(e) => {
-                    tracing::warn!("could not reap the shell: {e}");
-                    return;
-                }
-                Ok(None) => {}
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(REAP_POLL);
+        if let Err(e) = self.child.wait() {
+            tracing::warn!("could not reap the shell: {e}");
         }
-
-        if let Some(pid) = self.child.process_id() {
-            // SAFETY: `kill(2)` against a pid this process spawned and has not
-            // yet reaped, so the pid cannot have been recycled. The only error is
-            // `ESRCH` for one that just exited, which is the outcome we want.
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
-        }
-        let _ = self.child.wait();
     }
 }
 
@@ -761,12 +734,12 @@ mod tests {
     ///
     /// One real shell, deliberately not `#[ignore]`d: the whole point is that the
     /// leak is invisible to every test that does not spawn one. `SKIP_SHELL_TESTS=1`
-    /// is the opt-out, the same one `app`'s shell tests honour — a variable someone
+    /// is the opt-out, and it is [`crate::testing::shell_tests_enabled`] rather than
+    /// a fourth hand-written copy of the same `var_os` check — a variable someone
     /// sets, never a failed spawn, which stays a failure.
     #[test]
     fn dropping_a_pty_reaps_its_shell() {
-        if std::env::var_os("SKIP_SHELL_TESTS").is_some() {
-            eprintln!("SKIP_SHELL_TESTS set; skipping the reaping check");
+        if !crate::testing::shell_tests_enabled() {
             return;
         }
         let pty = Pty::spawn(80, 24).expect("spawn a shell");

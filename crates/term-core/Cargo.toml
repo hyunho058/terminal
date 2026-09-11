@@ -10,11 +10,6 @@ description = "Headless terminal core: PTY, VT parsing, cell grid, scrollback. N
 base64 = "0.22.1"
 common.workspace = true
 image = { version = "0.25.10", default-features = false, features = ["png"] }
-# One call: `SIGKILL` in `Pty`'s drop, for a shell that trapped the `SIGHUP`
-# `portable_pty` sends. Same version `app` declares. Not a widening of this
-# crate's scope — the `dependency-direction` rule bars GPU and windowing, and
-# this is neither; term-core already spawns POSIX processes.
-libc = "0.2.186"
 portable-pty = "0.9.0"
 thiserror = "2.0.18"
 tracing = "0.1.44"
@@ -23,3 +18,7 @@ vte = "0.15.0"
 
 [dev-dependencies]
 insta = "1.48.0"
+# Test-only: `kill(pid, 0)` asks whether a pid still exists, which is how
+# `dropping_a_pty_reaps_its_shell` tells "exited" from "reaped". Production code
+# signals through `portable_pty`, so this stays out of [dependencies].
+libc = "0.2.186"
