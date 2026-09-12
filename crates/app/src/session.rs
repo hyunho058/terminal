@@ -12,14 +12,34 @@ use std::thread::JoinHandle;
 use term_core::{Color, CommandEnd, Pty, Terminal};
 
 use crate::tabmeta::TabMeta;
-use winit::event_loop::EventLoopProxy;
-
-use crate::terminal_app::UserEvent;
 
 /// A stable, monotonic tab identifier (never reused; survives index shifts on
 /// close, unlike a `Vec` position).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct TabId(pub u64);
+
+/// How a session's reader thread wakes the UI when its PTY produces output.
+///
+/// A plain callback rather than the `EventLoopProxy` it wraps, for exactly the
+/// reason the renderer takes a raw window handle instead of a `winit::Window`
+/// (C4): it keeps the whole input→shell→grid path constructible without an event
+/// loop. That is not a stylistic preference here — on macOS a `winit::EventLoop`
+/// can only be built on the main thread, and the test harness runs every test on
+/// a spawned one, so a `Session` that demanded a proxy could never be exercised
+/// end to end by any test at all. It was not: swallowing every byte in
+/// [`Session::write`] (a terminal that types nothing) left the workspace suite at
+/// 1460 passed / 0 failed.
+///
+/// `App::start` passes a closure over the real `EventLoopProxy` — it is the one
+/// place in the app that makes one. A test passes a recorder.
+pub type Wake = Box<dyn Fn(TabId) + Send + 'static>;
+
+/// Mints a fresh [`Wake`] per session.
+///
+/// [`Tabs`](crate::tabs::Tabs) spawns sessions on demand and so needs to produce
+/// wakers rather than hold one. `Rc`, not `Arc`: the tab set lives on the UI
+/// thread and never crosses one — only the `Wake` it hands out does.
+pub type WakeSource = std::rc::Rc<dyn Fn() -> Wake>;
 
 /// One tab's terminal session.
 pub struct Session {
@@ -60,14 +80,14 @@ pub struct Session {
 
 impl Session {
     /// Spawn a zsh session sized to `cols`×`rows`, wiring its reader thread to
-    /// wake the loop with `UserEvent::PtyOutput(id)` (D2).
+    /// call `wake` with this session's id on every chunk (D2).
     pub fn spawn(
         id: TabId,
         cols: u16,
         rows: u16,
         fg: Color,
         bg: Color,
-        proxy: EventLoopProxy<UserEvent>,
+        wake: Wake,
     ) -> anyhow_lite::Result<Session> {
         let terminal = Terminal::new(cols, rows, fg, bg);
         let pty = Pty::spawn(cols, rows).map_err(err)?;
@@ -87,7 +107,7 @@ impl Session {
                                 break;
                             }
                             // Tagged wake: this session's id (D2).
-                            let _ = proxy.send_event(UserEvent::PtyOutput(id));
+                            wake(id);
                         }
                     }
                 }
@@ -206,9 +226,6 @@ impl Session {
     ///
     /// Flags the tab dirty on a real change so the event loop resyncs + redraws at once,
     /// including for a background tab. Returns whether anything changed.
-    // Allowed dead until the rename field (T4) and the card menu (T6) call it — the same
-    // convention `seam.rs` uses for a seam landed one task ahead of its first consumer.
-    #[allow(dead_code)]
     pub fn set_user_title(&mut self, title: Option<String>) -> bool {
         let next = normalize_user_title(title);
         if next == self.user_title {
@@ -275,7 +292,12 @@ pub(crate) fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
             size,
         )
     };
-    if n < size {
+    // `!=`, not `<`: `proc_pidinfo` answers exactly `size` on success and 0 or -1
+    // on failure, so the two forms are equivalent — but `<` also admits a `>`
+    // mutant that no test can kill, and an equivalent mutant in the report costs
+    // more than the character it saves. Same shape as `tabmeta::proc`'s other
+    // three `proc_pidinfo` guards.
+    if n != size {
         return None; // error or short read
     }
     // pvi_cdir.vip_path is a fixed 1024-byte, NUL-terminated C path.
@@ -335,31 +357,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_published_cwd_wins_and_costs_no_fallback() {
-        // R2.1 — the published value is returned.
-        let got = published_or(Some(&meta_with(Some("/a/b"))), || {
-            Some(PathBuf::from("/fallback"))
-        });
-        assert_eq!(got, Some(PathBuf::from("/a/b")));
-    }
-
-    /// A real `Session` with no winit event loop.
+    /// A live session **plus** the sender its reader thread would own, so a test can
+    /// push PTY bytes and call [`Session::drain`] over them.
     ///
-    /// `EventLoopProxy` is a parameter of [`Session::spawn`], **not a field of `Session`** — so
-    /// the struct is constructible directly here, and `Session::cwd` (the actual subject of
-    /// R6.1) is measurable rather than merely arguable. Spawns a real `/bin/zsh` via
-    /// `Pty::spawn`, which is consistent with existing practice in this crate (`tabsession`
-    /// shells out to `/bin/ps`) and with the macOS-only rule.
-    ///
-    /// `Tabs` genuinely is out of reach — it holds an `EventLoopProxy` as a field — but its
-    /// `active_cwd`/`titles` are thin wrappers whose only cwd cost is the `Session::cwd` call
-    /// measured here.
-    fn live_session() -> Session {
-        let (_tx, rx) = mpsc::channel::<Vec<u8>>();
+    /// [`live_session`] drops its sender, which leaves `rx` disconnected and `drain`
+    /// a no-op — fine for the cwd tests it was written for, useless for anything that
+    /// arrives *from* the shell. Everything the OSC channels do (titles, command-end)
+    /// is only reachable through here.
+    /// `None` when shell tests are opted out of — see
+    /// [`term_core::testing::shell_tests_enabled`]. Returning an `Option` rather than
+    /// gating inside each test is the point: a new test that needs a shell cannot
+    /// compile without handling the skip.
+    fn session_with_feed() -> Option<(Session, mpsc::Sender<Vec<u8>>)> {
+        if !term_core::testing::shell_tests_enabled() {
+            return None;
+        }
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let pty = Pty::spawn(80, 24).expect("pty");
         let writer = pty.writer().expect("writer");
-        Session {
+        let session = Session {
             id: TabId(1),
             terminal: Terminal::new(80, 24, Color::rgb(200, 200, 200), Color::rgb(0, 0, 0)),
             pty,
@@ -370,7 +386,222 @@ mod tests {
             title_dirty: false,
             command_end: None,
             _reader: std::thread::spawn(|| {}),
-        }
+        };
+        Some((session, tx))
+    }
+
+    /// Push bytes the way the reader thread would, then advance the grid over them.
+    fn feed(session: &mut Session, tx: &mpsc::Sender<Vec<u8>>, bytes: &[u8]) {
+        tx.send(bytes.to_vec()).expect("send");
+        session.drain();
+    }
+
+    // ---------------------------------------------------------------------
+    // The title channels (sticky-tab-title D3/D5, R1.1/R1.3/R2.2/R2.3).
+    //
+    // Added after a `cargo mutants` run over this file: 16 mutants survived, and
+    // all but two of those were in this precedence machinery. (Survivors, not a
+    // ratio — the total moves with every edit to the file, and three different
+    // ones for this same run were recorded in three places. See CLAUDE.md.)
+    // `set_user_title` could be made to return a constant `true` or `false`, its
+    // `==` could be flipped to `!=`, `user_title` could answer `Some("xyzzy")`,
+    // `program_title` could answer `""` — and the whole workspace suite stayed
+    // green. The feature's own tests live at the layers above (`rename.rs`,
+    // `card_menu.rs`, the tab model) and drive their own state, so nothing was
+    // asserting the state machine they all read.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn a_fresh_session_carries_neither_title_and_is_not_dirty() {
+        let Some((mut s, _tx)) = session_with_feed() else {
+            return;
+        };
+        assert_eq!(s.user_title(), None, "a new tab is not named");
+        assert_eq!(s.program_title(), "", "no program has set a title yet");
+        assert!(
+            !s.take_title_dirty(),
+            "nothing has changed, so nothing to redraw"
+        );
+    }
+
+    #[test]
+    fn naming_a_tab_reports_the_change_and_asks_for_one_redraw() {
+        let Some((mut s, _tx)) = session_with_feed() else {
+            return;
+        };
+        assert!(
+            s.set_user_title(Some("build".into())),
+            "a new name is a change"
+        );
+        assert_eq!(s.user_title(), Some("build"));
+        // Dirty is a *take*: the loop must be asked to resync exactly once, or a
+        // background tab's new label either never shows or repaints every tick.
+        assert!(s.take_title_dirty(), "a rename must ask for a resync");
+        assert!(!s.take_title_dirty(), "and must not keep asking");
+    }
+
+    #[test]
+    fn renaming_a_tab_to_the_name_it_already_has_changes_nothing() {
+        // The `==` guard (R2.2). Flipped to `!=` this still *looks* right — the tab
+        // keeps its name — but every no-op rename reports a change and drags a
+        // resync + redraw behind it.
+        let Some((mut s, _tx)) = session_with_feed() else {
+            return;
+        };
+        assert!(s.set_user_title(Some("build".into())));
+        assert!(s.take_title_dirty());
+        assert!(
+            !s.set_user_title(Some("build".into())),
+            "setting the same name twice is not a change"
+        );
+        assert!(
+            !s.take_title_dirty(),
+            "a no-op rename must not cost a resync"
+        );
+        assert_eq!(s.user_title(), Some("build"));
+    }
+
+    #[test]
+    fn a_blank_name_resets_the_tab_to_its_auto_label() {
+        // R2.3 — whitespace-only is the user clearing the name, not naming the tab
+        // "   ". Normalized at the setter so no caller has to know the rule.
+        let Some((mut s, _tx)) = session_with_feed() else {
+            return;
+        };
+        assert!(s.set_user_title(Some("build".into())));
+        assert!(
+            s.set_user_title(Some("   ".into())),
+            "blank clears the name"
+        );
+        assert_eq!(s.user_title(), None);
+        assert!(
+            !s.set_user_title(None),
+            "clearing an already-clear name is not a change"
+        );
+    }
+
+    #[test]
+    fn a_program_title_lands_in_the_program_channel_and_shows() {
+        // R1.1/D3 — OSC 2 is any program's channel, kept separate from the user's.
+        let Some((mut s, tx)) = session_with_feed() else {
+            return;
+        };
+        feed(&mut s, &tx, b"\x1b]2;vim README.md\x07");
+        assert_eq!(s.program_title(), "vim README.md");
+        assert_eq!(s.user_title(), None, "a program cannot name the tab");
+        assert!(
+            s.take_title_dirty(),
+            "with no user title the program's title is what shows, so it must redraw"
+        );
+    }
+
+    #[test]
+    fn a_program_title_hidden_under_a_user_title_is_recorded_but_costs_no_redraw() {
+        // R1.3 — recorded so the channel keeps working if the user clears their
+        // name, but invisible now, and redrawing for an invisible change is waste.
+        let Some((mut s, tx)) = session_with_feed() else {
+            return;
+        };
+        assert!(s.set_user_title(Some("mine".into())));
+        assert!(s.take_title_dirty());
+
+        feed(&mut s, &tx, b"\x1b]2;vim README.md\x07");
+        assert_eq!(
+            s.program_title(),
+            "vim README.md",
+            "the program channel keeps recording underneath"
+        );
+        assert_eq!(s.user_title(), Some("mine"), "and never outranks the user");
+        assert!(
+            !s.take_title_dirty(),
+            "an invisible change must not trigger a resync (R1.3)"
+        );
+    }
+
+    #[test]
+    fn a_command_end_is_delivered_once_and_then_is_gone() {
+        // T3 — the waiting model polls this. Delivered twice it raises a phantom
+        // second completion; never cleared it raises one every tick.
+        let Some((mut s, tx)) = session_with_feed() else {
+            return;
+        };
+        assert_eq!(s.take_command_end(), None, "nothing has run yet");
+
+        feed(&mut s, &tx, b"\x1b]133;D;7;1234\x07");
+        assert_eq!(
+            s.take_command_end(),
+            Some(CommandEnd {
+                exit_code: 7,
+                elapsed_ms: 1234
+            })
+        );
+        assert_eq!(s.take_command_end(), None, "and it is consumed");
+    }
+
+    #[test]
+    fn resize_refits_the_grid_and_not_only_the_pty() {
+        // R5 — both halves. A resize that moved the PTY but left the grid would
+        // reflow the shell's output into a grid that is still the old size.
+        let Some((mut s, _tx)) = session_with_feed() else {
+            return;
+        };
+        assert_eq!(s.terminal.dimensions(), (80, 24));
+        s.resize(40, 10).expect("resize");
+        assert_eq!(
+            s.terminal.dimensions(),
+            (40, 10),
+            "the grid must follow the resize, not just the PTY"
+        );
+    }
+
+    #[test]
+    fn shell_pid_names_this_sessions_own_live_child() {
+        // The root the ai-monitor walks to find *this tab's* agent. A wrong pid does
+        // not fail loudly — it silently binds the panel to another tab's session.
+        let Some((s, _tx)) = session_with_feed() else {
+            return;
+        };
+        let pid = s.shell_pid().expect("a spawned session has a shell");
+        assert!(pid > 1, "pid {pid} is not a real child process");
+        // A live process has a cwd; this is the session's own child, so the check is
+        // about *this* process rather than about what the machine happens to run.
+        assert!(
+            cwd_of_pid(pid).is_some(),
+            "pid {pid} does not resolve to a live process"
+        );
+    }
+
+    #[test]
+    fn a_published_cwd_wins_and_costs_no_fallback() {
+        // R2.1 — the published value is returned.
+        let got = published_or(Some(&meta_with(Some("/a/b"))), || {
+            Some(PathBuf::from("/fallback"))
+        });
+        assert_eq!(got, Some(PathBuf::from("/a/b")));
+    }
+
+    /// A real `Session` with no winit event loop, and no sender for its reader
+    /// channel.
+    ///
+    /// No `EventLoopProxy` anywhere: [`Session::spawn`] takes a [`Wake`] callback and
+    /// `Session` holds no proxy, so the struct is constructible directly here and
+    /// `Session::cwd` (the actual subject of R6.1) is measurable rather than merely
+    /// arguable. Spawns a real `/bin/zsh` via `Pty::spawn`, which is consistent with
+    /// existing practice in this crate (`tabsession` shells out to `/bin/ps`) and with
+    /// the macOS-only rule.
+    ///
+    /// [`crate::tabs::Tabs`] is reachable the same way and for the same reason — it
+    /// holds a [`WakeSource`], not a proxy — and `tabs.rs` constructs one directly in
+    /// its own tests. An earlier version of this comment said the opposite ("`Tabs`
+    /// genuinely is out of reach — it holds an `EventLoopProxy` as a field"), which
+    /// would send a reader looking for a workaround that is no longer needed.
+    ///
+    /// Dropping `session_with_feed`'s sender is the entire difference between the two
+    /// fixtures: it leaves `rx` disconnected, so `drain` is a no-op. Building the
+    /// `Session` twice instead meant two copies of a twelve-field literal that had to
+    /// be edited in lockstep, 220 lines apart.
+    fn live_session() -> Option<Session> {
+        session_with_feed().map(|(s, _tx)| s)
     }
 
     #[test]
@@ -379,7 +610,9 @@ mod tests {
         // about whether a closure ran. This is the path evaluated twice per key press
         // (`terminal_app.rs`) and once per tab per sidebar resync (`tabs.rs`), where it used to
         // cost a `proc_pidinfo` every single time.
-        let s = live_session();
+        let Some(s) = live_session() else {
+            return;
+        };
         let meta = meta_with(Some("/published"));
 
         // Published: zero syscalls, however many times it is called.

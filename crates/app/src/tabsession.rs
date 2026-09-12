@@ -490,7 +490,10 @@ fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
             size,
         )
     };
-    if n < size {
+    // `!=` rather than `<` for the reason given at `session::cwd_of_pid`: the
+    // success value is exactly `size`, and `<` carries a `>` mutant that is
+    // equivalent and therefore unkillable.
+    if n != size {
         return None;
     }
     let raw = &info.pvi_cdir.vip_path;
@@ -719,6 +722,36 @@ fn looks_like_session_id(s: &str) -> bool {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// The third `proc_pidinfo` copy resolves its own process, exactly as
+    /// `session.rs` and `tabmeta::proc` assert about theirs.
+    ///
+    /// It had no test at all, which only became visible when the blanket
+    /// `exclude_re` covering "replace < with > in cwd_of_pid" came out of
+    /// `.cargo/mutants.toml`: that pattern was unanchored, so it silenced the
+    /// guard mutant in all three copies while its comment described one. With it
+    /// gone, this copy reported four survivors — the whole function could be
+    /// replaced with `None` — and the two that have tests reported none. That is
+    /// the cost of an over-broad exclusion, and it is why the fix was to rewrite
+    /// the guard rather than to widen the amnesty.
+    #[test]
+    fn cwd_of_pid_resolves_this_process() {
+        let got = cwd_of_pid(std::process::id()).expect("own cwd is resolvable");
+        let expected = std::env::current_dir().expect("current_dir");
+        assert_eq!(
+            got.canonicalize().ok(),
+            expected.canonicalize().ok(),
+            "cwd_of_pid(self) must equal current_dir()"
+        );
+    }
+
+    /// The failure arm: `proc_pidinfo` reports an error for a pid that cannot
+    /// exist, and the short-read guard must turn that into `None` rather than
+    /// reading the zeroed struct as a path.
+    #[test]
+    fn cwd_of_unusable_pid_is_none() {
+        assert!(cwd_of_pid(0).is_none());
+    }
 
     /// A process table shaped like the measured one: two mac-terminal tabs each with
     /// their own `claude`, and Warp running a resumed session in the same project.

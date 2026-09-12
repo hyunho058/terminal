@@ -248,8 +248,8 @@ fn child_command() -> CommandBuilder {
 
 /// A spawned zsh session behind a pseudo-terminal.
 ///
-/// Keep this alive for the lifetime of the session: dropping it closes the
-/// master and signals the child.
+/// Keep this alive for the lifetime of the session: dropping it signals the
+/// child and reaps it.
 pub struct Pty {
     master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -308,6 +308,44 @@ impl Pty {
                 pixel_height: 0,
             })
             .map_err(Error::pty)
+    }
+}
+
+/// Signal the shell **and reap it**.
+///
+/// Dropping a `Pty` used to do neither directly. The child noticed only
+/// indirectly, when the last owner of the master fd went away, and nothing ever
+/// called `wait`, so every shell that exited stayed a zombie for the life of the
+/// process. Measured on the `app` lib tests, whose fixtures open a real shell per
+/// tab: **55** zombie children at peak, every one of them a shell that had
+/// already exited. The app leaks the same way, one per closed tab, for the whole
+/// session.
+///
+/// Two details decide the shape of this.
+///
+/// The signal is not redundant with the fd closing. `Session` declares `pty`
+/// before `writer`, and the reader thread holds its own clone, so at this point
+/// the master is still open and the shell has had no reason to exit yet. Waiting
+/// without signalling first would deadlock against a fd that only closes after
+/// this function returns.
+///
+/// And the `wait` needs no timeout, because `kill` already carries one. Our
+/// `child` is a `Box<std::process::Child>` (`portable_pty`'s `unix.rs` spawns
+/// one and boxes it), so `kill` is `impl ChildKiller for std::process::Child`:
+/// it sends `SIGHUP`, polls `try_wait` five times over 200ms — reaping the child
+/// itself if it goes — and only then sends `SIGKILL`. `SIGHUP` being catchable
+/// is therefore already handled upstream: the spawned zsh chains the user's own
+/// `.zshrc` (D13), and a `trap '' HUP` in it costs that grace period and then
+/// dies to a signal it cannot trap. So by the time `kill` returns the child is
+/// dead or `SIGKILL`ed, and `wait` is bounded by the kernel rather than by the
+/// shell. Escalating a second time here bought nothing and made a tab close pay
+/// the grace period twice.
+impl Drop for Pty {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        if let Err(e) = self.child.wait() {
+            tracing::warn!("could not reap the shell: {e}");
+        }
     }
 }
 
@@ -683,5 +721,47 @@ mod tests {
         let line = drift_trace(&stripped, &survey_agent_passthrough(&cmd)).expect("a line is due");
         // "MAC_TERMINAL_USER_ZDOTDIR" contains "ZDOTDIR", so one check covers both.
         assert!(!line.contains("ZDOTDIR"), "{line}");
+    }
+
+    /// Dropping a `Pty` leaves no zombie.
+    ///
+    /// Signal 0 delivers nothing and only asks whether the pid exists, which is
+    /// precisely the right question: a zombie still *answers* it, because the pid
+    /// stays valid until someone waits on it. So this distinguishes "the shell
+    /// exited" — which was always true — from "the shell was reaped", which was
+    /// not, and which nothing observed. Before the `Drop` impl the second
+    /// assertion fails while the first passes.
+    ///
+    /// One real shell, deliberately not `#[ignore]`d: the whole point is that the
+    /// leak is invisible to every test that does not spawn one. `SKIP_SHELL_TESTS=1`
+    /// is the opt-out, and it is [`crate::testing::shell_tests_enabled`] rather than
+    /// a fourth hand-written copy of the same `var_os` check — a variable someone
+    /// sets, never a failed spawn, which stays a failure.
+    #[test]
+    fn dropping_a_pty_reaps_its_shell() {
+        if !crate::testing::shell_tests_enabled() {
+            return;
+        }
+        let pty = Pty::spawn(80, 24).expect("spawn a shell");
+        let pid = pty.child_pid().expect("a live shell has a pid") as libc::pid_t;
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "pid {pid} is not running before the drop, so this proves nothing"
+        );
+
+        drop(pty);
+
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "pid {pid} still exists after the drop — the shell was signalled but \
+             never reaped, and stays a zombie for the life of the process"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "the pid should be gone, not merely unreachable"
+        );
     }
 }

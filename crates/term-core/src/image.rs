@@ -183,7 +183,10 @@ fn decode_png(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
 
 fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgb.len() / 3 * 4);
-    for px in rgb.chunks_exact(3) {
+    // `as_chunks`, not `chunks_exact(3)`: the width is a constant, so this hands the
+    // loop a `&[u8; 3]` whose indices the compiler can bounds-check away. Both discard
+    // a trailing partial pixel identically. (`clippy::chunks_exact_to_as_chunks`.)
+    for px in rgb.as_chunks::<3>().0 {
         out.extend_from_slice(px);
         out.push(255);
     }

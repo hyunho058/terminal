@@ -123,9 +123,6 @@ pub(crate) struct ClaudeId {
 /// Agent activity. **No `Done`** — a finished agent is a process that exited, i.e.
 /// `agent: None` (D8). `Unknown` asserts presence only: the consumer must render the
 /// "agent present" affordance for it, never "ready".
-// Variants are constructed by the T3 classifier / T5 activity rule and consumed by
-// sidebar-row-redesign; landed here ahead of them (like `register_overlay`).
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AgentState {
     /// Mid-turn: the agent is actively working (a tool_use turn, a tool_result the agent is
@@ -147,7 +144,6 @@ pub enum AgentState {
 /// Which agent CLI is running. App-side vocabulary only — never a renderer type
 /// (D11); `sidebar-row-redesign` owns the mapping from `AgentKind` to a renderer skin
 /// with an exhaustive match (no `_` arm), so adding a variant is a compile error there.
-#[allow(dead_code)] // variants constructed by the T3 classifier; consumed by feature 3
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AgentKind {
     Claude,
@@ -159,7 +155,6 @@ pub enum AgentKind {
 
 impl AgentKind {
     /// A printable identity for logging / future tooltips (not stringly-typed at the seam).
-    #[allow(dead_code)] // used by T6 logging + feature 3 tooltips
     pub fn label(self) -> &'static str {
         match self {
             AgentKind::Claude => "Claude",
@@ -193,7 +188,6 @@ pub(crate) struct TabMetaShared {
 
 /// Commands the UI thread sends to the worker; they arrive on the channel the worker
 /// blocks on, so `recv_timeout` doubles as the sleep and the inbox (D4).
-#[allow(dead_code)] // constructed by the handle setters, consumed by feature 3 / sidebar-interaction
 #[allow(clippy::enum_variant_names)] // the `Set*` prefix mirrors the setter methods, intentionally
 pub(crate) enum Cmd {
     SetRoster(Vec<TabPid>),
@@ -210,13 +204,9 @@ pub(crate) enum Cmd {
 #[derive(Clone)]
 pub struct TabMetaHandle {
     shared: Arc<TabMetaShared>,
-    #[allow(dead_code)] // read by the setters below, whose consumer is feature 3
     tx: Sender<Cmd>,
 }
 
-// The read/command API is landed here for `sidebar-row-redesign` (roster/active/sync)
-// and `sidebar-interaction` (set_enabled live reload); unused until they land.
-#[allow(dead_code)]
 impl TabMetaHandle {
     /// Start the worker thread. `wake` runs ON THE WORKER THREAD once per tick in
     /// which at least one tab changed — keep it cheap (an `EventLoopProxy::send_event`).
@@ -287,9 +277,24 @@ pub struct TabMetaSnapshot {
     tabs: Vec<(TabId, TabMeta)>,
 }
 
-// Read by sidebar-row-redesign's DrawLayer; landed ahead of it.
-#[allow(dead_code)]
 impl TabMetaSnapshot {
+    /// A snapshot standing in for one the worker published, for tests in sibling
+    /// modules.
+    ///
+    /// `tabs` is private to this module, so without this the only reachable snapshot
+    /// is the empty `default()` — and against an empty one every consumer correctly
+    /// answers `None`, which makes "always answer `None`" indistinguishable from the
+    /// real implementation. Mutation testing found exactly that: `Tabs::active_cwd`
+    /// and `Tabs::active_agent_pid` could both be replaced by `None` with the whole
+    /// suite green.
+    #[cfg(test)]
+    pub(crate) fn from_entries(entries: Vec<(TabId, TabMeta)>) -> TabMetaSnapshot {
+        TabMetaSnapshot {
+            generation: 1,
+            tabs: entries,
+        }
+    }
+
     /// This tab's metadata, if present in the last publish.
     pub fn get(&self, id: TabId) -> Option<&TabMeta> {
         self.tabs.iter().find(|(i, _)| *i == id).map(|(_, m)| m)
@@ -381,7 +386,6 @@ pub fn install(handle: TabMetaHandle) {
 
 /// The installed handle, if any. Returns `None` before `install` (e.g. in tests,
 /// which never touch the global — every test builds its own handle).
-#[allow(dead_code)] // called from tabs.rs (sidebar-row-redesign) to push roster/active
 pub fn global() -> Option<&'static TabMetaHandle> {
     HANDLE.get()
 }
@@ -393,9 +397,8 @@ pub fn global() -> Option<&'static TabMetaHandle> {
 
 // The full counter set is declared here (D13(6)) so the T2–T5 data-source modules
 // never depend on each other to observe their own cost; each is incremented as its
-// module lands, and read by T6's cost tests — unused until then.
+// module lands, and read by T6's cost tests.
 #[cfg(test)]
-#[allow(dead_code)]
 pub(crate) mod probe {
     use std::sync::atomic::{AtomicU64, Ordering};
 

@@ -30,6 +30,7 @@ pub mod sidebar_row;
 pub mod sidebar_shapes;
 pub mod sidebar_theme;
 pub mod tab_bar;
+pub mod testing;
 
 use atlas::{Atlas, GlyphKey};
 use bytemuck::{Pod, Zeroable};
@@ -57,6 +58,13 @@ pub enum RendererError {
     NoFont(String),
     #[error("could not acquire next frame ({0})")]
     Frame(&'static str),
+    /// A GPU readback in [`Renderer::capture`] failed. Carries a `String` rather
+    /// than a `&'static str` because every cause here — a device poll timeout, a
+    /// failed buffer map, an unavailable mapped range — reports its own detail,
+    /// and folding that into a fixed message would leave the caller with nothing
+    /// to act on.
+    #[error("could not read back the rendered frame: {0}")]
+    Capture(String),
 }
 
 pub type Result<T> = std::result::Result<T, RendererError>;
@@ -1092,6 +1100,255 @@ impl Renderer {
 
         self.queue.submit(std::iter::once(encoder.finish()));
     }
+
+    /// Draw `snapshot` into a fresh offscreen target and read the pixels back.
+    ///
+    /// This is the only way to observe what a frame **actually contains**. Every
+    /// other observable the renderer exposes reports a *decision* — `reshape_count`
+    /// says the instance builders ran, `Atlas::generation` says a glyph was packed —
+    /// and each of those stays perfectly correct while the frame it describes comes
+    /// out blank. A regression that zeroes `glyph_count`, mis-derives the insets, or
+    /// swaps a pipeline is invisible to all of them and visible here.
+    ///
+    /// Costs a texture, a buffer and a device stall per call, so it belongs in tests
+    /// and benches, not on the frame path — `draw_to` is that path, and this wraps it
+    /// rather than reimplementing it, so the two can never drift.
+    ///
+    /// Returns [`RendererError::Capture`] rather than panicking. Its callers are all
+    /// tests today, which makes an `unwrap` tempting, but this is `pub` library code
+    /// on a path with real runtime failures — a lost device, a rejected map — and the
+    /// crate's rule is a `thiserror` enum, with `unwrap` confined to tests. A test
+    /// that wants a panic writes `.expect(..)` at the call site and gets the cause in
+    /// the message; the reverse cannot be recovered.
+    pub fn capture(&mut self, snapshot: &GridSnapshot) -> Result<CapturedFrame> {
+        // Refused here, before a texture, a buffer and a device stall are spent on
+        // a frame that could not be decoded anyway.
+        let Some(bgra) = capture_channel_order(self.config.format) else {
+            return Err(RendererError::Capture(format!(
+                "target format {:?} is not an 8-bit, four-channel layout, so the \
+                 readback cannot be decoded. Widening this means teaching \
+                 `capture_channel_order` and the normalisation loop the new \
+                 layout, not relaxing the check.",
+                self.config.format
+            )));
+        };
+        let (width, height) = (self.config.width, self.config.height);
+        // Also refused before any GPU work. `new_headless` cannot produce a
+        // zero-sized config, but `capture` is `pub` and reads `self.config`, which
+        // on the windowed path follows the surface: a minimised or zero-sized
+        // window configures 0×0, and `create_texture` answers that with a wgpu
+        // validation *panic*, not an error this method could report. The same
+        // argument that made this return `Result` covers it.
+        if width == 0 || height == 0 {
+            return Err(RendererError::Capture(format!(
+                "the target is {width}x{height}; there is no frame to read back. \
+                 The surface is configured to a zero-sized window, so this is a \
+                 caller's timing question rather than a GPU failure."
+            )));
+        }
+        let target = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("capture-target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        self.draw_to(&view, snapshot);
+
+        // `copy_texture_to_buffer` requires a 256-byte-aligned row pitch, so the
+        // readback rows are padded and the padding is stripped below.
+        let unpadded = width * 4;
+        let padded = unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("capture-readback"),
+            size: padded as u64 * height as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("capture-copy"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        // Submitted after `draw_to`'s encoder on the same queue, so the copy sees
+        // the finished frame.
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Three results, all of which have to be read. `poll` returning `Ok` says
+        // the queue drained, not that the mapping succeeded, and the map's own
+        // outcome is reported *only* through the callback — so discarding either
+        // (the `|_| {}` and `let _ =` this replaces) turned a device loss into an
+        // unexplained panic on the `get_mapped_range` line below.
+        let slice = readback.slice(..);
+        let (map_tx, map_rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = map_tx.send(res);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| RendererError::Capture(format!("device poll failed: {e}")))?;
+        map_rx
+            .recv()
+            .map_err(|_| RendererError::Capture("map callback never ran (device lost?)".into()))?
+            .map_err(|e| RendererError::Capture(format!("buffer map failed: {e}")))?;
+        let mapped = slice
+            .get_mapped_range()
+            .map_err(|e| RendererError::Capture(format!("mapped range unavailable: {e}")))?;
+
+        // Normalise to RGBA so callers never branch on the target's channel order.
+        //
+        // Every product here widens to `usize` before multiplying. In `u32` a
+        // 4K-by-4K target already puts `row * padded` within a factor of four of
+        // wrapping, and the failure is silent in release: the offset wraps to a
+        // small number and the frame is assembled from the wrong rows.
+        let mut pixels = Vec::with_capacity(unpadded as usize * height as usize);
+        for row in 0..height as usize {
+            let start = row * padded as usize;
+            let bytes = &mapped[start..start + unpadded as usize];
+            for px in bytes.as_chunks::<4>().0 {
+                if bgra {
+                    pixels.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                } else {
+                    pixels.extend_from_slice(px);
+                }
+            }
+        }
+        drop(mapped);
+        readback.unmap();
+
+        Ok(CapturedFrame {
+            width,
+            height,
+            pixels,
+        })
+    }
+}
+
+/// Whether [`Renderer::capture`] can decode `format`, and if so whether its
+/// channels arrive as BGRA rather than RGBA.
+///
+/// `Some(true)` = BGRA, `Some(false)` = RGBA, `None` = refuse.
+///
+/// The readback is not format-agnostic and never was. Its row pitch is
+/// `width * 4` and its normalisation walks `as_chunks::<4>()`, so every step
+/// assumes four bytes per pixel with one byte per channel. What used to stand in
+/// for this check was a bare `matches!` on the two BGRA variants, whose `false`
+/// arm meant "RGBA" rather than "unknown" — so any other format was decoded as
+/// RGBA and returned as `Ok`.
+///
+/// That is reachable. `new_headless` pins `Bgra8UnormSrgb`, but `capture` is
+/// `pub` and reads `self.config.format`, which on the windowed path comes from
+/// `surface.get_default_config`, and on macOS that can be `Rgba16Float` for an
+/// EDR display or `Rgb10a2Unorm`. At eight bytes per pixel every `pixel(x, y)`
+/// would be half of one channel pair: `modal_pixel`, `is_ink` and every golden
+/// assertion would go on measuring noise, with nothing to act on. A method whose
+/// whole purpose is to report what a frame contains must not answer confidently
+/// when it cannot read it.
+fn capture_channel_order(format: wgpu::TextureFormat) -> Option<bool> {
+    match format {
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => Some(true),
+        wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => Some(false),
+        _ => None,
+    }
+}
+
+/// One rendered frame read back from the GPU, in tightly packed RGBA8.
+///
+/// Produced by [`Renderer::capture`]. Row-major, `width * height * 4` bytes, with
+/// the readback row padding already stripped and the channel order normalised, so
+/// a caller indexes it without knowing anything about the target's format.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CapturedFrame {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+impl CapturedFrame {
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// The raw RGBA8 bytes, row-major and tightly packed.
+    pub fn pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    /// RGBA at `(x, y)`. Panics out of bounds — a test that reads outside the
+    /// frame has a bug in its geometry, which is exactly what these frames exist
+    /// to catch, so it must not read as a silent black pixel.
+    pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
+        assert!(
+            x < self.width && y < self.height,
+            "pixel({x}, {y}) is outside the {}x{} frame",
+            self.width,
+            self.height
+        );
+        // Widened before the multiply: `(y * self.width + x) * 4` in `u32`
+        // overflows on a large frame, which debug-panics inside the accessor and
+        // in release wraps into a wrong — but in-bounds — pixel.
+        let i = (y as usize * self.width as usize + x as usize) * 4;
+        [
+            self.pixels[i],
+            self.pixels[i + 1],
+            self.pixels[i + 2],
+            self.pixels[i + 3],
+        ]
+    }
+
+    /// The most common pixel value in the frame — the painted background, derived
+    /// from the frame itself rather than from the config.
+    ///
+    /// Deriving it here is deliberate: the clear color goes through
+    /// `to_wgpu_color` and an sRGB target before it becomes a byte, so a test that
+    /// compared against `cfg.theme.background` would be asserting that conversion
+    /// chain, not the thing it came to check. Every terminal frame is
+    /// overwhelmingly background, so the mode is that background by construction.
+    pub fn modal_pixel(&self) -> [u8; 4] {
+        let mut counts: std::collections::HashMap<[u8; 4], u32> = std::collections::HashMap::new();
+        for px in self.pixels.as_chunks::<4>().0 {
+            *counts.entry(*px).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .max_by_key(|&(_, n)| n)
+            .map(|(px, _)| px)
+            .unwrap_or([0, 0, 0, 0])
+    }
 }
 
 /// Upload `data` into a resident vertex buffer (D6), reusing it across frames and
@@ -1695,6 +1952,35 @@ mod tests {
         }))
         .ok()?;
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+    }
+
+    /// `capture` decodes the two 8-bit layouts and refuses everything else.
+    ///
+    /// A pure decision, so it is asserted without a GPU — which matters, because
+    /// the formats that used to be mis-decoded are exactly the ones this machine
+    /// cannot easily produce. The old code was a `matches!` on the BGRA pair whose
+    /// `false` arm meant "RGBA" rather than "unknown", so the two macOS surface
+    /// formats below were read as BGRA at half their real stride and returned as
+    /// `Ok`.
+    #[test]
+    fn capture_decodes_8_bit_layouts_and_refuses_the_rest() {
+        use wgpu::TextureFormat as F;
+        assert_eq!(capture_channel_order(F::Bgra8UnormSrgb), Some(true));
+        assert_eq!(capture_channel_order(F::Bgra8Unorm), Some(true));
+        assert_eq!(capture_channel_order(F::Rgba8UnormSrgb), Some(false));
+        assert_eq!(capture_channel_order(F::Rgba8Unorm), Some(false));
+
+        // What `surface.get_default_config` can actually hand us on macOS: an EDR
+        // display's float surface, and a 10-bit one. Both are wider than four
+        // bytes per pixel or not byte-aligned per channel.
+        assert_eq!(
+            capture_channel_order(F::Rgba16Float),
+            None,
+            "an EDR surface is 8 bytes per pixel; decoding it as RGBA8 reads half \
+             of one channel pair per 'pixel'"
+        );
+        assert_eq!(capture_channel_order(F::Rgb10a2Unorm), None);
+        assert_eq!(capture_channel_order(F::Rgba32Float), None);
     }
 
     /// The primary face of the loaded chain (T2). `None` when no system font is

@@ -27,6 +27,20 @@ The full derivation lives in `scaffold-spec.md`. This is the working summary.
   snapshot.
 - **`app`** depends on all three. Owns the winit event loop, the PTY reader
   thread, and input encoding. The only crate that knows about windows.
+  It is a **library plus a thin `main.rs`**, not a bare binary: a `[[bin]]`-only
+  crate has no importable surface, so `crates/app/tests/` could not exist and no
+  test could reach the assembled path — only the pure decision functions each
+  module happens to expose. What stays in `main.rs` is what a library cannot own:
+  the `EventLoop` (macOS builds one only on the main thread) and the
+  process-global `tabmeta` worker. The registration set moved out to
+  `feature_overlays`/`feature_handlers` so it is a value a test can assert.
+  Consequently `Session::spawn` takes a `session::Wake` callback rather than an
+  `EventLoopProxy` — the same move the renderer makes with `raw-window-handle`,
+  one layer up: it keeps the whole input→shell→grid path constructible without an
+  event loop, which is what `crates/app/tests/vertical_slice.rs` needs. The proxy
+  becomes a `Wake` in exactly one place, `App::start` (`terminal_app.rs`), because
+  that is the first moment a window exists and so the first moment there is a grid
+  size to spawn a session against. `main` only creates the proxy and hands it over.
 
 ## Runtime model (C6)
 

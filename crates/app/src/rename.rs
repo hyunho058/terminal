@@ -69,6 +69,12 @@ struct Editing {
     cursor: usize,
 }
 
+impl Default for RenameOverlay {
+    fn default() -> RenameOverlay {
+        RenameOverlay::new()
+    }
+}
+
 impl RenameOverlay {
     pub fn new() -> RenameOverlay {
         RenameOverlay {

@@ -23,6 +23,7 @@ pub mod scrollback;
 pub mod selection;
 mod shell_integration;
 pub mod snapshot;
+pub mod testing;
 
 pub use error::{Error, Result};
 pub use grid::{Cell, CellAttrs, Color, CommandEnd, Cursor, Grid, MouseEncoding, MouseProtocol};

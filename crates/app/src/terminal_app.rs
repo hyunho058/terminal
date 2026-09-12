@@ -59,10 +59,10 @@ use crate::input::{
     ResizeEdge, SidebarAction, TabAction, WheelDelta,
 };
 use crate::seam::{
-    AppCtx, AppRequest, Handled, InputHandler, InputRouter, KeyInput, Overlay, OverlayCommand,
-    OverlayHost, WriteProbe,
+    AppCtx, AppRequest, Handled, InputRouter, KeyInput, OverlayCommand, OverlayHost, Registrations,
+    WriteProbe,
 };
-use crate::session::{Session, TabId};
+use crate::session::{Session, TabId, WakeSource};
 use crate::tabmeta::{AgentState, TabMetaSnapshot};
 use crate::tabs::Tabs;
 use crate::waiting::{WaitingKind, WaitingState};
@@ -121,38 +121,39 @@ pub struct App {
     cfg: Config,
     proxy: EventLoopProxy<UserEvent>,
     inner: Option<Running>,
-    /// SD4 seam: features register handlers/overlays here (from `main.rs`, in
-    /// their own module) *before* `run_app` — never by editing this file (C1).
-    /// Consumed into the live registries on `resumed`.
-    pending_handlers: Vec<Box<dyn InputHandler>>,
-    pending_overlays: Vec<Box<dyn Overlay>>,
+    /// SD4 seam: the handlers/overlays features registered *before* `run_app` —
+    /// never by editing this file (C1). Consumed into the live registries on
+    /// `resumed`.
+    ///
+    /// A [`Registrations`] rather than two bare `Vec`s so the whole
+    /// registration→registry step is a value transformation `crates/app/tests/`
+    /// can assert; `App` itself is unconstructible in a test (it needs an
+    /// `EventLoopProxy`), so anything that stays in here is unreachable by any
+    /// test at all.
+    pending: Registrations,
 }
 
 impl App {
-    pub fn new(cfg: Config, proxy: EventLoopProxy<UserEvent>) -> Self {
+    /// `registrations` is the set `main` assembled — see [`crate::feature_registrations`].
+    ///
+    /// The **only** way extensions enter the app. There were once
+    /// `register_handler` / `register_overlay` methods beside this for registering
+    /// after construction, and they were the problem rather than a convenience:
+    /// a second path meant part of the set was assembled where nothing could
+    /// assert it, and the one feature that used it — the `tabmeta` pump — could be
+    /// dropped from `main` with every test still green. Taking the whole set by
+    /// value leaves one place to look and one value to assert.
+    pub fn new(
+        cfg: Config,
+        proxy: EventLoopProxy<UserEvent>,
+        registrations: Registrations,
+    ) -> Self {
         App {
             cfg,
             proxy,
             inner: None,
-            pending_handlers: Vec::new(),
-            pending_overlays: Vec::new(),
+            pending: registrations,
         }
-    }
-
-    /// Register an input handler (SD4/R3.3) — the seam entry a sibling feature
-    /// (e.g. image-paste's Cmd+V) calls from `main.rs` instead of editing the
-    /// event loop. No in-tree consumer yet (first: image-paste).
-    #[allow(dead_code)]
-    pub fn register_handler(&mut self, handler: Box<dyn InputHandler>) {
-        self.pending_handlers.push(handler);
-    }
-
-    /// Register an overlay (SD4/R4) — its `on_key` runs before default input and
-    /// its `DrawLayer` is drawn above the grid (ai-monitor/settings). No in-tree
-    /// consumer yet.
-    #[allow(dead_code)]
-    pub fn register_overlay(&mut self, overlay: Box<dyn Overlay>) {
-        self.pending_overlays.push(overlay);
     }
 }
 
@@ -387,15 +388,11 @@ impl App {
         renderer.add_layer(Box::new(link_layer));
 
         // Drain the SD4 seam registrations into the live registries. Each
-        // overlay also contributes a DrawLayer drawn above the grid (R4.1).
-        let mut router = InputRouter::default();
-        for h in self.pending_handlers.drain(..) {
-            router.register(h);
-        }
-        let mut overlays = OverlayHost::default();
-        for o in self.pending_overlays.drain(..) {
-            renderer.add_layer(o.layer());
-            overlays.register(o);
+        // overlay also contributes a DrawLayer drawn above the grid (R4.1),
+        // stacked in registration order.
+        let (router, overlays, layers) = self.pending.install();
+        for layer in layers {
+            renderer.add_layer(layer);
         }
 
         // grid_size() now reports rows *below* the inset (R2.2).
@@ -403,8 +400,27 @@ impl App {
         let fg = Color(self.cfg.theme.foreground);
         let bg = Color(self.cfg.theme.background);
 
-        let first = Session::spawn(TabId(0), cols, rows, fg, bg, self.proxy.clone())?;
-        let tabs = Tabs::new(first, fg, bg, self.proxy.clone());
+        // The one place the winit proxy is turned into the event-loop-free `Wake`
+        // the session layer takes. Everything below this line — sessions, tabs,
+        // the whole input→shell→grid path — is constructible without an event
+        // loop, which is what lets `crates/app/tests/` drive it.
+        //
+        // Here rather than in `main`, and that is not an accident to be tidied
+        // away: `App::start` is the first moment a window exists, and therefore
+        // the first moment there is a grid size to spawn a session against. `main`
+        // holds the proxy only long enough to hand it over. Any doc that says
+        // otherwise is describing a design that was considered and not built.
+        let wake: WakeSource = {
+            let proxy = self.proxy.clone();
+            std::rc::Rc::new(move || {
+                let proxy = proxy.clone();
+                Box::new(move |id| {
+                    let _ = proxy.send_event(UserEvent::PtyOutput(id));
+                })
+            })
+        };
+        let first = Session::spawn(TabId(0), cols, rows, fg, bg, (wake)())?;
+        let tabs = Tabs::new(first, fg, bg, wake);
 
         // Live-config watcher (settings feature): on a valid change it sends the
         // fresh Config and wakes the loop with UserEvent::ConfigReloaded.

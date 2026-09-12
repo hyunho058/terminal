@@ -22,13 +22,11 @@
 //! or takes its syscall as an injected closure ([`resolve_rdevs`]), so every branch is tested
 //! with no tmux installed and no live tty.
 
-// This module is the mechanism half of the `tmux-pane-resolution` set: its two entry points
-// are consumed by `tabmeta-tmux-reroot` (worker.rs) and `tabsession-tmux-reroot`
-// (tabsession.rs), which land after it. Until they do, the whole chain is unreachable from a
-// live root and every item reads as dead. Same disposition as `mod.rs`'s `global()`, which
-// carries an `#[allow(dead_code)]` naming the feature that calls it. Remove this once both
-// consumers are wired.
-#![allow(dead_code)]
+// This module was the mechanism half of the `tmux-pane-resolution` set, and carried a
+// blanket `#![allow(dead_code)]` while its consumers (`worker.rs`, `tabsession.rs`) were
+// still to land. They have; the chain is reachable from a live root, and the one item that
+// is still unread carries its own narrow allow instead. A module-wide allow would go on
+// hiding the next one.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -44,6 +42,10 @@ use super::worker::TICK;
 /// spawn would work under `cargo run` and then silently never resolve in the shipped app.
 /// It costs no extra syscall — the gate already read this path to classify the process.
 pub(crate) struct TmuxClient {
+    /// Which client this is. Nothing reads it yet — the join runs on `exe` and the
+    /// tty device — but it is what identifies the record when one has to be
+    /// reported or matched, so dropping it would be losing the row's identity.
+    #[allow(dead_code)]
     pub(crate) pid: u32,
     pub(crate) exe: PathBuf,
 }

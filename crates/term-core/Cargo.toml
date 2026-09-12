@@ -18,3 +18,7 @@ vte = "0.15.0"
 
 [dev-dependencies]
 insta = "1.48.0"
+# Test-only: `kill(pid, 0)` asks whether a pid still exists, which is how
+# `dropping_a_pty_reaps_its_shell` tells "exited" from "reaped". Production code
+# signals through `portable_pty`, so this stays out of [dependencies].
+libc = "0.2.186"

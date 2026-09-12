@@ -11,3 +11,19 @@
 # insta pending snapshots
 **/*.snap.new
 specs/*/progress.md
+
+# cargo-mutants working output (see .cargo/mutants.toml)
+/mutants.out/
+/mutants.out.old/
+
+# /check-harness report output (harness-ops). Dated, generated, regenerable by
+# re-running the skill — tool-owned scratch, like /mutants.out/ above, and
+# ignored as a whole directory for the same reason. A file under here that ever
+# does belong in the tree is a deliberate `git add -f`.
+/.harness/
+
+# Ad-hoc raw PTY captures kept at the repo root while debugging the vte parser
+# (escape sequences dumped straight off the master fd). Local scratch, not a
+# fixture: a capture the tests depend on belongs in a crate's tests/ directory
+# and tracked. Anchored to the root so it cannot hide one that does.
+/agy_raw.bin

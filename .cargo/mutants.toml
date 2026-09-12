@@ -1,0 +1,60 @@
+# cargo-mutants configuration.
+#
+# Mutation testing answers the question the test *count* cannot: which functions
+# can be broken without any test noticing. Run it scoped, never whole — the
+# workspace generates ~6300 mutants and each costs a rebuild plus a test run, so
+# a full pass is measured in days. Scope to what you changed:
+#
+#   cargo mutants -f crates/app/src/session.rs      # one file
+#   cargo mutants --in-diff <(git diff origin/main) # just this branch's changes
+#
+# `-j 4` roughly quarters the wall time on this machine.
+
+# REQUIRED, not a preference. cargo-mutants tests each mutant in a *copy* of the
+# tree, and without the VCS directory two tabmeta tests
+# (`steady_state_repo_derivation_does_no_git_read`,
+# `disabling_git_clears_branch_and_stops_git_work`) fail in the copy because they
+# assert the working directory is a git repo. That aborts the whole run at the
+# baseline with "cargo test failed in an unmutated tree".
+copy_vcs = true
+
+# There is deliberately no `additional_cargo_test_args` here. The key held `[]`,
+# which is the default and therefore changed nothing, under a comment claiming it
+# narrowed each mutant's test run to `app`/`renderer`/`term-core` — so a reader
+# following the comment paid for the full workspace suite on every one of ~6300
+# mutants and believed otherwise.
+#
+# Encoding that narrowing would have been worse than the no-op: the claim behind it
+# is false. `common` has 39 tests and `ai-monitor` 204, and `-p app -p renderer
+# -p term-core` would make every mutant in those two crates survive for the sole
+# reason that nothing ran to kill them — false survivors, in a report whose only
+# value is that a survivor means something.
+#
+# Narrowing belongs at the call site, where the scope is known, and it composes
+# with the `-f` above:
+#
+#   cargo mutants -f crates/renderer/src/atlas.rs --cargo-test-arg -p --cargo-test-arg renderer
+
+# Mutants that are *equivalent* — they change the source without changing
+# behaviour, so no test can kill them and leaving them reported would train
+# everyone to ignore the report.
+#
+# Empty, and worth keeping empty. The one entry this list ever held silenced
+# "replace < with > in cwd_of_pid": `proc_pidinfo`'s short-read guard, where the
+# success value is exactly `size`, so `<` and `>` accept the same inputs and no
+# test can tell them apart. Two things were wrong with excluding it.
+#
+# `exclude_re` is matched against a mutant's *full* name including its path
+# (cargo-mutants `options.rs`), and that pattern was neither anchored nor
+# path-qualified — so it silenced the mutant in all three `cwd_of_pid` copies
+# (`session.rs`, `tabsession.rs`, `tabmeta/proc.rs`), not the one site its
+# comment described. If any copy later diverged, its real survivor would have
+# been hidden.
+#
+# And the exclusion was treating a symptom. The guard was rewritten as
+# `if n != size`, which has no `<`/`>` flip family at all, so the equivalent
+# mutant no longer exists to exclude. Prefer that: an equivalent mutant is
+# usually a sign the condition says less than it means. Reach for this list only
+# when the source genuinely cannot be written so the mutant disappears — and
+# then anchor the pattern to one path.
+exclude_re = []

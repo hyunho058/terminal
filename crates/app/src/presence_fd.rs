@@ -72,10 +72,6 @@ struct VnodeFdInfoWithPath {
 /// The conversation id of the presence lock `pid` holds open, under the real
 /// `~/.gemini/antigravity-cli/presence` (R1.1). `None` when `$HOME` is unset, when the
 /// process is gone, when we may not inspect it, or when it holds no lock.
-// Allowed dead until T4 wires the tab's `agy` pid into the overlay — the same convention
-// `session.rs`'s `set_user_title` and `tabmeta/proc.rs`'s tty helpers use for a seam landed
-// one task ahead of its first consumer.
-#[allow(dead_code)]
 pub(crate) fn conversation_of_pid(pid: u32) -> Option<String> {
     let root = ai_monitor::antigravity::antigravity_root()?;
     conversation_of_pid_in(&ai_monitor::antigravity::presence_dir_in(&root), pid)
@@ -84,7 +80,6 @@ pub(crate) fn conversation_of_pid(pid: u32) -> Option<String> {
 /// [`conversation_of_pid`] against an explicit presence directory, so the probe is testable
 /// against a temp dir instead of the author's real `~/.gemini` — the same root-as-parameter
 /// split `ai_monitor::resolve_log_in` and `registered_session_in` use.
-#[allow(dead_code)]
 pub(crate) fn conversation_of_pid_in(presence_dir: &Path, pid: u32) -> Option<String> {
     // Canonicalize OUR side of the comparison. `proc_pidfdinfo` reports the kernel's fully
     // resolved path, so a directory reached through a symlink comes back as `/private/var/…`

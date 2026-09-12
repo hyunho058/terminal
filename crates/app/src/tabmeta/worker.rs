@@ -609,6 +609,22 @@ mod tests {
         d.start_ms_of = |_| Some(1_000);
     }
 
+    /// The opposite fixture to [`with_fake_tree`]: every kernel read answers the way it does
+    /// for a pid that is **gone** — no cwd, no agent, no start time.
+    ///
+    /// Injected rather than left real, for the same reason [`tp`] picks unallocatable pids.
+    /// Left real, a "dead pid" test is not about a dead pid at all: the reads run against the
+    /// live machine, and the assertion silently becomes a claim about what is running on the
+    /// computer. That is not hypothetical — this fixture exists because
+    /// `dead_pid_derives_to_blank_without_panic` did exactly that and failed on any machine
+    /// with a detached `claude` on it, reporting a real live `agent_pid` where it expected
+    /// nothing.
+    fn with_dead_tree(d: &mut Deriver) {
+        d.cwd_of = |_| None;
+        d.agent_of = |_| None;
+        d.start_ms_of = |_| None;
+    }
+
     /// The `claude` pid the fake tree reports for a tab whose shell is at `n` — i.e. the pid a
     /// registry fixture must be keyed on.
     fn agent_pid(n: u32) -> u32 {
@@ -1457,11 +1473,47 @@ mod tests {
         assert!(!d.debug_seen.contains_key(&id));
     }
 
+    /// R5.6 / R10.5 — a dead root pid yields blank metadata, no panic. Every field
+    /// must stay `None`: a derivation that invented one from a pid that no longer
+    /// exists would attribute another process's branch, agent or cwd to this tab.
+    ///
+    /// This one deliberately keeps the **real** kernel readers — no
+    /// [`with_dead_tree`] — and it is the only test that does. Stubbed, `cwd_of`,
+    /// `agent_of` and `start_ms_of` all answer `None` by construction, and the
+    /// assertion degrades into a property of the fixture: `Deriver::tab` returns
+    /// `TabMeta::default()` when its injected readers return nothing. The thing R5.6
+    /// is actually about — that `proc_pidinfo` and the descendant walk *do* answer
+    /// nothing for a pid that is gone — would then be covered by no test at all, and
+    /// a `cwd_of_pid` that started synthesising a value would keep both cases green.
+    ///
+    /// It is deterministic here and was not at `pid: 0`, and the difference is
+    /// `agent_of_pid`: it walks the root's **descendants**, and a pid that was never
+    /// allocated (`tp` picks 900_1xx, above macOS's `pid_max`) has none — whatever
+    /// else the machine is running. Pid 0's descendants are every process on it,
+    /// which is how the original version of this test came to report a live
+    /// `agent_pid` from a detached `claude` that had nothing to do with any tab.
     #[test]
     fn dead_pid_derives_to_blank_without_panic() {
-        // R5.6 / R10.5 — a dead root pid yields blank metadata, no panic.
         let _g = super::super::probe::serial();
         let mut d = Deriver::new();
+        let meta = d.tab(&tp(900_199), 0, SystemTime::now(), true);
+        assert_eq!(meta, TabMeta::default());
+    }
+
+    /// The same for `pid: 0`, which **does** need the injected fixture.
+    ///
+    /// Kept as its own case rather than folded in, because 0 is not merely a dead
+    /// pid: it is the kernel. Every process on the machine descends from it, so the
+    /// real readers make this input a question about what happens to be running —
+    /// and it is also the one input where `tmux::effective_root` (the read
+    /// `with_dead_tree` cannot inject) is asked about a pid that genuinely exists.
+    /// What survives injection is still worth pinning: `tab()` must not panic on the
+    /// arithmetic, and must not manufacture a field out of a root of 0.
+    #[test]
+    fn pid_zero_derives_to_blank_without_panic() {
+        let _g = super::super::probe::serial();
+        let mut d = Deriver::new();
+        with_dead_tree(&mut d);
         let tp = TabPid {
             id: TabId(9),
             pid: 0,
