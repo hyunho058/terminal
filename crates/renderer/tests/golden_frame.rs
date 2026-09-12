@@ -123,8 +123,10 @@ fn a_frame_of_text_is_not_blank() {
 
     let inked = frame
         .pixels()
-        .chunks_exact(4)
-        .filter(|px| is_ink([px[0], px[1], px[2], px[3]], bg))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|&&px| is_ink(px, bg))
         .count();
     assert!(
         inked > 0,
@@ -245,8 +247,10 @@ fn an_empty_grid_paints_no_ink_at_all() {
 
     let inked = frame
         .pixels()
-        .chunks_exact(4)
-        .filter(|px| is_ink([px[0], px[1], px[2], px[3]], bg))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|&&px| is_ink(px, bg))
         .count();
     assert_eq!(
         inked, 0,

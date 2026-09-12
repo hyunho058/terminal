@@ -1235,7 +1235,7 @@ impl Renderer {
         for row in 0..height as usize {
             let start = row * padded as usize;
             let bytes = &mapped[start..start + unpadded as usize];
-            for px in bytes.chunks_exact(4) {
+            for px in bytes.as_chunks::<4>().0 {
                 if bgra {
                     pixels.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
                 } else {
@@ -1260,7 +1260,7 @@ impl Renderer {
 /// `Some(true)` = BGRA, `Some(false)` = RGBA, `None` = refuse.
 ///
 /// The readback is not format-agnostic and never was. Its row pitch is
-/// `width * 4` and its normalisation walks `chunks_exact(4)`, so every step
+/// `width * 4` and its normalisation walks `as_chunks::<4>()`, so every step
 /// assumes four bytes per pixel with one byte per channel. What used to stand in
 /// for this check was a bare `matches!` on the two BGRA variants, whose `false`
 /// arm meant "RGBA" rather than "unknown" — so any other format was decoded as
@@ -1340,8 +1340,8 @@ impl CapturedFrame {
     /// overwhelmingly background, so the mode is that background by construction.
     pub fn modal_pixel(&self) -> [u8; 4] {
         let mut counts: std::collections::HashMap<[u8; 4], u32> = std::collections::HashMap::new();
-        for px in self.pixels.chunks_exact(4) {
-            *counts.entry([px[0], px[1], px[2], px[3]]).or_default() += 1;
+        for px in self.pixels.as_chunks::<4>().0 {
+            *counts.entry(*px).or_default() += 1;
         }
         counts
             .into_iter()
