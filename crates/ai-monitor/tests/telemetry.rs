@@ -3011,3 +3011,85 @@ fn a_command_result_typed_generic_still_pairs_with_its_dispatch() {
          even with an older run_command still pending"
     );
 }
+// ---- the `/context` reading, folded from a real-shaped log -------------------
+//
+// A SEPARATE fixture, deliberately (D13). `session.jsonl` is asserted whole by
+// `fixture_transcript_folds_to_expected_telemetry`, so slipping a `local_command`
+// record into it would move assertions that have nothing to do with this feature.
+
+fn context_fixture() -> TelemetrySnapshot {
+    fold(include_str!("fixtures/context_command.jsonl"))
+}
+
+#[test]
+fn the_context_fixture_yields_the_window_it_printed() {
+    // R0.1 production side, and the byte-level end of it: the fixture carries its
+    // escapes the way a real log does, so this exercises the stripper, both anchors,
+    // both SGR encodings and the gate at once.
+    let s = context_fixture();
+    let reading = s
+        .context_window_reading
+        .as_ref()
+        .expect("the `/context` record should have been read");
+    assert_eq!(reading.tokens, 700_000);
+    assert_eq!(reading.model_at_read.as_deref(), Some("claude-opus-5"));
+
+    // The numerator was never in question — it already agreed with `/context` to the
+    // token. 217,737 against 700,000 is the 31% `/context` showed; against the guessed
+    // 200,000, promoted to 1,000,000, it was the 22% the panel showed.
+    assert_eq!(s.context_used, 5 + 210_000 + 7_732);
+}
+
+#[test]
+fn the_context_fixture_reads_nothing_from_its_four_decoys() {
+    // Each non-`/context` record in that file is a real near-miss, one per way the gate
+    // can be got wrong:
+    //   1. the `<command-name>/context</command-name>` echo — passes a `subtype`-only
+    //      gate, so under one it would raise the failure counter on every SUCCESSFUL
+    //      read;
+    //   2. a `turn_duration` system record whose content carries BOTH anchors and parses
+    //      cleanly to 500,000 — only the `subtype` half refuses it;
+    //   3. assistant prose quoting both anchors with wrong numbers — the majority case
+    //      by an order of magnitude, and why the dispatch is on `type` rather than on a
+    //      line grep;
+    //   4. `/model` output containing `1M` — passes `subtype`, needs the title.
+    // Silence from all four, in both counters, is the assertion.
+    let s = context_fixture();
+    assert_eq!(s.context_window_parse_failures, 0);
+    assert_eq!(s.context_window_anchor_conflicts, 0);
+    let read = s.context_window_reading.as_ref().map(|r| r.tokens);
+    assert_eq!(read, Some(700_000));
+    assert_ne!(read, Some(999_000), "the quoted window must never be read");
+    assert_ne!(
+        read,
+        Some(500_000),
+        "the wrong-subtype window must never be read"
+    );
+}
+
+#[test]
+fn the_new_fixture_leaves_the_original_untouched() {
+    // R7.1 — the reason this feature got its own file. Pinned here as a value rather
+    // than trusted: if the two ever share a fold, this fails before a snapshot does.
+    let s = fixture();
+    assert_eq!(s.context_window_reading, None);
+    assert_eq!(s.context_window_parse_failures, 0);
+    assert_eq!(s.context_window_anchor_conflicts, 0);
+    assert_eq!(s.session_id.as_deref(), Some("5e59b629-aaaa"));
+}
+
+#[test]
+fn the_context_fixture_carries_escaped_not_literal_escapes() {
+    // A trap this spec fell into while being written, and again while being built: an
+    // ESC byte is INVISIBLE, so a fixture holding a literal 0x1b looks right and tests
+    // something else. `serde_json` decodes both to the same string, which is exactly
+    // why nothing downstream would notice; the file would simply stop being the shape a
+    // real log has. Assert the bytes, since the eye cannot.
+    let raw = include_str!("fixtures/context_command.jsonl");
+    assert!(
+        !raw.contains(char::from(27)),
+        "a raw ESC byte is checked in; it must be the six-character JSON escape"
+    );
+    let escaped = format!("{}u001b", char::from(92));
+    assert_eq!(raw.matches(&escaped).count(), 44);
+}
