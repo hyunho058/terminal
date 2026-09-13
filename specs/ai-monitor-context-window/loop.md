@@ -101,4 +101,10 @@ boundary ends the loop in escalation, not completion.
 
 ## Lessons  (self-learning — carried across runs of THIS contract)
 
-_(none yet — this is the contract's first run)_
+### L1 — verify a clause's attribution by deleting it, not by reading it
+- cause: gate-fail
+- source: human-approved
+- form: gate3-item
+- status: active
+- check: "Attribution check: for every comment claiming that clause X is what refuses input Y, delete X and re-run Y. If Y is still refused, the comment is crediting the wrong clause — and the guard X is probably untested. Then check the converse: find the input that X alone refuses, and pin it."
+- note: `header_denominator`'s comment credited the numerator check with refusing `.claude/agents 534 tokens (…)`; that input dies one statement earlier at the denominator parse. The claim was wrong in the original and wrong again after being narrowed without measuring. Deleting the numerator check left all 1562 tests green, and cargo-mutants could not have asked for the missing test either — it only replaces `header_denominator`'s whole body, which other tests already kill. `the_numerator_check_buys_one_case_and_not_the_others` now pins both halves.

@@ -961,6 +961,16 @@ fn op_role(op: FileOp) -> ColorRole {
 /// reading sets and the panel UNDER-reports — the one direction a tile whose job is to
 /// warn "this is filling up" must not fail in.
 ///
+/// **It closes that hole only while the session's high-water is under 200k** (spec G-f).
+/// Refusing the reading drops to `promoted_window`, whose second argument is
+/// `context_high_water` — monotone, never reset. A session that spent 250k on the 1M tier
+/// and then switched down gets `promoted_window(200_000, 250_000)` = 1,000,000, and the
+/// under-report walks straight back in. That is `promoted_window`'s existing property,
+/// not one this predicate introduced, and fixing it would mean resetting the high-water
+/// on a model switch — which is what that field exists to prevent after a `/compact`. So
+/// the guarantee here is narrower than the paragraph above reads on its own, and saying
+/// so is the point of this one.
+///
 /// Compared as a WHOLE STRING, never by tier. Which id belongs to which tier is exactly
 /// the knowledge this spec established a log does not contain, so a tier comparison
 /// would smuggle the guess back in. The price is that `claude-opus-5` →
@@ -3695,6 +3705,14 @@ mod tests {
     /// The `ai-monitor` fixture, folded here rather than restated — so this asserts the
     /// whole path (raw JSONL bytes → strip → anchors → snapshot → denominator → tile)
     /// and not a hand-built snapshot that happens to agree with one.
+    ///
+    /// The `include_str!` reaches across a package boundary into `ai-monitor`'s *tests*
+    /// directory. The `session.jsonl` fold below does the same; every other
+    /// `include_str!` under `crates/app/src` reads a file of this crate's own. It follows
+    /// the dependency direction (`app` → `ai-monitor`) so no rule is bent, but it is a
+    /// real coupling with no compiler-visible owner: MOVING OR RENAMING EITHER FIXTURE
+    /// BREAKS THIS CRATE'S BUILD, from a crate that cannot depend on `app` and so has no
+    /// way to be told.
     fn folded_context_fixture() -> (TelemetrySnapshot, u64) {
         let mut t = SessionTelemetry::new();
         for l in include_str!("../../ai-monitor/tests/fixtures/context_command.jsonl").lines() {

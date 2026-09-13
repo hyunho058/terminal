@@ -3042,16 +3042,28 @@ fn the_context_fixture_yields_the_window_it_printed() {
 
 #[test]
 fn the_context_fixture_reads_nothing_from_its_four_decoys() {
-    // Each non-`/context` record in that file is a real near-miss: the command echo,
-    // prose quoting BOTH anchors with wrong numbers, and `/model` output containing
-    // `1M`. Silence from all four is what the two counters assert.
+    // Each non-`/context` record in that file is a real near-miss, one per way the gate
+    // can be got wrong:
+    //   1. the `<command-name>/context</command-name>` echo — passes a `subtype`-only
+    //      gate, so under one it would raise the failure counter on every SUCCESSFUL
+    //      read;
+    //   2. a `turn_duration` system record whose content carries BOTH anchors and parses
+    //      cleanly to 500,000 — only the `subtype` half refuses it;
+    //   3. assistant prose quoting both anchors with wrong numbers — the majority case
+    //      by an order of magnitude, and why the dispatch is on `type` rather than on a
+    //      line grep;
+    //   4. `/model` output containing `1M` — passes `subtype`, needs the title.
+    // Silence from all four, in both counters, is the assertion.
     let s = context_fixture();
     assert_eq!(s.context_window_parse_failures, 0);
     assert_eq!(s.context_window_anchor_conflicts, 0);
+    let read = s.context_window_reading.as_ref().map(|r| r.tokens);
+    assert_eq!(read, Some(700_000));
+    assert_ne!(read, Some(999_000), "the quoted window must never be read");
     assert_ne!(
-        s.context_window_reading.as_ref().map(|r| r.tokens),
-        Some(999_000),
-        "the quoted window must never be read"
+        read,
+        Some(500_000),
+        "the wrong-subtype window must never be read"
     );
 }
 

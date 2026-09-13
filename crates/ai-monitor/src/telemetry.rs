@@ -292,7 +292,19 @@ pub struct ContextWindowReading {
     /// A ROUNDED READING, not a measurement: the source prints `700k`, so this is
     /// 700,000 ± up to half a notation unit. Cross-checked as exactly 700,000 across
     /// the corpus (`33000/700000 = 4.714%` displays as `4.7%`), but consistency is not
-    /// proof. The residual error is ~0.07% of the window and invisible in a percentage.
+    /// proof.
+    ///
+    /// **The error bound is a property of the NOTATION, not a constant.** Half a unit of
+    /// `700k` is ±500 — 0.07%, invisible in a percentage, which is the case every reading
+    /// observed so far takes. Half a unit of `1.0M` is ±50,000 (5%), and of a bare `1M`
+    /// ±500,000 (50%) — and both clear [`WINDOW_FLOOR`], so both would be believed.
+    ///
+    /// No ANCHOR has yielded `M` notation yet — all 12 anchor readings in the corpus are
+    /// `700k`. Do not read that as "`M` is not in these records": `1M` appears in every
+    /// one of them, in the model banner `Opus 5 (1M context)` and the id
+    /// `claude-opus-5[1m]` (12 occurrences), and it is exactly the string D1a and the
+    /// header grammar exist to refuse. The day an anchor DOES print `M`, this bound is
+    /// the thing to revisit, not the parse.
     pub tokens: u64,
     /// The model folded at the moment of the read, or `None` if the log had not named
     /// one yet. Compared — as a whole string, never by tier — against the live model
@@ -636,11 +648,16 @@ impl SessionTelemetry {
             Some("tool_result") => self.on_tool_result(v, v, ts),
             // Routed on the TAG, acted on by the parse — the same rule the
             // task-notification branch follows (D12/R4.3), and for a sharper reason
-            // here. The string `Auto-compact window` lives in FIVE record types in the
-            // corpus, and the four that are prose outnumber the authoritative `system`
-            // records 5:1 (18 `assistant`, 10 `user`, 1 `attachment`, 1
-            // `queue-operation`, against 6). A whole-line grep reads a quotation as a
-            // measurement; dispatching on `type` cannot.
+            // here. The string `Auto-compact window` lives in FIVE record types, and the
+            // four that are prose outnumber the authoritative `system` records by an
+            // order of magnitude. A whole-line grep reads a quotation as a measurement;
+            // dispatching on `type` cannot.
+            //
+            // The RATIO is the durable fact; the absolute counts are not, and are given
+            // with a date for that reason. Every conversation about this feature adds
+            // more prose: 18/10/1/1 against 6 on 2026-09-11, already 58/57/4/4 against 6
+            // on 2026-09-12. A count written here as bare present tense is wrong within a
+            // day — the spec makes the same point about its own tables.
             Some("system") => self.on_system(v),
             _ => {}
         }
@@ -1166,13 +1183,14 @@ impl SessionTelemetry {
     /// Fold a `type == "system"` record, which is where a slash command's stdout lands
     /// — and so the only place the context window is ever STATED rather than guessed.
     ///
-    /// Two gates, and they are one gate used twice (D1a). `subtype` alone is not
-    /// enough: 16 of the 22 `local_command` records in the corpus are not `/context`
-    /// at all, and one of them reads ``Kept model as `Opus 5 (1M context) (default)` ``
-    /// — a string from which a permissive read takes `1M` and calls it a window. So the
-    /// panel's own title has to be there too. The cost is named rather than hidden: if
-    /// that title ever changes, the read and its diagnostics die TOGETHER and the panel
-    /// falls back to today's behaviour with nothing to say about it (G-i).
+    /// Two gates, and they are one gate used twice (D1a). `subtype` alone is not enough:
+    /// most `local_command` records are not `/context` at all — 16 of 22 on 2026-09-11,
+    /// 33 of 39 on 2026-09-12, a proportion that holds while the absolutes climb — and
+    /// one of them reads ``Kept model as `Opus 5 (1M context) (default)` ``, a string
+    /// from which a permissive read takes `1M` and calls it a window. So the panel's own
+    /// title has to be there too. The cost is named rather than hidden: if that title
+    /// ever changes, the read and its diagnostics die TOGETHER and the panel falls back
+    /// to today's behaviour with nothing to say about it (G-i).
     fn on_system(&mut self, v: &Value) {
         if str_at(v, "subtype") != Some("local_command") {
             return;
@@ -1996,6 +2014,25 @@ fn header_anchor(stripped: &str) -> Option<u64> {
 }
 
 /// The `<num>/<denom>` that must sit immediately left of a ` tokens (`.
+///
+/// **The numerator check buys none of the exclusions named above** — measure before
+/// crediting it, as two earlier versions of this comment did not. The category lines and
+/// the model banner are refused by the slash and the literal ` tokens (`; the
+/// `.claude/agents 534 tokens (…)` case is refused by the DENOMINATOR parse, one
+/// statement earlier, because `agents 534` is not a number. What the check actually buys
+/// is the narrower case where a path's right-hand component IS one: `logs/700000 tokens (`
+/// reads as a 700,000-token window without it. Both halves are pinned by the test named
+/// `the_numerator_check_buys_one_case_and_not_the_others`.
+///
+/// **It is also the quietest way to lose this anchor**, and that is the real cost: the
+/// header now depends on the NUMERATOR's notation too. A numerator
+/// this grammar does not know (a thousands separator, `217,737`; some future unit)
+/// returns `None` here while the labelled line still reads fine, so D2's redundancy
+/// silently halves and D10's "one anchor failing counts nothing" rule fires no counter,
+/// by design. That is the right trade while the labelled line is healthy and the wrong
+/// one the day it is not, and no session in the corpus can currently detect the
+/// difference — every observed numerator is `<digits>[.<digits>]k`. If the two anchors
+/// ever need to fail independently *and* visibly, this is the line that has to change.
 fn header_denominator(before: &str) -> Option<u64> {
     let (numerator, denominator) = before.rsplit_once('/')?;
     let window = parse_window_tokens(denominator)?;
@@ -2485,7 +2522,9 @@ mod tests {
     #[test]
     fn prose_quoting_the_label_is_not_a_reading() {
         // R1.2 — the trap this whole gate exists for. In the corpus the four prose
-        // types carrying this string outnumber the authoritative one 5:1.
+        // types carrying this string outnumber the authoritative one by an order of
+        // magnitude — 5:1 on 2026-09-11, 23:1 a day later, climbing as every discussion
+        // of this feature adds more prose. The ratio is the fact; the figure is a date.
         for ty in ["assistant", "user", "attachment", "queue-operation"] {
             let quoted = line(serde_json::json!({
                 "type": ty,
@@ -2792,10 +2831,27 @@ mod tests {
 
     #[test]
     fn header_ignores_a_slash_that_is_not_a_gauge() {
-        // A path, not a `used/total`. The numerator check is what refuses it.
+        // Three ways a `X ... tokens (` line can fail to be a gauge: a path's slash, a
+        // missing `(`, a missing slash. Each is refused by a DIFFERENT clause, which is
+        // why the next test exists — for two revisions this comment credited all three
+        // to the numerator check, and none of them is.
         assert_eq!(header_anchor("see .claude/agents 534 tokens (0.1%)"), None);
         assert_eq!(header_anchor("74.7k/700k tokens 11%"), None);
         assert_eq!(header_anchor("74.7k 700k tokens (11%)"), None);
+    }
+
+    #[test]
+    fn the_numerator_check_buys_one_case_and_not_the_others() {
+        // Which clause does which work — asserted, because prose about it was wrong
+        // twice. The path case never reaches the numerator check: `parse_window_tokens`
+        // rejects `agents 534` one line earlier.
+        assert_eq!(parse_window_tokens("agents 534"), None);
+
+        // The case the numerator check alone refuses: a path whose right-hand component
+        // IS a plausible window. Delete the check and this reads as 700,000.
+        assert_eq!(parse_window_tokens("700000"), Some(700_000));
+        assert_eq!(parse_token_count("logs"), None);
+        assert_eq!(header_anchor("logs/700000 tokens (5%)"), None);
     }
 
     #[test]
