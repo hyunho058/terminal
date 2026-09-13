@@ -273,6 +273,33 @@ pub struct TaskNotification {
     pub status: Option<String>,
 }
 
+/// A context window READ out of a `/context` command's stdout, paired with the model
+/// that was running when it was read (`ai-monitor-context-window` D12).
+///
+/// One struct rather than two snapshot fields, because the pair must move ATOMICALLY:
+/// the app refuses a reading whose model no longer matches (D9), so a window updated
+/// without its model — or the reverse — is a reading attributed to the wrong model.
+/// Two independent fields put that mismatch one coding slip away; this puts it beyond
+/// construction, since the pair is written whole and replaced whole.
+///
+/// It does NOT make "a window with no model" unrepresentable, and must not try to:
+/// `model_at_read: None` is a state D9 explicitly requires, for a log that has not
+/// named a model yet.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContextWindowReading {
+    /// The window `/context` printed, in tokens.
+    ///
+    /// A ROUNDED READING, not a measurement: the source prints `700k`, so this is
+    /// 700,000 ± up to half a notation unit. Cross-checked as exactly 700,000 across
+    /// the corpus (`33000/700000 = 4.714%` displays as `4.7%`), but consistency is not
+    /// proof. The residual error is ~0.07% of the window and invisible in a percentage.
+    pub tokens: u64,
+    /// The model folded at the moment of the read, or `None` if the log had not named
+    /// one yet. Compared — as a whole string, never by tier — against the live model
+    /// before the reading is used.
+    pub model_at_read: Option<String>,
+}
+
 /// The versioned contract the watcher sends and the app formats (D11).
 ///
 /// Deliberately omits the pending-tool map and the dedupe set — internal
@@ -300,6 +327,15 @@ pub struct TelemetrySnapshot {
     /// the app needs the second to pick a denominator: a window cannot shrink mid-session,
     /// so evidence of its size must not expire with the reading that produced it.
     pub context_high_water: u64,
+    /// The window READ from a `/context` record, when this session has one — the only
+    /// place in a log where the window is stated rather than inferred.
+    ///
+    /// `None` is the ordinary case (37 of 42 logs in the measured corpus never ran
+    /// `/context`), and it means exactly what it meant before this field existed: the
+    /// app falls back to its model table and its high-water promotion. Last-wins across
+    /// a session, on the same grounds as `model` — `/model` can change the window
+    /// mid-session, so the newest reading is the true one.
+    pub context_window_reading: Option<ContextWindowReading>,
     // time (D3) — the app derives uptime/idle from these
     pub first_event_ms: Option<u64>,
     pub last_event_ms: Option<u64>,
@@ -351,6 +387,22 @@ pub struct TelemetrySnapshot {
     pub orphan_task_updates: u64,
     pub unparsed_task_creates: u64,
     pub duplicate_tool_ids: u64,
+    /// `/context` rendered and NEITHER anchor yielded a usable window (D10).
+    ///
+    /// Without it this failure is unobservable: both anchors can break at once and the
+    /// panel just goes back to guessing, silently, with no test able to assert that the
+    /// format moved. Since the gate is the panel's own title, a non-zero value is a
+    /// definite, actionable statement — "the panel rendered and we could not read it" —
+    /// rather than a count of slash commands. What it does NOT say is WHY: a drifted
+    /// format, a truncated record and a sub-floor value are one number here.
+    pub context_window_parse_failures: u64,
+    /// Both anchors yielded a window and they DISAGREED (the labelled line is adopted).
+    ///
+    /// Kept apart from the failures above on this crate's existing rule: those count a
+    /// read that produced nothing, this counts two sources of the same fact
+    /// contradicting each other. Filing one under the other's name would be a lie about
+    /// what went wrong — the same reason `failed_tool_calls` is not a `parse_error`.
+    pub context_window_anchor_conflicts: u64,
 }
 
 /// A `tool_use` awaiting its `tool_result`, holding the per-kind facts D7 extracts.
@@ -419,6 +471,10 @@ pub struct SessionTelemetry {
     total_cache_creation: u64,
     context_used: u64,
     context_high_water: u64,
+    /// Last `/context` reading (D5 last-wins). Reset with everything else by
+    /// `restarted()`: a file that shrank is most likely a different session, and a
+    /// window read from the old one would outlive its evidence.
+    context_window_reading: Option<ContextWindowReading>,
     first_event_ms: Option<u64>,
     last_event_ms: Option<u64>,
 
@@ -455,6 +511,8 @@ pub struct SessionTelemetry {
     orphan_task_updates: u64,
     unparsed_task_creates: u64,
     duplicate_tool_ids: u64,
+    context_window_parse_failures: u64,
+    context_window_anchor_conflicts: u64,
 }
 
 impl SessionTelemetry {
@@ -576,6 +634,14 @@ impl SessionTelemetry {
         match v.get("type").and_then(Value::as_str) {
             Some("tool_use") => self.on_tool_use(v, ts),
             Some("tool_result") => self.on_tool_result(v, v, ts),
+            // Routed on the TAG, acted on by the parse — the same rule the
+            // task-notification branch follows (D12/R4.3), and for a sharper reason
+            // here. The string `Auto-compact window` lives in FIVE record types in the
+            // corpus, and the four that are prose outnumber the authoritative `system`
+            // records 5:1 (18 `assistant`, 10 `user`, 1 `attachment`, 1
+            // `queue-operation`, against 6). A whole-line grep reads a quotation as a
+            // measurement; dispatching on `type` cannot.
+            Some("system") => self.on_system(v),
             _ => {}
         }
         match v.pointer("/message/content") {
@@ -957,6 +1023,7 @@ impl SessionTelemetry {
             total_cache_creation: self.total_cache_creation,
             context_used: self.context_used,
             context_high_water: self.context_high_water,
+            context_window_reading: self.context_window_reading.clone(),
             first_event_ms: self.first_event_ms,
             last_event_ms: self.last_event_ms,
             tools: self.tools.iter().cloned().collect(),
@@ -976,6 +1043,8 @@ impl SessionTelemetry {
             orphan_task_updates: self.orphan_task_updates,
             unparsed_task_creates: self.unparsed_task_creates,
             duplicate_tool_ids: self.duplicate_tool_ids,
+            context_window_parse_failures: self.context_window_parse_failures,
+            context_window_anchor_conflicts: self.context_window_anchor_conflicts,
         }
     }
 
@@ -1090,6 +1159,56 @@ impl SessionTelemetry {
         // already proven it was not on. Keeping the maximum is what makes the deduction a
         // property of the session rather than of the newest line.
         self.context_high_water = self.context_high_water.max(used);
+    }
+
+    // ---- context window (`ai-monitor-context-window`) --------------------------
+
+    /// Fold a `type == "system"` record, which is where a slash command's stdout lands
+    /// — and so the only place the context window is ever STATED rather than guessed.
+    ///
+    /// Two gates, and they are one gate used twice (D1a). `subtype` alone is not
+    /// enough: 16 of the 22 `local_command` records in the corpus are not `/context`
+    /// at all, and one of them reads ``Kept model as `Opus 5 (1M context) (default)` ``
+    /// — a string from which a permissive read takes `1M` and calls it a window. So the
+    /// panel's own title has to be there too. The cost is named rather than hidden: if
+    /// that title ever changes, the read and its diagnostics die TOGETHER and the panel
+    /// falls back to today's behaviour with nothing to say about it (G-i).
+    fn on_system(&mut self, v: &Value) {
+        if str_at(v, "subtype") != Some("local_command") {
+            return;
+        }
+        let Some(raw) = str_at(v, "content") else {
+            return;
+        };
+        if !raw.contains(CONTEXT_PANEL_TITLE) {
+            return;
+        }
+        let stripped = strip_sgr(raw);
+        let (dedicated, header) = read_window_anchors(&stripped);
+        // Two anchors and two counters, each with exactly one trigger. One anchor
+        // failing alone is the redundancy WORKING and is counted nowhere.
+        if let (Some(a), Some(b)) = (dedicated, header) {
+            if a != b {
+                self.context_window_anchor_conflicts += 1;
+            }
+        }
+        let Some(tokens) = dedicated.or(header) else {
+            self.context_window_parse_failures += 1;
+            return;
+        };
+        // Plain assignment, so a second `/context` replaces the first (D5). The rule
+        // follows `model`, not `session_id`: an id is fixed for the life of a file, but
+        // a window tracks the model tier and `/model` can move it mid-session, so the
+        // newest reading is the true one.
+        //
+        // The pair is written in ONE statement, which is the whole reason it is one
+        // struct: `model_at_read` is read back beside `tokens` when the app decides
+        // whether to believe this, and a window carrying the wrong model's name is a
+        // reading that looks valid and is not.
+        self.context_window_reading = Some(ContextWindowReading {
+            tokens,
+            model_at_read: self.model.clone(),
+        });
     }
 
     // ---- tool correlation (D5, D7, D8, D9) ------------------------------------
@@ -1697,6 +1816,196 @@ fn scrape_model_selection(content: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+// ---- context window: reading `/context` stdout (spec ai-monitor-context-window) ----
+//
+// The window is the DENOMINATOR of the CONTEXT tile, and it appears in exactly one
+// place in a log: the stdout of the `/context` command. No field anywhere carries it —
+// `dashboard.rs` already records that every `[1m]` in a real log is prose inside a
+// message, never a field, and a sweep for a numeric `200000|700000|1000000` field over
+// the whole corpus returns nothing. So the app has been GUESSING it from the model id,
+// and guessed wrong: a session at 74,677 used showed 11% under `/context` (74.7k/700k)
+// and 37% on the panel (74.7k/200k). The numerator already agrees to the token; only
+// the denominator is wrong. These helpers read the real one.
+
+/// Smallest value that may be believed as a context window (D7).
+///
+/// The header anchor's neighbourhood contains a percentage (`74.7k/700k tokens (11%)`),
+/// so a loose match could pick `11` as the denominator. Real windows are >= 1,000 and
+/// percentages are 0-100, which this cuts cleanly between. The number itself is
+/// assumed, not measured — no observed window comes anywhere near it.
+const WINDOW_FLOOR: u64 = 1_000;
+
+/// Strip CSI-SGR sequences (`ESC [ … m`) from `s`, keeping every other byte.
+///
+/// Written here rather than pulled in: the workspace has no ANSI stripper, and
+/// `ai-monitor` depends on `serde_json` + `notify` and nothing else. One screenful of
+/// code does not justify a third.
+///
+/// **SGR only, and that is measured, not assumed.** Across the `local_command` stdout
+/// of every `/context` record in the corpus there are 572 escape sequences and the
+/// final byte is `m` on all 572 — no OSC, no cursor motion. A CSI that is not SGR is
+/// therefore left VERBATIM: stripping it would be unreachable code dressed as
+/// robustness, and the name of this function would stop being true.
+///
+/// **Not written against one sample.** Two SGR encodings coexist in the corpus —
+/// truecolor `ESC[38;2;153;153;153m` in most logs and 256-colour `ESC[38;5;246m` in
+/// one — so a `38;2`-shaped matcher would silently read half the logs. This matches the
+/// CSI shape instead: `ESC [`, parameter bytes, final byte `m`.
+///
+/// **Driven by the escapes, not by a cursor.** An earlier version walked the string
+/// with a hand-advanced index; mutation testing reported five mutants that turned an
+/// increment into a no-op and HUNG the suite, plus two that made a scan of bytes no
+/// input ever contains unobservable. Both classes were properties of the cursor rather
+/// than of the job: `match_indices` supplies the only positions that matter, and the
+/// parameter run is COUNTED rather than walked, so there is no index left to advance
+/// wrongly. ECMA-48's intermediate bytes (`0x20..=0x2f`) are not scanned at all —
+/// nothing in the corpus has one, an SGR with an intermediate byte is not SGR by that
+/// standard anyway, and code that only a fabricated input can reach is the
+/// robustness-shaped unreachable branch the paragraph above refuses.
+fn strip_sgr(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    // Start of the run not yet copied. An `ESC` can never fall inside a sequence
+    // already removed — neither a parameter byte nor `m` can be 0x1b — so this only
+    // ever moves forward, and every slice below is `copied <= start` with both ends on
+    // an ASCII byte, hence on a char boundary.
+    let mut copied = 0usize;
+    for (start, _) in s.match_indices('\u{1b}') {
+        if bytes.get(start + 1) != Some(&b'[') {
+            continue;
+        }
+        let params = s[start + 2..]
+            .bytes()
+            .take_while(|b| (0x30..=0x3f).contains(b))
+            .count();
+        let end = start + 2 + params;
+        if bytes.get(end) != Some(&b'm') {
+            continue;
+        }
+        out.push_str(&s[copied..start]);
+        copied = end + 1;
+    }
+    out.push_str(&s[copied..]);
+    out
+}
+
+/// Parse one human-facing token count — `700k`, `74.7k`, `1.0M`, `700000`.
+///
+/// The whole of `s` (trimmed) must be the number; a caller hands in an exact slice it
+/// has already anchored, so trailing prose is a parse failure rather than something to
+/// skip over. The bare-integer case is not an invented notation — it is the natural
+/// boundary of the same grammar `<digits>[.<digits>][k|K|m|M]`.
+///
+/// Integer arithmetic throughout, and `checked_*` rather than saturating: a value that
+/// overflowed to `u64::MAX` would sail past [`WINDOW_FLOOR`] and become a denominator,
+/// which is the one failure mode worse than reading nothing.
+fn parse_token_count(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (digits, mult) = match s.as_bytes().last() {
+        Some(b'k' | b'K') => (&s[..s.len() - 1], 1_000u64),
+        Some(b'm' | b'M') => (&s[..s.len() - 1], 1_000_000u64),
+        _ => (s, 1u64),
+    };
+    // `split_once` reports a trailing `.` as an EMPTY fractional part, and "every byte
+    // of nothing is a digit" is vacuously true — so `700.k` would parse as 700,000
+    // unless the optionality is spelt out here. The grammar's `[.<digits>]` means the
+    // dot and at least one digit together, or neither.
+    let (int_part, frac_part) = match digits.split_once('.') {
+        Some((_, "")) => return None,
+        Some((a, b)) => (a, b),
+        None => (digits, ""),
+    };
+    if int_part.is_empty() || !int_part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if !frac_part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // `74.7` * 1_000 is computed as (747 * 1_000 + 5) / 10 — one scaled integer, then a
+    // round-half-up divide. No floats, and `74.7k` lands on exactly 74,700.
+    let scale = 10u64.checked_pow(u32::try_from(frac_part.len()).ok()?)?;
+    let int_val: u64 = int_part.parse().ok()?;
+    let frac_val: u64 = if frac_part.is_empty() {
+        0
+    } else {
+        frac_part.parse().ok()?
+    };
+    let scaled = int_val.checked_mul(scale)?.checked_add(frac_val)?;
+    scaled
+        .checked_mul(mult)?
+        .checked_add(scale / 2)?
+        .checked_div(scale)
+}
+
+/// A token count that is allowed to be believed as a window: the grammar, then the
+/// floor (D7). Both failures collapse to `None` on purpose — the caller counts them
+/// under one diagnostic because both mean the same thing, "this anchor yielded nothing
+/// usable".
+fn parse_window_tokens(s: &str) -> Option<u64> {
+    parse_token_count(s).filter(|n| *n >= WINDOW_FLOOR)
+}
+
+/// The panel title every `/context` render opens with, and the gate both the read and
+/// its diagnostics hang on (D1a).
+///
+/// Checked against the RAW content, before [`strip_sgr`] — which is not merely an
+/// optimisation for the records it rejects. The two orderings are distinguishable: a
+/// title interrupted by an SGR sequence would pass a post-strip gate and fail this one,
+/// and passing it is the wrong answer, since this string is what says "the panel
+/// rendered", not "something mentions context".
+const CONTEXT_PANEL_TITLE: &str = "Context Usage";
+
+/// Label of the authoritative anchor — a line of its own carrying nothing else.
+const WINDOW_LABEL: &str = "Auto-compact window:";
+
+/// Both anchors of a `/context` stdout, as `(dedicated line, header denominator)`.
+///
+/// Two, because the caller wants drift tolerance out of a redundancy that ACTUALLY
+/// EXISTS in the source rather than out of guesses about notations nobody has seen:
+/// the same window is printed twice per render, once labelled and once as the header's
+/// denominator. Either may survive the other's format changing.
+///
+/// Takes text that has already been through [`strip_sgr`]; both anchors have SGR
+/// sequences sitting inside them in the raw bytes — the label and its digits are
+/// separated by two of them, which is why the obvious regex over raw content fails.
+fn read_window_anchors(stripped: &str) -> (Option<u64>, Option<u64>) {
+    (dedicated_anchor(stripped), header_anchor(stripped))
+}
+
+/// `Auto-compact window: 700k tokens` — the labelled line.
+fn dedicated_anchor(stripped: &str) -> Option<u64> {
+    let after = stripped.split(WINDOW_LABEL).nth(1)?;
+    // The value is the first word after the label. Taking a word rather than the rest
+    // of the line is what makes the trailing ` tokens` a non-event.
+    parse_window_tokens(after.split_whitespace().next()?)
+}
+
+/// `74.7k/700k tokens (11%)` — the header's DENOMINATOR.
+///
+/// Pinned as a grammar and not as an example, because an example cannot say what it
+/// excludes. The slash and the literal ` tokens (` are both required, and together they
+/// rule out the two things in the same stdout that a looser match would swallow: the
+/// per-category lines (`System prompt: 4.7k tokens (0.7%)` — no slash) and the model
+/// banner (`Opus 5 (1M context)` — neither), the second of which would otherwise hand
+/// back 1,000,000 as a window.
+fn header_anchor(stripped: &str) -> Option<u64> {
+    const TAIL: &str = " tokens (";
+    stripped
+        .match_indices(TAIL)
+        .find_map(|(idx, _)| header_denominator(stripped.get(..idx)?))
+}
+
+/// The `<num>/<denom>` that must sit immediately left of a ` tokens (`.
+fn header_denominator(before: &str) -> Option<u64> {
+    let (numerator, denominator) = before.rsplit_once('/')?;
+    let window = parse_window_tokens(denominator)?;
+    // The numerator is only ever checked, never used: its job is to prove the slash was
+    // a `used/total` separator and not, say, a path. The line begins with block glyphs,
+    // so "the word before the slash" — not "everything before it" — is the numerator.
+    let used = numerator.rsplit(char::is_whitespace).next()?;
+    parse_token_count(used).map(|_| window)
+}
+
 /// Whether a `message.model` value names a model that actually ran.
 ///
 /// `<synthetic>` is a REAL value of that field, not a hypothetical: Claude Code writes
@@ -2007,4 +2316,528 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let doy = (153 * mp + 2) / 5 + d as i64 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The private half of `specs/ai-monitor-context-window`. The crate's other tests
+    // are integration tests over fixture JSONL, which cannot reach a private free
+    // function — and these three ARE the parse, so leaving them to be exercised only
+    // through a whole folded log would test them by implication rather than directly.
+
+    #[test]
+    fn strip_sgr_removes_both_observed_encodings() {
+        // R2.7 — truecolor and 256-colour coexist in the corpus. Text between them
+        // survives intact; this is the case a `38;2`-shaped matcher gets half right.
+        let raw = "\u{1b}[38;2;153;153;153mtrue\u{1b}[39m/\u{1b}[38;5;246mindexed\u{1b}[39m";
+        assert_eq!(strip_sgr(raw), "true/indexed");
+    }
+
+    #[test]
+    fn strip_sgr_clears_the_label_number_boundary() {
+        // R2.1 — the reason a naive `Auto-compact window: (\d+)` regex fails: two SGR
+        // sequences sit BETWEEN the label and the digits.
+        let raw = "\u{1b}[1mAuto-compact window: \u{1b}[22m\u{1b}[38;5;246m700k tokens\u{1b}[39m";
+        assert_eq!(strip_sgr(raw), "Auto-compact window: 700k tokens");
+    }
+
+    #[test]
+    fn strip_sgr_keeps_non_sgr_and_malformed_sequences() {
+        // Measured: 572/572 escapes in the corpus end in `m`. A CSI that is not SGR is
+        // left verbatim — the function strips SGR, and says so. A bare `ESC[` with no
+        // final byte must not eat the rest of the string either.
+        assert_eq!(strip_sgr("a\u{1b}[2Jb"), "a\u{1b}[2Jb");
+        assert_eq!(strip_sgr("a\u{1b}[38;5b"), "a\u{1b}[38;5b");
+        assert_eq!(strip_sgr("a\u{1b}b"), "a\u{1b}b");
+        assert_eq!(strip_sgr("a\u{1b}["), "a\u{1b}[");
+    }
+
+    #[test]
+    fn strip_sgr_is_utf8_safe_around_multibyte_text() {
+        // The panel's own stdout is full of these — `⛶ ⛁ ⛝` between colour changes.
+        let raw = "\u{1b}[38;5;246m⛶ ⛁\u{1b}[39m ⛝";
+        assert_eq!(strip_sgr(raw), "⛶ ⛁ ⛝");
+        assert_eq!(strip_sgr("한글"), "한글");
+    }
+
+    #[test]
+    fn strip_sgr_needs_the_escape_and_not_just_the_brackets() {
+        // The corpus string that makes this a real case rather than a hypothetical:
+        // `/context` prints the model id as `claude-opus-5[1m]`, which is `[`, a
+        // parameter byte and `m` with NO escape in front. `dashboard.rs` documents the
+        // same trap from the other side — every `[1m]` in a log is prose, never a
+        // field. A stripper keyed on the brackets eats the id.
+        assert_eq!(strip_sgr("claude-opus-5[1m]"), "claude-opus-5[1m]");
+        assert_eq!(strip_sgr("a[0mb"), "a[0mb");
+        assert_eq!(strip_sgr("[38;2;153;153;153m"), "[38;2;153;153;153m");
+    }
+
+    #[test]
+    fn strip_sgr_passes_through_text_without_escapes() {
+        assert_eq!(
+            strip_sgr("Auto-compact window: 700k tokens"),
+            "Auto-compact window: 700k tokens"
+        );
+        assert_eq!(strip_sgr(""), "");
+    }
+
+    #[test]
+    fn parse_token_count_reads_the_observed_notations() {
+        // R2.5 — `700k`, `74.7k`, `1.0M`, and the bare integer at the grammar's edge.
+        assert_eq!(parse_token_count("700k"), Some(700_000));
+        assert_eq!(parse_token_count("74.7k"), Some(74_700));
+        assert_eq!(parse_token_count("1.0M"), Some(1_000_000));
+        assert_eq!(parse_token_count("700000"), Some(700_000));
+        assert_eq!(parse_token_count("200K"), Some(200_000));
+        assert_eq!(parse_token_count("1m"), Some(1_000_000));
+        assert_eq!(parse_token_count(" 700k "), Some(700_000));
+    }
+
+    #[test]
+    fn parse_token_count_rounds_half_up_without_floats() {
+        // `591.8k` is a real value from the corpus (`Free space`). The scaled-integer
+        // divide must not truncate a half away.
+        assert_eq!(parse_token_count("591.8k"), Some(591_800));
+        assert_eq!(parse_token_count("0.0005M"), Some(500));
+        assert_eq!(parse_token_count("700.5"), Some(701));
+        assert_eq!(parse_token_count("1.2345k"), Some(1_235));
+    }
+
+    #[test]
+    fn parse_token_count_rejects_what_is_not_a_number() {
+        for bad in [
+            "",
+            "k",
+            ".5k",
+            "abc",
+            "7 0 0k",
+            "700kk",
+            "70-0",
+            "700k tokens",
+            "1M)",
+            "+700k",
+            "-700",
+            "7.0.0k",
+            "700.k",
+        ] {
+            assert_eq!(parse_token_count(bad), None, "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn parse_token_count_refuses_to_overflow_into_a_denominator() {
+        // Saturating here would hand `u64::MAX` to the tile as a window — a number that
+        // passes the floor and renders 1% forever. `None` is the only safe answer.
+        assert_eq!(parse_token_count("99999999999999999999M"), None);
+        assert_eq!(parse_token_count(&format!("{}M", u64::MAX)), None);
+    }
+
+    // ---- the gate, and the fold behind it (R1, R3) ---------------------------
+
+    /// One `/context` stdout, wrapped the way the real record wraps it.
+    fn context_stdout(body: &str) -> String {
+        format!("<local-command-stdout> \u{1b}[1mContext Usage\u{1b}[22m\n{body}</local-command-stdout>")
+    }
+
+    fn line(v: serde_json::Value) -> String {
+        v.to_string()
+    }
+
+    fn folded(lines: &[String]) -> TelemetrySnapshot {
+        let mut t = SessionTelemetry::new();
+        for l in lines {
+            t.apply(l);
+        }
+        t.snapshot()
+    }
+
+    fn assistant_turn(model: &str) -> String {
+        line(serde_json::json!({
+            "type": "assistant",
+            "message": { "model": model, "content": [] },
+        }))
+    }
+
+    fn context_record(body: &str) -> String {
+        line(serde_json::json!({
+            "type": "system",
+            "subtype": "local_command",
+            "level": "info",
+            "content": context_stdout(body),
+        }))
+    }
+
+    #[test]
+    fn a_context_record_fills_the_reading() {
+        // R1.1
+        let snap = folded(&[context_record(&format!("{HEADER}\n{DEDICATED}\n"))]);
+        assert_eq!(
+            snap.context_window_reading,
+            Some(ContextWindowReading {
+                tokens: 700_000,
+                model_at_read: None,
+            })
+        );
+    }
+
+    #[test]
+    fn prose_quoting_the_label_is_not_a_reading() {
+        // R1.2 — the trap this whole gate exists for. In the corpus the four prose
+        // types carrying this string outnumber the authoritative one 5:1.
+        for ty in ["assistant", "user", "attachment", "queue-operation"] {
+            let quoted = line(serde_json::json!({
+                "type": ty,
+                "subtype": "local_command",
+                "content": context_stdout("Auto-compact window: 999k tokens\n"),
+            }));
+            assert_eq!(
+                folded(&[quoted]).context_window_reading,
+                None,
+                "{ty} was read as authoritative"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_command_that_is_not_context_is_not_a_reading() {
+        // R1.3 — verbatim from the corpus, and the exact string that reads as a
+        // 1,000,000-token window if either the title gate or the header grammar is
+        // missing. Both are removed here in turn to show each one alone refuses it.
+        let body = "<local-command-stdout>Kept model as `Opus 5 (1M context) (default)`</local-command-stdout>";
+        let record = line(serde_json::json!({
+            "type": "system",
+            "subtype": "local_command",
+            "content": body,
+        }));
+        assert_eq!(folded(&[record]).context_window_reading, None);
+        assert_eq!(read_window_anchors(body), (None, None));
+    }
+
+    #[test]
+    fn the_title_gate_is_checked_before_the_escapes_are_stripped() {
+        // R1.4 — the two orderings are DISTINGUISHABLE, which is what makes this a
+        // test and not a comment. A title interrupted by an SGR sequence survives
+        // stripping and would pass a post-strip gate; on the raw bytes it does not
+        // match, and not matching is the right answer — the unbroken title is what
+        // says "the panel rendered this".
+        let split_title = format!(
+            "<local-command-stdout> \u{1b}[1mContext\u{1b}[0m Usage\u{1b}[22m\n{DEDICATED}\n</local-command-stdout>"
+        );
+        assert!(strip_sgr(&split_title).contains(CONTEXT_PANEL_TITLE));
+        let record = line(serde_json::json!({
+            "type": "system",
+            "subtype": "local_command",
+            "content": split_title,
+        }));
+        assert_eq!(folded(&[record]).context_window_reading, None);
+    }
+
+    #[test]
+    fn a_system_record_of_another_subtype_is_not_a_reading() {
+        // `turn_duration` and `stop_hook_summary` are 360 of the corpus's 389 `system`
+        // records; the dispatch reaches every one of them.
+        let record = line(serde_json::json!({
+            "type": "system",
+            "subtype": "turn_duration",
+            "content": context_stdout(&format!("{DEDICATED}\n")),
+        }));
+        assert_eq!(folded(&[record]).context_window_reading, None);
+    }
+
+    #[test]
+    fn a_system_record_with_no_string_content_is_not_a_reading() {
+        for content in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!(7),
+        ] {
+            let record = line(serde_json::json!({
+                "type": "system",
+                "subtype": "local_command",
+                "content": content,
+            }));
+            assert_eq!(folded(&[record]).context_window_reading, None);
+        }
+    }
+
+    #[test]
+    fn the_last_context_in_a_session_wins() {
+        // R3.1 — the `model` rule, not the `session_id` rule: `/model` can move the
+        // window mid-session, so the newest reading is the true one.
+        let first = context_record("Auto-compact window: 200k tokens\n");
+        let second = context_record("Auto-compact window: 700k tokens\n");
+        let snap = folded(&[first, second]);
+        assert_eq!(snap.context_window_reading.map(|r| r.tokens), Some(700_000));
+    }
+
+    #[test]
+    fn the_window_and_the_model_are_stored_as_one_pair() {
+        // R3.2 — the model in force at the moment of the read, not at end of file.
+        let snap = folded(&[
+            assistant_turn("claude-opus-5"),
+            context_record(&format!("{DEDICATED}\n")),
+        ]);
+        assert_eq!(
+            snap.context_window_reading,
+            Some(ContextWindowReading {
+                tokens: 700_000,
+                model_at_read: Some("claude-opus-5".to_string()),
+            })
+        );
+
+        // A later `/model` moves `model` but cannot move a reading already taken —
+        // that divergence is the fact D9 consumes.
+        let snap = folded(&[
+            assistant_turn("claude-opus-5"),
+            context_record(&format!("{DEDICATED}\n")),
+            assistant_turn("claude-haiku-4-5"),
+        ]);
+        assert_eq!(snap.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(
+            snap.context_window_reading.and_then(|r| r.model_at_read),
+            Some("claude-opus-5".to_string())
+        );
+    }
+
+    #[test]
+    fn a_conflict_between_the_anchors_adopts_the_labelled_line() {
+        // R2.4 — the dedicated line is authoritative; the header only corroborates.
+        let body = format!(
+            "\u{1b}[38;2;153;153;153m\u{2036}   74.7k/1.0M tokens (7%)\u{1b}[39m\n{DEDICATED}\n"
+        );
+        let snap = folded(&[context_record(&body)]);
+        assert_eq!(snap.context_window_reading.map(|r| r.tokens), Some(700_000));
+    }
+
+    #[test]
+    fn either_anchor_alone_still_yields_a_reading() {
+        // R6.2's other half: the redundancy is there to be used, not just counted.
+        let header_only = folded(&[context_record(&format!("{HEADER}\n{CATEGORIES}"))]);
+        assert_eq!(
+            header_only.context_window_reading.map(|r| r.tokens),
+            Some(700_000)
+        );
+        let dedicated_only = folded(&[context_record(&format!("{CATEGORIES}\n{DEDICATED}\n"))]);
+        assert_eq!(
+            dedicated_only.context_window_reading.map(|r| r.tokens),
+            Some(700_000)
+        );
+    }
+
+    #[test]
+    fn a_context_record_that_reads_nothing_leaves_the_field_alone() {
+        // The fallback that keeps every non-reading session byte-identical to today.
+        let snap = folded(&[context_record("the panel rendered but the format moved\n")]);
+        assert_eq!(snap.context_window_reading, None);
+
+        // And it does not erase a reading already taken.
+        let snap = folded(&[
+            context_record(&format!("{DEDICATED}\n")),
+            context_record("the panel rendered but the format moved\n"),
+        ]);
+        assert_eq!(snap.context_window_reading.map(|r| r.tokens), Some(700_000));
+    }
+
+    // ---- diagnostics (R6) ----------------------------------------------------
+
+    #[test]
+    fn both_anchors_failing_counts_once_as_a_parse_failure() {
+        // R6.1 — and only under the failures counter: nothing here disagreed.
+        let snap = folded(&[context_record("the panel rendered but the format moved\n")]);
+        assert_eq!(snap.context_window_parse_failures, 1);
+        assert_eq!(snap.context_window_anchor_conflicts, 0);
+        assert_eq!(snap.context_window_reading, None);
+    }
+
+    #[test]
+    fn a_sub_floor_value_counts_as_a_parse_failure() {
+        // D10's table folds "read nothing" and "read something impossible" into one
+        // counter, because to the panel they are the same event.
+        let snap = folded(&[context_record("Auto-compact window: 11 tokens\n")]);
+        assert_eq!(snap.context_window_parse_failures, 1);
+        assert_eq!(snap.context_window_reading, None);
+    }
+
+    #[test]
+    fn one_anchor_failing_counts_nothing() {
+        // R6.2 — this is the redundancy doing its job, not a fault. Counting it would
+        // make the failure counter a measure of format variety.
+        for body in [
+            format!("{HEADER}\n{CATEGORIES}"),
+            format!("{CATEGORIES}\n{DEDICATED}\n"),
+        ] {
+            let snap = folded(&[context_record(&body)]);
+            assert_eq!(snap.context_window_parse_failures, 0);
+            assert_eq!(snap.context_window_anchor_conflicts, 0);
+            assert_eq!(snap.context_window_reading.map(|r| r.tokens), Some(700_000));
+        }
+    }
+
+    #[test]
+    fn disagreeing_anchors_count_as_a_conflict_and_not_as_a_failure() {
+        // R2.4 / R6 — a reading still lands, so nothing "failed to parse"; what
+        // happened is that two sources of one fact disagreed.
+        let body = format!(
+            "\u{1b}[38;2;153;153;153m\u{2036}   74.7k/1.0M tokens (7%)\u{1b}[39m\n{DEDICATED}\n"
+        );
+        let snap = folded(&[context_record(&body)]);
+        assert_eq!(snap.context_window_anchor_conflicts, 1);
+        assert_eq!(snap.context_window_parse_failures, 0);
+        assert_eq!(snap.context_window_reading.map(|r| r.tokens), Some(700_000));
+    }
+
+    #[test]
+    fn agreeing_anchors_count_nothing() {
+        let snap = folded(&[context_record(&format!("{HEADER}\n{DEDICATED}\n"))]);
+        assert_eq!(snap.context_window_anchor_conflicts, 0);
+        assert_eq!(snap.context_window_parse_failures, 0);
+    }
+
+    #[test]
+    fn records_outside_the_gate_count_nothing() {
+        // R6.3 — the reason the gate is the panel title and not `subtype` alone. In
+        // the corpus 16 of 22 `local_command` records are not `/context`; under a
+        // `subtype`-only gate the failure counter would rise every time the user typed
+        // ANY slash command, including once per successful `/context` (its own echo
+        // record), at a signal-to-noise ratio of 1:16.
+        let noise = [
+            line(serde_json::json!({
+                "type": "system", "subtype": "local_command",
+                "content": "<command-name>/context</command-name>",
+            })),
+            line(serde_json::json!({
+                "type": "system", "subtype": "local_command", "content": "",
+            })),
+            line(serde_json::json!({
+                "type": "system", "subtype": "local_command",
+                "content": "<local-command-stdout>Kept model as `Opus 5 (1M context)`</local-command-stdout>",
+            })),
+            line(serde_json::json!({
+                "type": "system", "subtype": "turn_duration", "content": "12s",
+            })),
+            line(serde_json::json!({
+                "type": "assistant",
+                "message": { "model": "claude-opus-5", "content": [] },
+            })),
+        ];
+        let snap = folded(&noise);
+        assert_eq!(snap.context_window_parse_failures, 0);
+        assert_eq!(snap.context_window_anchor_conflicts, 0);
+    }
+
+    #[test]
+    fn a_successful_read_next_to_the_noise_still_counts_nothing() {
+        // The baseline is a CONSTANT zero, not a function of slash-command usage —
+        // which is what makes `> 0` actionable.
+        let mut lines = vec![line(serde_json::json!({
+            "type": "system", "subtype": "local_command",
+            "content": "<command-name>/context</command-name>",
+        }))];
+        lines.push(context_record(&format!("{HEADER}\n{DEDICATED}\n")));
+        let snap = folded(&lines);
+        assert_eq!(snap.context_window_parse_failures, 0);
+        assert_eq!(snap.context_window_reading.map(|r| r.tokens), Some(700_000));
+    }
+
+    // ---- anchors (R2.1-R2.4) ------------------------------------------------
+
+    /// The header line as it really appears — block glyphs, then the gauge.
+    const HEADER: &str = "\u{1b}[38;2;153;153;153m\u{2036}   74.7k/700k tokens (11%)\u{1b}[39m";
+    /// The labelled line as it really appears — two SGR sequences between the label
+    /// and the digits, which is exactly what a naive regex trips on.
+    const DEDICATED: &str =
+        "\u{1b}[1mAuto-compact window: \u{1b}[22m\u{1b}[38;2;153;153;153m700k tokens\u{1b}[39m";
+    /// The per-category block, verbatim from a real record. Nothing here is a window.
+    const CATEGORIES: &str = concat!(
+        "  \u{1b}[1mEstimated usage by category\u{1b}[22m\n",
+        "  System prompt: 4.7k tokens (0.7%)\n",
+        "  System tools: 22k tokens (3.1%)\n",
+        "  Custom agents: 534 tokens (0.1%)\n",
+        "  Messages: 31.8k tokens (4.5%)\n",
+        "  Free space: 591.8k (84.5%)\n",
+        "  Autocompact buffer: 33k tokens (4.7%)\n",
+    );
+
+    #[test]
+    fn dedicated_anchor_reads_across_the_sgr_between_label_and_digits() {
+        // R2.1
+        let (dedicated, _) = read_window_anchors(&strip_sgr(DEDICATED));
+        assert_eq!(dedicated, Some(700_000));
+    }
+
+    #[test]
+    fn header_anchor_reads_the_denominator_not_the_numerator_or_percentage() {
+        // R2.2 — three numbers on that line and only the middle one is the window.
+        let (_, header) = read_window_anchors(&strip_sgr(HEADER));
+        assert_eq!(header, Some(700_000));
+    }
+
+    #[test]
+    fn header_grammar_excludes_the_category_lines() {
+        // R2.3 — every one of these has ` tokens (` and none has the slash. `Free
+        // space` has the slash-less form AND no ` tokens (`; it must miss on both.
+        let (dedicated, header) = read_window_anchors(&strip_sgr(CATEGORIES));
+        assert_eq!((dedicated, header), (None, None));
+    }
+
+    #[test]
+    fn header_grammar_excludes_the_model_banner() {
+        // The concrete near-miss D1a was written for: `1M` inside prose. Without the
+        // slash and the ` tokens (` this reads as a 1,000,000-token window.
+        let banner = "  Opus 5 (1M context)\n  claude-opus-5[1m]\n";
+        assert_eq!(read_window_anchors(banner), (None, None));
+    }
+
+    #[test]
+    fn header_ignores_a_slash_that_is_not_a_gauge() {
+        // A path, not a `used/total`. The numerator check is what refuses it.
+        assert_eq!(header_anchor("see .claude/agents 534 tokens (0.1%)"), None);
+        assert_eq!(header_anchor("74.7k/700k tokens 11%"), None);
+        assert_eq!(header_anchor("74.7k 700k tokens (11%)"), None);
+    }
+
+    #[test]
+    fn header_refuses_a_denominator_under_the_floor() {
+        // R2.6 at the anchor: the shape is right, the number is not a window.
+        assert_eq!(header_anchor("3/11 tokens ("), None);
+    }
+
+    #[test]
+    fn both_anchors_read_the_same_full_stdout() {
+        let content = format!("{HEADER}\n{CATEGORIES}\n{DEDICATED}\n");
+        assert_eq!(
+            read_window_anchors(&strip_sgr(&content)),
+            (Some(700_000), Some(700_000))
+        );
+    }
+
+    #[test]
+    fn the_anchors_are_independent_so_either_survives_the_other() {
+        // The whole point of keeping two (D2): a format change on one side still
+        // leaves a reading. A pre-filter on the label would have destroyed exactly
+        // this property, which is why there is none.
+        let header_only = format!("{HEADER}\n{CATEGORIES}");
+        assert_eq!(
+            read_window_anchors(&strip_sgr(&header_only)),
+            (None, Some(700_000))
+        );
+        let dedicated_only = format!("{CATEGORIES}\n{DEDICATED}");
+        assert_eq!(
+            read_window_anchors(&strip_sgr(&dedicated_only)),
+            (Some(700_000), None)
+        );
+    }
+
+    #[test]
+    fn parse_window_tokens_applies_the_floor() {
+        // R2.6 — `11` is the percentage from the header's own line, and the one value a
+        // loose match is most likely to pick up.
+        assert_eq!(parse_window_tokens("11"), None);
+        assert_eq!(parse_window_tokens("999"), None);
+        assert_eq!(parse_window_tokens("1000"), Some(1_000));
+        assert_eq!(parse_window_tokens("700k"), Some(700_000));
+        assert_eq!(parse_window_tokens("nonsense"), None);
+    }
 }

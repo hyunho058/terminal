@@ -460,16 +460,22 @@ fn context_tile(t: &TelemetrySnapshot, env: &Env) -> StatTile {
         return StatTile::new("CONTEXT", DASH, ColorRole::TextMuted);
     };
     // `>100%` because a percentage over 100 is self-evidently impossible and reads as a
-    // broken dashboard, when what it means is that the assumed window is too small — a
-    // 1M-context session logs the same bare model id as a 200k one. The gauge clamps to
-    // full alongside it.
+    // broken dashboard. The gauge clamps to full alongside it.
     //
-    // Reachable only past the largest known tier — unobserved in the measured corpus (max 666,545), but retained because a larger window shipping is exactly when it matters, and still the right answer, now that `promoted_window` corrects
-    // the assumption: it only promotes to a window this table KNOWS about, so usage past
-    // the largest known tier fits nothing and lands here. The statement is narrower than
-    // it was — no longer "your window might be bigger than 200k" (deduced now) but "your
-    // window is bigger than any size this build knows" — and `[ai_monitor]
-    // context_window` remains how a user resolves it.
+    // It now means TWO different things, and which one depends on the branch
+    // `context_pct` took for the denominator. The tile does not distinguish them —
+    // changing what this displays is out of scope — so the distinction is recorded here:
+    //
+    // * Via a `/context` READING, it is a true statement about the session: usage has
+    //   passed the auto-compact threshold the session itself printed. Nothing is wrong
+    //   with the denominator; the number really is over budget. This is why a reading is
+    //   terminal rather than promoted — promotion would hide a fact behind a guess.
+    // * Via the TABLE, it is the old signal: the assumed window is too small, and this
+    //   build knows no tier large enough. Reachable only past the largest known tier —
+    //   unobserved in the measured corpus (max 666,545), but retained because a larger
+    //   window shipping is exactly when it matters. `promoted_window` only promotes to a
+    //   window the table KNOWS about, so usage past the largest tier fits nothing and
+    //   lands here. `[ai_monitor] context_window` remains how a user resolves it.
     let value = if pct > 100 {
         ">100%".to_string()
     } else {
@@ -942,6 +948,40 @@ fn op_role(op: FileOp) -> ColorRole {
 
 // ---- formatting helpers -------------------------------------------------------
 
+/// The session's `/context` reading, if it has one and it still applies to the model
+/// that is running now (`ai-monitor-context-window` D9).
+///
+/// A PREDICATE, evaluated here, not a mutation applied when the model changed. The
+/// difference is observable: a session that goes opus → haiku → opus gets its reading
+/// back, and it should, because the reading is a fact measured on opus and opus is what
+/// is running again. Discarding it at the switch would lose it permanently.
+///
+/// The hole this closes is real and one-directional. Run `/context` on a 1M session,
+/// then `/model` down to a 200k one, and last-wins has nothing newer to offer: the 1M
+/// reading sets and the panel UNDER-reports — the one direction a tile whose job is to
+/// warn "this is filling up" must not fail in.
+///
+/// Compared as a WHOLE STRING, never by tier. Which id belongs to which tier is exactly
+/// the knowledge this spec established a log does not contain, so a tier comparison
+/// would smuggle the guess back in. The price is that `claude-opus-5` →
+/// `claude-opus-5-20260301` throws away a still-valid reading; it errs toward
+/// over-reporting, which is the safe side.
+///
+/// Four cases, and the fourth is a known tension rather than a tidy rule:
+///
+/// | at read → now | | |
+/// |---|---|---|
+/// | `None` → `None` | use | a log that never named a model; the case above exists for it |
+/// | `None` → `Some` | use | `None` at read is "no evidence yet", not "a different model" |
+/// | `Some(a)` → `Some(b)` | refuse | a genuine switch |
+/// | `Some(a)` → `None` | refuse | unreachable today, and NOT free if it ever is: with no model the fallback's `?` fires and the percentage vanishes entirely — which is the very failure the paragraph above exists to prevent. Whoever makes this arm reachable must revisit it together with that one. |
+fn usable_window_reading(t: &TelemetrySnapshot) -> Option<u64> {
+    let reading = t.context_window_reading.as_ref()?;
+    let applies =
+        reading.model_at_read.is_none() || reading.model_at_read.as_deref() == t.model.as_deref();
+    applies.then_some(reading.tokens)
+}
+
 /// Context occupancy as a whole percentage, or `None` when it cannot be stated.
 pub fn context_pct(t: &TelemetrySnapshot, env: &Env) -> Option<u64> {
     if t.context_used == 0 {
@@ -954,20 +994,37 @@ pub fn context_pct(t: &TelemetrySnapshot, env: &Env) -> Option<u64> {
     // before `promoted_window` is ever consulted.
     let window = match env.context_window {
         Some(w) => w,
-        // Assumed from the id, then corrected by measurement. The correction is inert
-        // unless the session has itself proved the assumption wrong.
+        // Second: the window the session PRINTED, if it ever ran `/context`. A read
+        // beats a guess, and it beats the high-water deduction too — but not the line
+        // above, because the doctrine there is about knowledge the panel does not have,
+        // and that is still true of a reading.
         //
-        // Measured against the session HIGH-WATER, never the current reading. The window
-        // is a property of the session; occupancy is a property of the newest turn, and
-        // occupancy falls — a `/compact` took a real session from 517,389 to 53,268. Read
-        // against `context_used` the deduction is amnesiac: it would re-derive a 200k
-        // window from the smaller number and report 27% of a window that session had
-        // already proven it was not on. Evidence of a window's size cannot expire with
-        // the reading that produced it, because a window does not shrink mid-session.
-        None => promoted_window(
-            context_window(t.model.as_deref()?)?,
-            t.context_high_water.max(t.context_used),
-        ),
+        // It is also a TERMINAL value: `promoted_window` is not consulted afterwards,
+        // and that is the opposite of how it first looked. The two numbers are not on
+        // one axis. What `/context` prints is an auto-compact BUDGET (700,000, with the
+        // 33k buffer as a slice INSIDE it — `33000/700000` displays as the `4.7%` the
+        // panel shows); `WINDOW_TIERS` are raw API windows. Feeding 700,000 in as an
+        // assumption would promote it to 1,000,000 the moment usage passed it — a
+        // denominator `/context` never displays, produced at exactly the occupancy
+        // where this tile matters most, and reached by replacing the one measured truth
+        // with the guess this whole path exists to retire.
+        None => match usable_window_reading(t) {
+            Some(read) => read,
+            // Assumed from the id, then corrected by measurement. The correction is inert
+            // unless the session has itself proved the assumption wrong.
+            //
+            // Measured against the session HIGH-WATER, never the current reading. The window
+            // is a property of the session; occupancy is a property of the newest turn, and
+            // occupancy falls — a `/compact` took a real session from 517,389 to 53,268. Read
+            // against `context_used` the deduction is amnesiac: it would re-derive a 200k
+            // window from the smaller number and report 27% of a window that session had
+            // already proven it was not on. Evidence of a window's size cannot expire with
+            // the reading that produced it, because a window does not shrink mid-session.
+            None => promoted_window(
+                context_window(t.model.as_deref()?)?,
+                t.context_high_water.max(t.context_used),
+            ),
+        },
     };
     if window == 0 {
         return None;
@@ -1155,7 +1212,9 @@ pub fn dur(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_monitor::telemetry::{CompletedTool, FileActivity, SessionTelemetry, SkillEntry};
+    use ai_monitor::telemetry::{
+        CompletedTool, ContextWindowReading, FileActivity, SessionTelemetry, SkillEntry,
+    };
     use renderer::monitor_layout::layout;
     use std::fmt::Write as _;
 
@@ -3427,6 +3486,271 @@ mod tests {
         );
     }
 
+    // ---- the read window as a denominator (`ai-monitor-context-window`) ------
+
+    /// A snapshot carrying a `/context` reading taken on `model_at_read`.
+    fn with_reading(tokens: u64, model_at_read: Option<&str>) -> (TelemetrySnapshot, u64) {
+        let (mut t, now) = populated();
+        t.context_window_reading = Some(ContextWindowReading {
+            tokens,
+            model_at_read: model_at_read.map(str::to_string),
+        });
+        (t, now)
+    }
+
+    #[test]
+    fn the_configured_window_still_beats_a_reading() {
+        // R4.1 — a reading is knowledge the panel gained, but the user's own statement
+        // is knowledge the panel could not have. The existing doctrine is untouched.
+        let (t, now) = with_reading(700_000, Some("claude-opus-5"));
+        let e = Env {
+            context_window: Some(500_000),
+            ..env(now)
+        };
+        assert_eq!(context_pct(&t, &e), Some(23), "117066/500000 = 23.4%");
+        assert_eq!(context_pct(&t, &env(now)), Some(17), "117066/700000");
+    }
+
+    #[test]
+    fn a_reading_beats_the_model_table() {
+        // The headline defect: `claude-opus-5` guesses 200k, `/context` printed 700k.
+        // Same numerator, and it already agreed to the token.
+        let (t, now) = with_reading(700_000, Some("claude-opus-5"));
+        assert_eq!(context_pct(&t, &env(now)), Some(17));
+        let (plain, _) = populated();
+        assert_eq!(
+            context_pct(&plain, &env(now)),
+            Some(59),
+            "without a reading, the table's guess stands"
+        );
+    }
+
+    #[test]
+    fn a_reading_is_terminal_and_is_never_promoted() {
+        // R4.2 — the reversal that matters. `promoted_window(700_000, 750_000)` returns
+        // 1,000,000, a denominator `/context` never prints; feeding the reading in as an
+        // assumption would swap the one measured truth for the guess this path retires.
+        let (mut t, now) = with_reading(700_000, Some("claude-opus-5"));
+        t.context_used = 350_000;
+        t.context_high_water = 750_000;
+        assert_eq!(context_pct(&t, &env(now)), Some(50), "350000/700000");
+        assert_eq!(
+            promoted_window(700_000, 750_000),
+            1_000_000,
+            "which is what the reading is being kept away from"
+        );
+    }
+
+    #[test]
+    fn a_reading_short_circuits_the_model_requirement() {
+        // R4.3 — `context_window(t.model?)?` gives up the moment the model is unknown,
+        // so the percentage disappears. A reading does not depend on the model id at
+        // all, which is why its branch has to come FIRST; behind the `?` it would be
+        // unreachable in exactly the case it was added for.
+        let (mut t, now) = with_reading(700_000, None);
+        t.model = None;
+        t.context_used = 70_000;
+        assert_eq!(context_pct(&t, &env(now)), Some(10));
+
+        let (mut without, _) = populated();
+        without.model = None;
+        without.context_used = 70_000;
+        assert_eq!(
+            context_pct(&without, &env(now)),
+            None,
+            "and with no reading, the model requirement still bites"
+        );
+    }
+
+    #[test]
+    fn usage_past_a_read_window_reads_over_a_hundred_percent() {
+        // R4.4 — and here it is a TRUE statement (past the auto-compact threshold),
+        // not the table's "this build knows no window that big".
+        let (mut t, now) = with_reading(700_000, Some("claude-opus-5"));
+        t.context_used = 750_000;
+        t.context_high_water = 750_000;
+        assert_eq!(
+            context_pct(&t, &env(now)),
+            Some(107),
+            "750000/700000 = 107.1%"
+        );
+        assert_eq!(
+            tile_of(&model(Some(&t), &env(now)), "CONTEXT").value,
+            ">100%"
+        );
+    }
+
+    #[test]
+    fn a_reading_survives_while_the_model_is_unchanged() {
+        // R5.1
+        let (t, now) = with_reading(700_000, Some("claude-opus-5"));
+        assert_eq!(usable_window_reading(&t), Some(700_000));
+        assert_eq!(
+            context_pct(&t, &env(now)),
+            Some(17),
+            "117066/700000 = 16.7%"
+        );
+    }
+
+    #[test]
+    fn a_reading_taken_before_any_model_line_still_applies() {
+        // R5.2 — `None` at read time means "no evidence yet", not "a different model".
+        // Reading it as a mismatch would silently discard a perfectly good reading from
+        // the ordinary case of typing `/context` before the first assistant turn.
+        let (t, _) = with_reading(700_000, None);
+        assert_eq!(t.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(usable_window_reading(&t), Some(700_000));
+    }
+
+    #[test]
+    fn a_reading_is_refused_after_the_model_changes() {
+        // R5.3 — the under-reporting hole: read 1M, switch down to a 200k model, and
+        // last-wins has nothing newer. The panel must fall back rather than divide by a
+        // window the session is no longer on.
+        let (mut t, now) = with_reading(1_000_000, Some("claude-opus-5"));
+        t.model = Some("claude-haiku-4-5".into());
+        assert_eq!(usable_window_reading(&t), None);
+        assert_eq!(
+            context_pct(&t, &env(now)),
+            Some(59),
+            "falls through to table then promotion: 117066/200000"
+        );
+    }
+
+    #[test]
+    fn a_reading_is_refused_when_the_model_becomes_unknown() {
+        // The fourth arm. Unreachable today — `is_real_model` never writes `None` back
+        // and `restarted()` discards the whole accumulator — but written out because it
+        // is NOT free: refusing here means the fallback's `?` fires on a missing model
+        // and the percentage vanishes altogether.
+        let (mut t, now) = with_reading(700_000, Some("claude-opus-5"));
+        t.model = None;
+        assert_eq!(usable_window_reading(&t), None);
+        assert_eq!(context_pct(&t, &env(now)), None);
+    }
+
+    #[test]
+    fn a_reading_returns_when_the_model_returns() {
+        // R5.4 — the observable difference between a predicate and a mutation. The
+        // reading is a fact measured on opus; opus is running again, so it is a fact
+        // again. A discard-on-switch would have lost it for good.
+        let (mut t, now) = with_reading(700_000, Some("claude-opus-5"));
+        t.model = Some("claude-haiku-4-5".into());
+        assert_eq!(usable_window_reading(&t), None);
+        t.model = Some("claude-opus-5".into());
+        assert_eq!(usable_window_reading(&t), Some(700_000));
+        assert_eq!(context_pct(&t, &env(now)), Some(17));
+    }
+
+    #[test]
+    fn the_model_pairing_is_compared_whole_never_by_tier() {
+        // A deliberate cost, stated where someone will be tempted to "fix" it: the same
+        // tier under a dated id loses its reading. Tier comparison would need a table
+        // mapping ids to tiers — which is precisely the knowledge this spec proved a log
+        // does not carry, and the guess it exists to remove.
+        let (mut t, _) = with_reading(700_000, Some("claude-opus-5"));
+        t.model = Some("claude-opus-5-20260301".into());
+        assert_eq!(
+            usable_window_reading(&t),
+            None,
+            "lost, and losing it over-reports — the safe direction"
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_reading_behaves_exactly_as_before() {
+        // R0.2 — the preservation property. 37 of the corpus's 42 logs take this path.
+        let (mut t, now) = populated();
+        assert_eq!(t.context_window_reading, None);
+        assert_eq!(context_pct(&t, &env(now)), Some(59));
+        t.context_high_water = 250_000;
+        assert_eq!(
+            context_pct(&t, &env(now)),
+            Some(12),
+            "promotion to 1M still happens when nothing was read"
+        );
+    }
+
+    #[test]
+    fn an_antigravity_style_session_never_reaches_the_reading() {
+        // R0.3 — no token usage is ever recorded in that dialect, so `context_used`
+        // stays 0 and the function returns before any of this. A reading cannot
+        // resurrect a percentage there, and must not appear to.
+        let (mut t, now) = with_reading(700_000, None);
+        t.context_used = 0;
+        t.context_high_water = 0;
+        assert_eq!(context_pct(&t, &env(now)), None);
+        assert_eq!(tile_of(&model(Some(&t), &env(now)), "CONTEXT").value, DASH);
+    }
+
+    #[test]
+    fn a_zero_reading_cannot_divide_by_zero() {
+        // The crate floors readings at 1,000, so this is unconstructible from a log —
+        // but the contract is a plain `u64` and the guard below it is what makes that
+        // safe. Assert the guard rather than trusting the producer.
+        let (t, now) = with_reading(0, Some("claude-opus-5"));
+        assert_eq!(context_pct(&t, &env(now)), None);
+    }
+
+    /// The `ai-monitor` fixture, folded here rather than restated — so this asserts the
+    /// whole path (raw JSONL bytes → strip → anchors → snapshot → denominator → tile)
+    /// and not a hand-built snapshot that happens to agree with one.
+    fn folded_context_fixture() -> (TelemetrySnapshot, u64) {
+        let mut t = SessionTelemetry::new();
+        for l in include_str!("../../ai-monitor/tests/fixtures/context_command.jsonl").lines() {
+            t.apply(l);
+        }
+        let s = t.snapshot();
+        let now = s.last_event_ms.expect("the fixture is timestamped");
+        (s, now)
+    }
+
+    #[test]
+    fn a_real_context_log_makes_the_tile_agree_with_the_command() {
+        // R0.1 — the defect, end to end, at the measured numbers. `/context` printed
+        // 31% (217.7k/700k); the panel printed 22%, because it guessed 200k from
+        // `claude-opus-5` and then promoted that to 1M off the high-water. The
+        // numerator was never wrong.
+        let (t, now) = folded_context_fixture();
+        assert_eq!(t.context_used, 217_737);
+        assert_eq!(context_pct(&t, &env(now)), Some(31));
+        assert_eq!(tile_of(&model(Some(&t), &env(now)), "CONTEXT").value, "31%");
+
+        // The same snapshot with the reading removed is today's behaviour, so the two
+        // numbers in this spec's opening paragraph sit side by side in one assertion.
+        let mut guessed = t.clone();
+        guessed.context_window_reading = None;
+        assert_eq!(context_pct(&guessed, &env(now)), Some(22));
+    }
+
+    #[test]
+    fn a_log_that_never_ran_the_command_is_byte_identical_to_before() {
+        // R0.2 — 37 of the corpus's 42 logs. The fold must leave the field empty and
+        // the cascade must then take exactly the path it took before this feature.
+        let mut t = SessionTelemetry::new();
+        for l in include_str!("../../ai-monitor/tests/fixtures/session.jsonl").lines() {
+            t.apply(l);
+        }
+        let s = t.snapshot();
+        assert_eq!(s.context_window_reading, None);
+        assert_eq!(usable_window_reading(&s), None);
+
+        let now = s.last_event_ms.unwrap_or_default();
+        let expected = promoted_window(
+            context_window(s.model.as_deref().expect("fixture names a model"))
+                .expect("a known model"),
+            s.context_high_water.max(s.context_used),
+        );
+        assert_eq!(
+            context_pct(&s, &env(now)),
+            Some(
+                (s.context_used.saturating_mul(200) / expected)
+                    .div_ceil(2)
+                    .max(1)
+            ),
+            "the table-then-promotion path, unchanged"
+        );
+    }
     #[test]
     fn the_errors_tile_counts_failed_calls_not_parser_faults() {
         // D3/R2.3 — `parse_errors` counts PARSER faults. Showing it under an ERRORS

@@ -103,6 +103,18 @@ zsh ──PTY──> reader thread ──mpsc──> [wake] winit loop
   `tabsession::resolve_hint_cwd` is its only detector, and it only fires when a registry record
   exists); and **A2**, that a `claude` process's cwd is fixed at launch (`process.chdir()` would
   make the directory stale with no trigger, since the pid does not change).
+- **G6** The CONTEXT tile's denominator is now READ rather than guessed, and the read hangs on
+  one string of someone else's UI. `specs/ai-monitor-context-window` establishes that a session
+  log states its context window in exactly one place — the stdout of `/context` — and nowhere as
+  a field: no numeric `200000|700000|1000000` field exists anywhere in the corpus, and every
+  `[1m]` marker is prose inside a message. So `telemetry::on_system` gates on the panel's own
+  title (`Context Usage`) and reads two anchors inside it. Recorded here, beside G5's A1/A2,
+  because it is the same *kind* of fact as those: an assumption about an external tool's output
+  that this repo cannot enforce and would not be told about. If Claude Code renames that title,
+  the read and **both** its diagnostic counters die together, and the panel falls back to today's
+  table-plus-promotion behaviour with nothing to say about it. Two counters reading 0 for a long
+  time is the signal to suspect the gate first. The fallback is byte-identical to the pre-feature
+  path, which is why the failure is quiet rather than wrong — and why it needs to be written down.
 - **G2** ~~Inline-image protocol undecided~~ — **resolved**: the Kitty graphics-APC
   protocol shipped (`term-core::image::parse_graphics_apc`).
 - **G3** ~~Glyph atlas not yet wired into the shader~~ — **resolved**: glyphs render
