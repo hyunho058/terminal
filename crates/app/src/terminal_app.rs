@@ -1094,8 +1094,14 @@ impl Running {
         // function of that process's cwd, which is fixed at its launch — so the directory
         // goes stale exactly when the pid changes, and this wake is where that is noticed.
         let agent_pid = self.tabs.active_agent_pid(&self.tabmeta_snapshot);
+        // The same publish also carries whether that agent is mid-turn. The panel needs it to
+        // decide whether arming an idle deadline would be a lie: a long `cargo build` leaves a
+        // genuinely working session silent for minutes, which is the case the five-minute
+        // threshold was sized for, and a deadline armed through it would flip the pill to IDLE
+        // while the agent works (idle-timestamps D18).
+        let agent_state = self.tabs.active_agent_state(&self.tabmeta_snapshot);
         self.overlays
-            .notify_active_changed(cwd, shell_pid, agent_pid);
+            .notify_active_changed(cwd, shell_pid, agent_pid, agent_state);
         self.push_agent_states()
     }
 
@@ -1791,8 +1797,13 @@ impl Running {
         // Re-point cwd-derived overlays (ai-monitor) at the new active tab (R3.1).
         let cwd = self.tabs.active_cwd(&self.tabmeta_snapshot);
         let agent_pid = self.tabs.active_agent_pid(&self.tabmeta_snapshot);
-        self.overlays
-            .notify_active_changed(cwd, self.tabs.active_shell_pid(), agent_pid);
+        let agent_state = self.tabs.active_agent_state(&self.tabmeta_snapshot);
+        self.overlays.notify_active_changed(
+            cwd,
+            self.tabs.active_shell_pid(),
+            agent_pid,
+            agent_state,
+        );
         self.redraw();
     }
 
@@ -2332,6 +2343,25 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::OverlayPending => {
                 // An overlay (ai-monitor) tailed new data — fold it in + redraw (R1.3).
+                //
+                // Since idle-timestamps D2 this does more than fold in tailed data: while the
+                // panel is visible it rebuilds the panel's model on **every** wake through
+                // here, whatever produced the wake, and reports whether the model differs.
+                // Three producers reach this arm (the panel's own watcher, the tabmeta worker,
+                // and `refresh_rivals`' probe ping), and on the latter two the old `poll`
+                // returned false while the app went on to redraw for the waiting band — a
+                // frame drawn from a model nobody had rebuilt.
+                //
+                // **The cost, stated as it actually is: no new WAKES, which is not the same as
+                // free.** An earlier framing called this a free refresh; it is not. It is one
+                // `dashboard::model` per wake, plus a full stage-one re-shape on the subset of
+                // those wakes where a formatted string actually changed — commonly most of
+                // them for a session under an hour old, where the UPTIME and IDLE tiles tick
+                // every second, and few for an older one, where `dur()` has gone
+                // minute-granular. What it does not do is create a single frame that was not
+                // already going to be drawn, and absorbing a re-shape is what the panel's
+                // two-stage cache exists for. The weaker claim is the true one, and writing
+                // the weaker one down is what stops a later reader trusting the stronger.
                 let overlay_changed = inner.overlays.poll_all();
                 // The tab-metadata worker also wakes the loop through this path; sync
                 // the fresh agent states into the waiting model (rising-edge Waiting
@@ -3182,15 +3212,28 @@ mod tests {
             }
         }
 
-        // 2. The panel's app-side module schedules nothing against a clock. Its only two
-        //    redraw triggers are `on_key` (a keystroke) and `poll` returning true (a
-        //    watcher update that actually carried a new snapshot) — both events, both
-        //    already under test elsewhere in `overlay.rs`.
+        // 2. The panel's app-side module schedules nothing against a clock.
+        //
+        //    CORRECTED (ai-monitor-idle-timestamps D2/D16). This used to say the panel's
+        //    "only two redraw triggers are `on_key` (a keystroke) and `poll` returning true
+        //    (a watcher update that actually carried a new snapshot)". The parenthesis is now
+        //    false: `poll` rebuilds the model on EVERY wake that reaches it while the panel is
+        //    visible — including wakes that carried no snapshot at all, which is the whole of
+        //    D2 — and returns whether the rebuilt model differs. A third trigger also exists:
+        //    a one-shot deadline the panel arms so a quiet session's pill can stop reading
+        //    CONNECTED. The redraw is now gated by the model rather than by the wake's origin.
+        //
+        //    None of that is a clock in THIS module, which is what the scan below asserts and
+        //    why its ban list needs no edit. The deadline is held by `tabmeta::worker`, which
+        //    is not scanned and already owns a `Duration` for its own tick; `overlay.rs`
+        //    receives a plain `u64` instant from `dashboard::idle_deadline_ms` and passes it
+        //    through an injected callback, so it names no `Duration`, no `Instant`, no sleep.
         //
         //    `now_ms` is not a cadence and is not scanned for: the model records *when*
-        //    it was built (D20's one absolute timestamp qualifying the whole panel), which
-        //    is the opposite of a repaint — it is what let D9 drop the relative age that
-        //    would have needed one.
+        //    it was built, which is the opposite of a repaint — it is what let D9 drop the
+        //    relative age that would have needed one. (D20 describes that timestamp as the
+        //    footer's; the footer in fact formats `last_event_ms`, and it is the footer
+        //    together with the IDLE tile that recovers the instant the frame was composed.)
         let overlay = production_half("overlay.rs", include_str!("overlay.rs"));
         for scheduler in [
             "Duration",

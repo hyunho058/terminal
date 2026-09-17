@@ -192,7 +192,18 @@ pub(crate) struct TabMetaShared {
 pub(crate) enum Cmd {
     SetRoster(Vec<TabPid>),
     SetActive(Option<TabId>),
-    SetEnabled { git: bool, agent: bool },
+    SetEnabled {
+        git: bool,
+        agent: bool,
+    },
+    /// The ai-monitor panel's one-shot deadline: wake the loop once at this epoch-millis
+    /// instant, then forget it. `None` disarms (ai-monitor-idle-timestamps D6/D7/D8).
+    ///
+    /// A `Cmd` rather than a shared atomic because a deadline is the same *shape* of fact as
+    /// the three above — something the app tells the worker — and the channel already
+    /// guarantees the ordering an atomic would not: an arm that overtakes a disarm would
+    /// leave a wake pending for a panel that had closed.
+    SetPanelDeadline(Option<u64>),
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +253,23 @@ impl TabMetaHandle {
     /// clears that field on the next publish. Both default to `true`.
     pub fn set_enabled(&self, git: bool, agent: bool) {
         let _ = self.tx.send(Cmd::SetEnabled { git, agent });
+    }
+
+    /// Arm the ai-monitor panel's one-shot wake at `at` (epoch millis), or disarm with `None`
+    /// (ai-monitor-idle-timestamps D6/D7).
+    ///
+    /// **One slot, replaced on every arm.** The worker holds at most one deadline; arming
+    /// over a pending one replaces it, which is the requirement rather than an optimisation —
+    /// a session that resumes and re-quiets must not leave two deadlines racing. There is no
+    /// generation token: the wake this produces carries no payload (`UserEvent::OverlayPending`
+    /// is a unit variant), and it does not need one, because the pill is recomputed from the
+    /// current snapshot against the current clock, so a late or spurious wake can only produce
+    /// the right answer one rebuild early.
+    ///
+    /// **This is one edge, not a cadence.** The worker emits nothing on the other ticks of the
+    /// wait, which is what keeps `ControlFlow::Wait` and the panel's idle-CPU guarantee intact.
+    pub fn set_panel_deadline(&self, at: Option<u64>) {
+        let _ = self.tx.send(Cmd::SetPanelDeadline(at));
     }
 
     /// The current publication generation. Monotonic; starts at 0; bumped only when a

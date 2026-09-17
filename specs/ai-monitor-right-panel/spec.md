@@ -203,12 +203,41 @@ scope:
 - **Status**: resolved
 - **Rationale**: The design pulses the CONNECTED dot, the agent ring, and the footer dot. The
   event loop waits (`ControlFlow::Wait`, `docs/architecture.md` C6) and the renderer holds a
-  tested idle-CPU guarantee (G1; `overlay_layer.rs:674-724` asserts zero rebuilds across
-  4 idle frames). Liveness is carried by **colour**, not motion — lime for a live session,
-  grey for a stopped one. **Rejected**: a ~2Hz repaint timer (breaks G1 and would require
-  rewriting that guarantee in `docs/architecture.md`), and blinking only on snapshot arrival
-  (works, but produces a single-frame flash the user will usually miss, so it buys the cost
-  of a mechanism without buying the signal).
+  tested idle-CPU guarantee (G1; `crates/renderer/src/monitor_panel.rs:992` and `:1451` assert
+  zero re-layouts and zero rebuilds across idle frames). Liveness is carried by **colour**, not
+  motion — lime for a live session, grey for a stopped one. **Rejected**: a ~2Hz repaint timer
+  (breaks G1 and would require rewriting that guarantee in `docs/architecture.md`), and
+  blinking only on snapshot arrival (works, but produces a single-frame flash the user will
+  usually miss, so it buys the cost of a mechanism without buying the signal).
+- **Citation fixed (ai-monitor-idle-timestamps D5/D16).** This rationale used to cite
+  `overlay_layer.rs:674-724` for the G1 guarantee. **That file no longer exists**, so anyone
+  following this decision's evidence landed on nothing; the guarantee moved to
+  `monitor_panel.rs` when the panel gained its two-stage cache, and the citation above is the
+  live one.
+- **AMENDED by `specs/ai-monitor-idle-timestamps` D3/D5 — a bounded edge is now allowed, a
+  cadence is still not.** This decision is still right about what it rejected, and the
+  distinction it did not draw is the one that matters:
+  - A **cadence** is a wake that repeats on a clock — the ~2 Hz timer above. It costs a frame
+    forever, it costs it whether or not anything changed, and it is what G1 exists to keep out.
+    Still rejected, and nothing in the amendment weakens that.
+  - A **bounded edge** is one wake, at one instant, armed only while the panel is open, fired
+    once and then gone. The panel arms one when a session goes quiet, so that the CONNECTED
+    pill can stop asserting liveness five minutes after the log stopped moving. A quiet session
+    costs exactly one wake and one frame, ever; the metadata worker that carries it emits
+    nothing on the other 599 ticks of the wait.
+  Why the reversal was accepted rather than routed around: the pill is the one value on this
+  panel that goes *false* rather than merely stale. Everything else freezes into a reading that
+  the footer and the IDLE tile together still qualify — those two recover the instant the frame
+  was computed — whereas CONNECTED for a session that stopped ten minutes ago is a claim about
+  right now, and it is wrong. D9 already made this argument for the footer, which went absolute
+  precisely because a relative age "freezes and becomes actively false". The amendment applies
+  D9's own reasoning to the pill.
+  What is unchanged: `ControlFlow::Wait`, set exactly once in `main.rs`; no timer in
+  `overlay.rs`; no animation anywhere; and the renderer's idle guarantee, which is untouched
+  because this adds no frame that was not already going to be drawn. The property that keeps
+  the edge from silently becoming the cadence is behavioural and cannot be seen by a source
+  scan, so it is a test:
+  `tabmeta::worker::tests::r3_1_a_passed_deadline_produces_exactly_one_wake`.
 
 ### D3: TOOL USAGE and ERRORS read **cumulative session counters** added to `ai-monitor`
 - **Status**: resolved

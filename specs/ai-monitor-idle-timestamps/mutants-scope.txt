@@ -1,0 +1,36 @@
+# The mutation scope for ai-monitor-idle-timestamps, checked by check-mutants-scope.sh.
+# Survivor COUNTS are recorded here, not ratios: a file's mutant total moves with every edit
+# to it, so a ratio is stale by the next commit (CLAUDE.md).
+
+## mutated
+# Each was run as: cargo mutants -j 4 -f <file> -F '<fn>'
+active_agent_state
+deadline_due
+disarm
+epoch_ms
+feature_overlays
+feature_registrations
+idle_deadline_ms
+no_deadline
+notify_active_changed
+on_active_changed
+poll
+reconsider_deadline
+refresh_model
+run
+
+## survivors
+# run — 2 survivors, both PRE-EXISTING and both in the `Cmd::SetActive` in-band-refresh path
+#   (`roster.iter().find(|tp| tp.id == id)` and the published-slot lookup beside it,
+#   worker.rs:327 and :334, authored by commits 27716e0f / f9ffb581, not by this feature).
+#   Killing them needs a non-empty roster and therefore a real process walk, which is a
+#   different test shape from anything this feature introduced. `replace run with ()` — the
+#   one that mattered, because it made this feature's wake site deletable with a green
+#   suite — is CAUGHT as of the r3_1_r3_5 loop test.
+# Every other scoped function: 0 survivors.
+
+## not-changed
+# Reported by the hunk-header heuristic because a hunk landed immediately after them; their
+# bodies are untouched by this feature, verified against the diff.
+status — `idle_deadline_ms` was added directly below it in dashboard.rs
+resolve_anchor — `refresh_model`'s edits sit directly below it in overlay.rs

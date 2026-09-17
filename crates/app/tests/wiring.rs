@@ -32,6 +32,7 @@
 //! storing the set, and `resumed` calling `install()`. Both need an `App`, which
 //! needs an `EventLoopProxy`, which no test on this platform can obtain.
 
+use app::no_deadline;
 use app::Overlay;
 use app::TabMetaHandle;
 use app::{feature_handlers, feature_overlays, feature_registrations};
@@ -47,7 +48,7 @@ fn priorities(overlays: &[Box<dyn Overlay>]) -> Vec<i32> {
 #[test]
 fn every_feature_extension_is_registered() {
     assert_eq!(
-        feature_overlays(None).len(),
+        feature_overlays(None, no_deadline()).len(),
         4,
         "the overlay set changed — rename, ai-monitor, image presenter, selection \
          presenter. If a feature was added, assert its priority below too; if one \
@@ -139,7 +140,7 @@ fn the_metadata_pump_joins_the_set_the_app_runs() {
 /// features, which is exactly the kind neither feature's own tests can hold.
 #[test]
 fn the_rename_field_outranks_the_ai_monitor_panel() {
-    let overlays = feature_overlays(None);
+    let overlays = feature_overlays(None, no_deadline());
     let prios = priorities(&overlays);
     assert_eq!(
         prios,
@@ -155,7 +156,7 @@ fn the_rename_field_outranks_the_ai_monitor_panel() {
 /// way keys are offered.
 #[test]
 fn the_registration_list_reads_in_the_order_keys_are_offered() {
-    let overlays = feature_overlays(None);
+    let overlays = feature_overlays(None, no_deadline());
     let prios = priorities(&overlays);
     let mut sorted = prios.clone();
     sorted.sort_by(|a, b| b.cmp(a));
@@ -171,7 +172,7 @@ fn the_registration_list_reads_in_the_order_keys_are_offered() {
 /// first frame — and would look like a broken terminal, not like a broken overlay.
 #[test]
 fn no_extension_starts_visible() {
-    for (i, o) in feature_overlays(None).iter().enumerate() {
+    for (i, o) in feature_overlays(None, no_deadline()).iter().enumerate() {
         assert!(
             !o.visible(),
             "overlay #{i} (priority {}) is visible before anything opened it",

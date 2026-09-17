@@ -190,6 +190,23 @@ fn resolve_anchor(anchor: &Anchor, prev: &[RungKey], next: &[RungKey]) -> usize 
     0
 }
 
+/// How the panel asks for a one-shot wake at an epoch-millis instant; `None` disarms
+/// (ai-monitor-idle-timestamps D7).
+///
+/// An injected callback rather than a `TabMetaHandle`, and that is the same move
+/// `Session::spawn` already makes with `session::Wake`: the overlay needs one verb, not a
+/// handle, and taking the verb keeps the whole arming path constructible in a test. The two
+/// routes it replaces both fail for concrete reasons — `tabmeta::global()` returns `None`
+/// before `install`, so the entire arming path would be dead under `cargo test`; threading the
+/// handle would couple the overlay to a type it never otherwise names.
+pub type ArmDeadline = Box<dyn Fn(Option<u64>)>;
+
+/// An [`ArmDeadline`] that goes nowhere, for a build with no metadata worker and for tests
+/// that are not about the deadline.
+pub fn no_deadline() -> ArmDeadline {
+    Box::new(|_| {})
+}
+
 pub struct AiMonitorOverlay {
     visible: bool,
     handle: MonitorHandle,
@@ -300,6 +317,59 @@ pub struct AiMonitorOverlay {
     /// forks `/bin/ps`: asking on the event loop would put a fork on every wake. The event
     /// loop consumes the flag and answers with a full re-point.
     claude_appeared: Arc<AtomicBool>,
+    /// The last model handed to [`MonitorHandle::set`] — D9's short-circuit, and the only
+    /// thing that makes D2's "rebuild on every wake" affordable.
+    ///
+    /// Held here rather than read back from the handle because the comparison is an *app*
+    /// decision: the model is the authority on whether anything the reader can see has moved,
+    /// and it is already stage one's cache key, so the diff that gates the frame is one the
+    /// renderer would otherwise pay for a frame later. `None` before the first publish, which
+    /// is what makes that first rebuild take the full path.
+    ///
+    /// **Cost, stated rather than glossed:** a *changed* rebuild clones the model once to keep
+    /// this copy. D9 says a real change costs "exactly what `refresh_model` costs today, not a
+    /// byte more"; that is the one byte more. It rides only on rebuilds that already trigger a
+    /// full stage-one re-shape, which walks every glyph in the document, so it is noise against
+    /// the work it gates — but it is not nothing, and the alternative (a hand-maintained
+    /// fingerprint instead of the real `PartialEq`) is the exact "both halves or neither"
+    /// failure `monitor_panel.rs` warns about.
+    published: Option<MonitorModel>,
+    /// How many times `dashboard::model` has been composed here (R1.1/R1.3/R1.4).
+    ///
+    /// A counter rather than an output comparison, for the reason `monitor_panel.rs` records
+    /// for its own `layouts`: composing is pure, so a test that only compared the published
+    /// model would pass with D9's gate deleted — it would just recompute the same answer.
+    /// Only a count can tell "skipped" from "recomputed to an equal value".
+    #[cfg(test)]
+    models_built: u32,
+    /// How many times the work **past** D9's gate has run: the ladder, the rung keys, the
+    /// anchor walk and the badge count (R1.2). Distinct from `models_built` on purpose — the
+    /// gap between the two IS the short-circuit, and a test asserting one without the other
+    /// cannot see it.
+    #[cfg(test)]
+    ladders_built: u32,
+    /// How the panel asks the metadata worker for its one-shot wake (D7).
+    arm_deadline: ArmDeadline,
+    /// The `last_event_ms` the currently-armed deadline was computed from; `None` = disarmed.
+    ///
+    /// **This one field is both arming triggers.** D11 names two — a rebuild that sees a newer
+    /// `last_event_ms`, and the tab's agent leaving `Busy` — because the two inputs arrive on
+    /// different wakes at different cadences, and a design that waited for them together arms
+    /// nothing on the common path. Storing what the pending deadline was computed *from*
+    /// collapses both into one test: arm when this is `None`, or when the snapshot's
+    /// `last_event_ms` is newer than it. While the agent is `Busy` nothing is armed, so this
+    /// stays `None` and the first non-`Busy` rebuild arms — the deferred arm, executing itself
+    /// with no second mechanism. And once armed it holds the timestamp, so further non-`Busy`
+    /// wakes with an unchanged timestamp arm nothing: the trigger is the edge, not the level.
+    armed_from: Option<u64>,
+    /// The tab's agent state from the last publish, stored **unconditionally** — including
+    /// when it is absent (D18).
+    ///
+    /// Not guarded by `is_some()` the way `last_seen_pid` beside it is. That guard is the
+    /// seam's no-information rule for an *identity*; applying it here would keep a stale
+    /// `Busy` forever once the agent exited, suppressing every future deadline and pinning the
+    /// pill at CONNECTED — fail-closed by the back door. Absent means "not mid-turn".
+    agent_state: Option<crate::tabmeta::AgentState>,
 }
 
 impl AiMonitorOverlay {
@@ -311,7 +381,7 @@ impl AiMonitorOverlay {
     /// and no shell pid and `open()` spawns nothing at all.
     #[cfg(test)]
     fn detached() -> Self {
-        Self::with_waker(None)
+        Self::with_waker(None, no_deadline())
     }
 
     /// Build the overlay over an optional event-loop waker.
@@ -319,7 +389,7 @@ impl AiMonitorOverlay {
     /// Public, and taking an `Option`, so [`crate::feature_overlays`] can hand back
     /// the registration set without an `EventLoop` — which on macOS exists only on
     /// the main thread, and so never inside a test.
-    pub fn with_waker(proxy: Option<EventLoopProxy<UserEvent>>) -> Self {
+    pub fn with_waker(proxy: Option<EventLoopProxy<UserEvent>>, arm_deadline: ArmDeadline) -> Self {
         AiMonitorOverlay {
             visible: false,
             handle: MonitorHandle::default(),
@@ -340,6 +410,14 @@ impl AiMonitorOverlay {
             claude_appeared: Arc::new(AtomicBool::new(false)),
             rivals: Arc::new(Mutex::new(ai_monitor::RivalSet::default())),
             refreshing: Arc::new(AtomicBool::new(false)),
+            published: None,
+            #[cfg(test)]
+            models_built: 0,
+            #[cfg(test)]
+            ladders_built: 0,
+            arm_deadline,
+            armed_from: None,
+            agent_state: None,
         }
     }
 
@@ -924,7 +1002,80 @@ impl AiMonitorOverlay {
         self.handle.set_scroll(ScrollState { top: 0, badge: 0 });
     }
 
-    fn refresh_model(&mut self) {
+    /// Compose the model, and publish it **only if it differs** from the last one published.
+    ///
+    /// Returns whether it differed — which is what the `OverlayPending` arm redraws on (D2).
+    ///
+    /// **The diff runs first, and everything below it runs only on a change (D9).** Before
+    /// this feature the ladder, the rung keys, the anchor walk and the badge count ran on
+    /// every call, because every call came from a watcher update that had carried content.
+    /// D2 now calls this on wakes that carried nothing, so that work would run to produce a
+    /// computed nothing several times a second. Gating it on the model comparison puts the
+    /// cost where the result is: a no-change wake costs one `dashboard::model` and one
+    /// `PartialEq`, and a real change costs what it always did.
+    ///
+    /// Correctness does not depend on the gate — an equal model yields equal keys, hence an
+    /// unmoved anchor and a zero badge — so this is purely about not paying for nothing. What
+    /// the gate does *not* excuse is the unequal branch, which D13 says is the common one on a
+    /// young session: see `r6_*`, which pin that a rebuild whose only delta is a ticking tile
+    /// still leaves the badge and a held anchor where they were.
+    /// Decide whether the panel wants a one-shot wake, given the pill `status` it is about to
+    /// show (D3/D11/D14/D18).
+    ///
+    /// **The pill is the authority, which is what collapses D14's four rules into one test.**
+    /// A deadline exists only to correct a CONNECTED that has gone stale, so any other status
+    /// means there is nothing to correct and the slot is cleared. That covers all four edges at
+    /// once, and none of them needed its own branch: a past-due session already reads IDLE; a
+    /// `last_event_ms` of `None` already reads IDLE; a detached snapshot already reads
+    /// NO SESSION; and `Some(a) → Some(b)` with `b <= a` leaves a CONNECTED pill whose
+    /// `armed_from` is not older, so nothing re-arms and the pending deadline is left alone.
+    ///
+    /// **`Busy` defers rather than disarms.** A tab mid-turn is silent for a reason the log
+    /// cannot show — the `tool_result` has not been written yet — and that is exactly the
+    /// scenario the five-minute threshold was sized for, so arming through it would
+    /// manufacture a false IDLE for the rest of a long call. Returning early leaves
+    /// `armed_from` untouched, so the arm is *deferred*, and the first non-`Busy` rebuild
+    /// performs it. The cost of this gate is recorded rather than hidden: the `Busy` signals
+    /// do not decay, so a turn interrupted before its `end_turn` is written leaves the tab
+    /// `Busy` indefinitely and this pill stays CONNECTED — which is today's behaviour,
+    /// unchanged, and a better trade than introducing a false IDLE into a working session.
+    fn reconsider_deadline(&mut self, status: renderer::monitor_model::PanelStatus) {
+        use renderer::monitor_model::PanelStatus;
+        let last = self.session.latest.as_ref().and_then(|t| t.last_event_ms);
+        // Nothing costs anything while the panel is closed — including this.
+        let (Some(last), true, PanelStatus::Connected) = (last, self.visible, status) else {
+            self.disarm();
+            return;
+        };
+        if self.agent_state == Some(crate::tabmeta::AgentState::Busy) {
+            return; // deferred, not dropped — see above
+        }
+        if self.armed_from.is_some_and(|from| last <= from) {
+            return; // already armed from this timestamp or a newer one
+        }
+        self.armed_from = Some(last);
+        // Never `last + IDLE_AFTER_MS`: the threshold comparison is `<=`, so that instant is
+        // one millisecond before the pill actually flips. `dashboard` owns the rule and hands
+        // back the instant, so the overlay never learns the threshold at all.
+        (self.arm_deadline)(Some(dashboard::idle_deadline_ms(last)));
+    }
+
+    /// Clear the slot, telling the worker only if there was something to clear.
+    ///
+    /// Idempotent on purpose: a detached or already-idle panel passes through
+    /// [`Self::reconsider_deadline`] on every wake, and an unconditional send would put one
+    /// `Cmd` per wake on the channel to repeat a fact the worker already holds.
+    fn disarm(&mut self) {
+        if self.armed_from.take().is_some() {
+            (self.arm_deadline)(None);
+        }
+    }
+
+    fn refresh_model(&mut self) -> bool {
+        #[cfg(test)]
+        {
+            self.models_built += 1;
+        }
         let env = dashboard::Env {
             now_ms: now_ms(),
             attached: self.session.attach.attached,
@@ -938,11 +1089,40 @@ impl AiMonitorOverlay {
         // **shut**: the panel's job is to stay readable at a glance, and RECENT CALLS alone
         // can run to dozens of rows. Opening one is a click; being unable to see the other
         // five sections without scrolling past those dozens is not.
-        if self.folds.len() < model.sections.len() {
+        // `!=`, not `<`, and the difference is the one `CLAUDE.md` names: the condition now
+        // says what it means, which is "the fold vector is per-section, so it tracks the
+        // section count". Written as `<` it left three mutants alive that no test could tell
+        // apart from the original, because two of them differ only in a case where `resize` is
+        // a no-op — the tell that the comparison was saying less than the code intended.
+        if self.folds.len() != model.sections.len() {
             self.folds.resize(model.sections.len(), true);
         }
         for (s, &shut) in model.sections.iter_mut().zip(self.folds.iter()) {
             s.collapsed = shut;
+        }
+
+        // The deadline is reconsidered ABOVE D9's gate, and that placement is load-bearing.
+        // An unchanged model does **not** imply an unchanged `last_event_ms`: the two places
+        // the timestamp reaches the screen are `clock(last_event_ms)`, which is
+        // second-granular, and `dur(now - last_event_ms)`, which is second-granular below an
+        // hour and minute-granular above it — so a burst that moves the timestamp by a few
+        // hundred milliseconds can leave every formatted string identical. Below the gate,
+        // such a burst would arm from the previous timestamp, fire early while the pill still
+        // read CONNECTED, and then re-arm nothing, which is the same dead-pill failure the
+        // `idle_deadline_ms` boundary exists to prevent, reached by a different road.
+        self.reconsider_deadline(model.status);
+
+        // D9 — the gate, and it sits HERE for a reason: below the two stamps and above every
+        // consumer of the document. `visible` and the folds are part of what the reader sees,
+        // so a model compared before them would report "unchanged" for a panel that had just
+        // closed or a section that had just folded. Everything after this line is a function
+        // of the document, so none of it can differ while the document does not.
+        if self.published.as_ref() == Some(&model) {
+            return false;
+        }
+        #[cfg(test)]
+        {
+            self.ladders_built += 1;
         }
 
         // D8/D19/D37 — carry the reading position across the swap.
@@ -971,8 +1151,10 @@ impl AiMonitorOverlay {
         // D11/D33 — how much has piled up above the reader while they were away.
         let badge = count_new_above(&self.keys, &keys, top);
         self.keys = keys;
+        self.published = Some(model.clone());
         self.handle.set(model);
         self.handle.set_scroll(ScrollState { top, badge });
+        true
     }
 }
 
@@ -1935,18 +2117,43 @@ impl Overlay for AiMonitorOverlay {
         Box::new(MonitorPanel::from_handle(self.handle.clone()))
     }
 
+    /// Fold any tailed data in, then **rebuild the model regardless** — and report whether
+    /// the model moved, not whether the watcher carried anything (D2).
+    ///
+    /// The old form returned `newest.is_some()`, so a wake that found the queue empty was
+    /// declined outright. That was wrong in a specific way: this arm also receives the
+    /// tabmeta worker's wakes and `refresh_rivals`' probe ping, and on those the app goes on
+    /// to redraw anyway if the waiting band moved — drawing a frame from a model nobody had
+    /// rebuilt. The panel was declining a frame it was already paying for.
+    ///
+    /// **What gates the redraw now is the model, not the source of the wake.** That is the
+    /// whole of D2: the model is a tree of already-formatted strings and is already stage
+    /// one's cache key, so "did anything the reader can see move" is exactly the question
+    /// `refresh_model`'s diff answers. A time-derived value that ticks earns its frame with no
+    /// special case, and so will the next one.
+    ///
+    /// **The one gate that survives is `self.visible`.** D2 argues against gating the rebuild
+    /// on whether a frame is coming; it does not argue against gating on whether the panel
+    /// exists. A closed panel rebuilds nothing, arms nothing and costs nothing, which the
+    /// Constraints require. The drain still runs first so a watcher that outlived its panel
+    /// cannot back its channel up.
     fn poll(&mut self) -> bool {
-        let Some(watcher) = self.watcher.as_ref() else {
-            return false;
-        };
-        let newest = drain_to_newest(&watcher.rx);
-        let changed = newest.is_some();
-        if let Some(update) = newest {
-            self.session
-                .note(update.snap, self.started_ms, update.owned);
-            self.refresh_model();
+        // The drain is conditional on a watcher; the rebuild deliberately is NOT. An open
+        // panel whose `open()` resolved no log to tail has no watcher, and the old early
+        // return meant such a panel could never rebuild — so a deadline wake aimed at it
+        // would land on a function that returns before doing anything. Its model is static in
+        // that state (no telemetry, so the tiles and footer render `DASH`), which means the
+        // rebuild costs one `dashboard::model` and then loses the diff, exactly as it should.
+        if let Some(watcher) = self.watcher.as_ref() {
+            if let Some(update) = drain_to_newest(&watcher.rx) {
+                self.session
+                    .note(update.snap, self.started_ms, update.owned);
+            }
         }
-        changed
+        if !self.visible {
+            return false;
+        }
+        self.refresh_model()
     }
 
     /// The launch restore (R6.6): reopen the panel because `[ai_monitor].open` says the
@@ -1978,6 +2185,7 @@ impl Overlay for AiMonitorOverlay {
         cwd: Option<PathBuf>,
         shell_pid: Option<u32>,
         agent_pid: Option<u32>,
+        agent_state: Option<crate::tabmeta::AgentState>,
     ) {
         let visible = self.visible;
         let tab_changed = self.repoint.changed(visible, cwd.as_deref(), shell_pid);
@@ -1987,6 +2195,26 @@ impl Overlay for AiMonitorOverlay {
         // of it) would erase `last_seen_pid` and make the next real publish look like a change.
         if agent_pid.is_some() {
             self.last_seen_pid = agent_pid;
+        }
+        // The agent STATE, stored unconditionally — note the contrast with the guard directly
+        // above, which is the whole of D18's asymmetry (argued at the seam). Both stores sit
+        // above the dispatch because `tick_action` no-ops on every wake where the tab did not
+        // change, which is every wake in the quiet case this feature exists for.
+        self.agent_state = agent_state;
+        // Execute a deferred arm here, on the wake that delivered the state, rather than
+        // leaving it to the next rebuild. The two arming inputs arrive on different wakes at
+        // different cadences: `last_event_ms` rides the panel's own watcher, which fires per
+        // append burst, while the state rides the worker's 500 ms publish. On a clean turn
+        // ending the watcher wins that race — the timestamp moves while the state still reads
+        // a stale `Busy`, so the rebuild defers — and the later publish that flips the state
+        // finds the timestamp unchanged. Waiting for a rebuild after it would mean waiting for
+        // a wake that a now-quiet session will never produce, which is the primary path this
+        // feature targets, so the arm would never happen at all.
+        //
+        // It reads the status of the model already on screen, because that is the pill the
+        // deadline would be correcting; there is nothing to correct before the first publish.
+        if let Some(status) = self.published.as_ref().map(|m| m.status) {
+            self.reconsider_deadline(status);
         }
         // The order, and the laziness, live in `tick_action` — one author for both.
         match tick_action(tab_changed, visible, agent_moved, || self.session_rotated()) {
@@ -2706,11 +2934,12 @@ mod tests {
     }
     use super::{
         agent_pid_moved, apply_rotation, backfill_from_scratch, baseline_from, count_new_above,
-        drain_to_newest, hint_or_pane_cwd, hint_or_pane_cwd_with, pane_cwd_with, proves_ownership,
-        reopen_is_inert, resolve_anchor, rival_refresh_needed, rival_set_of, rung_key,
-        session_rotated_with, tick_action, AiMonitorOverlay, Anchor, Attachment, OpenedOn, Repoint,
-        Rotation, RungKey, Session, Tick,
+        drain_to_newest, hint_or_pane_cwd, hint_or_pane_cwd_with, now_ms, pane_cwd_with,
+        proves_ownership, reopen_is_inert, resolve_anchor, rival_refresh_needed, rival_set_of,
+        rung_key, session_rotated_with, tick_action, AiMonitorOverlay, Anchor, Attachment,
+        OpenedOn, Repoint, Rotation, RungKey, Session, Tick,
     };
+    use crate::dashboard;
     use crate::seam::{AppCtx, AppRequest, Handled, KeyInput, Overlay, WriteProbe};
     use crate::tabsession;
     use ai_monitor::telemetry::TelemetrySnapshot;
@@ -4087,8 +4316,23 @@ mod tests {
         // could travel in", and a third `Option<u32>` — an agent pid — preserves it exactly.
         // Deleting the pin because the signature moved would have thrown away the guarantee
         // along with the shape it was asserted through.
-        let _: fn(&mut AiMonitorOverlay, Option<PathBuf>, Option<u32>, Option<u32>) =
-            <AiMonitorOverlay as Overlay>::on_active_changed;
+        //
+        // RE-TYPED a second time, for the same reason and to the same end: idle-timestamps
+        // D18 adds the tab's `AgentState`. That is a three-variant enum the panel READS to
+        // decide whether arming a deadline would be a lie — it carries no channel, no handle
+        // and no callback, so the seam still offers nothing an `AppRequest` could ride. Each
+        // re-typing is the moment to check that claim rather than to drop the pin.
+        // The spelled-out type IS the assertion, so it is not factored into an alias: an
+        // alias would let a parameter be added to the seam and to the alias in one edit,
+        // with this line still compiling and still looking like it was checked.
+        #[allow(clippy::type_complexity)]
+        let _: fn(
+            &mut AiMonitorOverlay,
+            Option<PathBuf>,
+            Option<u32>,
+            Option<u32>,
+            Option<crate::tabmeta::AgentState>,
+        ) = <AiMonitorOverlay as Overlay>::on_active_changed;
         let _: fn(&mut AiMonitorOverlay, &crate::seam::OverlayCommand) -> crate::seam::Handled =
             <AiMonitorOverlay as Overlay>::on_command;
 
@@ -4404,15 +4648,15 @@ mod tests {
         let mut o = AiMonitorOverlay::detached();
         // Closed, so every one of these is `Tick::Idle` and no `open()` is attempted — the
         // memory rule is what is under test, not the action.
-        o.on_active_changed(None, Some(8060), Some(74922));
+        o.on_active_changed(None, Some(8060), Some(74922), None);
         assert_eq!(o.last_seen_pid, Some(74922));
-        o.on_active_changed(None, Some(8060), None);
+        o.on_active_changed(None, Some(8060), None, None);
         assert_eq!(
             o.last_seen_pid,
             Some(74922),
             "a None publish is no information, not an erasure"
         );
-        o.on_active_changed(None, Some(8060), Some(74923));
+        o.on_active_changed(None, Some(8060), Some(74923), None);
         assert_eq!(o.last_seen_pid, Some(74923), "a real publish moves it");
     }
 
@@ -4790,5 +5034,715 @@ mod tests {
         );
         assert!(rival_refresh_needed(false, true));
         assert!(rival_refresh_needed(false, false));
+    }
+
+    // ---- idle-timestamps T3 / R2: arming the deadline ----
+
+    /// An open panel plus the log of every arming call it made.
+    ///
+    /// The recorder IS the test seam D7 chose the injected callback for: production hands the
+    /// overlay `TabMetaHandle::set_panel_deadline`, a test hands it this, and the overlay
+    /// needs no handle, no global and no knowledge that a worker exists.
+    fn armed_panel(age_ms: u64) -> (AiMonitorOverlay, Arc<Mutex<Vec<Option<u64>>>>) {
+        let log: Arc<Mutex<Vec<Option<u64>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        let mut o = AiMonitorOverlay::with_waker(
+            None,
+            Box::new(move |at| sink.lock().expect("arming log").push(at)),
+        );
+        o.visible = true;
+        o.session.attach.attached = true;
+        o.session.latest = Some(snapshot_aged(age_ms));
+        (o, log)
+    }
+
+    fn arms(log: &Arc<Mutex<Vec<Option<u64>>>>) -> Vec<Option<u64>> {
+        log.lock().expect("arming log").clone()
+    }
+
+    /// The `last_event_ms` currently on the panel — what a correct arm must be computed from.
+    fn last_event(o: &AiMonitorOverlay) -> u64 {
+        o.session
+            .latest
+            .as_ref()
+            .and_then(|t| t.last_event_ms)
+            .expect("the fixture sets a timestamp")
+    }
+
+    #[test]
+    fn r0_2_the_instant_armed_is_an_instant_at_which_the_pill_reads_idle() {
+        // The feature's whole point, composed end to end as far as a headless test can reach:
+        // T1's arithmetic, T3's arming rule and the panel's own composer, checked against each
+        // other. The one step missing is the event loop delivering the wake, which `cargo
+        // test` cannot host — that is what `/run-term` is for.
+        //
+        // An inert feature passes every part of this and fails here. Arming one millisecond
+        // early makes the wake land while `status` still says CONNECTED; because that wake
+        // moves no timestamp it re-arms nothing, so the pill would stay CONNECTED for the rest
+        // of the session — the defect being fixed, reintroduced by an off-by-one.
+        let (mut o, log) = armed_panel(30_000);
+        let t = last_event(&o);
+        o.poll();
+
+        let armed = match arms(&log).as_slice() {
+            [Some(at)] => *at,
+            other => panic!("expected exactly one arming call, got {other:?}"),
+        };
+
+        let snap = o
+            .session
+            .latest
+            .as_deref()
+            .expect("the fixture attached one");
+        let at = |now_ms| {
+            dashboard::model(
+                Some(snap),
+                &dashboard::Env {
+                    now_ms,
+                    attached: true,
+                    context_window: None,
+                    tab_agent: None,
+                    utc_offset_secs: 0,
+                },
+            )
+            .status
+        };
+
+        assert_eq!(
+            at(armed),
+            renderer::monitor_model::PanelStatus::Idle,
+            "the wake must land on a frame whose pill has flipped"
+        );
+        assert_eq!(
+            at(armed - 1),
+            renderer::monitor_model::PanelStatus::Connected,
+            "and not one millisecond before it — that wake would be wasted, and it is the \
+             only one this session gets"
+        );
+        assert_eq!(armed, dashboard::idle_deadline_ms(t));
+    }
+
+    #[test]
+    fn r0_4_a_session_that_goes_quiet_costs_exactly_one_arm() {
+        // R0.3's companion, and the reason R0.3 had to grow a precondition: a panel open on a
+        // session that is quiet but not yet past the threshold does NOT cost zero wakes. It
+        // costs exactly one, ever, which is what separates this from the repaint cadence the
+        // panel's approved design rejected. The firing half is `worker::tests::r3_1`.
+        let (mut o, log) = armed_panel(30_000);
+        for _ in 0..40 {
+            o.poll();
+        }
+        assert_eq!(
+            arms(&log).len(),
+            1,
+            "forty wakes over one quiet session, one deadline"
+        );
+    }
+
+    #[test]
+    fn r2_1_a_newer_last_event_ms_arms_the_deadline() {
+        // D11 trigger one, and D15's arithmetic: the instant armed is the first at which the
+        // pill reads IDLE, never `last + IDLE_AFTER_MS`, which is one millisecond too early
+        // and would burn the one-shot while the pill still read CONNECTED.
+        let (mut o, log) = armed_panel(30_000);
+        let first = last_event(&o);
+        o.poll();
+        assert_eq!(arms(&log), vec![Some(dashboard::idle_deadline_ms(first))]);
+
+        // A later burst moves the timestamp: re-arm, once, from the NEW value.
+        o.session.latest = Some(snapshot_aged(1_000));
+        let second = last_event(&o);
+        assert!(second > first);
+        o.poll();
+        assert_eq!(
+            arms(&log),
+            vec![
+                Some(dashboard::idle_deadline_ms(first)),
+                Some(dashboard::idle_deadline_ms(second)),
+            ]
+        );
+    }
+
+    #[test]
+    fn r2_2_an_unchanged_last_event_ms_arms_nothing() {
+        // One `Cmd` per burst, not per line. A streaming session wakes this path far more
+        // often than 500 ms, and re-sending an identical instant on every one of those wakes
+        // would put the channel traffic of the deferred heartbeat on a feature that is
+        // supposed to be a single edge.
+        let (mut o, log) = armed_panel(30_000);
+        o.poll();
+        assert_eq!(arms(&log).len(), 1);
+        for _ in 0..6 {
+            o.poll();
+        }
+        assert_eq!(
+            arms(&log).len(),
+            1,
+            "an unchanged timestamp re-arms nothing"
+        );
+    }
+
+    #[test]
+    fn r2_3_a_busy_tab_defers_the_arm() {
+        // D18 — the regression this gate exists to prevent. A long `cargo build` writes its
+        // `tool_use` line and then nothing until the result lands, so the log is silent while
+        // the session is emphatically working. That is the scenario `IDLE_AFTER_MS` was sized
+        // for, and arming through it would manufacture a false IDLE for the rest of the call.
+        let (mut o, log) = armed_panel(30_000);
+        o.agent_state = Some(crate::tabmeta::AgentState::Busy);
+        for _ in 0..4 {
+            o.poll();
+        }
+        assert!(
+            arms(&log).is_empty(),
+            "a working session must not be told it is idle"
+        );
+    }
+
+    #[test]
+    fn r2_4_leaving_busy_executes_the_deferred_arm() {
+        // The ordering fix, and the test must drive the two inputs on SEPARATE wakes or it
+        // passes against the inert version. The timestamp arrives first, on the panel's own
+        // watcher, while the state still reads a stale `Busy`; the state arrives up to 500 ms
+        // later, on the worker's publish, by which time the timestamp is unchanged. A
+        // single-trigger design arms on neither and the pill stays CONNECTED forever.
+        let (mut o, log) = armed_panel(30_000);
+        o.agent_state = Some(crate::tabmeta::AgentState::Busy);
+
+        // Wake one: the timestamp moves, the state is still stale. Deferred.
+        o.session.latest = Some(snapshot_aged(1_000));
+        let t = last_event(&o);
+        o.poll();
+        assert!(arms(&log).is_empty(), "still Busy — the arm is deferred");
+
+        // Wake two: the state flips, carrying no new timestamp. This is the arm.
+        o.on_active_changed(None, None, None, Some(crate::tabmeta::AgentState::Waiting));
+        assert_eq!(
+            arms(&log),
+            vec![Some(dashboard::idle_deadline_ms(t))],
+            "leaving Busy executes the deferred arm, from the unchanged timestamp"
+        );
+    }
+
+    #[test]
+    fn r2_5_the_second_trigger_is_an_edge_not_a_level() {
+        // What bounds the arming rate is the `Busy →` transition, not a pending flag — the
+        // overlay has no way to clear such a flag, because the wake its deadline produces
+        // carries no payload and never tells it that the deadline fired.
+        let (mut o, log) = armed_panel(30_000);
+        o.agent_state = Some(crate::tabmeta::AgentState::Busy);
+        o.poll();
+        o.on_active_changed(None, None, None, Some(crate::tabmeta::AgentState::Waiting));
+        assert_eq!(arms(&log).len(), 1);
+
+        for _ in 0..5 {
+            o.on_active_changed(None, None, None, Some(crate::tabmeta::AgentState::Waiting));
+            o.poll();
+        }
+        assert_eq!(
+            arms(&log).len(),
+            1,
+            "further non-Busy wakes with an unchanged timestamp arm nothing"
+        );
+    }
+
+    #[test]
+    fn r2_6_the_incoming_agent_state_survives_the_repoint_guard() {
+        // `on_active_changed` dispatches through `tick_action`, which no-ops on every wake
+        // where the tab did not change — i.e. every wake in the quiet case this feature
+        // targets. The state must be stored above that, and stored UNCONDITIONALLY: the guard
+        // one line up ignores a `None` pid, and mirroring it here would keep a stale `Busy`
+        // forever once the agent exited, suppressing every future deadline.
+        let (mut o, log) = armed_panel(30_000);
+        o.agent_state = Some(crate::tabmeta::AgentState::Busy);
+        o.poll();
+        assert!(arms(&log).is_empty());
+
+        // No tab change: `Repoint::changed` reports nothing moved. The state must land anyway.
+        o.on_active_changed(None, None, None, Some(crate::tabmeta::AgentState::Idle));
+        assert_eq!(o.agent_state, Some(crate::tabmeta::AgentState::Idle));
+        assert_eq!(arms(&log).len(), 1, "and the deferred arm fires from it");
+
+        // An agent that exits publishes `None`. That is "not mid-turn", not "no information".
+        o.agent_state = Some(crate::tabmeta::AgentState::Busy);
+        o.on_active_changed(None, None, None, None);
+        assert_eq!(
+            o.agent_state, None,
+            "an absent state overwrites Busy, or the suppression latches forever"
+        );
+    }
+
+    #[test]
+    fn an_exited_agent_executes_the_deferred_arm_rather_than_latching_busy() {
+        // The `Some(Busy) -> None` half of R2.4's "anything other than Busy, INCLUDING absent".
+        // The sibling test above proves the STORE is unconditional; this proves the store
+        // actually releases the deferred arm, which is the behaviour the store exists for and
+        // which was previously covered by argument rather than by assertion.
+        //
+        // This is the common shape of a finished session: the user quits `claude`, the process
+        // disappears, the worker publishes no `Agent` at all, and that session's pill must
+        // still be able to go IDLE on schedule. Reading the absence as "keep the last state"
+        // would leave it CONNECTED forever.
+        let (mut o, log) = armed_panel(30_000);
+        o.agent_state = Some(crate::tabmeta::AgentState::Busy);
+        let t = last_event(&o);
+        o.poll();
+        assert!(arms(&log).is_empty(), "Busy defers the arm");
+
+        o.on_active_changed(None, None, None, None);
+        assert_eq!(
+            arms(&log),
+            vec![Some(dashboard::idle_deadline_ms(t))],
+            "an exited agent is not mid-turn, so the deferred arm executes"
+        );
+    }
+
+    #[test]
+    fn r2_7_a_past_due_deadline_is_never_armed() {
+        // Opening onto a session last written 19 minutes ago: `status` already returns IDLE,
+        // so the model is correct with no wake at all. Arming would queue an immediately-due
+        // wake to recompute a value that is already right.
+        let (mut o, log) = armed_panel(19 * 60_000);
+        o.poll();
+        assert_eq!(
+            o.published.as_ref().map(|m| m.status),
+            Some(renderer::monitor_model::PanelStatus::Idle),
+            "the fixture is past the threshold"
+        );
+        assert!(arms(&log).is_empty());
+    }
+
+    #[test]
+    fn r2_8_a_detached_snapshot_arms_nothing() {
+        // `status` returns NO SESSION whenever the snapshot is detached, never CONNECTED, so
+        // the pill cannot be the thing a deadline would correct. Left unstated, this would
+        // cost one wake and one full re-shape per detached quiet session, to move tiles the
+        // spec puts out of scope.
+        let (mut o, log) = armed_panel(30_000);
+        o.session.attach.attached = false;
+        o.poll();
+        assert_eq!(
+            o.published.as_ref().map(|m| m.status),
+            Some(renderer::monitor_model::PanelStatus::NoSession)
+        );
+        assert!(arms(&log).is_empty());
+    }
+
+    #[test]
+    fn r2_9_option_transitions_follow_the_decision_table() {
+        // `last_event_ms` is an `Option`, so "newer" has to be defined over the Option and not
+        // just over the number.
+        let (mut o, log) = armed_panel(30_000);
+
+        // None -> Some(t): the ordinary first arming.
+        o.session.latest = Some(Arc::new(TelemetrySnapshot::default()));
+        o.poll();
+        assert!(arms(&log).is_empty(), "no timestamp, nothing to arm from");
+        o.session.latest = Some(snapshot_aged(30_000));
+        let t = last_event(&o);
+        o.poll();
+        assert_eq!(arms(&log), vec![Some(dashboard::idle_deadline_ms(t))]);
+
+        // Some(a) -> Some(b) with b <= a: a re-ordered or duplicate record must not push the
+        // deadline out. The pending one is left exactly as it is.
+        o.session.latest = Some(snapshot_aged(45_000));
+        o.poll();
+        assert_eq!(
+            arms(&log).len(),
+            1,
+            "an older timestamp must not move the deadline"
+        );
+
+        // Some(_) -> None: a re-point to a log with no parseable time. `status` reads IDLE, so
+        // the model is already right and a deadline computed from a timestamp that no longer
+        // exists has nothing to assert.
+        o.session.latest = Some(Arc::new(TelemetrySnapshot::default()));
+        o.poll();
+        assert_eq!(
+            arms(&log),
+            vec![Some(dashboard::idle_deadline_ms(t)), None],
+            "the pending deadline is disarmed, once"
+        );
+    }
+
+    #[test]
+    fn r2_10_closing_the_panel_disarms() {
+        // Nothing costs anything while the panel is closed, and no later wake may flip a
+        // reopened panel on the strength of a deadline armed before it closed.
+        let (mut o, log) = armed_panel(30_000);
+        o.poll();
+        assert_eq!(arms(&log).len(), 1);
+
+        o.close();
+        assert_eq!(
+            arms(&log).last(),
+            Some(&None),
+            "closing disarms the pending deadline"
+        );
+
+        // And a closed panel keeps arming nothing, without repeating the disarm.
+        let after = arms(&log).len();
+        for _ in 0..4 {
+            o.poll();
+        }
+        assert_eq!(arms(&log).len(), after, "a closed panel is silent");
+    }
+
+    /// **A finding, pinned rather than fixed: a LIVE agent card's timer does move the badge.**
+    ///
+    /// R6 asks whether a rebuild whose only delta is clock-derived can disturb the reading
+    /// position, and for the tiles, the footer and the pill the answer is no, by construction —
+    /// none of them is part of a rung. But a *live* subagent's card carries `agent_elapsed` in
+    /// its `value`, and `rung_key` hashes `c.value`, so that rung's key changes every second
+    /// the agent runs. To `count_new_above` a changed key is a new item, so a reader who has
+    /// scrolled away from the bottom watches the new-items badge climb by one per second while
+    /// nothing has arrived. That is exactly the shape D17 warned about — "a silent badge that
+    /// counts new items every time a clock ticks would be a worse defect than the one being
+    /// fixed, and it would look like a feature".
+    ///
+    /// It is **pre-existing**: `refresh_model` has always run this path on watcher updates, and
+    /// a running subagent produces those constantly. What this feature changes is the floor —
+    /// D2 now reaches the same path on wakes that carried nothing, so the badge climbs on a
+    /// metadata tick too, not only when the log moved.
+    ///
+    /// It is **not fixed here**, and that is a scope judgement rather than an oversight. The
+    /// fix is in `rung_key`, as T4 anticipated, but choosing it means deciding whether a card
+    /// whose timer advanced is "the same row" — which is D19's keys-on-appearance rule, an
+    /// approved decision this spec does not reopen. The spec's own instruction for this case is
+    /// that it is a finding. So the behaviour is pinned here, where a future fix will trip over
+    /// it and read the argument, instead of being left for someone to rediscover as a bug.
+    #[test]
+    fn a_live_agents_ticking_timer_does_move_the_badge_and_that_is_recorded_not_fixed() {
+        let (mut o, _log) = armed_panel(30_000);
+        let last = last_event(&o);
+        let with_agent_running_for = |elapsed_ms: u64| {
+            Arc::new(TelemetrySnapshot {
+                first_event_ms: Some(now_ms() - 600_000),
+                last_event_ms: Some(last),
+                subagents: vec![ai_monitor::telemetry::Subagent {
+                    id: "t1".into(),
+                    subagent_type: Some("researcher".into()),
+                    start_ms: Some(now_ms() - elapsed_ms),
+                    // The state the crate models explicitly, and the one that keeps a timer
+                    // climbing: an in-flight agent, or one whose ending was never observed.
+                    completed: false,
+                    description: None,
+                    model: None,
+                    end_ms: None,
+                    agent_id: None,
+                    ended_ok: true,
+                }],
+                ..Default::default()
+            })
+        };
+
+        o.session.latest = Some(with_agent_running_for(60_000));
+        o.poll();
+
+        // Put the reader at the bottom, so the agent card is above them and counts.
+        let n = o.keys.len();
+        let held = o.keys.last().cloned().expect("the document has rungs");
+        o.anchor = Anchor::Held {
+            key: held,
+            index: n - 1,
+        };
+        o.poll();
+        assert_eq!(o.handle.scroll().badge, 0, "nothing new yet");
+
+        // One second of the agent running. No row arrived, no row changed meaning.
+        o.session.latest = Some(with_agent_running_for(61_000));
+        o.poll();
+        assert_eq!(
+            o.handle.scroll().badge,
+            1,
+            "TODAY'S BEHAVIOUR, pinned deliberately: the ticking timer reads as one new \
+             item. If this assertion starts failing, `rung_key` has been narrowed — check \
+             that the narrowing was argued against D19 before accepting it."
+        );
+    }
+
+    // ---- idle-timestamps T4 / R6: view state survives a clock-only rebuild ----
+    //
+    // Nothing here was known to be broken. R6 exists because D17 found that the design
+    // *asserts* key-set stability under a tile-only change without anywhere proving it, and
+    // D2 is what makes the question urgent: before this feature the ladder, the anchor walk
+    // and the badge count ran only when the watcher delivered CONTENT. They now run on time —
+    // on a wake whose only delta is a tile ticking from `4m03s` to `4m04s`. A badge that
+    // counted "new items" every time a clock ticked would be a worse defect than the one
+    // being fixed, and it would look like a feature.
+    //
+    // The answer, now pinned rather than assumed: `rung_key` is built from the section label
+    // plus the entry's own fields, and the tiles, the footer and the pill are none of those —
+    // they are siblings of `sections` on the model, not members of it. So a clock-only rebuild
+    // cannot move a key, hence cannot move the badge or the anchor.
+
+    /// A rebuild in which only the UPTIME tile has ticked.
+    ///
+    /// `first_event_ms` moves and `last_event_ms` does not, so the tile changes while the
+    /// footer (`clock(last_event_ms)`) and every section stay exactly as they were.
+    fn tick_only_the_uptime_tile(o: &mut AiMonitorOverlay, age_ms: u64) {
+        let last = last_event(o);
+        o.session.latest = Some(Arc::new(TelemetrySnapshot {
+            first_event_ms: Some(now_ms() - age_ms),
+            last_event_ms: Some(last),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn a_rebuild_sizes_the_fold_vector_to_the_sections_and_starts_them_shut() {
+        // Found by `cargo mutants`, not by reading: the fold resize could be turned into a
+        // no-op with the whole suite green. Every section must get a stamp, so the vector has
+        // to track the section count — and a fresh panel starts every foldable section SHUT,
+        // which is the decision that stamp exists to carry.
+        let (mut o, _log) = armed_panel(30_000);
+        assert!(o.folds.is_empty(), "a fresh panel has decided nothing yet");
+        o.poll();
+
+        let sections = o
+            .published
+            .as_ref()
+            .map(|m| m.sections.len())
+            .expect("the first rebuild published");
+        assert_eq!(
+            o.folds.len(),
+            sections,
+            "one fold decision per section, or the last sections never get stamped"
+        );
+        assert!(
+            o.published
+                .as_ref()
+                .is_some_and(|m| m.sections.iter().all(|s| s.collapsed)),
+            "and every section starts shut"
+        );
+    }
+
+    #[test]
+    fn an_anchor_that_resolves_back_to_the_top_returns_to_following() {
+        // Also a mutants finding. `refresh_model` re-arms the anchor from the document it just
+        // built, and the `top > 0` guard is what keeps D37's rule — the mode is a function of
+        // the index, so an anchor that has landed on rung zero is not "held at the top", it is
+        // Following. Without the guard the panel latches into Held at index 0 and stops
+        // following new arrivals, which looks like a frozen panel rather than a bug.
+        let (mut o, _log) = armed_panel(30_000);
+        o.poll();
+        let top_key = o.keys.first().cloned().expect("the document has rungs");
+        o.anchor = Anchor::Held {
+            key: top_key,
+            index: 0,
+        };
+
+        tick_only_the_uptime_tile(&mut o, 31_000);
+        o.poll();
+        assert!(
+            matches!(o.anchor, Anchor::Following),
+            "an anchor resolving to rung zero is Following, not Held at zero"
+        );
+    }
+
+    #[test]
+    fn r6_1_a_tile_only_change_does_not_move_the_new_items_badge() {
+        let (mut o, _log) = armed_panel(30_000);
+        assert!(o.poll(), "the first publish");
+        assert_eq!(o.handle.scroll().badge, 0);
+
+        for extra in 1..6 {
+            tick_only_the_uptime_tile(&mut o, 30_000 + extra * 1_000);
+            o.poll();
+            assert_eq!(
+                o.handle.scroll().badge,
+                0,
+                "a ticking clock is not an arriving item"
+            );
+        }
+    }
+
+    #[test]
+    fn r6_2_a_tile_only_change_does_not_move_a_held_anchor() {
+        let (mut o, _log) = armed_panel(30_000);
+        o.poll();
+
+        // Hold the reader somewhere that is not the top, keyed on what that rung displays.
+        let held = o.keys.get(2).cloned().expect("the document has rungs");
+        o.anchor = Anchor::Held {
+            key: held.clone(),
+            index: 2,
+        };
+
+        for extra in 1..6 {
+            tick_only_the_uptime_tile(&mut o, 30_000 + extra * 1_000);
+            o.poll();
+            assert_eq!(
+                o.handle.scroll().top,
+                2,
+                "the reading position must not slide because a tile ticked"
+            );
+            assert!(
+                matches!(&o.anchor, Anchor::Held { key, index } if *key == held && *index == 2),
+                "and the anchor must still be held on the same rung"
+            );
+        }
+    }
+
+    #[test]
+    fn r6_3_fold_state_survives_every_rebuild() {
+        // Fine by inspection — `self.folds` is stamped onto the fresh model independently of
+        // its contents — and pinned anyway, because "by inspection" is what D17 found the rest
+        // of this area resting on.
+        let (mut o, _log) = armed_panel(30_000);
+        o.poll();
+        let n = o.published.as_ref().map(|m| m.sections.len()).unwrap_or(0);
+        assert!(n > 3, "the panel has its six sections");
+
+        o.toggle_fold(3);
+        let want = o.folds[3];
+
+        for extra in 1..8 {
+            tick_only_the_uptime_tile(&mut o, 30_000 + extra * 1_000);
+            o.poll();
+            assert_eq!(o.folds[3], want, "the user's fold decision is theirs");
+            assert_eq!(
+                o.published.as_ref().map(|m| m.sections[3].collapsed),
+                Some(want),
+                "and it is stamped onto every rebuilt model"
+            );
+        }
+    }
+
+    // ---- idle-timestamps T2 / R1: the rebuild rides the wake, the diff gates the frame ----
+
+    /// A snapshot whose first and last event both landed `age_ms` ago.
+    ///
+    /// Ageing the *snapshot* is how these tests advance the clock. `refresh_model` reads
+    /// `now_ms()` internally and there is no seam to inject it through, but the tiles are
+    /// `dur(now - first_event_ms)`, so moving the timestamp one second further into the past
+    /// is arithmetically identical to waiting one second — `dur` cannot tell them apart, and
+    /// the resulting model is the model a real tick produces.
+    fn snapshot_aged(age_ms: u64) -> Arc<TelemetrySnapshot> {
+        let now = now_ms();
+        Arc::new(TelemetrySnapshot {
+            first_event_ms: Some(now - age_ms),
+            last_event_ms: Some(now - age_ms),
+            ..Default::default()
+        })
+    }
+
+    /// An **open** panel holding such a snapshot, with no watcher and no waker.
+    ///
+    /// `detached()` is exactly the right shape for R1: every `poll` on it finds nothing to
+    /// drain, which is the case the old `poll` declined outright and the one D2 exists for.
+    fn open_on(age_ms: u64) -> AiMonitorOverlay {
+        let mut o = AiMonitorOverlay::detached();
+        o.visible = true;
+        o.session.attach.attached = true;
+        o.session.latest = Some(snapshot_aged(age_ms));
+        o
+    }
+
+    #[test]
+    fn r1_1_a_wake_carrying_no_log_data_still_rebuilds_the_model() {
+        // D2 — the gap. The watcher carried nothing, so the old `poll` returned false and
+        // `refresh_model` never ran; but the same arm goes on to redraw when the waiting band
+        // moved, so a frame could be drawn from a model nobody had rebuilt. The rebuild has
+        // to ride the wake, not the payload.
+        let mut o = open_on(90_000);
+        assert_eq!(o.models_built, 0);
+
+        // Nothing has ever been published, so the first model differs by construction.
+        assert!(o.poll(), "the first rebuild publishes and earns its frame");
+        assert_eq!(
+            o.models_built, 1,
+            "an empty queue must not skip the rebuild"
+        );
+        assert_eq!(o.ladders_built, 1);
+
+        // One second later: both tiles tick, so this is a changed model on a wake that still
+        // carried no log data whatsoever.
+        o.session.latest = Some(snapshot_aged(91_000));
+        assert!(
+            o.poll(),
+            "a ticked tile is a changed model — it earns a frame"
+        );
+        assert_eq!(o.models_built, 2);
+        assert_eq!(o.ladders_built, 2);
+    }
+
+    #[test]
+    fn r1_2_an_unchanged_model_costs_one_build_and_one_compare() {
+        // D9 — asserted by COUNTING the work past the gate, never by comparing the published
+        // model. Composing is pure, so an equal model publishes identically whether the
+        // ladder ran or not: only the counter separates "skipped" from "recomputed to the
+        // same answer", which is the same reason `monitor_panel.rs` counts its own layouts.
+        //
+        // Five hours old, because `dur()` goes minute-granular above an hour
+        // (`{h}h{:02}m`) — so the model genuinely does not move between these polls. Below
+        // an hour the tiles tick every second and D13 says the gate would rarely fire, which
+        // is the honest cost this feature accepts rather than the property under test here.
+        let mut o = open_on(5 * 3_600_000);
+        assert!(o.poll());
+        let (built, ladders) = (o.models_built, o.ladders_built);
+
+        for _ in 0..8 {
+            assert!(!o.poll(), "an unchanged model must not ask for a frame");
+        }
+        assert_eq!(
+            o.models_built,
+            built + 8,
+            "every wake still composes a model — that is the cost D13 accepts"
+        );
+        assert_eq!(
+            o.ladders_built, ladders,
+            "and not one of them walked the ladder, keyed a rung or counted a badge"
+        );
+    }
+
+    #[test]
+    fn r1_3_a_closed_panel_rebuilds_nothing() {
+        // The one gate that survived D2's revision. What D2 rejected was gating on whether a
+        // frame is coming; gating on whether the panel exists is required by the Constraints,
+        // and a reader of D2's rationale could otherwise think both gates died together.
+        let mut o = open_on(90_000);
+        o.visible = false;
+        for _ in 0..5 {
+            assert!(!o.poll());
+        }
+        assert_eq!(
+            o.models_built, 0,
+            "a closed panel composes no model, so it cannot cost a frame"
+        );
+    }
+
+    #[test]
+    fn r1_4_the_rebuild_hangs_off_the_wake_arm_not_the_redraw_seam() {
+        // D1 — `redraw()` has 24 call sites and fires on every `CursorMoved` of a sidebar
+        // resize drag, which `monitor_panel.rs` names as the exact load stage one's cache was
+        // built to absorb. Hooking the rebuild there would differ on most frames of a drag,
+        // because the tiles tick every second below an hour, and would re-shape the whole
+        // document per drag frame. So the number of rebuilds must be bounded by the wake
+        // count, which is pinned here structurally: the rebuild is reached from one arm.
+        let src = include_str!("terminal_app.rs");
+        let (production, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("terminal_app.rs has a test module to split on");
+        let code = production
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            code.matches("poll_all()").count(),
+            1,
+            "the panel's model is rebuilt from exactly one site; a second one is the \
+             `redraw()` seam creeping back in"
+        );
+        let arm = code
+            .split("UserEvent::OverlayPending =>")
+            .nth(1)
+            .expect("the wake arm exists");
+        assert!(
+            arm.contains("poll_all()"),
+            "and that site is the OverlayPending arm"
+        );
     }
 }
