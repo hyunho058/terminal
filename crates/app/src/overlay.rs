@@ -1120,10 +1120,6 @@ impl AiMonitorOverlay {
         if self.published.as_ref() == Some(&model) {
             return false;
         }
-        #[cfg(test)]
-        {
-            self.ladders_built += 1;
-        }
 
         // D8/D19/D37 — carry the reading position across the swap.
         //
@@ -1131,7 +1127,19 @@ impl AiMonitorOverlay {
         // here (C11): two counts that drift apart put the view a rung from where the user
         // asked, and they drift silently. Resolved BEFORE the model is published so the
         // panel never draws a frame at an index belonging to the previous document.
-        let ladder = renderer::monitor_layout::item_ladder(&model);
+        //
+        // The counter is bound to the CALL, not to a line after the gate. Written as a bare
+        // statement below the early return it measured position rather than work: moving
+        // `item_ladder` above the gate — the exact regression D9 exists to prevent — would
+        // leave the count unchanged and `r1_2` still green. Inside the initialiser it travels
+        // with the call it stands for.
+        let ladder = {
+            #[cfg(test)]
+            {
+                self.ladders_built += 1;
+            }
+            renderer::monitor_layout::item_ladder(&model)
+        };
         let keys: Vec<RungKey> = ladder.iter().map(|i| rung_key(&model, i)).collect();
         let top = resolve_anchor(&self.anchor, &self.keys, &keys);
         // Re-arm from the new document: the key is unchanged but its index moved, and D15's
@@ -5140,6 +5148,82 @@ mod tests {
     }
 
     #[test]
+    fn r0_3_an_idle_machine_costs_no_wake_and_no_frame() {
+        // R0.3 previously had no test of its own — it was implied by `r2_7`, which asserts
+        // only that a past-due session arms nothing. That is half the requirement. R0.3 also
+        // claims no FRAME is drawn, which is the `refresh_model` diff's job, not the arming
+        // rule's, and nothing tied the two halves together.
+        //
+        // Note the precondition the requirement carries, and why it is not a weakening: the
+        // session must already be past the threshold. A panel opened onto a session that is
+        // quiet but NOT yet past it costs exactly one wake, by design — that is R0.4, and the
+        // first form of R0.3 contradicted it by claiming zero wakes for any open panel.
+        let (mut o, log) = armed_panel(19 * 60_000);
+
+        // The first poll publishes the initial model, which is a frame the panel owes anyway.
+        assert!(o.poll());
+        assert_eq!(
+            o.published.as_ref().map(|m| m.status),
+            Some(renderer::monitor_model::PanelStatus::Idle),
+            "the fixture is past the threshold, so the pill is already correct"
+        );
+        let ladders_after_open = o.ladders_built;
+
+        // Now five minutes of nothing: no append, no agent, no tab change.
+        for _ in 0..600 {
+            assert!(
+                !o.poll(),
+                "an idle machine must not ask for a frame it has no news for"
+            );
+        }
+
+        assert!(arms(&log).is_empty(), "nothing was armed, so nothing wakes");
+        assert_eq!(
+            o.ladders_built, ladders_after_open,
+            "and no rebuild reached the ladder, the anchor or the badge"
+        );
+    }
+
+    #[test]
+    fn a_deadline_armed_before_busy_survives_into_the_busy_window() {
+        // The THIRD bypass of D18's suppression, and the only one caused by this feature's own
+        // structure rather than by a config toggle or a transient failure.
+        //
+        // `reconsider_deadline` returns early on `Busy` WITHOUT disarming, because the gate is
+        // built to defer an arm rather than cancel one — D11's second trigger is what later
+        // executes that deferral. The consequence is that a deadline armed on the last append
+        // *before* the worker publishes `Busy` stays pending straight through the busy window.
+        //
+        // Pinned rather than fixed. Disarming on `Busy` would close this and reopen something
+        // strictly worse: the deferred arm is the mechanism the primary path depends on, so
+        // cancelling it would put a clean turn ending back on the single-trigger design that
+        // arms nothing at all. The Known Gaps record the trade; this test makes sure a future
+        // reader who "fixes" it finds out immediately which of the two they chose.
+        let (mut o, log) = armed_panel(30_000);
+        let t = last_event(&o);
+
+        // The append lands while the tab still reads not-Busy: the arm happens.
+        o.poll();
+        assert_eq!(arms(&log), vec![Some(dashboard::idle_deadline_ms(t))]);
+
+        // Up to 500ms later the worker publishes Busy — the long tool call has begun.
+        o.on_active_changed(None, None, None, Some(crate::tabmeta::AgentState::Busy));
+
+        // The pending deadline is NOT cancelled by that transition.
+        assert_eq!(
+            o.armed_from,
+            Some(t),
+            "today's behaviour: the arm placed before Busy survives into the busy window"
+        );
+        assert_eq!(
+            arms(&log).len(),
+            1,
+            "and no disarm was sent — if this starts failing, `Busy` now cancels rather than \
+             defers, which breaks D11's second trigger and the primary path with it"
+        );
+    }
+
+    #[test]
     fn r2_1_a_newer_last_event_ms_arms_the_deadline() {
         // D11 trigger one, and D15's arithmetic: the instant armed is the first at which the
         // pill reads IDLE, never `last + IDLE_AFTER_MS`, which is one millisecond too early
@@ -5719,7 +5803,35 @@ mod tests {
         // built to absorb. Hooking the rebuild there would differ on most frames of a drag,
         // because the tiles tick every second below an hour, and would re-shape the whole
         // document per drag frame. So the number of rebuilds must be bounded by the wake
-        // count, which is pinned here structurally: the rebuild is reached from one arm.
+        // count, and that is asserted in BOTH the ways it can go wrong.
+        //
+        // Half one, behavioural, and the one the requirement actually states. `layer()` is the
+        // overlay's entire frame-facing surface: the app asks for a draw layer and the renderer
+        // composes from the published handle. It takes `&self`, so a frame structurally cannot
+        // rebuild — but "structurally cannot" is what a later `&mut self` signature change
+        // would quietly undo, so the count is asserted rather than reasoned about.
+        let (mut o, _log) = armed_panel(30_000);
+        o.poll();
+        let after_one_wake = o.models_built;
+
+        for _ in 0..60 {
+            let _ = o.layer();
+        }
+        assert_eq!(
+            o.models_built, after_one_wake,
+            "60 drag frames must not compose a single model — this is the R7.3 regression, \
+             and it is invisible in output because composing is pure"
+        );
+
+        o.poll();
+        assert_eq!(
+            o.models_built,
+            after_one_wake + 1,
+            "the count tracks WAKES; 60 frames plus one wake is one more rebuild, not 61"
+        );
+
+        // Half two, structural: the rebuild is reached from exactly one site, and that site is
+        // the wake arm rather than the `redraw()` seam.
         let src = include_str!("terminal_app.rs");
         let (production, _) = src
             .split_once("\n#[cfg(test)]\nmod tests {")
