@@ -17,29 +17,43 @@ on_active_changed
 poll
 reconsider_deadline
 refresh_model
+rostered
 run
+upsert_meta
 
 ## survivors
-# run — 2 survivors, both PRE-EXISTING and both in the `Cmd::SetActive` in-band-refresh path
-#   (`roster.iter().find(|tp| tp.id == id)` and the published-slot lookup beside it,
-#   worker.rs:327 and :334, authored by commits 27716e0f / f9ffb581, not by this feature).
-#   `replace run with ()` — the one that mattered, because it made this feature's wake site
-#   deletable with a green suite — is CAUGHT as of the r3_1_r3_5 loop test.
+# NONE. Every scoped function is at 0.
 #
-#   NOT equivalent, so by CLAUDE.md's rule they are missing tests rather than noise. What
-#   they cost was checked rather than assumed, and it is why they are recorded instead of
-#   killed here. Reaching either mutant needs a NON-EMPTY roster, because with an empty one
-#   the `SetActive` arm's `roster.iter().find(..)` yields `None` and the whole block is
-#   skipped. A non-empty roster makes `deriver.tab()` run for a real pid, and distinguishing
-#   the correct tab from the wrong one needs two tabs that derive to DIFFERENT metas — with
-#   every tab deriving to `TabMeta::default()` the mutants are observationally identical.
-#   So a test would have to read the live process table, which is the class of test this repo
-#   has already been bitten by (a machine-dependent failure reads as your regression). The
-#   alternative is injection, and `run` builds its own `Deriver::new()` internally while the
-#   seams tests use — `cwd_of`, `agent_of`, `start_ms_of` (worker.rs:697-701) — are fields on
-#   a Deriver the caller owns. Injecting would mean changing `run`'s signature: a production
-#   change, on a path this feature never touched, to cover a pre-existing gap.
-#   If they are ever killed, that is the shape it takes.
+# `run` was at 3 and is now at 0, in two steps, and the second step corrects a claim this
+# file previously made — recorded rather than deleted, because the wrong reasoning is the
+# part worth keeping:
+#
+#   1. `replace run with ()` survived, which meant no test executed a single statement of
+#      the worker loop: the two lines that turn an armed deadline into a wake could be
+#      deleted with all 769 tests green and this whole feature inert. Killed by the
+#      `r3_1_r3_5` test, which drives the real loop over an empty roster so every iteration
+#      is command-driven — no process walks, no ticks to wait out, no sleeps.
+#
+#   2. Two more survived in the `Cmd::SetActive` arm (`tp.id == id` and the published-slot
+#      lookup beside it, both pre-existing, authored by 27716e0f / f9ffb581). This file
+#      previously recorded them as effectively unkillable: reaching them needs a non-empty
+#      roster, a non-empty roster makes `Deriver::tab` walk a real process tree, and telling
+#      the right tab from the wrong one appeared to need two tabs deriving to different
+#      metas — so a test would have to read the live process table, and the only alternative
+#      looked like changing `run`'s signature to inject a `Deriver`.
+#
+#      **That analysis was wrong, and it was wrong in a specific, repeatable way: it treated
+#      the code's shape as fixed and asked only what a test could reach.** The third option
+#      is to move the decision to where a test already is. Both mutants were pure logic —
+#      "which rostered tab does this id name" and "which published slot does it update" —
+#      tangled into a loop that also does I/O. Extracted as `rostered` and `upsert_meta`,
+#      they are testable with no clock, no processes and no thread, which is the same move
+#      `publish_if_changed` already documents for the differ ("a free function so the differ
+#      is unit-testable without the thread"). The refactor preserves behaviour exactly.
+#
+#      The general lesson, and the reason this paragraph stays: "no test can reach it" is a
+#      statement about the code's shape, not about the test suite. Reach for the shape before
+#      concluding a survivor is too expensive to kill.
 # Every other scoped function: 0 survivors.
 
 ## not-changed

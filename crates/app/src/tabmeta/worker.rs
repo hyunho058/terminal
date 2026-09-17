@@ -324,17 +324,13 @@ pub(crate) fn run(shared: Arc<TabMetaShared>, rx: Receiver<Cmd>, wake: impl Fn()
                 // (R1.7). The global tick phase is NOT reset (that phase staggers the
                 // background tabs, D4).
                 if let Some(id) = a {
-                    if let Some(tp) = roster.iter().find(|tp| tp.id == id).copied() {
+                    if let Some(tp) = rostered(&roster, id) {
                         // `is_active = true` by construction: this arm derives the tab that
                         // just BECAME active. That is also what makes the panel's staleness
                         // check land in band on a tab switch rather than waiting a tick.
                         let meta = deriver.tab(&tp, tick_index, SystemTime::now(), true);
                         deriver.note_activity_gap(id, &meta);
-                        let mut next = published.clone();
-                        match next.iter_mut().find(|(tid, _)| *tid == id) {
-                            Some(slot) => slot.1 = meta,
-                            None => next.push((id, meta)),
-                        }
+                        let next = upsert_meta(&published, id, meta);
                         publish_if_changed(&shared, &mut published, next, &wake);
                     }
                 }
@@ -378,6 +374,37 @@ pub(crate) fn run(shared: Arc<TabMetaShared>, rx: Receiver<Cmd>, wake: impl Fn()
             wake();
         }
     }
+}
+
+/// Which rostered tab does `id` name? `None` when the roster does not hold it.
+///
+/// A free function for the same reason [`publish_if_changed`] is one: it is pure decision logic
+/// that was inline in [`run`]'s `SetActive` arm, where **no test could reach it**. `cargo
+/// mutants` proved that rather than suggesting it — `tp.id == id` could be flipped to `!=` with
+/// the whole suite green, because reaching the inline form meant a non-empty roster, which
+/// meant `Deriver::tab` walking a real process tree. Out here the predicate is testable with no
+/// clock, no processes and no thread.
+///
+/// The `!=` mutant is not harmless: it hands the arm the **wrong tab**, so a tab switch derives
+/// some other tab's metadata and publishes it under the active tab's id.
+fn rostered(roster: &[TabPid], id: TabId) -> Option<TabPid> {
+    roster.iter().find(|tp| tp.id == id).copied()
+}
+
+/// `published` with `id`'s entry replaced by `meta`, or appended when it has none.
+///
+/// Extracted with [`rostered`] and for the same reason: `*tid == id` was an unreachable
+/// mutation survivor inline. The `!=` form is the more dangerous of the two — it overwrites a
+/// *different* tab's slot with this tab's metadata and then, because it found a match, never
+/// appends the tab it was actually asked about. The tab being switched to would simply never
+/// appear in the published set.
+fn upsert_meta(published: &[(TabId, TabMeta)], id: TabId, meta: TabMeta) -> Vec<(TabId, TabMeta)> {
+    let mut next = published.to_vec();
+    match next.iter_mut().find(|(tid, _)| *tid == id) {
+        Some(slot) => slot.1 = meta,
+        None => next.push((id, meta)),
+    }
+    next
 }
 
 /// Has the panel's deadline come due? Takes it if so, so it can fire **exactly once**
@@ -1595,6 +1622,83 @@ mod tests {
         };
         let meta = d.tab(&tp, 0, SystemTime::now(), true);
         assert_eq!(meta, TabMeta::default());
+    }
+
+    // ---- the `SetActive` arm's two decisions, now reachable ----
+
+    #[test]
+    fn rostered_names_the_tab_asked_for_and_nothing_else() {
+        // The `!=` form of this predicate hands the arm the WRONG tab, so a switch derives
+        // some other tab's metadata and publishes it under the active tab's id. It survived
+        // mutation while the logic was inline in `run`, because reaching it there needed a
+        // non-empty roster and therefore a real process walk.
+        let roster = [
+            TabPid {
+                id: TabId(7),
+                pid: 700,
+            },
+            TabPid {
+                id: TabId(8),
+                pid: 800,
+            },
+        ];
+
+        assert_eq!(rostered(&roster, TabId(7)).map(|tp| tp.pid), Some(700));
+        assert_eq!(
+            rostered(&roster, TabId(8)).map(|tp| tp.pid),
+            Some(800),
+            "the SECOND entry, not merely 'some entry that is not the first'"
+        );
+        assert_eq!(
+            rostered(&roster, TabId(9)),
+            None,
+            "a tab that is not rostered names nothing — a closed tab must not refresh a \
+             surviving one under its id"
+        );
+        assert_eq!(rostered(&[], TabId(7)), None);
+    }
+
+    #[test]
+    fn upsert_meta_replaces_that_tabs_slot_and_appends_when_it_has_none() {
+        // The `!=` form is the more dangerous of the two: it overwrites a DIFFERENT tab's slot
+        // and then, having found a match, never appends the tab it was asked about — so the
+        // tab being switched to would never appear in the published set at all.
+        let a = TabMeta {
+            branch: Some("main".into()),
+            ..Default::default()
+        };
+        let b = TabMeta {
+            branch: Some("feature".into()),
+            ..Default::default()
+        };
+        let published = vec![(TabId(1), a.clone()), (TabId(2), b.clone())];
+
+        // Replace in place: same length, same order, only tab 2's slot moves.
+        let fresh = TabMeta {
+            branch: Some("hotfix".into()),
+            ..Default::default()
+        };
+        let next = upsert_meta(&published, TabId(2), fresh.clone());
+        assert_eq!(next, vec![(TabId(1), a.clone()), (TabId(2), fresh.clone())]);
+
+        // Append when absent: the asked-for tab must actually arrive.
+        let next = upsert_meta(&published, TabId(3), fresh.clone());
+        assert_eq!(
+            next,
+            vec![
+                (TabId(1), a.clone()),
+                (TabId(2), b.clone()),
+                (TabId(3), fresh.clone())
+            ],
+            "a newly-active tab with no slot yet must be added, not merged into a neighbour"
+        );
+
+        // The empty case, which both the correct and the `!=` form reach identically — pinned
+        // so the append path is covered from nothing as well as from something.
+        assert_eq!(
+            upsert_meta(&[], TabId(1), fresh.clone()),
+            vec![(TabId(1), fresh)]
+        );
     }
 
     // ---- idle-timestamps T3 / R3: holding and firing the panel's deadline ----
