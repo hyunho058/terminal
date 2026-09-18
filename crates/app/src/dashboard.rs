@@ -255,6 +255,32 @@ fn status(t: &TelemetrySnapshot, env: &Env, detached: Option<Detached>) -> Panel
     }
 }
 
+/// The first instant at which [`status`] reports `Idle` for a session whose last log line
+/// landed at `last_event_ms` (ai-monitor-idle-timestamps D15/R4.1).
+///
+/// **Defined by that postcondition rather than by an expression**, and the distinction is
+/// load-bearing. The comparator above is `<=`, so IDLE needs *strictly* more than
+/// [`IDLE_AFTER_MS`] and the obvious `last_event_ms + IDLE_AFTER_MS` is one millisecond early.
+/// A deadline armed there fires at an instant where the pill still reads CONNECTED; because
+/// that wake moves no timestamp it re-arms nothing, so the pill would then read CONNECTED for
+/// the rest of the session — the exact defect the deadline exists to remove, reintroduced by
+/// an off-by-one. `r4_1_the_deadline_is_the_first_instant_status_says_idle` asserts the
+/// boundary against `status` itself, so the two cannot drift apart.
+///
+/// This exists so that [`IDLE_AFTER_MS`] can stay **private**: the overlay arms with an
+/// *instant* and never learns the threshold, which keeps the boundary rule in the module that
+/// owns it (D10/D15/R4.2) instead of re-derived next to the code that schedules the wake.
+///
+/// The postcondition holds for every `last_event_ms` a session log can carry. It does not
+/// hold within [`IDLE_AFTER_MS`] of `u64::MAX`, where the addition saturates and no instant
+/// satisfies it — the same degenerate regime as a log timestamp from the future, which the
+/// spec records as a pre-existing Known Gap: `saturating_sub` yields 0 and the pill holds at
+/// CONNECTED. Both are absent-of-a-real-clock cases, and neither is reachable from a log this
+/// process wrote.
+pub fn idle_deadline_ms(last_event_ms: u64) -> u64 {
+    last_event_ms.saturating_add(IDLE_AFTER_MS + 1)
+}
+
 /// The session identity row, with the detached wording underneath it (R5.3).
 ///
 /// The panel's name is already in the header, so this row spends its columns on the
@@ -3233,6 +3259,71 @@ mod tests {
             model(Some(&t), &unattached(now)).status,
             PanelStatus::NoSession
         );
+    }
+
+    #[test]
+    fn r4_1_the_deadline_is_the_first_instant_status_says_idle() {
+        // D15 — `idle_deadline_ms` is defined by its postcondition, so it is asserted against
+        // `status` ITSELF rather than against a recomputed `last + IDLE_AFTER_MS`. Comparing
+        // it to an expression would pass for an implementation that drifts with the `<=`
+        // comparator; comparing it to the predicate cannot.
+        //
+        // The boundary is the whole test: at the returned instant the pill must have flipped,
+        // and one millisecond earlier it must not have. An off-by-one in either direction
+        // fails exactly one of the two assertions.
+        for last in [
+            0,
+            1,
+            1_700_000_000_000,
+            // The largest input for which the postcondition is satisfiable at all: one more
+            // and the add saturates below the instant `status` would need. Documented on the
+            // function as the degenerate regime, and asserted here so "every real timestamp"
+            // is a tested claim rather than a comment.
+            u64::MAX - IDLE_AFTER_MS - 1,
+        ] {
+            let t = TelemetrySnapshot {
+                last_event_ms: Some(last),
+                ..Default::default()
+            };
+            let deadline = idle_deadline_ms(last);
+            assert_eq!(
+                status(&t, &env(deadline), None),
+                PanelStatus::Idle,
+                "last = {last}: at the deadline the pill must read IDLE"
+            );
+            assert_eq!(
+                status(&t, &env(deadline - 1), None),
+                PanelStatus::Connected,
+                "last = {last}: one ms before the deadline it must still read CONNECTED"
+            );
+        }
+    }
+
+    #[test]
+    fn r4_2_the_overlay_never_names_the_threshold() {
+        // D10/D15/R4.2 — the overlay arms with an instant and never learns the threshold, so
+        // the boundary rule has exactly one home. Both spellings are banned, and for different
+        // reasons: `IDLE_AFTER_MS` is private so naming it would not compile, but the literal
+        // `300_000` would compile perfectly and silently duplicate the rule.
+        //
+        // Trailing comments are stripped as well as whole-line ones. R7.4's own scan in
+        // `terminal_app.rs` strips only lines that *begin* with `//`, which makes a trailing
+        // comment fail it with a confusing message; that gap is recorded in the spec, and this
+        // scan is written not to inherit it. Prose in `overlay.rs` may therefore discuss the
+        // threshold freely — only code is scanned.
+        let src = include_str!("overlay.rs");
+        let code = src
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for banned in ["IDLE_AFTER_MS", "300_000"] {
+            assert!(
+                !code.contains(banned),
+                "overlay.rs names `{banned}` in code: the threshold belongs to dashboard.rs, \
+                 and the overlay takes an instant from `idle_deadline_ms` instead (D15)"
+            );
+        }
     }
 
     #[test]

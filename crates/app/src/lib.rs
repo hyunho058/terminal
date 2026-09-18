@@ -69,6 +69,7 @@ pub(crate) mod waiting;
 pub use input::encode_key;
 /// The SD4 seam: named in the signatures below and asserted by
 /// `crates/app/tests/wiring.rs`.
+pub use overlay::{no_deadline, ArmDeadline};
 pub use seam::{InputHandler, Overlay, Registrations};
 /// `crates/app/tests/vertical_slice.rs` drives a real shell through a session.
 pub use session::{Session, TabId, Wake};
@@ -112,7 +113,17 @@ pub fn feature_registrations(
     tabmeta: Option<tabmeta::TabMetaHandle>,
 ) -> Registrations {
     let mut set = Registrations::default();
-    for overlay in feature_overlays(proxy) {
+    // The ai-monitor panel's route to the metadata worker (idle-timestamps D7): one verb,
+    // captured here where both halves exist, rather than a handle threaded into the overlay or
+    // a `tabmeta::global()` lookup inside it. The global was rejected for a concrete reason —
+    // it answers `None` until `install`, which no test performs, so the whole arming path
+    // would be unreachable under `cargo test`. With no worker there is nothing to arm, and the
+    // panel simply never gets its wake.
+    let arm: overlay::ArmDeadline = match tabmeta.clone() {
+        Some(handle) => Box::new(move |at| handle.set_panel_deadline(at)),
+        None => overlay::no_deadline(),
+    };
+    for overlay in feature_overlays(proxy, arm) {
         set.overlay(overlay);
     }
     // tab-metadata's pump, at `i32::MIN`: headless, invisible, consumes no key.
@@ -141,13 +152,16 @@ pub fn feature_registrations(
 /// `proxy` is `None` only in tests. Production always passes `Some`: the
 /// ai-monitor's log watcher wakes the loop through it, and an overlay built
 /// without one folds its log without ever asking for a repaint.
-pub fn feature_overlays(proxy: Option<EventLoopProxy<UserEvent>>) -> Vec<Box<dyn Overlay>> {
+pub fn feature_overlays(
+    proxy: Option<EventLoopProxy<UserEvent>>,
+    arm: overlay::ArmDeadline,
+) -> Vec<Box<dyn Overlay>> {
     vec![
         // sticky-tab-title: the Cmd+Shift+R rename field. Ahead of the ai-monitor
         // so an open field owns the keyboard (D8a.1).
         Box::new(rename::RenameOverlay::new()),
         // ai-monitor's Cmd+Shift+M panel.
-        Box::new(AiMonitorOverlay::with_waker(proxy)),
+        Box::new(AiMonitorOverlay::with_waker(proxy, arm)),
         // image-paste: the inline-image presenter, whose DrawLayer draws snapshot images.
         Box::new(ImagePresenter),
         // copy-clipboard: the selection-highlight DrawLayer, on the same seam.

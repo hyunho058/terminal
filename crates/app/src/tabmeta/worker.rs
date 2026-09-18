@@ -301,6 +301,10 @@ pub(crate) fn run(shared: Arc<TabMetaShared>, rx: Receiver<Cmd>, wake: impl Fn()
     let mut tick_index: u64 = 0;
     let mut published: Vec<(TabId, TabMeta)> = Vec::new();
     let mut deriver = Deriver::new();
+    // The ai-monitor panel's one-shot deadline (idle-timestamps D6/D8). At most one, replaced
+    // on arm, cleared on fire or disarm. A local rather than shared state: it is read and
+    // written only here, on this thread, so it needs neither a lock nor an atomic.
+    let mut panel_deadline: Option<u64> = None;
 
     loop {
         // Empty roster → block with no timeout: zero wakeups, zero syscalls until a
@@ -320,17 +324,13 @@ pub(crate) fn run(shared: Arc<TabMetaShared>, rx: Receiver<Cmd>, wake: impl Fn()
                 // (R1.7). The global tick phase is NOT reset (that phase staggers the
                 // background tabs, D4).
                 if let Some(id) = a {
-                    if let Some(tp) = roster.iter().find(|tp| tp.id == id).copied() {
+                    if let Some(tp) = rostered(&roster, id) {
                         // `is_active = true` by construction: this arm derives the tab that
                         // just BECAME active. That is also what makes the panel's staleness
                         // check land in band on a tab switch rather than waiting a tick.
                         let meta = deriver.tab(&tp, tick_index, SystemTime::now(), true);
                         deriver.note_activity_gap(id, &meta);
-                        let mut next = published.clone();
-                        match next.iter_mut().find(|(tid, _)| *tid == id) {
-                            Some(slot) => slot.1 = meta,
-                            None => next.push((id, meta)),
-                        }
+                        let next = upsert_meta(&published, id, meta);
                         publish_if_changed(&shared, &mut published, next, &wake);
                     }
                 }
@@ -343,6 +343,7 @@ pub(crate) fn run(shared: Arc<TabMetaShared>, rx: Receiver<Cmd>, wake: impl Fn()
                 let next = deriver.pass(&roster, active, tick_index, SystemTime::now(), &published);
                 publish_if_changed(&shared, &mut published, next, &wake);
             }
+            Ok(Cmd::SetPanelDeadline(at)) => panel_deadline = at,
             Err(RecvTimeoutError::Timeout) => {
                 tick_index = tick_index.wrapping_add(1);
                 let next = deriver.pass(&roster, active, tick_index, SystemTime::now(), &published);
@@ -350,13 +351,114 @@ pub(crate) fn run(shared: Arc<TabMetaShared>, rx: Receiver<Cmd>, wake: impl Fn()
             }
             Err(RecvTimeoutError::Disconnected) => break, // handle dropped → shut down
         }
+        // The panel's deadline, checked once per loop iteration rather than inside the
+        // `Timeout` arm (idle-timestamps D6/R3.1).
+        //
+        // Outside the match on purpose: a machine busy enough to keep delivering commands
+        // never reaches the `Timeout` arm, and a deadline that only fires there would be
+        // starved for exactly as long as the app kept talking. Out here every path through
+        // the loop passes over it.
+        //
+        // **This is the second `wake()` site in this file, and it does not mean what the
+        // first one means.** `publish_if_changed` wakes only when a `TabMeta` changed, and
+        // several readers reason about cadence from that. This one fires with no generation
+        // bump, no lock and nothing published — the app rebuilds the panel's model on the
+        // wake and finds its own reason to redraw. One wake per armed deadline, and nothing
+        // on the other ticks of the wait: an edge, not the heartbeat that was deferred.
+        //
+        // Conditional on the roster being non-empty, because an empty roster blocks on
+        // `recv()` with no timeout and this line is then unreachable until a command arrives.
+        // Benign in production — a panel is open on a tab, so there is a roster — but it is a
+        // precondition of the whole mechanism rather than something a reader should infer.
+        if deadline_due(&mut panel_deadline, epoch_ms()) {
+            wake();
+        }
     }
+}
+
+/// Which rostered tab does `id` name? `None` when the roster does not hold it.
+///
+/// A free function for the same reason [`publish_if_changed`] is one: it is pure decision logic
+/// that was inline in [`run`]'s `SetActive` arm, where **no test could reach it**. `cargo
+/// mutants` proved that rather than suggesting it — `tp.id == id` could be flipped to `!=` with
+/// the whole suite green, because reaching the inline form meant a non-empty roster, which
+/// meant `Deriver::tab` walking a real process tree. Out here the predicate is testable with no
+/// clock, no processes and no thread.
+///
+/// The `!=` mutant is not harmless: it hands the arm the **wrong tab**, so a tab switch derives
+/// some other tab's metadata and publishes it under the active tab's id.
+fn rostered(roster: &[TabPid], id: TabId) -> Option<TabPid> {
+    roster.iter().find(|tp| tp.id == id).copied()
+}
+
+/// `published` with `id`'s entry replaced by `meta`, or appended when it has none.
+///
+/// Extracted with [`rostered`] and for the same reason: `*tid == id` was an unreachable
+/// mutation survivor inline. The `!=` form is the more dangerous of the two — it overwrites a
+/// *different* tab's slot with this tab's metadata and then, because it found a match, never
+/// appends the tab it was actually asked about. The tab being switched to would simply never
+/// appear in the published set.
+fn upsert_meta(published: &[(TabId, TabMeta)], id: TabId, meta: TabMeta) -> Vec<(TabId, TabMeta)> {
+    let mut next = published.to_vec();
+    match next.iter_mut().find(|(tid, _)| *tid == id) {
+        Some(slot) => slot.1 = meta,
+        None => next.push((id, meta)),
+    }
+    next
+}
+
+/// Has the panel's deadline come due? Takes it if so, so it can fire **exactly once**
+/// (ai-monitor-idle-timestamps D8/R3.1).
+///
+/// A free function, and it takes the slot by `&mut` rather than returning advice, because the
+/// clearing and the reporting must not be separable: a caller that fired on the answer and
+/// forgot to clear would turn one bounded edge into a wake on every remaining tick — the
+/// deferred heartbeat, arrived by accident. Clearing *before* the wake is the same reasoning
+/// one step further in.
+///
+/// `>=` and not `>`: the instant handed in is already "the first instant at which the pill
+/// reads IDLE" (`dashboard::idle_deadline_ms`), so the deadline is due *at* it. Pushing the
+/// comparison out by one millisecond here would silently re-introduce the off-by-one that
+/// function exists to kill.
+fn deadline_due(slot: &mut Option<u64>, now_ms: u64) -> bool {
+    match *slot {
+        Some(at) if now_ms >= at => {
+            *slot = None;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Wall clock as epoch millis — the same scale the panel's `last_event_ms` and
+/// `dashboard::idle_deadline_ms` are on, which is why the deadline travels as a `u64` instant
+/// rather than as a `Duration` the two sides would each have to anchor.
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 /// Publish `next` only if it differs from the last publish (D4): otherwise take no lock,
 /// bump no generation, and — crucially — do not `wake` (an unconditional wake would force
 /// a full grid re-clone at 2 Hz forever, reintroducing the G1 idle-CPU debt). A free
 /// function so the differ is unit-testable without the thread.
+///
+/// **This is no longer the only `wake()` site in this file, and readers elsewhere depended on
+/// it being so** (ai-monitor-idle-timestamps D16). `run` now also wakes once when the
+/// ai-monitor panel's armed deadline comes due, with no generation bump and nothing published.
+/// So a wake from this worker no longer implies "a `TabMeta` changed" — it means "either a
+/// `TabMeta` changed, or the panel's one-shot deadline fired". That implication was
+/// load-bearing: `overlay.rs` reasons about its own cadence from it, and reads the absence of
+/// wakes on a quiet tab as "no tick at all". That reading is still true of *this* function and
+/// no longer true of the worker as a whole.
+///
+/// What has not changed is the invariant this comment exists for. The deadline wake is a
+/// single bounded edge — one per armed deadline, cleared by the firing — not a cadence, so the
+/// 2 Hz re-clone it warns about is still impossible. The difference is pinned by
+/// `tests::r3_1_a_passed_deadline_produces_exactly_one_wake`, because a source scan cannot see
+/// the difference between one wake and one wake per tick.
 fn publish_if_changed(
     shared: &TabMetaShared,
     published: &mut Vec<(TabId, TabMeta)>,
@@ -1520,5 +1622,270 @@ mod tests {
         };
         let meta = d.tab(&tp, 0, SystemTime::now(), true);
         assert_eq!(meta, TabMeta::default());
+    }
+
+    // ---- the `SetActive` arm's two decisions, now reachable ----
+
+    #[test]
+    fn rostered_names_the_tab_asked_for_and_nothing_else() {
+        // The `!=` form of this predicate hands the arm the WRONG tab, so a switch derives
+        // some other tab's metadata and publishes it under the active tab's id. It survived
+        // mutation while the logic was inline in `run`, because reaching it there needed a
+        // non-empty roster and therefore a real process walk.
+        let roster = [
+            TabPid {
+                id: TabId(7),
+                pid: 700,
+            },
+            TabPid {
+                id: TabId(8),
+                pid: 800,
+            },
+        ];
+
+        assert_eq!(rostered(&roster, TabId(7)).map(|tp| tp.pid), Some(700));
+        assert_eq!(
+            rostered(&roster, TabId(8)).map(|tp| tp.pid),
+            Some(800),
+            "the SECOND entry, not merely 'some entry that is not the first'"
+        );
+        assert_eq!(
+            rostered(&roster, TabId(9)),
+            None,
+            "a tab that is not rostered names nothing — a closed tab must not refresh a \
+             surviving one under its id"
+        );
+        assert_eq!(rostered(&[], TabId(7)), None);
+    }
+
+    #[test]
+    fn upsert_meta_replaces_that_tabs_slot_and_appends_when_it_has_none() {
+        // The `!=` form is the more dangerous of the two: it overwrites a DIFFERENT tab's slot
+        // and then, having found a match, never appends the tab it was asked about — so the
+        // tab being switched to would never appear in the published set at all.
+        let a = TabMeta {
+            branch: Some("main".into()),
+            ..Default::default()
+        };
+        let b = TabMeta {
+            branch: Some("feature".into()),
+            ..Default::default()
+        };
+        let published = vec![(TabId(1), a.clone()), (TabId(2), b.clone())];
+
+        // Replace in place: same length, same order, only tab 2's slot moves.
+        let fresh = TabMeta {
+            branch: Some("hotfix".into()),
+            ..Default::default()
+        };
+        let next = upsert_meta(&published, TabId(2), fresh.clone());
+        assert_eq!(next, vec![(TabId(1), a.clone()), (TabId(2), fresh.clone())]);
+
+        // Append when absent: the asked-for tab must actually arrive.
+        let next = upsert_meta(&published, TabId(3), fresh.clone());
+        assert_eq!(
+            next,
+            vec![
+                (TabId(1), a.clone()),
+                (TabId(2), b.clone()),
+                (TabId(3), fresh.clone())
+            ],
+            "a newly-active tab with no slot yet must be added, not merged into a neighbour"
+        );
+
+        // The empty case, which both the correct and the `!=` form reach identically — pinned
+        // so the append path is covered from nothing as well as from something.
+        assert_eq!(
+            upsert_meta(&[], TabId(1), fresh.clone()),
+            vec![(TabId(1), fresh)]
+        );
+    }
+
+    // ---- idle-timestamps T3 / R3: holding and firing the panel's deadline ----
+    //
+    // These drive `deadline_due` rather than the thread, for the reason `publish_if_changed`
+    // is a free function: the loop needs a real `Receiver` and a real 500 ms tick, so a test
+    // of the slot through it would be a sleep with an assertion at the end. What the slot has
+    // to get right — fire once, fire never before time, replace rather than accumulate — is
+    // all in this one function, and it is testable at full speed.
+
+    #[test]
+    fn epoch_ms_reads_the_wall_clock_in_milliseconds() {
+        // The deadline travels as an absolute epoch-millis instant computed on the app side
+        // from a log timestamp, so this function and `dashboard::idle_deadline_ms` must be on
+        // the same scale and the same origin. Nothing else in the loop would notice if they
+        // were not: a clock reading seconds, or zero, simply makes every deadline look long
+        // past due, and the worker would fire each one on the very next tick — the arm would
+        // still "work", one wake and all, just always immediately.
+        let before = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the system clock is after 1970")
+            .as_millis() as u64;
+        let read = epoch_ms();
+        let after = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the system clock is after 1970")
+            .as_millis() as u64;
+
+        assert!(
+            (before..=after).contains(&read),
+            "epoch_ms must read the same clock, in the same unit: {before} <= {read} <= {after}"
+        );
+        // Belt and braces on the unit itself, since the bracket above would also hold for a
+        // clock in seconds if all three readings happened to agree.
+        assert!(
+            read > 1_700_000_000_000,
+            "epoch_ms returned {read}, which is not milliseconds since 1970"
+        );
+    }
+
+    #[test]
+    fn r3_1_a_passed_deadline_produces_exactly_one_wake() {
+        // THE property of this feature, and the one no source scan can see. A deadline that
+        // fired on every tick past its instant would be a 2 Hz repaint cadence — precisely the
+        // thing the panel's approved design rejected and the thing the deferred Option 2 would
+        // have been. The difference between an edge and a heartbeat is this assertion.
+        let mut slot = Some(1_000);
+        let mut wakes = 0;
+        for tick in 0..20 {
+            if deadline_due(&mut slot, 1_500 + tick) {
+                wakes += 1;
+            }
+        }
+        assert_eq!(wakes, 1, "an armed deadline is ONE edge, not a cadence");
+        assert_eq!(slot, None, "and the slot is cleared by the firing");
+    }
+
+    #[test]
+    fn r3_2_an_unreached_deadline_produces_no_wake() {
+        let mut slot = Some(10_000);
+        for tick in 0..20 {
+            assert!(!deadline_due(&mut slot, 9_000 + tick));
+        }
+        assert_eq!(slot, Some(10_000), "and it is still armed for later");
+    }
+
+    #[test]
+    fn r3_3_arming_replaces_the_pending_deadline() {
+        // The real requirement behind the single slot, and it is about REPLACEMENT rather than
+        // staleness: a session that resumes and re-quiets must not leave two deadlines racing.
+        let mut slot = Some(1_000);
+        assert!(
+            !deadline_due(&mut slot, 999),
+            "T1 is pending and not yet due"
+        );
+        slot = Some(5_000); // the arm that arrives while the first is pending
+        assert!(!deadline_due(&mut slot, 1_200), "T1 is gone, not pending");
+        assert!(deadline_due(&mut slot, 5_000), "and T2 is what fires");
+        assert_eq!(slot, None);
+    }
+
+    #[test]
+    fn r3_4_disarming_clears_the_slot() {
+        let mut slot = Some(1_000);
+        assert!(!deadline_due(&mut slot, 999), "armed before the disarm");
+        slot = None; // Cmd::SetPanelDeadline(None)
+        for tick in 0..10 {
+            assert!(!deadline_due(&mut slot, 100_000 + tick));
+        }
+    }
+
+    #[test]
+    fn the_deadline_fires_at_its_instant_and_not_a_millisecond_later() {
+        // `>=`, not `>`. The instant handed over is already "the first instant at which the
+        // pill reads IDLE", so firing one millisecond later would be a second off-by-one
+        // stacked on the one `idle_deadline_ms` exists to remove.
+        let mut slot = Some(300_001);
+        assert!(!deadline_due(&mut slot, 300_000), "not due one ms early");
+        assert!(deadline_due(&mut slot, 300_001), "due at the instant");
+    }
+
+    /// R3.1 + R3.5, driven through the **real `run` loop** rather than through `deadline_due`
+    /// alone — and that distinction is the whole reason this test exists.
+    ///
+    /// It replaces a test that could not fail. The previous version asserted that firing a
+    /// deadline bumped no generation and published nothing, but it called `deadline_due`, whose
+    /// signature is `(&mut Option<u64>, u64) -> bool`: it is handed neither the shared state nor
+    /// the published vector, so the assertions were true by type and would have held just as
+    /// well against a `run` that published on every firing tick.
+    ///
+    /// Worse, `cargo mutants` showed `replace run with ()` SURVIVING: no test executed a single
+    /// statement of the worker loop, so the two lines that actually turn an armed deadline into
+    /// a wake could be deleted with the whole suite green — the feature wholly inert, the pill
+    /// never flipping, and nothing anywhere going red. That is the failure class `CLAUDE.md`
+    /// keeps `golden_frame.rs` for: every other observable reports a decision while the thing
+    /// the decision was for never happens.
+    ///
+    /// **The roster is left EMPTY on purpose.** With no roster the loop blocks on `recv()` with
+    /// no timeout (D4), so every iteration here is driven by a command this test sends — no
+    /// process walks, no `SystemTime` dependence, no 500 ms tick to wait out, and no sleep. The
+    /// loop still passes over the deadline check once per iteration, which is exactly the
+    /// property under test. It is also the precondition D16 records: with an empty roster the
+    /// deadline is only reached when something else wakes the loop.
+    #[test]
+    fn r3_1_r3_5_the_worker_loop_fires_an_armed_deadline_once_and_publishes_nothing() {
+        use std::sync::mpsc;
+
+        let (tx, rx) = mpsc::channel::<Cmd>();
+        let (woke_tx, woke_rx) = mpsc::channel::<()>();
+        let wakes = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&wakes);
+        let s = shared();
+        let worker_shared = Arc::clone(&s);
+
+        let handle = std::thread::spawn(move || {
+            run(worker_shared, rx, move || {
+                counter.fetch_add(1, Ordering::Release);
+                let _ = woke_tx.send(());
+            })
+        });
+
+        let generation_before = s.generation.load(Ordering::Acquire);
+
+        // Arm a deadline already long past due; the next pass over the check must fire it.
+        tx.send(Cmd::SetPanelDeadline(Some(1)))
+            .expect("worker alive");
+        woke_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("an armed, past-due deadline must wake the loop");
+        assert_eq!(wakes.load(Ordering::Acquire), 1);
+
+        // Ten more iterations over a slot the firing already cleared. None may wake.
+        for _ in 0..10 {
+            tx.send(Cmd::SetActive(None)).expect("worker alive");
+        }
+        // Re-arm and wait for the second wake. Because the channel is FIFO, receiving this
+        // proves all ten commands above were processed — which is what makes the count
+        // assertion below meaningful without sleeping for an arbitrary interval.
+        tx.send(Cmd::SetPanelDeadline(Some(1)))
+            .expect("worker alive");
+        woke_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a re-armed deadline must wake the loop again");
+
+        assert_eq!(
+            wakes.load(Ordering::Acquire),
+            2,
+            "one wake per ARMED deadline — the ten iterations in between fired nothing, which \
+             is what separates a bounded edge from the repaint cadence RP-D2 rejected"
+        );
+
+        // R3.5, now asserted where it can actually fail: the deadline rides the worker's loop
+        // but not its publish path. `run` holds the shared state this test also holds, so a
+        // firing tick that took the lock, bumped the generation or published would show here.
+        assert_eq!(
+            s.generation.load(Ordering::Acquire),
+            generation_before,
+            "firing a deadline is not a metadata change, and the app's band logic keys on this"
+        );
+        assert!(
+            s.tabs.lock().expect("not poisoned").is_empty(),
+            "and a firing tick publishes nothing"
+        );
+
+        drop(tx); // channel closes → `run` returns → the thread ends cleanly (D14)
+        handle
+            .join()
+            .expect("the worker thread exits on disconnect");
     }
 }

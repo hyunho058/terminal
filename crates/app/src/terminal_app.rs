@@ -1094,8 +1094,14 @@ impl Running {
         // function of that process's cwd, which is fixed at its launch — so the directory
         // goes stale exactly when the pid changes, and this wake is where that is noticed.
         let agent_pid = self.tabs.active_agent_pid(&self.tabmeta_snapshot);
+        // The same publish also carries whether that agent is mid-turn. The panel needs it to
+        // decide whether arming an idle deadline would be a lie: a long `cargo build` leaves a
+        // genuinely working session silent for minutes, which is the case the five-minute
+        // threshold was sized for, and a deadline armed through it would flip the pill to IDLE
+        // while the agent works (idle-timestamps D18).
+        let agent_state = self.tabs.active_agent_state(&self.tabmeta_snapshot);
         self.overlays
-            .notify_active_changed(cwd, shell_pid, agent_pid);
+            .notify_active_changed(cwd, shell_pid, agent_pid, agent_state);
         self.push_agent_states()
     }
 
@@ -1791,8 +1797,13 @@ impl Running {
         // Re-point cwd-derived overlays (ai-monitor) at the new active tab (R3.1).
         let cwd = self.tabs.active_cwd(&self.tabmeta_snapshot);
         let agent_pid = self.tabs.active_agent_pid(&self.tabmeta_snapshot);
-        self.overlays
-            .notify_active_changed(cwd, self.tabs.active_shell_pid(), agent_pid);
+        let agent_state = self.tabs.active_agent_state(&self.tabmeta_snapshot);
+        self.overlays.notify_active_changed(
+            cwd,
+            self.tabs.active_shell_pid(),
+            agent_pid,
+            agent_state,
+        );
         self.redraw();
     }
 
@@ -2332,6 +2343,25 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::OverlayPending => {
                 // An overlay (ai-monitor) tailed new data — fold it in + redraw (R1.3).
+                //
+                // Since idle-timestamps D2 this does more than fold in tailed data: while the
+                // panel is visible it rebuilds the panel's model on **every** wake through
+                // here, whatever produced the wake, and reports whether the model differs.
+                // Three producers reach this arm (the panel's own watcher, the tabmeta worker,
+                // and `refresh_rivals`' probe ping), and on the latter two the old `poll`
+                // returned false while the app went on to redraw for the waiting band — a
+                // frame drawn from a model nobody had rebuilt.
+                //
+                // **The cost, stated as it actually is: no new WAKES, which is not the same as
+                // free.** An earlier framing called this a free refresh; it is not. It is one
+                // `dashboard::model` per wake, plus a full stage-one re-shape on the subset of
+                // those wakes where a formatted string actually changed — commonly most of
+                // them for a session under an hour old, where the UPTIME and IDLE tiles tick
+                // every second, and few for an older one, where `dur()` has gone
+                // minute-granular. What it does not do is create a single frame that was not
+                // already going to be drawn, and absorbing a re-shape is what the panel's
+                // two-stage cache exists for. The weaker claim is the true one, and writing
+                // the weaker one down is what stops a later reader trusting the stronger.
                 let overlay_changed = inner.overlays.poll_all();
                 // The tab-metadata worker also wakes the loop through this path; sync
                 // the fresh agent states into the waiting model (rising-edge Waiting
@@ -3182,15 +3212,28 @@ mod tests {
             }
         }
 
-        // 2. The panel's app-side module schedules nothing against a clock. Its only two
-        //    redraw triggers are `on_key` (a keystroke) and `poll` returning true (a
-        //    watcher update that actually carried a new snapshot) — both events, both
-        //    already under test elsewhere in `overlay.rs`.
+        // 2. The panel's app-side module schedules nothing against a clock.
+        //
+        //    CORRECTED (ai-monitor-idle-timestamps D2/D16). This used to say the panel's
+        //    "only two redraw triggers are `on_key` (a keystroke) and `poll` returning true
+        //    (a watcher update that actually carried a new snapshot)". The parenthesis is now
+        //    false: `poll` rebuilds the model on EVERY wake that reaches it while the panel is
+        //    visible — including wakes that carried no snapshot at all, which is the whole of
+        //    D2 — and returns whether the rebuilt model differs. A third trigger also exists:
+        //    a one-shot deadline the panel arms so a quiet session's pill can stop reading
+        //    CONNECTED. The redraw is now gated by the model rather than by the wake's origin.
+        //
+        //    None of that is a clock in THIS module, which is what the scan below asserts and
+        //    why its ban list needs no edit. The deadline is held by `tabmeta::worker`, which
+        //    is not scanned and already owns a `Duration` for its own tick; `overlay.rs`
+        //    receives a plain `u64` instant from `dashboard::idle_deadline_ms` and passes it
+        //    through an injected callback, so it names no `Duration`, no `Instant`, no sleep.
         //
         //    `now_ms` is not a cadence and is not scanned for: the model records *when*
-        //    it was built (D20's one absolute timestamp qualifying the whole panel), which
-        //    is the opposite of a repaint — it is what let D9 drop the relative age that
-        //    would have needed one.
+        //    it was built, which is the opposite of a repaint — it is what let D9 drop the
+        //    relative age that would have needed one. (D20 describes that timestamp as the
+        //    footer's; the footer in fact formats `last_event_ms`, and it is the footer
+        //    together with the IDLE tile that recovers the instant the frame was composed.)
         let overlay = production_half("overlay.rs", include_str!("overlay.rs"));
         for scheduler in [
             "Duration",
@@ -3202,6 +3245,142 @@ mod tests {
             assert!(
                 !overlay.contains(scheduler),
                 "`{scheduler}` in overlay.rs — the panel repaints on events only (D2)"
+            );
+        }
+    }
+
+    /// The idle-CPU **frame rate** is pinned here, because nothing else pins it.
+    ///
+    /// Idle cost is `frames/sec × work/frame`. The renderer already guards the second
+    /// factor — `monitor_panel.rs:992` asserts `layouts == 1` across idle frames and
+    /// `:1451` asserts no rebuild — so an idle frame re-presents cached buffers and is
+    /// cheap. **Nothing guarded the first factor**, and it is the multiplier: a visible
+    /// window presents ~60fps forever because this arm asks for the next redraw, which
+    /// measured at ~7% of a core in release and ~19% in debug (`docs/architecture.md` C6).
+    ///
+    /// Why this is a source scan and not a measurement. A real CPU assertion needs a GUI
+    /// session, a window, and a release build, none of which `cargo test` has — the same
+    /// constraint R7.4 reasons about above. It would also be machine-dependent: the rate
+    /// tracks the display, so a 120 Hz panel doubles it, and any threshold would either
+    /// flake on a loaded machine or be too loose to catch a regression. What IS stable is
+    /// the *shape* that sets the rate, and these are the two edits that would change it:
+    ///
+    /// 1. **A second `request_redraw()` in this arm doubles the frame rate**, and so
+    ///    doubles idle CPU, with every test still green and nothing visibly different.
+    /// 2. **Losing the `!occluded` gate** makes a hidden window cost what a visible one
+    ///    does. That gate is the only reason a backgrounded terminal is free, and its
+    ///    absence is invisible precisely because you cannot see an occluded window.
+    ///
+    /// This does not pin 60fps itself, which belongs to the display, and it does not stop
+    /// anyone changing the design deliberately. It makes the change loud.
+    #[test]
+    fn the_idle_frame_rate_stays_one_redraw_per_frame_and_stops_when_occluded() {
+        let src = production_half("terminal_app.rs", include_str!("terminal_app.rs"));
+
+        // The `RedrawRequested` arm, from its marker to the catch-all that closes the match.
+        let arm = src
+            .split_once("WindowEvent::RedrawRequested => {")
+            .and_then(|(_, rest)| rest.split_once("\n            _ => {}"))
+            .map(|(arm, _)| arm)
+            .expect(
+                "could not isolate the RedrawRequested arm — the match's shape changed, so \
+                 this test is no longer reading what it claims to. Re-anchor it before \
+                 trusting a pass.",
+            );
+
+        // Count CODE, not prose. This arm is heavily commented and the comments name the very
+        // call being counted, so counting raw text makes the next explanatory line fail the
+        // test with a message about doubled CPU — a false alarm that reads exactly like a real
+        // one, on a test whose whole value is that its alarm means something.
+        let code = arm
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            code.matches("request_redraw()").count(),
+            1,
+            "the RedrawRequested arm must request exactly ONE redraw. Two would double the \
+             frame rate and double idle CPU (~7% -> ~14% of a core in release) with the \
+             whole suite green and nothing on screen looking different."
+        );
+
+        assert!(
+            code.contains("if !inner.occluded"),
+            "the continuous redraw must stay gated on `!inner.occluded`. Without it a hidden \
+             window keeps presenting ~60fps, which is invisible by construction — you cannot \
+             see the window that is costing you the power."
+        );
+
+        // The gate is only meaningful if something still sets the flag.
+        assert!(
+            src.contains("WindowEvent::Occluded(occluded)") && src.contains("inner.occluded ="),
+            "`occluded` must still be written from the Occluded event, or the gate above is \
+             dead code that always reads false"
+        );
+    }
+
+    /// Both re-point sites must forward the agent state to the overlays.
+    ///
+    /// This is the wiring D18's Busy suppression runs on, and it is wiring rather than logic:
+    /// the decision it feeds (`Tabs::active_agent_state`) is mutation-tested on its own, and
+    /// so is the seam it feeds into (`OverlayHost::notify_active_changed`). What is untested
+    /// between them is the two lines that connect them, in two functions that no test can
+    /// execute — `Running` owns an `Arc<Window>` and a `Renderer`, so constructing one needs
+    /// a window and a GPU, which is the same wall `wiring.rs` documents.
+    ///
+    /// **Added because mutation testing found the hole, not because the code looked thin.**
+    /// `replace Running::feed_agent_states -> bool with false`, its `true` twin, and
+    /// `replace Running::after_roster_change with ()` all survived the full suite. A no-op
+    /// `after_roster_change` means switching tabs re-points nothing; a `feed_agent_states`
+    /// that returns a constant means the panel never hears that an agent went busy, and the
+    /// gate that stops a five-minute build being reported as IDLE never sees its input. Both
+    /// are silent: the pill keeps showing a plausible value, just not a true one.
+    ///
+    /// A source scan reaches what execution cannot because `cargo mutants` rewrites the file
+    /// this reads through `include_str!`, so a body replaced by a constant no longer contains
+    /// the call and this fails. That also bounds the claim honestly — it pins that the wiring
+    /// is present, not that it runs.
+    #[test]
+    fn both_re_point_sites_forward_the_agent_state() {
+        let src = production_half("terminal_app.rs", include_str!("terminal_app.rs"));
+
+        for (name, sig) in [
+            (
+                "feed_agent_states",
+                "fn feed_agent_states(&mut self) -> bool {",
+            ),
+            ("after_roster_change", "fn after_roster_change(&mut self) {"),
+        ] {
+            let body = src
+                .split_once(sig)
+                .and_then(|(_, rest)| rest.split_once("\n    }"))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name}: could not isolate the body — its signature changed, so this \
+                         test is no longer reading what it claims to. Re-anchor it before \
+                         trusting a pass."
+                    )
+                });
+
+            assert!(
+                body.contains("active_agent_state"),
+                "{name} must read the active tab's agent state. Without it the panel cannot \
+                 tell a mid-turn agent from a quiet one, and D18's Busy gate — the thing that \
+                 stops a long build being reported IDLE — has no input."
+            );
+            assert!(
+                body.contains("notify_active_changed"),
+                "{name} must re-point the overlays. Losing this call leaves the panel on the \
+                 previous tab's session with nothing to correct it."
+            );
+            assert!(
+                body.contains("agent_state"),
+                "{name} must PASS the state on. Reading it and dropping it type-checks and \
+                 leaves the gate reading `None` forever, which fails open — every pill goes \
+                 on flipping to IDLE mid-turn."
             );
         }
     }

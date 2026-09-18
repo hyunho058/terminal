@@ -309,11 +309,23 @@ pub trait Overlay {
     /// computes it — so this seam is the cheapest place to notice. `None` means **no
     /// information**, never "a different pid": a consumer must not treat an absent value as a
     /// change, or a toggle flip or a transient walk failure becomes a re-point storm.
+    ///
+    /// `agent_state` is that tab's [`crate::tabmeta::AgentState`] from the same publish, and
+    /// it does **not** follow the `agent_pid` rule above — the two look alike on this call and
+    /// are read oppositely on purpose (ai-monitor-idle-timestamps D18). An absent pid is no
+    /// information, so a consumer keeps the one it had. An absent *state* is a value, meaning
+    /// "not mid-turn", and a consumer stores it: it is `None` both when the agent has exited
+    /// and when `[sidebar] show_agent_status` is off, and treating that as "keep the last
+    /// state" would latch a stale `Busy` forever after every agent exit. The asymmetry is
+    /// deliberate because the values differ in kind — a pid is an identity, where a wrong read
+    /// causes a re-point storm; the state is a predicate, where a latched read causes a
+    /// permanent suppression.
     fn on_active_changed(
         &mut self,
         _cwd: Option<PathBuf>,
         _shell_pid: Option<u32>,
         _agent_pid: Option<u32>,
+        _agent_state: Option<crate::tabmeta::AgentState>,
     ) {
     }
 
@@ -488,9 +500,10 @@ impl OverlayHost {
         cwd: Option<PathBuf>,
         shell_pid: Option<u32>,
         agent_pid: Option<u32>,
+        agent_state: Option<crate::tabmeta::AgentState>,
     ) {
         for o in &mut self.overlays {
-            o.on_active_changed(cwd.clone(), shell_pid, agent_pid);
+            o.on_active_changed(cwd.clone(), shell_pid, agent_pid, agent_state);
         }
     }
 
@@ -807,6 +820,78 @@ mod tests {
             }
             Box::new(L)
         }
+    }
+
+    /// What each overlay was told on a re-point: the agent pid and the agent state.
+    type Repoints =
+        std::rc::Rc<std::cell::RefCell<Vec<(Option<u32>, Option<crate::tabmeta::AgentState>)>>>;
+
+    /// Records what the host forwarded, so "the host forwards at all" is assertable.
+    struct Repointed {
+        seen: Repoints,
+    }
+    impl Overlay for Repointed {
+        fn priority(&self) -> i32 {
+            0
+        }
+        fn visible(&self) -> bool {
+            false
+        }
+        fn on_key(&mut self, _in: &KeyInput, _c: &mut AppCtx) -> Handled {
+            Handled::Passthrough
+        }
+        fn on_active_changed(
+            &mut self,
+            _cwd: Option<PathBuf>,
+            _shell_pid: Option<u32>,
+            agent_pid: Option<u32>,
+            agent_state: Option<crate::tabmeta::AgentState>,
+        ) {
+            self.seen.borrow_mut().push((agent_pid, agent_state));
+        }
+        fn layer(&self) -> Box<dyn DrawLayer> {
+            struct L;
+            impl DrawLayer for L {
+                fn z_order(&self) -> i32 {
+                    0
+                }
+                fn record(&mut self, _: &mut renderer::FrameCtx<'_>) {}
+            }
+            Box::new(L)
+        }
+    }
+
+    #[test]
+    fn the_host_forwards_a_re_point_to_every_overlay() {
+        // Found by `cargo mutants`: the whole body of `notify_active_changed` could be deleted
+        // with the suite green. That is a silent failure of the worst kind — the panel would
+        // simply never re-point and never learn the tab's agent state, with no error anywhere
+        // and every overlay's own tests still passing, which is the exact failure mode the
+        // registration set was made a value to prevent one layer up.
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut host = OverlayHost::default();
+        host.register(Box::new(Repointed {
+            seen: std::rc::Rc::clone(&seen),
+        }));
+        host.register(Box::new(Repointed {
+            seen: std::rc::Rc::clone(&seen),
+        }));
+
+        host.notify_active_changed(
+            None,
+            Some(4242),
+            Some(77),
+            Some(crate::tabmeta::AgentState::Busy),
+        );
+
+        assert_eq!(
+            *seen.borrow(),
+            vec![
+                (Some(77), Some(crate::tabmeta::AgentState::Busy)),
+                (Some(77), Some(crate::tabmeta::AgentState::Busy)),
+            ],
+            "EVERY overlay is told, and both values arrive intact"
+        );
     }
 
     #[test]

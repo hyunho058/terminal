@@ -259,6 +259,23 @@ impl Tabs {
     pub fn active_agent_pid(&self, meta: &crate::tabmeta::TabMetaSnapshot) -> Option<u32> {
         meta.get(self.active().id).and_then(|m| m.agent_pid)
     }
+
+    /// The active tab's agent **state**, as the worker last published it
+    /// (ai-monitor-idle-timestamps D18).
+    ///
+    /// `None` means "no state published", which is two situations this accessor cannot tell
+    /// apart and deliberately does not try to: the tab has no agent process, or
+    /// `[sidebar] show_agent_status` is off so the worker builds no `Agent` field at all.
+    /// Consumers read the absence as "not mid-turn"; the reasoning, and what it costs, is
+    /// argued at the seam this value travels on.
+    pub fn active_agent_state(
+        &self,
+        meta: &crate::tabmeta::TabMetaSnapshot,
+    ) -> Option<crate::tabmeta::AgentState> {
+        meta.get(self.active().id)
+            .and_then(|m| m.agent.as_ref())
+            .map(|a| a.state)
+    }
 }
 
 /// The active index after closing a **different** tab (sticky-tab-title R3.7): the active
@@ -670,6 +687,45 @@ mod tests {
             Some(111),
             "the pid must follow the active tab, not stay on the first one"
         );
+    }
+
+    #[test]
+    fn the_active_tabs_agent_state_follows_the_active_tab() {
+        // idle-timestamps D18 — the panel decides whether arming an idle deadline would be a
+        // lie from this value, so an accessor that always answered `None` would silently turn
+        // the suppression off and let a long build read IDLE. Against an empty snapshot every
+        // honest implementation answers `None`, so the fixture carries entries.
+        use crate::tabmeta::{Agent, AgentKind, AgentState};
+        let Some(mut tabs) = tabs_with(2) else {
+            return;
+        };
+        let all = ids(&tabs);
+        let meta_for = |state: AgentState| crate::tabmeta::TabMeta {
+            agent: Some(Agent {
+                kind: AgentKind::Claude,
+                state,
+            }),
+            ..Default::default()
+        };
+        let snap = crate::tabmeta::TabMetaSnapshot::from_entries(vec![
+            (all[0], meta_for(AgentState::Busy)),
+            (all[1], meta_for(AgentState::Waiting)),
+        ]);
+
+        assert_eq!(tabs.active_index(), 1);
+        assert_eq!(tabs.active_agent_state(&snap), Some(AgentState::Waiting));
+
+        tabs.jump(0);
+        assert_eq!(
+            tabs.active_agent_state(&snap),
+            Some(AgentState::Busy),
+            "the state must follow the active tab, not stay on the first one"
+        );
+
+        // A tab with no published `Agent` reads `None` — which the panel treats as "not
+        // mid-turn", never as "keep whatever I last saw".
+        let empty = crate::tabmeta::TabMetaSnapshot::default();
+        assert_eq!(tabs.active_agent_state(&empty), None);
     }
 
     #[test]

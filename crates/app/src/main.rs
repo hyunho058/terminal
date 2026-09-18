@@ -7,7 +7,15 @@
 //!
 //! Threading model (D7): the PTY reader runs on its own thread and hands bytes
 //! to the UI thread over a channel; an `EventLoopProxy` wakes the event loop so
-//! the render happens on the winit thread (C6 — no free-running loop).
+//! the render happens on the winit thread (C6).
+//!
+//! That parenthesis used to read "C6 — no free-running loop", which is true of the
+//! control flow set below and false of the frames: while the window is visible the
+//! `RedrawRequested` arm requests the next redraw, so the app presents ~60fps forever
+//! and costs ~7% of a core in release at idle. It is deliberate (winit#2640 would
+//! otherwise blank the window, and atlas eviction relies on it) and it is described in
+//! `docs/architecture.md` C6. `ControlFlow::Wait` still means no *spin*; it does not
+//! mean no frames.
 
 use winit::event_loop::{ControlFlow, EventLoop};
 

@@ -192,7 +192,18 @@ pub(crate) struct TabMetaShared {
 pub(crate) enum Cmd {
     SetRoster(Vec<TabPid>),
     SetActive(Option<TabId>),
-    SetEnabled { git: bool, agent: bool },
+    SetEnabled {
+        git: bool,
+        agent: bool,
+    },
+    /// The ai-monitor panel's one-shot deadline: wake the loop once at this epoch-millis
+    /// instant, then forget it. `None` disarms (ai-monitor-idle-timestamps D6/D7/D8).
+    ///
+    /// A `Cmd` rather than a shared atomic because a deadline is the same *shape* of fact as
+    /// the three above — something the app tells the worker — and the channel already
+    /// guarantees the ordering an atomic would not: an arm that overtakes a disarm would
+    /// leave a wake pending for a panel that had closed.
+    SetPanelDeadline(Option<u64>),
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +253,23 @@ impl TabMetaHandle {
     /// clears that field on the next publish. Both default to `true`.
     pub fn set_enabled(&self, git: bool, agent: bool) {
         let _ = self.tx.send(Cmd::SetEnabled { git, agent });
+    }
+
+    /// Arm the ai-monitor panel's one-shot wake at `at` (epoch millis), or disarm with `None`
+    /// (ai-monitor-idle-timestamps D6/D7).
+    ///
+    /// **One slot, replaced on every arm.** The worker holds at most one deadline; arming
+    /// over a pending one replaces it, which is the requirement rather than an optimisation —
+    /// a session that resumes and re-quiets must not leave two deadlines racing. There is no
+    /// generation token: the wake this produces carries no payload (`UserEvent::OverlayPending`
+    /// is a unit variant), and it does not need one, because the pill is recomputed from the
+    /// current snapshot against the current clock, so a late or spurious wake can only produce
+    /// the right answer one rebuild early.
+    ///
+    /// **This is one edge, not a cadence.** The worker emits nothing on the other ticks of the
+    /// wait, which is what keeps `ControlFlow::Wait` and the panel's idle-CPU guarantee intact.
+    pub fn set_panel_deadline(&self, at: Option<u64>) {
+        let _ = self.tx.send(Cmd::SetPanelDeadline(at));
     }
 
     /// The current publication generation. Monotonic; starts at 0; bumped only when a
@@ -597,6 +625,38 @@ mod tests {
                 assert_ne!(a, b);
             }
         }
+    }
+
+    #[test]
+    fn arming_through_the_handle_reaches_the_worker_and_wakes_the_loop() {
+        // The seam the panel actually arms through, end to end: handle → channel → worker →
+        // wake. Everything on either side of this method was already covered — the overlay's
+        // decision to arm, and the worker's loop firing a `Cmd::SetPanelDeadline` sent
+        // straight down a test's own channel — and this one line between them was not.
+        //
+        // `cargo mutants` is how that was found, and what it reported is the reason this test
+        // exists rather than a comment: replacing the body with `()` left all 1602 tests
+        // green. A no-op here sends no command, so nothing is ever armed, no wake is ever
+        // produced, and the pill never leaves CONNECTED — the whole feature inert, silently.
+        // It is the same shape as the `run` survivor recorded in `mutants-scope.txt`, reached
+        // the same way, and it escaped the scope guard for a reason now written down there:
+        // a diff hunk inside an `impl` block is attributed to the `impl`, not to the method.
+        let (woke_tx, woke_rx) = mpsc::channel::<()>();
+        let h = TabMetaHandle::spawn(move || {
+            let _ = woke_tx.send(());
+        })
+        .expect("spawn worker");
+
+        // Epoch-millis 1 is long past due, so the worker's very next pass fires it.
+        h.set_panel_deadline(Some(1));
+
+        woke_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect(
+                "arming through the handle must wake the loop — if this times out, the panel's \
+                 route to the worker is broken and a quiet session's pill will read CONNECTED \
+                 forever",
+            );
     }
 
     #[test]
