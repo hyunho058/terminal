@@ -65,9 +65,16 @@ scope:
 
 ### Open ambiguities carried into L2
 - **Pulse animation.** The design animates the CONNECTED dot, the agent ring, and the footer
-  dot. The event loop is `ControlFlow::Wait` (event-driven, no free-running frames), and the
+  dot. The event loop is `ControlFlow::Wait` (event-driven), and the
   renderer holds an explicit idle-CPU guarantee (G1). Animation requires a repaint cadence
   that directly contests that guarantee.
+  **Correction (measured later):** this line used to say "no free-running frames". It was
+  wrong. While the window is visible the app presents ~60fps continuously, because the
+  `RedrawRequested` arm requests the next redraw; `ControlFlow::Wait` prevents a spin, not
+  frames. See `docs/architecture.md` C6. **D2's conclusion is unaffected and its reasoning is
+  actually stronger**: what G1 protects is the per-frame *work*, and an animation would make
+  every one of those 60 frames re-shape instead of re-presenting a cached buffer. The frames
+  were always there; D2 rejected paying for them.
 - **Absolute timestamps.** The design shows SKILLS entries as `at 16:21:18`.
   `dashboard.rs:262` documents a deliberate rejection of wall-clock display: `std` alone
   cannot resolve a local timezone, and a UTC clock on a local-session dashboard was judged

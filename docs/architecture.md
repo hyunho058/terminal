@@ -44,10 +44,10 @@ The full derivation lives in `scaffold-spec.md`. This is the working summary.
 
 ## Runtime model (C6)
 
-The render loop is **event-driven**, not free-running: winit waits
-(`ControlFlow::Wait`). PTY output arrives on the reader thread, goes over an
-`mpsc` channel, and wakes the loop via `EventLoopProxy::send_event`. The loop
-drains the channel, advances the grid, and requests one redraw.
+Work is **event-driven**: winit waits (`ControlFlow::Wait`), set exactly once, in
+`main.rs`. PTY output arrives on the reader thread, goes over an `mpsc` channel, and
+wakes the loop via `EventLoopProxy::send_event`. The loop drains the channel, advances
+the grid, and requests one redraw.
 
 ```
 zsh ──PTY──> reader thread ──mpsc──> [wake] winit loop
@@ -55,6 +55,43 @@ zsh ──PTY──> reader thread ──mpsc──> [wake] winit loop
                                           ▼
                                      term-core Grid ──snapshot──> renderer ──> Metal
 ```
+
+**Presentation is not, and this used to say it was.** An earlier version of this
+paragraph read "the render loop is event-driven, **not free-running**". That is true of
+the control flow and false of what the app does: while the window is visible it draws
+**60 frames a second, forever**, because `WindowEvent::RedrawRequested` ends by
+requesting the next redraw (`terminal_app.rs`, the arm's last statement). The loop never
+sleeps to idle; it is woken by its own redraw request, measured at
+`cause:WaitCancelled=60 win:RedrawRequested=60` per second on an idle window.
+
+That is deliberate and it is load-bearing twice over, which is why the fix is to
+describe it rather than to remove it:
+
+1. **winit#2640.** On this macOS/winit-0.30/wgpu stack the compositor drops the
+   presented frame as soon as the run loop sleeps, so the window holds content only
+   while it is actively drawing. Stop the continuous redraw and an idle window goes
+   blank. Four targeted alternatives were tried and failed, `pre_present_notify`,
+   `presentsWithTransaction`, a commit-cycle fix, and a buffer refill.
+2. **Atlas eviction (D17).** `Renderer::draw_to` clears `last_snapshot` when the glyph
+   atlas `generation` bumps, and never asks for a frame itself. It relies on this loop
+   to repaint. Reverting to on-demand redraws silently reopens a permanent stale-glyph
+   corruption path.
+
+**What it costs, measured rather than assumed**, on an idle window with nothing on
+screen changing:
+
+| build | CPU at idle |
+|-------|-------------|
+| `--release` | ~7% of one core |
+| debug | ~19% of one core |
+
+The debug premium is `objc2` verifying Objective-C method signatures on every message
+send, which at 60fps is a great many sends. It is a development-time cost only.
+
+Occlusion is the escape hatch and it is honoured: the redraw request is gated on
+`!inner.occluded`, so a hidden or fully covered window costs nothing. **There is no such
+escape for a visible idle window**, and that is the honest statement of this project's
+idle behaviour. See G1 for what the caches do and do not buy against it.
 
 ## Deferred / known gaps
 
@@ -82,7 +119,16 @@ zsh ──PTY──> reader thread ──mpsc──> [wake] winit loop
   the panel resolving the point against its own published bands so the app still performs no
   geometry.
 - **G1** Performance *numbers* still unconfirmed — CI checks build/test, not
-  fps/latency; committing the thresholds remains a human decision. (The idle-CPU
+  fps/latency; committing the thresholds remains a human decision. **And the one idle
+  number that has now been measured is not zero: a visible idle window costs ~7% of a
+  core in release, ~19% in debug.** That is the price of C6's continuous redraw, which
+  exists so the window does not go blank; read this gap together with that section,
+  because "the idle-CPU debt has been fixed" below is easy to read as "idle is free" and
+  it never meant that. What was fixed is the **per-frame work**, not the frames. The
+  frames are unconditional while the window is visible, and no cache can remove them.
+  Nothing currently guards this number: no test, no CI check, no budget. A change that
+  doubled it would be invisible.
+  (The idle-CPU
   debt from PR #2 — a full re-shape every frame at idle — has since been fixed: the
   renderer skips re-shape on an unchanged snapshot, re-presenting cached buffers. The
   ai-monitor panel carries its **own** shaping cache, and since `specs/ai-monitor-panel-scroll`
