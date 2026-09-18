@@ -27,17 +27,40 @@
 # would otherwise go blank, and because the renderer's atlas-eviction invalidation relies
 # on it to repaint. See `docs/architecture.md` C6. Occluded windows are free.
 #
-# Usage:  scripts/measure-idle-cpu.sh [debug|release]   (default: release)
+# Usage:
+#   scripts/measure-idle-cpu.sh [debug|release]   launch a window and measure it
+#   scripts/measure-idle-cpu.sh --pid N [debug|release]
+#                                                measure an ALREADY-RUNNING window
+#
+# The `--pid` form exists because of a constraint worth stating: nothing here can bring a
+# window to the front. A freshly launched window lands behind whatever had focus, macOS
+# occludes it, the redraw loop pauses by design, and the measurement is of the wrong path.
+# There is no scriptable fix without Accessibility permission, so the honest division of
+# labour is that a human puts the window in front and points this at its pid.
 set -euo pipefail
+
+EXISTING_PID=""
+if [ "${1:-}" = "--pid" ]; then
+  EXISTING_PID="${2:-}"
+  [ -n "$EXISTING_PID" ] || { echo "usage: $0 --pid N [debug|release]" >&2; exit 2; }
+  kill -0 "$EXISTING_PID" 2>/dev/null || { echo "no process $EXISTING_PID" >&2; exit 1; }
+  shift 2
+fi
 
 PROFILE="${1:-release}"
 case "$PROFILE" in
-  release) BIN=target/release/app; cargo build -p app --release >/dev/null ;;
-  debug)   BIN=target/debug/app;   cargo build -p app >/dev/null ;;
-  *) echo "usage: $0 [debug|release]" >&2; exit 2 ;;
+  release) BIN=target/release/app ;;
+  debug)   BIN=target/debug/app ;;
+  *) echo "usage: $0 [--pid N] [debug|release]" >&2; exit 2 ;;
 esac
+if [ -z "$EXISTING_PID" ]; then
+  case "$PROFILE" in
+    release) cargo build -p app --release >/dev/null ;;
+    debug)   cargo build -p app >/dev/null ;;
+  esac
+fi
 
-[ -x "$BIN" ] || { echo "no binary at $BIN" >&2; exit 1; }
+[ -n "$EXISTING_PID" ] || [ -x "$BIN" ] || { echo "no binary at $BIN" >&2; exit 1; }
 
 # A GUI session is required: the window must be REAL and VISIBLE, because an occluded one
 # is gated off by design and would measure ~0 and look like a pass.
@@ -46,25 +69,35 @@ if ! /usr/bin/pgrep -q WindowServer; then
   exit 1
 fi
 
-echo "launching $BIN ..."
-RUST_LOG=warn "./$BIN" >/tmp/idle-cpu-probe.log 2>&1 &
-PID=$!
-trap 'kill "$PID" 2>/dev/null || true' EXIT
-sleep 5   # settle: first frames, GPU init, font atlas warm-up
+if [ -n "$EXISTING_PID" ]; then
+  PID="$EXISTING_PID"
+  echo "measuring the already-running window, pid $PID ($PROFILE baselines)"
+else
+  echo "launching $BIN ..."
+  RUST_LOG=warn "./$BIN" >/tmp/idle-cpu-probe.log 2>&1 &
+  PID=$!
+  trap 'kill "$PID" 2>/dev/null || true' EXIT
+  sleep 5   # settle: first frames, GPU init, font atlas warm-up
+fi
 
 cpu_seconds() { ps -o time= -p "$1" | tr -d ' '; }
 to_s() { awk -F: '{n=NF; s=$n; if(n>1) s+=60*$(n-1); if(n>2) s+=3600*$(n-2); print s}' <<<"$1"; }
 
-# The window must be VISIBLE and UNCOVERED, and this check is not ceremony: the first
-# version of this script omitted it, measured a window that had opened behind the
-# terminal running it, reported 0.1% and declared it "in line with the recorded
-# baseline". A measurement of the occluded path looks exactly like a pass, which is the
-# one way this script can lie. `lsappinfo` is how we tell.
+# The window must be VISIBLE and UNCOVERED. This matters because the first version of
+# this script measured a window that had opened behind the terminal running it, read
+# 0.1%, and declared it "in line with the recorded baseline" — a measurement of the
+# occluded path looks exactly like a pass, which is the one way this script can lie.
+#
+# `lsappinfo` is a HINT and nothing more, because frontmost is not the same as visible:
+# a window can be fully unoccluded while another app holds focus, and that case measures
+# correctly. Treat this as "check the window with your eyes", not as a verdict. The
+# authoritative detector is the implausibly-low guard at the end, which keys on the
+# thing that actually distinguishes the two paths — the cost itself.
 if ! lsappinfo info "$PID" 2>/dev/null | grep -q "in front"; then
   echo
-  echo "WARNING: the window is not frontmost, so it may be occluded." >&2
-  echo "An occluded window pauses the redraw loop BY DESIGN and measures ~0%." >&2
-  echo "Click the new window to bring it forward, then re-run." >&2
+  echo "note: this window is not frontmost. That is fine IF it is still fully visible;" >&2
+  echo "      only a genuinely covered window pauses the redraw loop. If the number" >&2
+  echo "      below comes out near zero, that is what happened — uncover it and re-run." >&2
   echo
 fi
 
