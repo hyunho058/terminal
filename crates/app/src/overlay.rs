@@ -581,6 +581,18 @@ impl AiMonitorOverlay {
         // Claude at all would otherwise leave the last tab's snapshot on screen with
         // nothing ever arriving to replace it (D13/R10.3).
         self.session.repoint();
+        // The pending deadline belongs to the session that just went, so it goes with it
+        // (idle-timestamps R2.x). `armed_from` holds a timestamp read off the OLD log, and the
+        // guard below compares the new one against it — so leaving it would make a switch onto
+        // a tab whose last event is *older* look like "already armed from a newer timestamp"
+        // and arm nothing. That tab's pill then flips whenever the previous tab's deadline
+        // happened to be due, up to a full threshold late.
+        //
+        // `disarm` rather than a bare clear: it also tells the worker, which is holding a wake
+        // computed for a session this panel no longer shows. Where the new tab does arm, that
+        // send is immediately superseded by the arm at the end of this function (one slot,
+        // replaced) — but where it does not, this is the only thing that clears the slot.
+        self.disarm();
         self.watcher = None;
 
         if let Some(agy_pid) = antigravity_pid(agent) {
@@ -1030,15 +1042,24 @@ impl AiMonitorOverlay {
     /// NO SESSION; and `Some(a) → Some(b)` with `b <= a` leaves a CONNECTED pill whose
     /// `armed_from` is not older, so nothing re-arms and the pending deadline is left alone.
     ///
-    /// **`Busy` defers rather than disarms.** A tab mid-turn is silent for a reason the log
-    /// cannot show — the `tool_result` has not been written yet — and that is exactly the
-    /// scenario the five-minute threshold was sized for, so arming through it would
-    /// manufacture a false IDLE for the rest of a long call. Returning early leaves
-    /// `armed_from` untouched, so the arm is *deferred*, and the first non-`Busy` rebuild
-    /// performs it. The cost of this gate is recorded rather than hidden: the `Busy` signals
-    /// do not decay, so a turn interrupted before its `end_turn` is written leaves the tab
-    /// `Busy` indefinitely and this pill stays CONNECTED — which is today's behaviour,
-    /// unchanged, and a better trade than introducing a false IDLE into a working session.
+    /// **`Busy` cancels, and the arm is still deferred.** A tab mid-turn is silent for a
+    /// reason the log cannot show — the `tool_result` has not been written yet — and that is
+    /// exactly the scenario the five-minute threshold was sized for, so a deadline that
+    /// survives into a long call manufactures a false IDLE while the agent works.
+    ///
+    /// This used to `return` without disarming, on the stated grounds that cancelling would
+    /// break the deferred arm D11's second trigger depends on. **That was wrong, and the
+    /// error is worth naming because it looks right:** deferral is not carried by the pending
+    /// deadline, it is carried by `armed_from` being `None`. `disarm` sets it to `None`, so
+    /// the first non-`Busy` rebuild arms from the current timestamp exactly as it would have.
+    /// Cancelling loses nothing and closes a real hole — the two inputs arrive on different
+    /// wakes up to one worker tick apart, so an append landing just before the `Busy` publish
+    /// armed a deadline that then sat pending straight through the tool call.
+    ///
+    /// What the gate still costs is recorded rather than hidden: the `Busy` signals do not
+    /// decay, so a turn interrupted before its `end_turn` is written leaves the tab `Busy`
+    /// indefinitely and this pill stays CONNECTED. That is today's behaviour, unchanged, and
+    /// a better trade than a false IDLE in a working session.
     fn reconsider_deadline(&mut self, status: renderer::monitor_model::PanelStatus) {
         use renderer::monitor_model::PanelStatus;
         let last = self.session.latest.as_ref().and_then(|t| t.last_event_ms);
@@ -1048,7 +1069,10 @@ impl AiMonitorOverlay {
             return;
         };
         if self.agent_state == Some(crate::tabmeta::AgentState::Busy) {
-            return; // deferred, not dropped — see above
+            // Cancel, don't merely skip: `disarm` clears `armed_from`, which is what defers
+            // the arm to the first non-`Busy` rebuild. See above.
+            self.disarm();
+            return;
         }
         if self.armed_from.is_some_and(|from| last <= from) {
             return; // already armed from this timestamp or a newer one
@@ -5185,20 +5209,23 @@ mod tests {
     }
 
     #[test]
-    fn a_deadline_armed_before_busy_survives_into_the_busy_window() {
-        // The THIRD bypass of D18's suppression, and the only one caused by this feature's own
-        // structure rather than by a config toggle or a transient failure.
+    fn a_deadline_armed_before_busy_is_cancelled_when_busy_arrives() {
+        // The race this closes, and the reasoning that previously left it open.
         //
-        // `reconsider_deadline` returns early on `Busy` WITHOUT disarming, because the gate is
-        // built to defer an arm rather than cancel one — D11's second trigger is what later
-        // executes that deferral. The consequence is that a deadline armed on the last append
-        // *before* the worker publishes `Busy` stays pending straight through the busy window.
+        // The two inputs land on different wakes: `last_event_ms` on the log watcher, the
+        // agent state on the worker's publish, up to one 500ms tick later. So an append that
+        // lands just before the `Busy` publish arms a deadline, and the `Busy` that would
+        // have suppressed it arrives too late to stop it. A tool call longer than the
+        // threshold then fires that deadline and the pill reads IDLE while the agent works —
+        // precisely the false IDLE D18 exists to prevent, reached by the feature's own
+        // structure rather than by any config toggle.
         //
-        // Pinned rather than fixed. Disarming on `Busy` would close this and reopen something
-        // strictly worse: the deferred arm is the mechanism the primary path depends on, so
-        // cancelling it would put a clean turn ending back on the single-trigger design that
-        // arms nothing at all. The Known Gaps record the trade; this test makes sure a future
-        // reader who "fixes" it finds out immediately which of the two they chose.
+        // This test previously asserted the OPPOSITE, pinning the survival as deliberate on
+        // the grounds that cancelling would break D11's second trigger and put a clean turn
+        // ending back on a design that arms nothing. That reasoning confused the mechanism:
+        // the deferred arm is carried by `armed_from` being `None`, not by a pending
+        // deadline. `disarm` clears `armed_from`, so the deferral survives cancellation
+        // intact — which the next test proves by executing it.
         let (mut o, log) = armed_panel(30_000);
         let t = last_event(&o);
 
@@ -5209,17 +5236,120 @@ mod tests {
         // Up to 500ms later the worker publishes Busy — the long tool call has begun.
         o.on_active_changed(None, None, None, Some(crate::tabmeta::AgentState::Busy));
 
-        // The pending deadline is NOT cancelled by that transition.
+        assert_eq!(
+            o.armed_from, None,
+            "Busy must clear the slot, or a deadline armed one tick earlier outlives the \
+             suppression and flips the pill mid-turn"
+        );
+        assert_eq!(
+            arms(&log),
+            vec![Some(dashboard::idle_deadline_ms(t)), None],
+            "and the worker must be TOLD, or it still holds the wake this cancelled"
+        );
+    }
+
+    #[test]
+    fn cancelling_on_busy_still_leaves_the_arm_deferred() {
+        // The other half of the correction above, and the claim the old rationale got wrong:
+        // that cancelling on `Busy` would break the deferred arm. It does not, because what
+        // defers the arm is `armed_from == None` — exactly what `disarm` leaves behind.
+        //
+        // Without this test the fix above could be read as trading one failure for another.
+        // With it, the deferral is asserted end to end: cancel during the turn, re-arm on the
+        // first rebuild after it, from the timestamp current at that moment.
+        let (mut o, log) = armed_panel(30_000);
+        let t = last_event(&o);
+
+        o.poll();
+        o.on_active_changed(None, None, None, Some(crate::tabmeta::AgentState::Busy));
+        assert_eq!(o.armed_from, None, "cancelled for the duration of the turn");
+
+        // Further Busy rebuilds arm nothing — the suppression holds while the turn runs.
+        o.poll();
+        assert_eq!(o.armed_from, None, "still mid-turn, still nothing armed");
+
+        // The turn ends. D11's second trigger: the state leaving `Busy` is itself the arm,
+        // with `last_event_ms` unchanged since before the cancel.
+        o.on_active_changed(None, None, None, Some(crate::tabmeta::AgentState::Waiting));
         assert_eq!(
             o.armed_from,
             Some(t),
-            "today's behaviour: the arm placed before Busy survives into the busy window"
+            "leaving Busy must execute the deferred arm — this is the assertion the old \
+             rationale claimed a cancel would make impossible"
         );
+        assert_eq!(
+            arms(&log),
+            vec![
+                Some(dashboard::idle_deadline_ms(t)),
+                None,
+                Some(dashboard::idle_deadline_ms(t)),
+            ],
+            "arm, cancel, re-arm — the worker sees the whole sequence"
+        );
+    }
+
+    #[test]
+    fn a_stale_armed_from_suppresses_the_arm_for_an_older_session() {
+        // Why `open()` must clear the slot, demonstrated on the guard that would otherwise
+        // swallow the arm.
+        //
+        // `armed_from` holds a timestamp read off one session's log. The guard treats "not
+        // newer than what I armed from" as "already covered", which is right within a session
+        // and wrong across a re-point: tab B's last event can be older than tab A's while
+        // being perfectly current for B. Without the clear, B arms nothing and its pill waits
+        // for A's deadline — due at an unrelated instant, up to a full threshold late.
+        let (mut o, log) = armed_panel(30_000);
+        let t_a = last_event(&o);
+        o.poll();
+        assert_eq!(arms(&log), vec![Some(dashboard::idle_deadline_ms(t_a))]);
+
+        // Re-point onto a session whose last event is OLDER — four minutes quiet, so still
+        // Connected, and still owed a deadline of its own.
+        o.session.latest = Some(snapshot_aged(240_000));
+        let t_b = last_event(&o);
+        assert!(t_b < t_a, "the fixture must model the older-successor case");
+
+        o.poll();
         assert_eq!(
             arms(&log).len(),
             1,
-            "and no disarm was sent — if this starts failing, `Busy` now cancels rather than \
-             defers, which breaks D11's second trigger and the primary path with it"
+            "the hazard: a surviving `armed_from` makes the older session look covered"
+        );
+
+        // What `open()` does, at the point it drops the old session.
+        o.disarm();
+        o.poll();
+        assert_eq!(
+            arms(&log),
+            vec![
+                Some(dashboard::idle_deadline_ms(t_a)),
+                None,
+                Some(dashboard::idle_deadline_ms(t_b)),
+            ],
+            "clearing the slot with the session restores the arm, keyed to the log now shown"
+        );
+    }
+
+    #[test]
+    fn the_re_point_drops_the_previous_sessions_deadline() {
+        // A source pin, for the same reason as `the_early_out_returns_only_after_repoint_has_
+        // re_keyed` directly above: the fact lives inside `open()`, and `open()` is not
+        // reachable from a unit test without reading the live machine — it loads the config,
+        // resolves a session against `~/.claude`, and spawns a watcher thread. The behaviour
+        // the pin stands for is asserted on the guard in the test above.
+        //
+        // The pairing matters: the test above proves the arm is lost without a clear, and
+        // this proves the clear is where the session is dropped. Either alone would pass
+        // while the panel still mis-armed on a tab switch.
+        let p = production_half()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+        assert!(
+            p.contains("self.session.repoint();self.disarm();"),
+            "`open()` must disarm where it drops the session, and immediately after it — the \
+             deadline was computed from the log that just went, and every branch below this \
+             point re-points onto a different one"
         );
     }
 

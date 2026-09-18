@@ -628,6 +628,38 @@ mod tests {
     }
 
     #[test]
+    fn arming_through_the_handle_reaches_the_worker_and_wakes_the_loop() {
+        // The seam the panel actually arms through, end to end: handle → channel → worker →
+        // wake. Everything on either side of this method was already covered — the overlay's
+        // decision to arm, and the worker's loop firing a `Cmd::SetPanelDeadline` sent
+        // straight down a test's own channel — and this one line between them was not.
+        //
+        // `cargo mutants` is how that was found, and what it reported is the reason this test
+        // exists rather than a comment: replacing the body with `()` left all 1602 tests
+        // green. A no-op here sends no command, so nothing is ever armed, no wake is ever
+        // produced, and the pill never leaves CONNECTED — the whole feature inert, silently.
+        // It is the same shape as the `run` survivor recorded in `mutants-scope.txt`, reached
+        // the same way, and it escaped the scope guard for a reason now written down there:
+        // a diff hunk inside an `impl` block is attributed to the `impl`, not to the method.
+        let (woke_tx, woke_rx) = mpsc::channel::<()>();
+        let h = TabMetaHandle::spawn(move || {
+            let _ = woke_tx.send(());
+        })
+        .expect("spawn worker");
+
+        // Epoch-millis 1 is long past due, so the worker's very next pass fires it.
+        h.set_panel_deadline(Some(1));
+
+        woke_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect(
+                "arming through the handle must wake the loop — if this times out, the panel's \
+                 route to the worker is broken and a quiet session's pill will read CONNECTED \
+                 forever",
+            );
+    }
+
+    #[test]
     fn default_tabmeta_is_blank() {
         assert_eq!(
             TabMeta::default(),

@@ -3288,8 +3288,18 @@ mod tests {
                  trusting a pass.",
             );
 
+        // Count CODE, not prose. This arm is heavily commented and the comments name the very
+        // call being counted, so counting raw text makes the next explanatory line fail the
+        // test with a message about doubled CPU — a false alarm that reads exactly like a real
+        // one, on a test whose whole value is that its alarm means something.
+        let code = arm
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
         assert_eq!(
-            arm.matches("request_redraw()").count(),
+            code.matches("request_redraw()").count(),
             1,
             "the RedrawRequested arm must request exactly ONE redraw. Two would double the \
              frame rate and double idle CPU (~7% -> ~14% of a core in release) with the \
@@ -3297,7 +3307,7 @@ mod tests {
         );
 
         assert!(
-            arm.contains("if !inner.occluded"),
+            code.contains("if !inner.occluded"),
             "the continuous redraw must stay gated on `!inner.occluded`. Without it a hidden \
              window keeps presenting ~60fps, which is invisible by construction — you cannot \
              see the window that is costing you the power."
@@ -3309,6 +3319,70 @@ mod tests {
             "`occluded` must still be written from the Occluded event, or the gate above is \
              dead code that always reads false"
         );
+    }
+
+    /// Both re-point sites must forward the agent state to the overlays.
+    ///
+    /// This is the wiring D18's Busy suppression runs on, and it is wiring rather than logic:
+    /// the decision it feeds (`Tabs::active_agent_state`) is mutation-tested on its own, and
+    /// so is the seam it feeds into (`OverlayHost::notify_active_changed`). What is untested
+    /// between them is the two lines that connect them, in two functions that no test can
+    /// execute — `Running` owns an `Arc<Window>` and a `Renderer`, so constructing one needs
+    /// a window and a GPU, which is the same wall `wiring.rs` documents.
+    ///
+    /// **Added because mutation testing found the hole, not because the code looked thin.**
+    /// `replace Running::feed_agent_states -> bool with false`, its `true` twin, and
+    /// `replace Running::after_roster_change with ()` all survived the full suite. A no-op
+    /// `after_roster_change` means switching tabs re-points nothing; a `feed_agent_states`
+    /// that returns a constant means the panel never hears that an agent went busy, and the
+    /// gate that stops a five-minute build being reported as IDLE never sees its input. Both
+    /// are silent: the pill keeps showing a plausible value, just not a true one.
+    ///
+    /// A source scan reaches what execution cannot because `cargo mutants` rewrites the file
+    /// this reads through `include_str!`, so a body replaced by a constant no longer contains
+    /// the call and this fails. That also bounds the claim honestly — it pins that the wiring
+    /// is present, not that it runs.
+    #[test]
+    fn both_re_point_sites_forward_the_agent_state() {
+        let src = production_half("terminal_app.rs", include_str!("terminal_app.rs"));
+
+        for (name, sig) in [
+            (
+                "feed_agent_states",
+                "fn feed_agent_states(&mut self) -> bool {",
+            ),
+            ("after_roster_change", "fn after_roster_change(&mut self) {"),
+        ] {
+            let body = src
+                .split_once(sig)
+                .and_then(|(_, rest)| rest.split_once("\n    }"))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name}: could not isolate the body — its signature changed, so this \
+                         test is no longer reading what it claims to. Re-anchor it before \
+                         trusting a pass."
+                    )
+                });
+
+            assert!(
+                body.contains("active_agent_state"),
+                "{name} must read the active tab's agent state. Without it the panel cannot \
+                 tell a mid-turn agent from a quiet one, and D18's Busy gate — the thing that \
+                 stops a long build being reported IDLE — has no input."
+            );
+            assert!(
+                body.contains("notify_active_changed"),
+                "{name} must re-point the overlays. Losing this call leaves the panel on the \
+                 previous tab's session with nothing to correct it."
+            );
+            assert!(
+                body.contains("agent_state"),
+                "{name} must PASS the state on. Reading it and dropping it type-checks and \
+                 leaves the gate reading `None` forever, which fails open — every pill goes \
+                 on flipping to IDLE mid-turn."
+            );
+        }
     }
 
     /// R6.6: a non-empty preedit composes; winit's synthetic empty one clears the

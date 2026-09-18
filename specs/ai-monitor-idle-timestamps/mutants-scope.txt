@@ -4,25 +4,38 @@
 
 ## mutated
 # Each was run as: cargo mutants -j 4 -f <file> -F '<fn>'
+#
+# `-F` IS MATCHED AGAINST THE QUALIFIED NAME, so a method needs `Type::method` (or a bare
+# substring). `-F '^with_waker$'` matches nothing at all, and cargo mutants reports that as a
+# clean run over zero mutants — a green result that means the opposite of what it looks like.
+# Anchor on the qualified name or leave it unanchored; never anchor on the bare method name.
 active_agent_state
+after_roster_change
 deadline_due
 disarm
 epoch_ms
 feature_overlays
 feature_registrations
+feed_agent_states
 idle_deadline_ms
 no_deadline
 notify_active_changed
 on_active_changed
+open
 poll
 reconsider_deadline
 refresh_model
 rostered
 run
+set_panel_deadline
 upsert_meta
+with_waker
 
 ## survivors
-# NONE. Every scoped function is at 0.
+# NONE REMAINING. Every scoped function is at 0 — but this line read the same when three of
+# the functions below still had live survivors, so read it with the history that follows.
+# Six mutants have survived this feature across three rounds; all six are recorded, because
+# the reasoning that let each one through is the part a future reader needs.
 #
 # `run` was at 3 and is now at 0, in two steps, and the second step corrects a claim this
 # file previously made — recorded rather than deleted, because the wrong reasoning is the
@@ -54,10 +67,71 @@ upsert_meta
 #      The general lesson, and the reason this paragraph stays: "no test can reach it" is a
 #      statement about the code's shape, not about the test suite. Reach for the shape before
 #      concluding a survivor is too expensive to kill.
-# Every other scoped function: 0 survivors.
+#
+#   3. `replace TabMetaHandle::set_panel_deadline with ()` survived, and it survived the
+#      REVIEW of this feature as well as its implementation — found only when the branch was
+#      re-audited after the PR was opened, by running `cargo mutants` on a function this file
+#      did not list. A no-op there sends no command, so nothing is ever armed, no wake is ever
+#      produced and the pill never leaves CONNECTED: the identical failure to (1), one link
+#      further along the same chain, with all 1602 tests green.
+#
+#      It was missed because THE GUARD WRITTEN TO CATCH (1) COULD NOT SEE IT. That script read
+#      the function name out of each diff hunk header, and a hunk header names the nearest
+#      preceding top-level item — for a method, the `impl` block:
+#
+#          @@ -246,0 +258,17 @@ impl TabMetaHandle {
+#
+#      No `fn` on the line, so the census matched nothing and reported nothing. Every method
+#      this feature touched was invisible to it, and the "every function the diff touches is
+#      accounted for" PASS was true only of free functions.
+#
+#      Killed by `tabmeta::tests::arming_through_the_handle_reaches_the_worker_and_wakes_the_
+#      loop`, which drives a real spawned worker through the handle. The guard now computes
+#      each function's body span and reports overlap, which sees methods; two further blind
+#      spots found while fixing it are documented in the script (a bare `#[cfg(test)]` is not
+#      the test-module boundary, and an inline `{}` body is not an opening brace).
+#
+#      The lesson is narrower than (2)'s and worth keeping separate: A GUARD IS CODE, AND AN
+#      UNTESTED GUARD IS A CLAIM, NOT A CHECK. This one passed green for the whole feature
+#      while measuring nothing on six of the functions it covered. What exposed it was not
+#      reading it again — it had been read — but running the expensive check it was standing
+#      in for, on something it had cleared.
+#
+#   4. Fixing that census immediately exposed three more, in two functions it had never been
+#      able to see: `replace Running::feed_agent_states -> bool with false`, the same with
+#      `true`, and `replace Running::after_roster_change with ()`. These are the two sites that
+#      forward the agent state to the overlays, so a no-op at either means D18's Busy gate
+#      never receives its input and every pill goes on flipping to IDLE mid-turn.
+#
+#      Neither function is executable in a test: `Running` owns an `Arc<Window>` and a
+#      `Renderer`, so building one needs a window and a GPU — the wall `crates/app/tests/
+#      wiring.rs` documents, and NOT the kind of "unreachable" (2) was wrong about. Here the
+#      shape cannot be moved: what survives is the orchestration itself, not a decision tangled
+#      into it, and the decisions it calls (`Tabs::active_agent_state`,
+#      `OverlayHost::notify_active_changed`) are already extracted and at 0 on their own.
+#
+#      Killed by `terminal_app::tests::both_re_point_sites_forward_the_agent_state`, a source
+#      scan — which works because cargo mutants rewrites the file that `include_str!` reads, so
+#      a body replaced by a constant no longer contains the call. That bounds the claim
+#      honestly: it pins that the wiring is PRESENT, not that it runs. For this feature that is
+#      the whole of what those two lines contribute; for anything with logic in it, it would
+#      not be enough.
+#
+#   Not mutated, recorded so the absence is not mistaken for coverage:
+#     - `AiMonitorOverlay::with_waker` — its only mutant (`-> Self with Default::default()`) is
+#       UNVIABLE; the type has no `Default`. Nothing to kill, nothing claimed.
+#     - `AiMonitorOverlay::detached` is `#[cfg(test)]`, so cargo mutants generates nothing for
+#       it. The census now skips such helpers rather than demanding a scope entry no run could
+#       satisfy.
 
 ## not-changed
-# Reported by the hunk-header heuristic because a hunk landed immediately after them; their
-# bodies are untouched by this feature, verified against the diff.
+# Reported because a hunk overlaps their body although the function itself is unchanged; each
+# verified against the diff. (Under the old hunk-header census this section absorbed a
+# different kind of noise — a hunk landing immediately AFTER a function was blamed on it.
+# The body-span census does not make that mistake, so the first two entries are kept only
+# because they cost nothing and the run genuinely covered them.)
 status — `idle_deadline_ms` was added directly below it in dashboard.rs
 resolve_anchor — `refresh_model`'s edits sit directly below it in overlay.rs
+user_event — the `OverlayPending` arm gained 17 lines of COMMENT and no code. Verified by
+  filtering the hunks over its body to non-comment lines: zero remain. It is in the diff
+  because D2's cost had to be written down where a reader meets it, not because it changed.

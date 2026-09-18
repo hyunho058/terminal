@@ -9,9 +9,16 @@
 - **Amended**: 2026-09-17 — review round 4, four fixes applied at their sites (D11, D18,
   R0.3/R0.4, R2.4, T3); see §"Review round 4". The approval stands: none of the four changes
   a decision, and two of them remove a gate that would have made a decision inert.
-- **Scope of approval**: the plan only. The user's standing instruction for `/specify` is to
-  stop at an approved spec; **nothing here has been implemented**. Execution is a separate,
-  explicit decision.
+- **Amended**: 2026-09-17 — post-PR review (PR #41), three fixes at their sites. Two are
+  defects: D18's third bypass is **closed** (`Busy` now cancels a pending deadline as well as
+  deferring the arm, R2.11) and a re-point no longer carries the previous session's deadline
+  into the new one (R2.12). The third is coverage: `TabMetaHandle::set_panel_deadline` was
+  never mutation-tested, survived `replace ... with ()`, and the guard written to prevent
+  exactly that could not see methods at all. See §"Post-PR review" and `loop.md` L6/L7.
+- **Scope of approval**: the plan only, *as written*. The user's standing instruction for
+  `/specify` is to stop at an approved spec. **Implementation followed as a separate, explicit
+  decision** and shipped in PR #41; this line previously read "nothing here has been
+  implemented", which was true when written and false by the time the spec was merged.
 
 ## Goal
 Let the ai-monitor panel's time-derived values stop going stale while nothing is appending
@@ -861,21 +868,29 @@ would otherwise re-derive from the two constants, exactly as this spec's author 
   "no agent" — which is the one that also closes the transient-failure half. Recorded
   **beside the per-TAB/per-SESSION gap below** because it is the same
   shape: D18 derives behaviour from a value whose absence is ambiguous.
-- **A deadline armed just before the agent goes `Busy` stays pending through the whole `Busy`
-  window — D18's third bypass.** Found at L2 review round 5, and it is the one of the three
-  that is caused by this feature's own structure rather than by a config toggle or a transient
-  failure. `reconsider_deadline` returns early on `Busy` **without disarming**, because the
-  gate is designed to *defer* an arm rather than cancel one. So a deadline armed on the last
-  append before the worker publishes `Busy` survives into the busy window and fires inside it.
-  The shape that reaches it: a user prompt whose turn opens with a long silent tool call, where
-  that prompt is the last log line for the full five minutes.
-  Narrow, and weaker than it first looks, because `status` is recomputed from the *current*
-  `last_event_ms` at fire time — so the wake usually finds CONNECTED and the pill does not
-  move. It is recorded because "D18 suppresses false IDLE during a long build" is the claim the
-  feature makes, and that claim has three holes, not the two the paragraphs below name.
-  Disarming on `Busy` instead of deferring would close it and reopen something worse: the
-  deferred arm is what D11's second trigger executes, and cancelling it would put the primary
-  path back on the single-trigger design that arms nothing at all.
+- ~~**A deadline armed just before the agent goes `Busy` stays pending through the whole
+  `Busy` window — D18's third bypass.**~~ **CLOSED at post-PR review.** Recorded here rather
+  than deleted, because the reasoning that kept it open for two review rounds is the part
+  worth keeping.
+  The hole was real: `reconsider_deadline` returned early on `Busy` **without disarming**, so a
+  deadline armed on the last append before the worker publishes `Busy` survived into the busy
+  window and fired inside it. The shape that reaches it is ordinary — a user prompt whose turn
+  opens with a long silent tool call — and the two inputs arrive on different wakes up to one
+  500 ms worker tick apart, which is the window in which it happens.
+  **Both reasons given for leaving it open were wrong.** The first was that cancelling would
+  reopen something worse, "the deferred arm is what D11's second trigger executes, and
+  cancelling it would put the primary path back on the single-trigger design that arms
+  nothing". That confuses the mechanism: deferral is carried by `armed_from` being `None`, not
+  by a pending deadline, and `disarm` sets `armed_from` to `None`. Cancelling loses nothing.
+  The second was that it is "narrow, and weaker than it first looks, because `status` is
+  recomputed from the *current* `last_event_ms` at fire time — so the wake usually finds
+  CONNECTED and the pill does not move". True only when the log moved in the meantime, which
+  in the case that matters is exactly what has not happened: a five-minute tool call writes
+  nothing, so `last_event_ms` is still the prompt, and the recomputed status is IDLE. The
+  mitigation argued from the general case while the bug lives in the specific one.
+  `Busy` now disarms. The deferred arm is unchanged and is asserted end to end by
+  `overlay::tests::cancelling_on_busy_still_leaves_the_arm_deferred`, which exists because the
+  first reason above, had it been true, would have made that assertion impossible.
 - **`AgentState` is per-TAB while the panel is per-SESSION, and they can legitimately
   diverge.** `TabMeta.agent` is keyed by `TabId` and resolves one log per tab, while the panel
   is re-pointed to the active tab's *session*. Under tmux one tab can host several panes each
@@ -1070,6 +1085,42 @@ citation in `RP-D2`. Four things needed fixing; none changed a decision.
    session is already past `IDLE_AFTER_MS`, so D14.1 armed nothing), and the property it was
    conflating with is stated separately as **R0.4**: one wake per quiet session, then none.
 
+### Post-PR review
+
+Three findings after the PR was opened, two of them defects that shipped.
+
+1. **D18's third bypass, closed.** `reconsider_deadline` returned early on `Busy` without
+   disarming, so a deadline armed in the one-worker-tick window before the `Busy` publish
+   survived into the busy window and fired inside it — the false IDLE during a long build that
+   D18 exists to prevent. Two arguments had kept it open across two rounds and both were
+   wrong; they are dissected at the (struck-through) Known Gaps entry, because the *shape* of
+   the error is the reusable part: one confused the mechanism carrying a deferral, the other
+   argued a mitigation from the general case while the bug lived in the specific one. Now
+   R2.11, with the deferral it was feared to break asserted end to end.
+
+2. **A re-point carried the old session's deadline.** `open()` dropped the session but not
+   `armed_from`, and R2.9's `b <= a` guard then read a *newer* tab-A timestamp as covering
+   tab B — so B armed nothing and its pill flipped whenever A's unrelated deadline came due.
+   Now R2.12. Not caught earlier because every existing arming test drives one session.
+
+3. **The mutation-scope guard was itself unverified, and wrong.** L5's script read the `fn`
+   name out of each diff hunk header, which for a method names the `impl` block and so matched
+   nothing: every method this feature touched was outside the scope it certified.
+   `TabMetaHandle::set_panel_deadline` — the panel's whole route to the worker — survived
+   `replace ... with ()` with 1602 tests green, the same failure as the `run` survivor one
+   link further along. Fixing the census to body-span overlap exposed two more functions with
+   live survivors (`Running::feed_agent_states`, `Running::after_roster_change`), neither
+   executable from a test, both now pinned by source scan.
+
+**What this round says about the four before it.** The recurring finding above was "a gate
+added to bound a cost also blocks the path it was meant to leave open", and (1) is its fifth
+instance — but it is the first found *after* the spec stopped being reviewed and started being
+trusted. (3) is the sharper lesson and a different one: the check standing in for expensive
+verification had never been run against a case it passed, so it certified six functions it
+could not see. A spec's guards deserve the scrutiny its decisions get.
+
+---
+
 **Final dimension note.** Error/Edge absorbed **four** separate "the gate defeats the feature"
 findings across four rounds (D2's round-1 form, D18's suppression, D18's ordering, and the
 pending-deadline condition). That recurrence is the honest summary of this spec: every gate
@@ -1201,6 +1252,30 @@ neighbours — each one fails visibly if the gate returns.
 - **Given**: A deadline is pending
 - **When**: `close()` runs
 - **Then**: A disarm call is made and no later wake can flip a reopened panel
+
+#### R2.11: `Busy` also CANCELS a deadline already pending
+- **Given**: A deadline is pending (armed while the tab was not `Busy`)
+- **When**: A wake reports the tab's `AgentState` as `Busy`
+- **Then**: A disarm call is made and `armed_from` is cleared — so no wake survives into the
+  busy window, and R2.4's deferred arm still executes afterwards from the current
+  `last_event_ms`
+- **Why it is a requirement and not an optimisation**: the two inputs arrive on different wakes
+  up to one worker tick apart, so an append landing just before the `Busy` publish arms a
+  deadline the suppression is then too late to stop. Left pending, it fires inside a long tool
+  call against an unmoved `last_event_ms` and the pill reads IDLE while the agent works — the
+  exact outcome D18 exists to prevent. Added post-PR; see the closed third bypass under Known
+  Gaps for the two arguments that wrongly kept it open.
+
+#### R2.12: A re-point drops the previous session's deadline
+- **Given**: A deadline is pending for tab A, armed from A's `last_event_ms`
+- **When**: The panel re-points to tab B (tab switch, or a `/clear` rotation)
+- **Then**: `armed_from` is cleared and a disarm call is made **before** B's first model is
+  built, so B arms from its own timestamp
+- **Why**: `armed_from` is a timestamp read off A's log, and R2.9's `b <= a` rule compares B's
+  against it. B's last event can legitimately be *older* than A's while B is perfectly current,
+  in which case the guard reads "already armed from something newer" and B arms nothing — its
+  pill then flips whenever A's unrelated deadline happened to be due, up to a full
+  `IDLE_AFTER_MS` late. Added post-PR.
 
 ---
 

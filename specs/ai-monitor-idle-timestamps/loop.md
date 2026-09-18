@@ -160,3 +160,37 @@ Every gate passes and the Evidence Report is emitted. A 🛑 boundary ends the l
   it — it strips trailing comments as well as whole-line ones, which the older R7.4 scan does
   not — but any NEW absence check added here must cut at `#[cfg(test)]` or it will match the
   string literals inside the very test asserting the absence.
+
+### L6 — a guard is code, and an untested guard is a claim rather than a check
+- cause: gate-fail
+- source: human-approved
+- form: gate1-command
+- status: active
+- check: `sh specs/ai-monitor-idle-timestamps/check-mutants-scope.sh main`
+- note: L5's guard passed green for this whole feature while measuring nothing on six of the
+  functions it covered, including `TabMetaHandle::set_panel_deadline` — the panel's entire
+  route to the worker, where `replace ... with ()` survived the full suite exactly as
+  `replace run with ()` had. The cause was that the census read the `fn` name out of each diff
+  HUNK HEADER, and a hunk header names the nearest preceding top-level item: for a method that
+  is the `impl` block, which carries no `fn` at all. Every method the diff touched was
+  invisible to it. It now computes each function's body span and reports overlap, and two
+  further blind spots surfaced while fixing it (a bare `#[cfg(test)]` is not the test-module
+  boundary; an inline `{}` body is not an opening brace) — both of which had also been silently
+  dropping functions. The transferable part is not "hunk headers are unreliable": it is that a
+  check written to catch a class of miss can belong to that class, and re-reading it will not
+  tell you, because it was read when it was written. What exposed it was running the expensive
+  thing it stands in for (`cargo mutants`) against something it had already cleared. Do that
+  once per guard, on a case the guard passes, before trusting the guard.
+
+### L7 — mutation testing a method needs the QUALIFIED name in `-F`
+- cause: gate-fail
+- source: human-approved
+- form: context
+- status: active
+- check: —
+- note: `cargo mutants -F '^with_waker$'` matches nothing, because `-F` tests the qualified
+  name (`AiMonitorOverlay::with_waker`). Worse than an error: the run reports a clean pass over
+  zero mutants, which reads exactly like success and is how five functions were briefly recorded
+  as covered here when nothing had been run on them. Sanity-check every scoped run with
+  `cargo mutants --list` first and confirm the mutant COUNT is non-zero and the names are the
+  ones intended. A mutation run that finds nothing to mutate has not verified anything.
