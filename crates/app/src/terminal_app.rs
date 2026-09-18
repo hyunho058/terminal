@@ -3249,6 +3249,68 @@ mod tests {
         }
     }
 
+    /// The idle-CPU **frame rate** is pinned here, because nothing else pins it.
+    ///
+    /// Idle cost is `frames/sec × work/frame`. The renderer already guards the second
+    /// factor — `monitor_panel.rs:992` asserts `layouts == 1` across idle frames and
+    /// `:1451` asserts no rebuild — so an idle frame re-presents cached buffers and is
+    /// cheap. **Nothing guarded the first factor**, and it is the multiplier: a visible
+    /// window presents ~60fps forever because this arm asks for the next redraw, which
+    /// measured at ~7% of a core in release and ~19% in debug (`docs/architecture.md` C6).
+    ///
+    /// Why this is a source scan and not a measurement. A real CPU assertion needs a GUI
+    /// session, a window, and a release build, none of which `cargo test` has — the same
+    /// constraint R7.4 reasons about above. It would also be machine-dependent: the rate
+    /// tracks the display, so a 120 Hz panel doubles it, and any threshold would either
+    /// flake on a loaded machine or be too loose to catch a regression. What IS stable is
+    /// the *shape* that sets the rate, and these are the two edits that would change it:
+    ///
+    /// 1. **A second `request_redraw()` in this arm doubles the frame rate**, and so
+    ///    doubles idle CPU, with every test still green and nothing visibly different.
+    /// 2. **Losing the `!occluded` gate** makes a hidden window cost what a visible one
+    ///    does. That gate is the only reason a backgrounded terminal is free, and its
+    ///    absence is invisible precisely because you cannot see an occluded window.
+    ///
+    /// This does not pin 60fps itself, which belongs to the display, and it does not stop
+    /// anyone changing the design deliberately. It makes the change loud.
+    #[test]
+    fn the_idle_frame_rate_stays_one_redraw_per_frame_and_stops_when_occluded() {
+        let src = production_half("terminal_app.rs", include_str!("terminal_app.rs"));
+
+        // The `RedrawRequested` arm, from its marker to the catch-all that closes the match.
+        let arm = src
+            .split_once("WindowEvent::RedrawRequested => {")
+            .and_then(|(_, rest)| rest.split_once("\n            _ => {}"))
+            .map(|(arm, _)| arm)
+            .expect(
+                "could not isolate the RedrawRequested arm — the match's shape changed, so \
+                 this test is no longer reading what it claims to. Re-anchor it before \
+                 trusting a pass.",
+            );
+
+        assert_eq!(
+            arm.matches("request_redraw()").count(),
+            1,
+            "the RedrawRequested arm must request exactly ONE redraw. Two would double the \
+             frame rate and double idle CPU (~7% -> ~14% of a core in release) with the \
+             whole suite green and nothing on screen looking different."
+        );
+
+        assert!(
+            arm.contains("if !inner.occluded"),
+            "the continuous redraw must stay gated on `!inner.occluded`. Without it a hidden \
+             window keeps presenting ~60fps, which is invisible by construction — you cannot \
+             see the window that is costing you the power."
+        );
+
+        // The gate is only meaningful if something still sets the flag.
+        assert!(
+            src.contains("WindowEvent::Occluded(occluded)") && src.contains("inner.occluded ="),
+            "`occluded` must still be written from the Occluded event, or the gate above is \
+             dead code that always reads false"
+        );
+    }
+
     /// R6.6: a non-empty preedit composes; winit's synthetic empty one clears the
     /// gate — but NOT the ownership (see `ownership_survives_the_pre_commit_preedit`).
     #[test]
