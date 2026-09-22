@@ -43,6 +43,7 @@
 // outside the crate genuinely names are re-exported by name below. That list is
 // the crate's real public surface, written down in one place, and everything not
 // on it is back under the lint.
+pub(crate) mod capture;
 pub(crate) mod card_menu;
 pub(crate) mod clipboard;
 pub(crate) mod copy;
@@ -156,6 +157,16 @@ pub fn feature_overlays(
     proxy: Option<EventLoopProxy<UserEvent>>,
     arm: overlay::ArmDeadline,
 ) -> Vec<Box<dyn Overlay>> {
+    // region-capture D10: the capture's watcher thread asks for a look the moment it
+    // has an outcome — success or not. A callback rather than the proxy itself, for the
+    // reason `session::Wake` is one: it keeps the whole capture path constructible, and
+    // so observable, without an event loop.
+    let capture_proxy = proxy.clone();
+    let capture_wake: capture::Wake = std::sync::Arc::new(move || {
+        if let Some(p) = capture_proxy.as_ref() {
+            let _ = p.send_event(UserEvent::OverlayPending);
+        }
+    });
     vec![
         // sticky-tab-title: the Cmd+Shift+R rename field. Ahead of the ai-monitor
         // so an open field owns the keyboard (D8a.1).
@@ -166,6 +177,11 @@ pub fn feature_overlays(
         Box::new(ImagePresenter),
         // copy-clipboard: the selection-highlight DrawLayer, on the same seam.
         Box::new(SelectionPresenter),
+        // region-capture: the Cmd+Shift+G screen capture. An overlay rather than a
+        // handler for one reason — `feature_handlers()` takes no arguments, so a
+        // handler cannot obtain a proxy, and a capture that completes seconds later on
+        // a thread has no way to wake the loop. It draws nothing (D10).
+        Box::new(capture::CaptureOverlay::new(capture_wake)),
     ]
 }
 

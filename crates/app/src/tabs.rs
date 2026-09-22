@@ -75,6 +75,31 @@ impl Tabs {
         self.sessions.iter().find(|s| s.id == id)
     }
 
+    /// Write background-produced bytes to tab `id`'s shell (region-capture D10/R7.4).
+    ///
+    /// Split out of `AppInner::deliver_to_tab` so it is reachable from a test: the
+    /// caller also snaps the viewport, which needs the drag latch and so needs an
+    /// `AppInner`, which needs a window and an `EventLoopProxy` — and macOS builds one
+    /// only on the main thread, which the harness never runs a test on. What is left
+    /// up there is the snap; the *routing* is here, where a real tab set exists.
+    ///
+    /// `true` when the bytes reached that tab. `false` when no tab carries that id
+    /// (R7.7: a capture whose originating tab was closed while the crosshair was up —
+    /// no other tab receives them, nothing panics, nothing surfaces) or when the write
+    /// itself failed. The caller snaps only on `true`, mirroring the typed-key path.
+    pub(crate) fn deliver(&mut self, id: TabId, bytes: &[u8]) -> bool {
+        let Some(session) = self.by_id_mut(id) else {
+            return false;
+        };
+        match session.write(bytes) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("delivery write to tab {id:?} failed: {e}");
+                false
+            }
+        }
+    }
+
     /// Whether `id` is the active tab (so background output skips redraw, R1.2).
     /// Bounds-safe: after the last tab closes (the app is exiting) a still-queued
     /// PTY wake must not index an empty set (C3 — clean exit).
@@ -800,5 +825,136 @@ mod tests {
         assert_eq!(active_after_close(2, 2), 1);
         // Close first (was active 0 of 2) → 1 remains, active 0.
         assert_eq!(active_after_close(0, 1), 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Background delivery (region-capture D10/D6, R7.4/R7.7).
+    //
+    // A screen capture completes seconds after the chord that started it, on a
+    // thread, and its bytes belong to the tab that ASKED for it — which may no
+    // longer be active, and may no longer exist. Routing by id is what makes those
+    // two cases different from "type into whatever is in front of me".
+    // ---------------------------------------------------------------------
+
+    /// Everything tab `id`'s grid currently holds, as one string per row joined by
+    /// newlines. Drains the reader channel first, so this sees what the shell echoed.
+    fn screen_of(tabs: &mut Tabs, id: TabId) -> String {
+        let session = tabs.by_id_mut(id).expect("tab exists");
+        session.drain();
+        let snap = session.terminal.snapshot();
+        (0..snap.rows)
+            .map(|y| {
+                (0..snap.cols)
+                    .map(|x| snap.cell(x, y).map(|c| c.ch).unwrap_or(' '))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Wait until tab `id`'s screen holds `marker`, or `limit` passes.
+    ///
+    /// The limit is a parameter because the two directions need opposite ones. Waiting
+    /// for an expected echo bounds a *failure*, so it is generous — a slow shell must
+    /// not turn a working delivery red. Waiting to confirm something *never* arrives
+    /// spends the whole limit on every green run, so it is short: a misroute would come
+    /// through the survivor's reader thread within milliseconds of the write, and 15 s
+    /// of sleeping would buy no extra confidence for 15 s of everyone's time.
+    fn wait_up_to(tabs: &mut Tabs, id: TabId, marker: &str, limit: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if screen_of(tabs, id).contains(marker) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn delivery_is_echoed_by_the_named_tab_and_by_no_other() {
+        // R7.4 / D6 — the capture was started for one tab's agent, and the roster can
+        // change between the press and the completion.
+        //
+        // **What this measures, stated precisely because gap A7 forbids the loose
+        // phrasing.** The `Then` it can assert is "the bytes reached that tab's PTY";
+        // it may NOT assert they "appear on screen", because display depends on the
+        // foreground program echoing and this repo cannot enforce that. Two separate
+        // observations are made here and they are not the same strength:
+        //
+        //   1. `deliver` returning `true` — the PTY write itself succeeded. That is the
+        //      requirement, and it holds under any foreground program.
+        //   2. the grid then showing the text — the tty line discipline echoing it back.
+        //      That is a *stronger, narrower* fact: it holds because this tab runs a
+        //      plain zsh with echo on, and would not under `read -s`. It is asserted
+        //      because it is what proves the bytes went to THIS tab rather than that
+        //      some write merely returned Ok.
+        //
+        // The test name says "echoed" for that reason; an earlier name claimed it
+        // measured the PTY, which is the one phrasing A7 rules out.
+        let Some(mut tabs) = tabs_with(2) else {
+            return;
+        };
+        let target = tabs.sessions[0].id;
+        let other = tabs.sessions[1].id;
+        // Tab 1 is active (as `open` leaves it), so this also pins that delivery does
+        // NOT follow the active tab.
+        assert_eq!(tabs.active().id, other, "the target is a background tab");
+
+        assert!(
+            tabs.deliver(target, b"CAPTUREMARK "),
+            "the PTY write to a live tab failed (the requirement's own observable)"
+        );
+        assert!(
+            wait_up_to(
+                &mut tabs,
+                target,
+                "CAPTUREMARK",
+                std::time::Duration::from_secs(15)
+            ),
+            "an echoing shell did not echo the delivered bytes. That is evidence, not \
+             proof, that they missed this tab — A7 allows the inference no further, \
+             since bytes can arrive and go unechoed:\n{}",
+            screen_of(&mut tabs, target)
+        );
+        assert!(
+            !screen_of(&mut tabs, other).contains("CAPTUREMARK"),
+            "another tab echoed a capture that was not its own:\n{}",
+            screen_of(&mut tabs, other)
+        );
+    }
+
+    #[test]
+    fn delivery_to_a_closed_tab_is_dropped_silently() {
+        // R7.7 — the originating tab was closed while the crosshair was still up. No
+        // tab receives the bytes, nothing panics, nothing surfaces. (The PNG stays on
+        // disk; that is a filesystem fact, not this function's.)
+        let Some(mut tabs) = tabs_with(2) else {
+            return;
+        };
+        let doomed = tabs.sessions[0].id;
+        let survivor = tabs.sessions[1].id;
+        tabs.close(doomed);
+        assert!(tabs.by_id(doomed).is_none(), "the tab really went away");
+
+        assert!(
+            !tabs.deliver(doomed, b"CAPTUREGHOST "),
+            "a closed tab must not report a successful delivery — the caller would \
+             then snap a viewport that received nothing"
+        );
+        // A settle window before the NEGATIVE, for the reason the positive test has
+        // one: a real misroute would arrive through the survivor's reader thread, and
+        // an assertion made immediately could simply outrun it and report a pass.
+        // `wait_up_to` returning false here is the result being asserted.
+        assert!(
+            !wait_up_to(
+                &mut tabs,
+                survivor,
+                "CAPTUREGHOST",
+                std::time::Duration::from_millis(500)
+            ),
+            "the orphaned bytes leaked into another tab:\n{}",
+            screen_of(&mut tabs, survivor)
+        );
     }
 }
