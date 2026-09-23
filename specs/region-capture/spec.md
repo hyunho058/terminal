@@ -9,6 +9,62 @@
 - **L2 review**: 3 rounds (NEEDS_FIX, NEEDS_FIX, PASS) — D10 was decided three times; the first two
   designs were blocking-defective and both failures are recorded in D10 itself.
 
+## Revision — 2026-09-23: delivery moved to the clipboard
+
+**The delivery model below is superseded.** The user, who owns this spec, directed the
+change after the feature shipped and after watching it fail on a permission problem
+unrelated to delivery. Recorded here rather than rewritten in place, because the original
+reasoning is what explains the machinery that was deleted.
+
+**What changed.** `screencapture -i -s -d <path>` became `screencapture -i -s -c`: the
+image goes to the **system pasteboard**, nothing is written to disk, and nothing is typed
+into the tab. The user presses `Cmd+V` — which, inside this terminal, lands on the
+existing image-paste path and does what the old model did directly (write a PNG, type its
+path for `claude`/`gemini`).
+
+**What that costs, stated plainly.** The Goal below says this feature exists for
+"skipping the user's current 'run a capture app → copy → paste into the agent' round
+trip", and the Confirmed Goal says the agent receives a path "with no clipboard
+involvement". The revision **puts that round trip back**, one `Cmd+V` per capture. It was
+chosen anyway, for a reason the original did not weigh: an image on the clipboard can go
+anywhere — a browser, a chat, another editor — where a path typed into one tab can only
+go to that tab's agent.
+
+**What it does NOT fix.** Measured 2026-09-23: `screencapture -c` is refused on this
+machine exactly as `-d <path>` was (`could not create image from rect`, exit 1). The
+clipboard form needs the same permission. The revision was not a workaround for that and
+does not act as one.
+
+**Decisions superseded** (their reasoning stands for the model they served):
+- **D2** — `-d` is dropped with the file. It was chosen so a denied capture explained
+  itself graphically; measured, its dialog reads "Screenshots are not allowed." and names
+  no permission, application or remedy, so it never delivered that. `-c` replaces `-d`.
+- **D3** — the file-existence verdict is replaced by an `NSPasteboard` `changeCount`
+  comparison, read on the UI thread at press time and again after the child exits. Its
+  rationale transfers: it depends on no undocumented exit code. Its new weakness is named
+  in `Capture::poll` — any other copy during the drag bumps the same counter — and is
+  bounded by the verdict driving nothing but a log line.
+- **D4, D9, D11** — no file is written, so the cache directory, the `capture-<secs>-<seq>`
+  naming, the never-overwrite guard and the "path plus one space" bytes are all gone.
+- **D6, D10, D13** — no bytes are delivered, so the tab-tagged delivery seam
+  (`Overlay::take_pending_write`, `OverlayHost::take_pending_writes`, the
+  `UserEvent::OverlayPending` drain, `AppInner::deliver_to_tab`, `Tabs::deliver`) and the
+  viewport snap were **deleted**, not left orphaned. `clipboard::pasted_dir` is private
+  again. A5's widened invariant is withdrawn with them: nothing but `AppCtx::writer`
+  reaches a PTY again.
+
+**Decisions that survive unchanged**: D1 (the chord), D5 (watcher thread, injectable
+spawn), D7 (single-flight, 5-minute budget, kill on expiry), D8 (`Consumed` on every
+failure path), D12 (a capture in flight at app exit is abandoned).
+
+**Requirements superseded**: R0.1, R4.*, R7.*, R9.* describe the file-and-path model.
+R0.2, R1.*, R2.1 (argv is now `-i -s -c`), R3.* (verdict by pasteboard, not file), R5.*,
+R6.*, R8.*, R10.1-R10.3, R11.1 hold. R10.4 and R11.2 are gone with the seam they guarded.
+
+**Gaps**: A1 and A2 are unchanged and still unmeasured — the permission question is
+orthogonal to delivery. A4, A5, A6, A7 are withdrawn (no file written outside the
+agent's workspace, no second byte-source, no kill/write race, no display claim to make).
+
 ## Goal
 Add a capture function to the terminal: one key chord runs an interactive region
 screen capture, and the resulting image is handed straight to the CLI AI agent

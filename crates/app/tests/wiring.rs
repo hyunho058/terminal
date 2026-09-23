@@ -182,24 +182,3 @@ fn no_extension_starts_visible() {
         );
     }
 }
-
-/// R10.4: the new background-write seam is inert for everything that was already here.
-///
-/// `Overlay::take_pending_write` was added for region-capture and defaults to `None`,
-/// which is what let it arrive without touching rename, the ai-monitor, or either
-/// presenter. Asserted on the **registered** set rather than on hand-built stubs,
-/// because that is the set the running app dispatches through — and because a capture
-/// overlay that somehow started with bytes queued would put them on a PTY at the first
-/// wake, before any chord was pressed.
-#[test]
-fn no_registered_overlay_starts_with_bytes_for_a_pty() {
-    for (i, o) in feature_overlays(None, no_deadline()).iter_mut().enumerate() {
-        assert_eq!(
-            o.take_pending_write(),
-            None,
-            "overlay #{i} (priority {}) had bytes queued for a shell before anything \
-             happened",
-            o.priority()
-        );
-    }
-}

@@ -85,10 +85,7 @@ fn is_paste(input: &KeyInput) -> bool {
 
 /// `~/.cache/mac-terminal/pasted`, created if missing (C4). `None` if `$HOME`
 /// is unset or the dir can't be made.
-///
-/// `pub(crate)` for region-capture D4: a screen capture lands beside pasted images,
-/// in one directory, rather than in a second answer to the same question.
-pub(crate) fn pasted_dir() -> Option<PathBuf> {
+fn pasted_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     let dir = PathBuf::from(home)
         .join(".cache")
