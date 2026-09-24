@@ -167,3 +167,36 @@ idle behaviour. See G1 for what the caches do and do not buy against it.
   through the swash atlas (`build_glyph_instances` feeds `renderer::atlas::Atlas`),
   with 256-color/truecolor and bold/dim/italic/underline/reverse; block-font is no
   longer the rendering path.
+- **G7** Bold now comes from the font file's **real** bold face, and the fallback to
+  synthesis is a real path that can come back silently. `specs/real-bold-faces`
+  establishes that both shipped fonts already carried faces this renderer never
+  opened — Menlo Bold/Italic/BoldItalic at faces 1/2/3, Apple SD Gothic Neo Bold
+  (weight 700) at face 6 — while every bold glyph was produced by `embolden`-ing the
+  regular outline. On AppleSDGothicNeo that does not thicken outlines, it **erodes**
+  them: 593 of 11,172 Hangul syllables lost 86–89% of their ink, 안/간/건/난 among
+  them, because offsetting those contours makes the fill cancel. Recorded here beside
+  G5's A1/A2 and G6 because it is the same *kind* of fact — a property of an external
+  font file that this repo cannot enforce and would not be told about:
+
+  - **A3: the second-choice fallback fonts ship no bold face at all.** Measured:
+    `Supplemental/AppleGothic.ttf` is one face at weight 400, `SFNSMono.ttf` one face
+    at weight 295. If Apple ever moves or removes `Menlo.ttc` or
+    `AppleSDGothicNeo.ttc`, that chain entry silently returns to synthesis — and for
+    Hangul the erosion comes back with it. This is `font_set.rs`'s D2 behaving
+    correctly, not a defect, but it means **"bold looks wrong again" should be read
+    as "check whether the first-choice font is still there"** before anything else.
+    Nothing detects it: an absent style is deliberately silent (a warning would fire
+    on every startup for AppleSDGothicNeo, which legitimately has no italic face),
+    so only the `#[ignore]`d sweeps in `crates/renderer/tests/bold_faces.rs` would
+    notice, and only when someone runs them.
+  - **A4: `BOLD_EMBOLDEN_FRAC` is no longer a weight knob.** Because it is reached
+    only when a file has no bold face, raising it to make bold "look heavier" now
+    deepens the erosion on exactly the glyphs that are already broken. The constant
+    carries this rule in its own doc comment, and D18 records the differentiability
+    floor (1.15× ink, zero Hangul syllables below it) that a re-tune has to cite.
+
+  What is guarded: `bold_faces.rs` sweeps all 11,172 syllables at ppem 14 and 28, and
+  `golden_frame.rs` asserts bold cells carry more ink **in the captured frame** than
+  regular ones — the pixel half, because the ink-map contract deliberately says
+  *which* cells carry ink and not *how much*, and so stays green while bold is a
+  ghost.

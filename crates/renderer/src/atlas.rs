@@ -6,11 +6,21 @@
 //! fills the texture it evicts everything and repacks, rather than growing
 //! unboundedly or panicking.
 //!
-//! The atlas spans the whole [`FontSet`] fallback chain (D7): it holds one
-//! [`GlyphRasterizer`] per face, and [`GlyphKey`] carries the face index. That axis
-//! is a *correctness* requirement, not a cache refinement — glyph ids are per-font
-//! namespaces, so without it Menlo's gid 42 and the Hangul face's gid 42 share one
-//! cache slot and the wrong glyph is drawn (R3.1).
+//! The atlas spans the whole [`FontSet`] fallback chain (H-D7): it holds a
+//! [`FamilyRasterizers`] per chain entry — up to four [`GlyphRasterizer`]s, one per
+//! style slot — and [`GlyphKey`] carries both the entry index and the slot.
+//!
+//! Both axes are *correctness* requirements, not cache refinements, and for the
+//! same underlying reason: **glyph ids are a per-face namespace**. Without the face
+//! axis, Menlo's gid 42 and the Hangul face's gid 42 share a cache slot (H-R3.1).
+//! Without the slot axis, Menlo's *regular* gid 407 (`Ǟ`, which the italic face
+//! lacks and which is therefore drawn sheared) and its *italic* gid 407 (`ǟ`) share
+//! one — measured reachable, and the wrong character wins (D15/R3.3).
+//!
+//! Style never selects the chain entry: coverage is judged on the regular face and
+//! the slot is chosen *within* the entry that wins (D7). That is what keeps H-R0.3
+//! — unstyled text renders exactly as it did before the chain existed — true of the
+//! style axis too.
 //!
 //! [`Atlas::resolve`] is the single character→glyph entry point for every draw
 //! path (grid, tab bar, overlay, preedit — D5/D10), so fallback and the
@@ -19,7 +29,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::font_set::FontSet;
+use crate::font_set::{FontSet, StyleResolution, StyleSlot};
 use crate::glyph::{GlyphBitmap, GlyphRasterizer};
 
 /// Source of [`Atlas::epoch`] — the identity of a *texture*, handed out by
@@ -69,27 +79,122 @@ fn new_atlas_texture(
     (texture, view, sampler, epoch)
 }
 
-/// Cache key for a rasterized glyph: the face it came from, the glyph id within
-/// that face, and its synthesized style — so a bold/italic variant caches
-/// separately from the regular one (D10) and two faces never collide (D7/R3.1).
+/// Cache key for a rasterized glyph.
+///
+/// The key names **the face the id came from**, never the style that was asked
+/// for (D15). Those are not the same thing: a character the italic face does not
+/// cover is drawn from the *regular* face with a synthetic shear (D7), so its id
+/// lives in `Regular`'s namespace while the cell is still italic.
+///
+/// Keying on the requested style instead collides two different glyphs, and the
+/// collision is reachable — on Menlo, regular gid 407 is `Ǟ` (which the italic
+/// face lacks) and italic gid 407 is `ǟ`. Both would key as
+/// `{face: 0, id: 407, italic: true}`, whichever cached first would win, and the
+/// other would render as the wrong character.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GlyphKey {
     /// Index into the [`FontSet`] chain the atlas was built from; 0 == primary.
+    /// Still a **chain entry**, not a face — that is what keeps `is_degraded()`
+    /// and `resolve`'s enumerate index meaning what they always meant (D10).
     pub face: u16,
+    /// Which face *within* that chain entry owns [`GlyphKey::id`].
+    pub slot: StyleSlot,
     pub id: u16,
-    pub bold: bool,
-    pub italic: bool,
+    /// Embolden applied on top of `slot`'s outline — a fallback for a file with
+    /// no real bold face, never used when `slot` is already `Bold` (D9).
+    pub synth_bold: bool,
+    /// Shear applied on top of `slot`'s outline. Still the normal path for
+    /// Hangul: AppleSDGothicNeo ships no italic face at all.
+    pub synth_italic: bool,
 }
 
 impl GlyphKey {
-    /// The regular (unstyled) key for a glyph id in the **primary** face (D7).
+    /// The regular (unstyled) key for a glyph id in the **primary** family (H-D7).
     pub fn plain(id: u16) -> Self {
         GlyphKey {
             face: 0,
+            slot: StyleSlot::Regular,
             id,
-            bold: false,
-            italic: false,
+            synth_bold: false,
+            synth_italic: false,
         }
+    }
+}
+
+/// Why a style slot ended up with no rasterizer (D2).
+///
+/// The two cases look identical downstream — both fall back to synthesis — but
+/// they mean opposite things about the machine, so only one is worth a log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotAbsence {
+    /// The font file ships no such face. **Normal.** AppleSDGothicNeo has no
+    /// italic face at all — all 18 of its faces are `style=Normal` — so warning
+    /// here would fire on every startup, for every user, about a face that was
+    /// never supposed to exist (R2.1).
+    NotOffered,
+    /// The file offers the face and it would not parse. **Anomalous** — the font
+    /// is damaged or swash rejected it — so say so once and degrade (R2.2).
+    Unparseable,
+}
+
+impl SlotAbsence {
+    /// Whether this absence is a signal or just the shape of the font file.
+    ///
+    /// Split out as a named predicate rather than an inline `if` so the rule
+    /// "absent is silent, broken is loud" is a value a test can assert, instead
+    /// of a branch whose only evidence is a comment beside it.
+    fn is_worth_reporting(self) -> bool {
+        matches!(self, SlotAbsence::Unparseable)
+    }
+}
+
+/// Classify a missing slot, or `None` when the slot was built successfully.
+fn slot_absence(offered: bool, built: bool) -> Option<SlotAbsence> {
+    match (offered, built) {
+        (_, true) => None,
+        (true, false) => Some(SlotAbsence::Unparseable),
+        (false, false) => Some(SlotAbsence::NotOffered),
+    }
+}
+
+/// The rasterizers built for one chain entry — one per style slot the family
+/// actually supplied *and* that parsed (D2).
+///
+/// Kept as a nested struct rather than flattened into the atlas's vector on
+/// purpose: flattening would make `rasterizers.len()` count style faces, and
+/// `is_degraded()` is `len() == 1`. A Menlo-only chain with four style faces would
+/// then report "not degraded" while Hangul had no font at all.
+struct FamilyRasterizers {
+    regular: GlyphRasterizer,
+    bold: Option<GlyphRasterizer>,
+    italic: Option<GlyphRasterizer>,
+    bold_italic: Option<GlyphRasterizer>,
+}
+
+impl FamilyRasterizers {
+    fn get(&self, slot: StyleSlot) -> Option<&GlyphRasterizer> {
+        match slot {
+            StyleSlot::Regular => Some(&self.regular),
+            StyleSlot::Bold => self.bold.as_ref(),
+            StyleSlot::Italic => self.italic.as_ref(),
+            StyleSlot::BoldItalic => self.bold_italic.as_ref(),
+        }
+    }
+
+    fn get_mut(&mut self, slot: StyleSlot) -> Option<&mut GlyphRasterizer> {
+        match slot {
+            StyleSlot::Regular => Some(&mut self.regular),
+            StyleSlot::Bold => self.bold.as_mut(),
+            StyleSlot::Italic => self.italic.as_mut(),
+            StyleSlot::BoldItalic => self.bold_italic.as_mut(),
+        }
+    }
+
+    /// Which style this entry can really serve, judged by the rasterizers that
+    /// were **built** — not by what the file claimed to have. A face that failed
+    /// to parse is absent here, so its style degrades to synthesis (D2/R2.2).
+    fn resolve_style(&self, bold: bool, italic: bool) -> StyleResolution {
+        crate::font_set::resolve_style_over(bold, italic, |slot| self.get(slot).is_some())
     }
 }
 
@@ -138,9 +243,13 @@ pub struct Atlas {
     /// Text layers key their cached bind groups on this so a live `apply_config`
     /// atlas swap cannot leave one sampling the replaced texture (D1/D2).
     epoch: u64,
-    /// One rasterizer per [`FontSet`] face, in chain order; index 0 is the
-    /// primary. [`GlyphKey::face`] indexes this vector (D7).
-    rasterizers: Vec<GlyphRasterizer>,
+    /// One entry per [`FontSet`] **chain step**, in priority order; index 0 is the
+    /// primary. [`GlyphKey::face`] indexes this vector (H-D7).
+    ///
+    /// Each entry carries up to four rasterizers, one per style slot — but the
+    /// vector's *length* is still the chain length, which `is_degraded()` and
+    /// `resolve`'s enumerate both depend on (D10).
+    rasterizers: Vec<FamilyRasterizers>,
     cache: HashMap<GlyphKey, Option<GlyphEntry>>,
     shelf_x: u32,
     shelf_y: u32,
@@ -163,10 +272,43 @@ impl Atlas {
     /// mapped bytes — the `FontData` handle is cloned, never the 55 MB behind it
     /// (D7/R3.2). `None` if any face fails to parse at its recorded index.
     pub fn new(device: &wgpu::Device, fonts: &FontSet, ppem: f32) -> Option<Atlas> {
+        // A styled slot that the file simply does not have is **normal** and logs
+        // nothing (R2.1) — AppleSDGothicNeo has no italic face by design, and
+        // warning about it would fire on every single startup. A slot the file
+        // *does* have but that fails to parse is a real anomaly: warn once and
+        // fall back to synthesis (R2.2). Only the regular face is fatal (R2.3).
+        let build_slot = |family: &crate::font_set::FontFamily, slot: StyleSlot| {
+            let offered = family.slot(slot);
+            let built =
+                offered.and_then(|face| GlyphRasterizer::new(face.data.clone(), face.index, ppem));
+            if let Some(absence) = slot_absence(offered.is_some(), built.is_some()) {
+                if absence.is_worth_reporting() {
+                    tracing::warn!(
+                        ?slot,
+                        index = offered.map(|f| f.index),
+                        "font file offers this face but it failed to parse; \
+                         falling back to synthesis for that style (D2/R2.2)"
+                    );
+                }
+            }
+            built
+        };
+
         let rasterizers = fonts
-            .faces()
+            .families()
             .iter()
-            .map(|face| GlyphRasterizer::new(face.data.clone(), face.index, ppem))
+            .map(|family| {
+                let face = family.regular();
+                // R2.3: the regular face is the only fatal one. `?` here makes the
+                // whole atlas `None`, exactly as before styles existed.
+                let regular = GlyphRasterizer::new(face.data.clone(), face.index, ppem)?;
+                Some(FamilyRasterizers {
+                    regular,
+                    bold: build_slot(family, StyleSlot::Bold),
+                    italic: build_slot(family, StyleSlot::Italic),
+                    bold_italic: build_slot(family, StyleSlot::BoldItalic),
+                })
+            })
             .collect::<Option<Vec<_>>>()?;
         if rasterizers.is_empty() {
             return None;
@@ -229,19 +371,51 @@ impl Atlas {
     ///   paths, "draw nothing" would make Hangul completely **invisible**, signalled
     ///   only by a `warn!` line the user never sees — strictly worse than today's
     ///   tofu boxes. Degraded mode keeps the breakage visible on purpose.
-    pub fn resolve(&self, ch: char) -> Option<GlyphKey> {
-        for (face, rasterizer) in self.rasterizers.iter().enumerate() {
-            let id = rasterizer.glyph_id(ch);
-            if id != 0 {
-                return Some(GlyphKey {
-                    face: face as u16,
-                    id,
-                    bold: false,
-                    italic: false,
-                });
+    pub fn resolve(&self, ch: char, bold: bool, italic: bool) -> Option<GlyphKey> {
+        for (face, family) in self.rasterizers.iter().enumerate() {
+            // D7: the chain walk asks the **regular** face, always. Style never
+            // changes *which font* a character comes from, so H-R0.3 — "what the
+            // primary covers renders exactly as it did before the chain existed"
+            // — survives the style axis untouched.
+            let regular_id = family.regular.glyph_id(ch);
+            if regular_id == 0 {
+                continue;
             }
+            let face = face as u16;
+            let want = family.resolve_style(bold, italic);
+
+            // Prefer the real styled face, but only if it actually has this
+            // glyph. Menlo Italic is missing 267 codepoints Menlo Regular has
+            // (`☁ ★ ☎ ✔` …), and Menlo Bold is missing 128 — though those 128 are
+            // exactly the box-drawing block, which never reaches shaping anyway.
+            if want.slot != StyleSlot::Regular {
+                if let Some(styled) = family.get(want.slot) {
+                    let id = styled.glyph_id(ch);
+                    if id != 0 {
+                        return Some(GlyphKey {
+                            face,
+                            slot: want.slot,
+                            id,
+                            synth_bold: want.synth_bold,
+                            synth_italic: want.synth_italic,
+                        });
+                    }
+                }
+            }
+
+            // R3.2: a hole in the styled face falls back to *this* entry's
+            // regular with full synthesis — not to the next chain entry, which
+            // would silently swap the font, and not to nothing, which would make
+            // a character vanish the moment an attribute was added to it.
+            return Some(GlyphKey {
+                face,
+                slot: StyleSlot::Regular,
+                id: regular_id,
+                synth_bold: bold,
+                synth_italic: italic,
+            });
         }
-        // D5: keep `.notdef` visible when there is no fallback face to consult.
+        // H-D5: keep `.notdef` visible when there is no fallback face to consult.
         self.is_degraded().then(|| GlyphKey::plain(0))
     }
 
@@ -251,7 +425,7 @@ impl Atlas {
     pub fn glyph_id(&self, ch: char) -> u16 {
         self.rasterizers
             .first()
-            .map_or(0, |rasterizer| rasterizer.glyph_id(ch))
+            .map_or(0, |family| family.regular.glyph_id(ch))
     }
 
     /// Get a glyph's atlas entry in the regular style. Backward-compatible entry
@@ -282,10 +456,14 @@ impl Atlas {
         if let Some(cached) = self.cache.get(&key) {
             return *cached;
         }
-        // A key naming a face outside the chain is malformed, not fatal: draw
-        // nothing rather than panic on an out-of-range index (no `unwrap`, C4).
-        let rasterizer = self.rasterizers.get_mut(key.face as usize)?;
-        let bmp = rasterizer.rasterize_glyph_styled(key.id, key.bold, key.italic);
+        // A key naming a face outside the chain, or a slot this family never
+        // built, is malformed rather than fatal: draw nothing instead of panicking
+        // on an out-of-range index (no `unwrap`, C4).
+        let rasterizer = self
+            .rasterizers
+            .get_mut(key.face as usize)?
+            .get_mut(key.slot)?;
+        let bmp = rasterizer.rasterize_glyph_synth(key.id, key.synth_bold, key.synth_italic);
         let entry = bmp.and_then(|bmp| self.pack(queue, &bmp));
         self.cache.insert(key, entry);
         entry
@@ -441,7 +619,9 @@ mod tests {
         // D7: the face-blind entry point is face 0, never "some face".
         assert_eq!(GlyphKey::plain(42).face, 0);
         assert_eq!(GlyphKey::plain(42).id, 42);
-        assert!(!GlyphKey::plain(42).bold && !GlyphKey::plain(42).italic);
+        let k = GlyphKey::plain(42);
+        assert_eq!(k.slot, StyleSlot::Regular);
+        assert!(!k.synth_bold && !k.synth_italic);
     }
 
     #[test]
@@ -454,6 +634,206 @@ mod tests {
         assert_ne!(primary, fallback);
         let distinct: HashSet<GlyphKey> = [primary, fallback].into_iter().collect();
         assert_eq!(distinct.len(), 2, "face must participate in the hash");
+    }
+
+    // ---- T3 / R2-R3: slot resolution and the key that cannot collide --------
+
+    #[test]
+    fn an_unoffered_slot_is_silent_and_a_broken_one_is_not() {
+        // R2.1 vs R2.2 — the distinction D2 exists to draw. Both end in synthesis,
+        // so behaviour alone cannot tell them apart; what differs is whether the
+        // machine is trying to tell you something.
+        assert_eq!(slot_absence(false, false), Some(SlotAbsence::NotOffered));
+        assert_eq!(slot_absence(true, false), Some(SlotAbsence::Unparseable));
+        assert_eq!(slot_absence(true, true), None, "built — nothing to report");
+
+        // R2.1: AppleSDGothicNeo legitimately has no italic face. Logging that
+        // would put a warning on every startup about a face that was never meant
+        // to exist.
+        assert!(!SlotAbsence::NotOffered.is_worth_reporting());
+        // R2.2: a face the file *does* offer failing to parse is a real signal.
+        assert!(SlotAbsence::Unparseable.is_worth_reporting());
+    }
+
+    /// A `FontFace` over bytes that are not a font, at `index`.
+    fn broken_face(index: usize) -> crate::font_set::FontFace {
+        let bytes = [0u8, 1, 2, 3];
+        let mut map = memmap2::MmapOptions::new()
+            .len(bytes.len())
+            .map_anon()
+            .expect("anon mapping");
+        map.copy_from_slice(&bytes);
+        crate::font_set::FontFace {
+            data: std::sync::Arc::new(map.make_read_only().expect("freeze")),
+            index,
+        }
+    }
+
+    #[test]
+    fn a_broken_style_face_degrades_that_style_but_still_builds_the_atlas() {
+        // R2.2: going from 2 faces to 8 quadruples the chance of hitting an
+        // unparseable one. A decorative defect must not become a black window —
+        // the trade H-D4 already refused for the fallback font.
+        let Some((device, _queue)) = crate::headless() else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        let Ok(real) = FontSet::load() else {
+            eprintln!("skipping: no system font");
+            return;
+        };
+        let good = real.families()[0].regular().clone();
+        let sabotaged = crate::font_set::FontFamily::from_parts(
+            good,
+            Some(broken_face(0)), // offered, will not parse
+            None,
+            None,
+        );
+        let fonts = FontSet::from_families(vec![sabotaged]);
+
+        let atlas = Atlas::new(&device, &fonts, 32.0)
+            .expect("R2.2: a broken STYLE face must not fail atlas construction");
+        // and that style quietly falls back to synthesis on the regular face
+        let key = atlas.resolve('A', true, false).expect("A resolves");
+        assert_eq!(key.slot, StyleSlot::Regular);
+        assert!(key.synth_bold, "the weight is owed as synthesis now");
+    }
+
+    #[test]
+    fn a_broken_regular_face_is_still_fatal() {
+        // R2.3: the one case that keeps its old severity. Without a regular face
+        // there is nothing to fall back *to*, so `Atlas::new` answers `None`
+        // exactly as it did before style slots existed.
+        let Some((device, _queue)) = crate::headless() else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        let fonts = FontSet::from_families(vec![crate::font_set::FontFamily::from_parts(
+            broken_face(0),
+            None,
+            None,
+            None,
+        )]);
+        assert!(
+            Atlas::new(&device, &fonts, 32.0).is_none(),
+            "R2.3: a broken REGULAR face must still be fatal"
+        );
+    }
+
+    #[test]
+    fn a_style_slot_is_part_of_the_key() {
+        // R3.3 at the key level: same face, same id, different slot → different
+        // cache entry. Without this the sheared-regular `Ǟ` and the real italic
+        // `ǟ` (both gid 407 on Menlo) share one slot and one wins.
+        let sheared_regular = GlyphKey {
+            face: 0,
+            slot: StyleSlot::Regular,
+            id: 407,
+            synth_bold: false,
+            synth_italic: true,
+        };
+        let real_italic = GlyphKey {
+            slot: StyleSlot::Italic,
+            synth_italic: false,
+            ..sheared_regular
+        };
+        assert_ne!(sheared_regular, real_italic);
+        let distinct: HashSet<GlyphKey> = [sheared_regular, real_italic].into_iter().collect();
+        assert_eq!(distinct.len(), 2, "slot must participate in the hash");
+    }
+
+    #[test]
+    fn hangul_bold_resolves_to_the_real_bold_slot() {
+        // R0.1: the point of the whole feature, at the resolver.
+        let Some((_, atlas)) = atlas_for_test() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let key = atlas.resolve('한', true, false).expect("한 resolves");
+        assert_eq!(key.face, 1, "Hangul comes from the fallback chain entry");
+        assert_eq!(key.slot, StyleSlot::Bold, "a real w700 face, not synthesis");
+        assert!(
+            !key.synth_bold,
+            "the weight is real, so embolden must never be applied — that is what \
+             erodes 593 syllables"
+        );
+    }
+
+    #[test]
+    fn hangul_bold_italic_keeps_the_real_weight_and_shears() {
+        // D9/R2.5: axes resolve independently. AppleSDGothicNeo has no italic
+        // face, so the slant is synthetic — but the weight must stay real.
+        let Some((_, atlas)) = atlas_for_test() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let key = atlas.resolve('한', true, true).expect("한 resolves");
+        assert_eq!(key.slot, StyleSlot::Bold);
+        assert!(!key.synth_bold, "real weight");
+        assert!(key.synth_italic, "synthetic slant");
+    }
+
+    #[test]
+    fn a_hole_in_the_styled_face_stays_on_the_same_chain_entry() {
+        // R3.1/R3.2. `★` is one of 267 codepoints Menlo Regular has and Menlo
+        // Italic does not. Adding an italic attribute must not move it to another
+        // font, and must not make it vanish.
+        let Some((_, atlas)) = atlas_for_test() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let plain = atlas.resolve('★', false, false).expect("★ resolves plain");
+        let italic = atlas.resolve('★', false, true).expect("★ resolves italic");
+        assert_eq!(
+            italic.face, plain.face,
+            "R3.1: style must not change WHICH font a character comes from"
+        );
+        assert_eq!(
+            italic.slot,
+            StyleSlot::Regular,
+            "R3.2: the italic face has no ★, so fall back to this entry's regular"
+        );
+        assert_eq!(italic.id, plain.id, "same face ⇒ same glyph id");
+        assert!(italic.synth_italic, "and owe the shear");
+    }
+
+    #[test]
+    fn the_italic_hole_and_a_real_italic_glyph_get_different_keys() {
+        // R3.4 — the collision, end to end on real fonts. On Menlo, regular gid
+        // 407 is `Ǟ` (absent from the italic face) and italic gid 407 is `ǟ`.
+        // Keyed on the requested style they would be indistinguishable.
+        let Some((_, atlas)) = atlas_for_test() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let hole = atlas.resolve('Ǟ', false, true).expect("Ǟ resolves");
+        let real = atlas.resolve('ǟ', false, true).expect("ǟ resolves");
+        assert_eq!(hole.slot, StyleSlot::Regular, "Ǟ: sheared regular");
+        assert_eq!(real.slot, StyleSlot::Italic, "ǟ: the real italic face");
+        assert_ne!(
+            hole, real,
+            "these must never share a cache entry, whatever their ids"
+        );
+    }
+
+    #[test]
+    fn an_empty_style_slot_does_not_degrade_the_chain() {
+        // R2.4/D11: `is_degraded` asks whether Hangul has a font at all. Gothic
+        // ships no italic face, and that must not be mistaken for a missing
+        // fallback — which would wrongly switch on the `.notdef` path (H-D5).
+        let Some((_, atlas)) = atlas_for_test() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        assert!(
+            !atlas.is_degraded(),
+            "two chain entries loaded, so not degraded — regardless of style slots"
+        );
+        assert_eq!(
+            atlas.rasterizers.len(),
+            2,
+            "R3.6: the vector counts CHAIN ENTRIES, not style faces"
+        );
     }
 
     #[test]

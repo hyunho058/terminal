@@ -1044,8 +1044,13 @@ impl SidebarTextPipeline {
 }
 
 /// Lay out `text` as glyph instances from `x` at `top` (physical px), scaled by `scale`
-/// (1.0 title, `meta_ratio` sub-line, D5). Truncated to `max_w` with `ellipsis` (D8). The
-/// title uses the atlas's synthesized bold; the sub-line the plain glyph.
+/// (1.0 title, `meta_ratio` sub-line, D5). Truncated to `max_w` with `ellipsis` (D8).
+///
+/// The title asks the atlas for bold and the sub-line for regular. It no longer says
+/// *synthesized* bold: since `specs/real-bold-faces`, a bold title on a Hangul path
+/// name is drawn from Apple SD Gothic Neo's real weight-700 face, and Latin from
+/// Menlo Bold. Synthesis is now only the fallback for a font that ships no bold
+/// face at all (R5.1/D9).
 #[allow(clippy::too_many_arguments)]
 fn push_glyphs(
     out: &mut Vec<TextInstance>,
@@ -1068,13 +1073,16 @@ fn push_glyphs(
     let mut pen = x;
     for c in clipped.chars() {
         // Resolve through the fallback chain (#6) so a Hangul/CJK basename renders on the
-        // fallback face instead of tofu, then carry the title's bold synthesis on the
-        // resolved key. `resolve` returns an owned key, so the immutable borrow is released
-        // before `get_or_insert_styled` takes the mutable one.
-        let entry = ctx.atlas.resolve(c).and_then(|mut key| {
-            key.bold = bold;
-            ctx.atlas.get_or_insert_styled(ctx.queue, key)
-        });
+        // fallback face instead of tofu. The style goes **into** `resolve`, not onto the
+        // key afterwards (D3/R3.5): the id it returns belongs to whichever face actually
+        // supplies the outline, and stamping a style onto an id resolved from a different
+        // face is precisely the collision D15 describes. `resolve` returns an owned key,
+        // so the immutable borrow is released before `get_or_insert_styled` takes the
+        // mutable one.
+        let entry = ctx
+            .atlas
+            .resolve(c, bold, false)
+            .and_then(|key| ctx.atlas.get_or_insert_styled(ctx.queue, key));
         if let Some(e) = entry {
             out.push(TextInstance {
                 rect: [
@@ -2063,6 +2071,45 @@ mod tests {
         view: wgpu::TextureView,
         snapshot: term_core::GridSnapshot,
         sidebar: SidebarConfig,
+    }
+
+    #[test]
+    fn a_bold_tab_title_resolves_to_the_real_bold_face() {
+        // R5.1. `push_glyphs` asks the atlas with `resolve(c, bold, false)`; this
+        // pins what that call answers, which is the whole content of the change
+        // here. Before it, the row resolved *unstyled* and then stamped
+        // `key.bold = bold` onto the result — a regular-face glyph id wearing a
+        // bold flag, which is the collision D15 describes.
+        let Some((device, _queue)) = crate::headless() else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        let Ok(fonts) = crate::FontSet::load() else {
+            eprintln!("skipping: no system font");
+            return;
+        };
+        let atlas = crate::atlas::Atlas::new(&device, &fonts, 32.0).expect("atlas");
+
+        // A Latin title: Menlo ships a real bold, so the title uses it.
+        let latin = atlas.resolve('A', true, false).expect("A resolves");
+        assert_eq!(latin.slot, crate::StyleSlot::Bold);
+        assert!(!latin.synth_bold, "Menlo Bold is real, never emboldened");
+
+        // A Hangul path name — the case that motivated the fallback chain, and the
+        // one where synthesis used to erode the glyph.
+        if atlas.is_degraded() {
+            eprintln!("skipping the Hangul half: no fallback face on this machine");
+            return;
+        }
+        let hangul = atlas.resolve('문', true, false).expect("문 resolves");
+        assert_eq!(hangul.face, 1, "from the fallback chain entry");
+        assert_eq!(hangul.slot, crate::StyleSlot::Bold);
+        assert!(!hangul.synth_bold);
+
+        // And the sub-line, which asks for no style at all, is untouched (H-R0.3).
+        let sub = atlas.resolve('문', false, false).expect("문 resolves");
+        assert_eq!(sub.slot, crate::StyleSlot::Regular);
+        assert!(!sub.synth_bold && !sub.synth_italic);
     }
 
     /// `None` when there is no adapter or no system font — the crate skips, never fails
