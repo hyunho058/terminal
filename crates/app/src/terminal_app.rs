@@ -1987,6 +1987,23 @@ impl Running {
         self.snap_tab_to_live(id);
     }
 
+    /// Write background-produced bytes to tab `id`'s shell (region-capture D10/R7.4).
+    ///
+    /// The tab is named, not assumed active: a capture started seconds ago belongs to
+    /// the tab that asked for it, and the roster may have moved since (D6). A tab that
+    /// has since closed is simply not found — no other tab receives the bytes, nothing
+    /// panics, nothing surfaces (R7.7). The file it would have named stays on disk.
+    ///
+    /// Snapping on success mirrors the typed-key path exactly, including its failure
+    /// arm: this is the **input** snap, which has no `SNAP_FLOOR`, so a delivery brings
+    /// even a far-scrolled viewport back to where the path will appear (D13/R9). That
+    /// is right because the user did originate it, by pressing the chord.
+    fn deliver_to_tab(&mut self, id: TabId, bytes: &[u8]) {
+        if self.tabs.deliver(id, bytes) {
+            self.snap_after_input(id);
+        }
+    }
+
     /// [`snap_after_input`](Self::snap_after_input) for the active tab — the common
     /// case (a typed key, a paste).
     fn snap_active_after_input(&mut self) {
@@ -2363,6 +2380,17 @@ impl ApplicationHandler<UserEvent> for App {
                 // two-stage cache exists for. The weaker claim is the true one, and writing
                 // the weaker one down is what stops a later reader trusting the stronger.
                 let overlay_changed = inner.overlays.poll_all();
+                // A screen capture that finished on its watcher thread hands over the path
+                // to type (region-capture D10/R7.4). Immediately after `poll_all`, because
+                // that is the call in which the overlay drained its own channel — so
+                // anything it has to hand out exists by now.
+                //
+                // Generic, not capture-specific: the arm knows only "some overlay produced
+                // bytes for some tab", which is what keeps SD4's rule (a feature does not
+                // edit this file) intact at one drain block rather than one per feature.
+                for (id, bytes) in inner.overlays.take_pending_writes() {
+                    inner.deliver_to_tab(id, &bytes);
+                }
                 // The tab-metadata worker also wakes the loop through this path; sync
                 // the fresh agent states into the waiting model (rising-edge Waiting
                 // detection, T3) and redraw if the waiting band changed.

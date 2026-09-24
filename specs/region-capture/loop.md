@@ -1,14 +1,5 @@
 # loop.md — Loop Contract: region-capture
 
-> **STALE as of 2026-09-23 — see `spec.md` § Revision.** This contract gates the
-> *file-and-path* delivery model. That model was replaced by clipboard delivery on the
-> user's instruction, and the machinery several gates below name — `take_pending_write`,
-> `OverlayHost::take_pending_writes`, the `OverlayPending` drain, `Tabs::deliver`,
-> `pasted_dir` — was deleted. The Gate-1 commands, the mutation thresholds and the
-> constraint checks still apply; the requirement-coverage row (43 sub-requirements) and
-> the R7.4/R9/R10.4/R11.2 guards do not, because the requirements they counted are
-> superseded. Re-derive before reusing this as a gate.
-
 ## Goal
 Verify that the shipped region-capture implementation satisfies
 `specs/region-capture/spec.md` — R0–R11, D1–D13, C1–C8 — without violating it,

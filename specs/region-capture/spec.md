@@ -9,61 +9,44 @@
 - **L2 review**: 3 rounds (NEEDS_FIX, NEEDS_FIX, PASS) — D10 was decided three times; the first two
   designs were blocking-defective and both failures are recorded in D10 itself.
 
-## Revision — 2026-09-23: delivery moved to the clipboard
+## Delivery history — file → clipboard → file (2026-09-23 / 2026-09-24)
 
-**The delivery model below is superseded.** The user, who owns this spec, directed the
-change after the feature shipped and after watching it fail on a permission problem
-unrelated to delivery. Recorded here rather than rewritten in place, because the original
-reasoning is what explains the machinery that was deleted.
+The model below — write a PNG, type its absolute path into the originating tab — is
+**what ships**. It was replaced by clipboard delivery for one day and then restored, and
+the round trip is recorded here because the reasons on both legs are worth keeping.
 
-**What changed.** `screencapture -i -s -d <path>` became `screencapture -i -s -c`: the
-image goes to the **system pasteboard**, nothing is written to disk, and nothing is typed
-into the tab. The user presses `Cmd+V` — which, inside this terminal, lands on the
-existing image-paste path and does what the old model did directly (write a PNG, type its
-path for `claude`/`gemini`).
+**Out (2026-09-23).** On the user's instruction, `-d <path>` became `-c`: the image went
+to the pasteboard, nothing was written or typed, and `Cmd+V` carried it onward. The
+argument for it was reach — an image on the clipboard goes to a browser or a chat, where
+a path typed into one tab only reaches that tab's agent.
 
-**What that costs, stated plainly.** The Goal below says this feature exists for
-"skipping the user's current 'run a capture app → copy → paste into the agent' round
-trip", and the Confirmed Goal says the agent receives a path "with no clipboard
-involvement". The revision **puts that round trip back**, one `Cmd+V` per capture. It was
-chosen anyway, for a reason the original did not weigh: an image on the clipboard can go
-anywhere — a browser, a chat, another editor — where a path typed into one tab can only
-go to that tab's agent.
+**Back (2026-09-24).** Reverted on the user's instruction after using it. The cost the
+original Goal predicted turned out to be the deciding one in practice: *"skipping the
+user's current 'run a capture app → copy → paste into the agent' round trip"*. Clipboard
+delivery put that paste back on every single capture, and that is the step the feature
+exists to remove. Reach was worth less than the keystroke.
 
-**What it does NOT fix.** Measured 2026-09-23: `screencapture -c` is refused on this
-machine exactly as `-d <path>` was (`could not create image from rect`, exit 1). The
-clipboard form needs the same permission. The revision was not a workaround for that and
-does not act as one.
+**What this cost, so the next person weighs it before trying again**: the clipboard leg
+deleted the delivery seam, the cache directory and the file verdict, and restoring them
+was a revert of a ~1500-line change. The `Verdict` enum written for the pasteboard
+comparison went with it. Nothing survives from that leg — the code here is byte-identical
+to what shipped in `16976a2`.
 
-**Decisions superseded** (their reasoning stands for the model they served):
-- **D2** — `-d` is dropped with the file. It was chosen so a denied capture explained
-  itself graphically; measured, its dialog reads "Screenshots are not allowed." and names
-  no permission, application or remedy, so it never delivered that. `-c` replaces `-d`.
-- **D3** — the file-existence verdict is replaced by an `NSPasteboard` `changeCount`
-  comparison, read on the UI thread at press time and again after the child exits. Its
-  rationale transfers: it depends on no undocumented exit code. Its new weakness is named
-  in `Capture::poll` — any other copy during the drag bumps the same counter — and is
-  bounded by the verdict driving nothing but a log line.
-- **D4, D9, D11** — no file is written, so the cache directory, the `capture-<secs>-<seq>`
-  naming, the never-overwrite guard and the "path plus one space" bytes are all gone.
-- **D6, D10, D13** — no bytes are delivered, so the tab-tagged delivery seam
-  (`Overlay::take_pending_write`, `OverlayHost::take_pending_writes`, the
-  `UserEvent::OverlayPending` drain, `AppInner::deliver_to_tab`, `Tabs::deliver`) and the
-  viewport snap were **deleted**, not left orphaned. `clipboard::pasted_dir` is private
-  again. A5's widened invariant is withdrawn with them: nothing but `AppCtx::writer`
-  reaches a PTY again.
+**What was learned and does NOT depend on delivery** — the permission question that
+dominated the day, and which the clipboard swap did not affect either way:
 
-**Decisions that survive unchanged**: D1 (the chord), D5 (watcher thread, injectable
-spawn), D7 (single-flight, 5-minute budget, kill on expiry), D8 (`Consumed` on every
-failure path), D12 (a capture in flight at app exit is abandoned).
-
-**Requirements superseded**: R0.1, R4.*, R7.*, R9.* describe the file-and-path model.
-R0.2, R1.*, R2.1 (argv is now `-i -s -c`), R3.* (verdict by pasteboard, not file), R5.*,
-R6.*, R8.*, R10.1-R10.3, R11.1 hold. R10.4 and R11.2 are gone with the seam they guarded.
-
-**Gaps**: A1 and A2 are unchanged and still unmeasured — the permission question is
-orthogonal to delivery. A4, A5, A6, A7 are withdrawn (no file written outside the
-agent's workspace, no second byte-source, no kill/write race, no display claim to make).
+- `screencapture` needs a **Screen Recording grant**, and it is per-application. Measured
+  2026-09-24: with the grant, `Cmd+Shift+G` works. Without it, every form is refused —
+  `-d <path>` and `-c` alike (`could not create image from rect`, exit 1), from a bare
+  binary, an `.app` bundle and unrelated shells. This settles **A2**: Apple's own signed
+  binary performing the capture is not sufficient.
+- The refusal is **not** self-explaining. `-d` does raise a dialog, but it reads
+  "Screenshots are not allowed." and names no permission, application or remedy — so D2's
+  "explained by Apple's own dialog, naming the right permission" does not hold. A
+  `tracing::warn!` on the no-file path is what reports it now.
+- **A1 remains unmeasured**: the grant was made against an ad-hoc-signed bundle whose
+  identity is recomputed by every `cargo build --release`. Whether it survives a rebuild
+  is still unknown, and is the next cheap thing to measure.
 
 ## Goal
 Add a capture function to the terminal: one key chord runs an interactive region
