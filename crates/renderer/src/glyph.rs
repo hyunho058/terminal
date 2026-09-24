@@ -14,9 +14,25 @@ use crate::font_set::FontData;
 
 /// Synthetic-italic slant applied via a shear transform when no italic face is
 /// available (about 14°, the common oblique angle).
+///
+/// Still the normal path for Hangul: all 18 AppleSDGothicNeo faces are
+/// `style=Normal`, so there is no italic face to prefer over this.
 const ITALIC_SKEW_DEGREES: f32 = 14.0;
-/// Synthetic-bold strength as a fraction of the em size (embolden is applied to
-/// the outline before rasterization when no bold face is available).
+
+/// Synthetic-bold strength as a fraction of the em size, applied to the outline
+/// before rasterization.
+///
+/// **This is a fallback, not the bold path (D1/D9).** When the font file ships a
+/// real bold face — Menlo at face 1, AppleSDGothicNeo at face 6 — the atlas
+/// rasterizes from *that face* and never reaches this constant. It is used only
+/// where a file has no bold face at all, which on this machine means the
+/// second-choice fallbacks (`AppleGothic.ttf`, `SFNSMono.ttf`; see G-A).
+///
+/// **Do not re-tune this value without citing D18's differentiability floor**
+/// (R7.3). It is not a knob for "bold looks too light": emboldening this font is
+/// what *erodes* 593 of 11,172 Hangul syllables instead of thickening them —
+/// 안/간/건/난 lose 86–89% of their ink — because the contour winding makes the
+/// offset outlines cancel. Raising it deepens that hole rather than filling it.
 const BOLD_EMBOLDEN_FRAC: f32 = 0.04;
 
 /// A rasterized glyph: alpha coverage plus placement offsets, in pixels.
@@ -78,20 +94,31 @@ impl GlyphRasterizer {
         self.rasterize_glyph(glyph_id)
     }
 
-    /// Rasterize a specific glyph id (post-shaping) in the regular style. Returns
-    /// `None` for an empty outline (e.g. a space glyph).
+    /// Rasterize a specific glyph id (post-shaping) with **no synthesis**.
+    /// Returns `None` for an empty outline (e.g. a space glyph).
+    ///
+    /// This is now the path a *real* styled face takes: the atlas points a
+    /// rasterizer at Menlo Bold or Gothic Bold and asks for the outline as drawn.
     pub fn rasterize_glyph(&mut self, glyph_id: u16) -> Option<GlyphBitmap> {
-        self.rasterize_glyph_styled(glyph_id, false, false)
+        self.rasterize_glyph_synth(glyph_id, false, false)
     }
 
-    /// Rasterize a glyph id with synthetic bold/italic. `bold` emboldens the
-    /// outline; `italic` applies a shear — both via `swash` synthesis, so no
-    /// separate font face is required (SD3). Regular = `(false, false)`.
-    pub fn rasterize_glyph_styled(
+    /// Rasterize a glyph id, applying the synthesis the **caller** asks for.
+    ///
+    /// The flags say *what to fake*, not *what style the cell is* — that is the
+    /// whole change (D9). Previously this method inferred "bold ⇒ embolden", so
+    /// there was no way to express "this cell is bold and the weight is already
+    /// real". Now the family decides (`FontFamily::resolve_style`) and passes down
+    /// only the leftovers, so bold-italic Hangul arrives here as
+    /// `(synth_bold: false, synth_italic: true)` — real w700 outlines, sheared.
+    ///
+    /// `glyph_id` must be an id in **this rasterizer's own face**; ids are a
+    /// per-face namespace and do not survive a face change (D15).
+    pub fn rasterize_glyph_synth(
         &mut self,
         glyph_id: u16,
-        bold: bool,
-        italic: bool,
+        synth_bold: bool,
+        synth_italic: bool,
     ) -> Option<GlyphBitmap> {
         // Safe to unwrap: validated in `new`.
         let font = FontRef::from_index(&self.data, self.index).unwrap();
@@ -102,10 +129,10 @@ impl GlyphRasterizer {
             .hint(true)
             .build();
         let mut render = Render::new(&[Source::Outline]);
-        if bold {
+        if synth_bold {
             render.embolden(self.ppem * BOLD_EMBOLDEN_FRAC);
         }
-        if italic {
+        if synth_italic {
             render.transform(Some(Transform::skew(
                 Angle::from_degrees(ITALIC_SKEW_DEGREES),
                 Angle::from_degrees(0.0),
@@ -156,10 +183,81 @@ mod tests {
         // Goes through `FontSet` so the primary face's bytes are shared, not read
         // into a `Vec` — the same zero-copy path production uses (D7/R3.2).
         let set = FontSet::load().expect("a monospace system font");
-        let face = set.faces().first().cloned().expect("a primary face");
+        let face = set
+            .families()
+            .first()
+            .map(|f| f.regular().clone())
+            .expect("a primary face");
         let mut r = GlyphRasterizer::new(face.data, face.index, 32.0).expect("valid font");
         let g = r.rasterize('A').expect("glyph A");
         assert!(g.width > 0 && g.height > 0);
         assert_eq!(g.coverage.len(), (g.width * g.height) as usize);
+    }
+
+    /// Coverage-weighted ink: the quantity "bold" is supposed to increase.
+    fn ink(g: &GlyphBitmap) -> f64 {
+        g.coverage.iter().map(|&a| a as f64 / 255.0).sum()
+    }
+
+    fn rasterizer_for(
+        slot: crate::font_set::StyleSlot,
+        family: usize,
+        ppem: f32,
+    ) -> Option<GlyphRasterizer> {
+        let set = FontSet::load().ok()?;
+        let face = set.families().get(family)?.slot(slot)?.clone();
+        GlyphRasterizer::new(face.data, face.index, ppem)
+    }
+
+    #[test]
+    #[ignore = "depends on a system font path; run with --ignored"]
+    fn no_synthesis_is_the_plain_outline() {
+        // The flags mean "fake this", so all-false must be byte-identical to the
+        // unstyled call — otherwise a real styled face would silently get extra
+        // weight applied on top of the weight it already has.
+        let mut r =
+            rasterizer_for(crate::font_set::StyleSlot::Regular, 0, 32.0).expect("a primary face");
+        let gid = r.glyph_id('A');
+        assert_eq!(
+            r.rasterize_glyph(gid),
+            r.rasterize_glyph_synth(gid, false, false)
+        );
+    }
+
+    #[test]
+    #[ignore = "depends on a system font path; run with --ignored"]
+    fn the_real_bold_face_thickens_hangul_where_embolden_erodes_it() {
+        // This is the defect, at the rasterizer level (R0.2/D1). `글` is one of
+        // 593 syllables whose outline swash's `embolden` makes *thinner*, because
+        // offsetting the contours makes the fill cancel rather than grow.
+        use crate::font_set::StyleSlot;
+        let (Some(mut regular), Some(mut bold)) = (
+            rasterizer_for(StyleSlot::Regular, 1, 28.0),
+            rasterizer_for(StyleSlot::Bold, 1, 28.0),
+        ) else {
+            eprintln!("skipping: no Hangul fallback family with a bold face");
+            return;
+        };
+
+        let plain = regular.rasterize('글').expect("regular 글");
+        let gid_reg = regular.glyph_id('글');
+        let synthetic = regular
+            .rasterize_glyph_synth(gid_reg, true, false)
+            .expect("emboldened 글");
+        let gid_bold = bold.glyph_id('글');
+        let real = bold.rasterize_glyph(gid_bold).expect("real bold 글");
+
+        assert!(
+            ink(&synthetic) < ink(&plain),
+            "the bug: embolden ERODES this glyph ({:.1} -> {:.1})",
+            ink(&plain),
+            ink(&synthetic)
+        );
+        assert!(
+            ink(&real) > ink(&plain),
+            "the fix: the real w700 face thickens it ({:.1} -> {:.1})",
+            ink(&plain),
+            ink(&real)
+        );
     }
 }

@@ -263,3 +263,102 @@ fn an_empty_grid_paints_no_ink_at_all() {
         "an empty grid must map to no ink"
     );
 }
+
+// ---- T7: bold reaches the screen, and is heavier when it gets there ---------
+
+/// Ink *quantity* in one cell: how many of its pixels differ from the background.
+///
+/// Deliberately a different measure from [`ink_map`]'s. That map answers "does
+/// this cell carry ink", which is exactly the question that stays green while
+/// every bold glyph on screen is a faint ghost — see this file's header for why
+/// it is written that way, and `specs/real-bold-faces` for what it cannot see.
+/// Bold is a claim about *how much* ink, so it needs counting, not a predicate.
+fn cell_ink(frame: &CapturedFrame, geo: &CellGeometry, col: u16, row: u16) -> u32 {
+    let bg = frame.modal_pixel();
+    let (x0, y0, x1, y1) = geo.cell_rect(col, row, frame);
+    let mut n = 0;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if is_ink(frame.pixel(x, y), bg) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Render one line and report the ink in each of its first `n` cells.
+fn row_ink(r: &mut Renderer, feed: &[u8], n: u16) -> Vec<u32> {
+    let (_, frame) = render(r, feed);
+    let geo = CellGeometry::of(r);
+    (0..n.min(geo.cols()))
+        .map(|col| cell_ink(&frame, &geo, col, 0))
+        .collect()
+}
+
+/// R8.2 — the half of the contract `bold_faces.rs` cannot reach.
+///
+/// That file proves the *glyphs* are right by rasterizing them directly. This one
+/// proves the right glyph reached the **framebuffer**, through `Renderer::capture`
+/// and therefore through shaping, run splitting, the atlas and the draw call. The
+/// two together are what CLAUDE.md means by covering a render-path change: a
+/// decision-level assertion stays correct while the frame it describes is blank.
+#[test]
+fn bold_cells_carry_more_ink_than_regular_ones() {
+    let cfg = Config::default();
+    let Some(mut r) = headless(&cfg) else { return };
+
+    // Same characters, same columns, differing only by SGR bold.
+    let plain = row_ink(&mut r, "한글 ABC".as_bytes(), 7);
+    let bold = row_ink(&mut r, "\x1b[1m한글 ABC".as_bytes(), 7);
+
+    assert_eq!(plain.len(), bold.len());
+    let compared: Vec<(u32, u32)> = plain
+        .iter()
+        .copied()
+        .zip(bold.iter().copied())
+        .filter(|&(p, _)| p > 0) // skip the space and any empty trailing cell
+        .collect();
+    assert!(
+        compared.len() >= 4,
+        "expected several inked cells to compare, got {compared:?}"
+    );
+    for (p, b) in &compared {
+        assert!(
+            b >= p,
+            "a bold cell must never carry LESS ink than the same cell regular \
+             (regular {p}, bold {b}) — that is the 593-syllable erosion, on screen: \
+             {plain:?} vs {bold:?}"
+        );
+    }
+    let total_plain: u32 = compared.iter().map(|&(p, _)| p).sum();
+    let total_bold: u32 = compared.iter().map(|&(_, b)| b).sum();
+    assert!(
+        total_bold > total_plain,
+        "and bold must be visibly heavier overall: {total_plain} vs {total_bold}"
+    );
+}
+
+/// The erosion, stated as the screen would show it (R0.2 at the pixel level).
+///
+/// `안` is one of the 593 syllables `swash`'s `embolden` thins instead of
+/// thickening — it loses 89% of its ink under synthesis. If bold ever routes back
+/// to the synthetic path, this cell goes faint and this test says so.
+#[test]
+fn a_bold_hangul_syllable_that_synthesis_would_erode_stays_solid() {
+    let cfg = Config::default();
+    let Some(mut r) = headless(&cfg) else { return };
+    let plain = row_ink(&mut r, "안간건난".as_bytes(), 8);
+    let bold = row_ink(&mut r, "\x1b[1m안간건난".as_bytes(), 8);
+    for (i, (p, b)) in plain.iter().zip(bold.iter()).enumerate() {
+        if *p == 0 {
+            continue;
+        }
+        assert!(
+            b > p,
+            "cell {i}: bold ink {b} vs regular {p} — this syllable is one of the \
+             ones synthesis erodes, so equal-or-less means the real bold face is \
+             not being used"
+        );
+    }
+}

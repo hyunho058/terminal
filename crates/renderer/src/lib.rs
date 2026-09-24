@@ -42,7 +42,7 @@ use term_core::{Cell, CellAttrs, GridSnapshot};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
-pub use font_set::{FontData, FontFace, FontSet};
+pub use font_set::{FontData, FontFace, FontFamily, FontSet, StyleResolution, StyleSlot};
 
 #[derive(Debug, Error)]
 pub enum RendererError {
@@ -1448,30 +1448,64 @@ pub(crate) fn glyph_color(cell: &Cell) -> [f32; 3] {
 /// [`row_chars`] produces), never raw column numbers: a wide char occupies two
 /// columns but one char, so column-based bounds would desync every run boundary
 /// after the first wide char (R4.3).
+/// Everything about a character that decides **which font file face shapes it**,
+/// plus the synthesis owed afterwards (D4/D15).
+///
+/// The face alone is not enough any more. Two cells can resolve to the same chain
+/// entry and still need different shapers — a bold cell shapes from Menlo Bold
+/// while its neighbour shapes from Menlo Regular, and their glyph ids are
+/// different namespaces. Splitting on the entry alone would shape both with one
+/// face and hand the other's ids to the atlas.
+///
+/// `synth_*` ride along even though they do not affect shaping: keeping them in
+/// the key makes each run uniform in style, so the [`GlyphKey`] is constant for
+/// the whole run instead of being re-derived from each cluster's lead cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RunStyle {
+    /// Chain entry — index into `FontSet::families()`.
+    face: usize,
+    /// Which face *within* that entry shapes and owns the resulting glyph ids.
+    slot: StyleSlot,
+    synth_bold: bool,
+    synth_italic: bool,
+}
+
+/// A maximal span of chars that shape together.
+///
+/// Bounds index the row's **continuation-skipped char sequence** (the order
+/// [`row_chars`] produces), never raw column numbers: a wide char occupies two
+/// columns but one char, so column-based bounds would desync every run boundary
+/// after the first wide char (H-R4.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Run {
-    /// The face every char in the run resolved to. `None` = no face covers them,
-    /// so the run draws nothing at all (D5/R4.2).
-    face: Option<usize>,
+    /// The resolved style every char in the run shares. `None` = no face covers
+    /// them, so the run draws nothing at all (H-D5/H-R4.2).
+    style: Option<RunStyle>,
     start_char: usize,
     /// Exclusive.
     end_char: usize,
 }
 
-/// Group a row's per-char face resolutions into maximal same-face runs (D16/R4.1).
+/// Group a row's per-char resolutions into maximal same-`RunStyle` runs
+/// (H-D16/H-R4.1, narrowed by D4/D15).
 ///
 /// The Confirmed Goal's "pick a font per cluster" is circular — a cluster is an
 /// *output* of shaping, so the shaping font cannot be chosen from it. The real
-/// order is: resolve each **char** to a face, group consecutive equal faces, then
-/// shape each group with that face's `FontRef`. Pure, so the grouping rule is
-/// table-testable with no GPU, font, or snapshot.
-fn split_runs(faces: &[Option<usize>]) -> Vec<Run> {
+/// order is: resolve each **char** to a face *and slot*, group consecutive equal
+/// resolutions, then shape each group with that slot's `FontRef`. Pure, so the
+/// grouping rule is table-testable with no GPU, font, or snapshot.
+///
+/// A run breaks wherever the *resolved* style changes — which is not the same as
+/// wherever the *requested* style changes. Italic text containing a character the
+/// italic face lacks splits at that character, because it alone shapes from the
+/// regular face (D7/R4.1).
+fn split_runs(styles: &[Option<RunStyle>]) -> Vec<Run> {
     let mut runs: Vec<Run> = Vec::new();
-    for (i, &face) in faces.iter().enumerate() {
+    for (i, &style) in styles.iter().enumerate() {
         match runs.last_mut() {
-            Some(run) if run.face == face => run.end_char = i + 1,
+            Some(run) if run.style == style => run.end_char = i + 1,
             _ => runs.push(Run {
-                face,
+                style,
                 start_char: i,
                 end_char: i + 1,
             }),
@@ -1488,6 +1522,20 @@ struct RowChars {
     /// `char_col[i]` is the absolute column of `chars[i]` — the anchor its cluster
     /// is placed at (R4.5). Wide chars leave a gap: `한a` → `[0, 2]`.
     char_col: Vec<u16>,
+}
+
+/// The `(bold, italic)` a cell asks for — what the *cell* wants, before any
+/// question of whether a real face can supply it (D7/D9).
+///
+/// Read once per char during the resolve pass rather than per cluster after
+/// shaping, because it selects the face the shaper is built from (D4).
+fn cell_style(snapshot: &GridSnapshot, col: u16, row: u16) -> (bool, bool) {
+    snapshot.cell(col, row).map_or((false, false), |c| {
+        (
+            c.attrs.contains(CellAttrs::BOLD),
+            c.attrs.contains(CellAttrs::ITALIC),
+        )
+    })
 }
 
 /// Whether `(col, row)` holds the trailing spacer of a double-width char.
@@ -1585,39 +1633,60 @@ fn build_glyph_instances(
     let mut procedural: Vec<(box_draw::Glyph, u16, u16)> = Vec::new();
     for row in 0..snapshot.rows {
         let RowChars { chars, char_col } = row_chars(snapshot, row);
-        // Resolve every char to a face first (D2/D16): `resolve` borrows the atlas
-        // immutably while the shaping closure below borrows it mutably, and the
-        // face is an *input* to shaping, so it has to be decided up front.
-        let mut faces: Vec<Option<usize>> = chars
+        // Resolve every char to a face *and slot* first (H-D2/H-D16, D4): `resolve`
+        // borrows the atlas immutably while the shaping closure below borrows it
+        // mutably, and the resolved face is an *input* to shaping, so it has to be
+        // decided up front.
+        //
+        // The style comes from the cell here, not from the cluster later. It has to:
+        // it selects the face the shaper is built from, and a shaper cannot be
+        // chosen from its own output (D4/D15).
+        let mut styles: Vec<Option<RunStyle>> = chars
             .iter()
-            .map(|&c| atlas.resolve(c).map(|key| key.face as usize))
+            .enumerate()
+            .map(|(i, &c)| {
+                let (bold, italic) = cell_style(snapshot, char_col[i], row);
+                atlas.resolve(c, bold, italic).map(|key| RunStyle {
+                    face: key.face as usize,
+                    slot: key.slot,
+                    synth_bold: key.synth_bold,
+                    synth_italic: key.synth_italic,
+                })
+            })
             .collect();
-        // D8: take box-drawing characters out of the shaping input by marking their
-        // face `None` — `split_runs` then yields a run the loop below already skips.
-        // Marking rather than *removing* is what keeps `chars`, `char_col` and the
-        // run-relative byte map in sync; deleting an element would desync every
-        // column after it (the hazard documented at the byte_col build below).
+        // H-D8: take box-drawing characters out of the shaping input by marking
+        // their style `None` — `split_runs` then yields a run the loop below already
+        // skips. Marking rather than *removing* is what keeps `chars`, `char_col`
+        // and the run-relative byte map in sync; deleting an element would desync
+        // every column after it (the hazard documented at the byte_col build below).
         //
         // Splitting a face-0 run here moves nothing: `pen` is reset per cluster to
         // `col * cw + offset`, and `center_offset(0, ..)` is always 0.0.
         for (i, &c) in chars.iter().enumerate() {
             if let Some(glyph) = box_draw::classify(c) {
-                faces[i] = None;
+                styles[i] = None;
                 procedural.push((glyph, char_col[i], row));
             }
         }
         let baseline = row as f32 * ch + ascent;
 
-        for run in split_runs(&faces) {
-            // D5/R4.2: no face covers these chars — emit nothing rather than a wall
-            // of tofu. (In degraded mode `resolve` answers face 0 instead, so the
-            // primary's `.notdef` still draws and the missing font stays visible.)
-            let Some(face_index) = run.face else {
+        for run in split_runs(&styles) {
+            // H-D5/H-R4.2: no face covers these chars — emit nothing rather than a
+            // wall of tofu. (In degraded mode `resolve` answers face 0 instead, so
+            // the primary's `.notdef` still draws and the missing font stays
+            // visible.)
+            let Some(style) = run.style else {
                 continue;
             };
+            let face_index = style.face;
+            // D4: the shaper is built from the **slot's** face, not the family's
+            // regular one. Shaping Menlo Regular and then rasterizing the result
+            // from Menlo Italic would draw the wrong glyphs outright — 1,712 of
+            // 2,116 codepoints have different ids between those two faces.
             let Some(font) = fonts
-                .faces()
+                .families()
                 .get(face_index)
+                .and_then(|family| family.slot(style.slot))
                 .and_then(|face| FontRef::from_index(&face.data, face.index))
             else {
                 continue;
@@ -1646,30 +1715,33 @@ fn build_glyph_instances(
             shaper.shape_with(|cluster| {
                 let src = cluster.source.start as usize;
                 let col = byte_col.get(src).copied().unwrap_or(0);
-                // Style comes from the cluster's lead cell (D11): color (reverse/dim)
-                // and the bold/italic that select a synthesized, separately-cached glyph.
-                let (color, bold, italic) = match snapshot.cell(col, row) {
-                    Some(c) => (
-                        glyph_color(c),
-                        c.attrs.contains(CellAttrs::BOLD),
-                        c.attrs.contains(CellAttrs::ITALIC),
-                    ),
-                    None => ([1.0; 3], false, false),
-                };
+                // Colour still comes from the cluster's lead cell (H-D11) — it is a
+                // per-cell property that does not affect shaping.
+                //
+                // The *style* no longer does, and that is the T4 change: it was
+                // read here, after the shaper had already been built from the
+                // regular face. It now lives on the run, decided before shaping,
+                // because it chooses which face shapes at all (D4). Every cell in
+                // this run shares it by construction of `split_runs`.
+                let color = snapshot.cell(col, row).map_or([1.0; 3], glyph_color);
                 // D6: a fallback cluster is centered in the span its lead cell
                 // covers; face 0 keeps `pen == col * cw` exactly as before (R4.8).
                 let adv: f32 = cluster.glyphs.iter().map(|g| g.advance).sum();
                 let offset = center_offset(face_index, cell_span(snapshot, col, row), cw, adv);
                 let mut pen = col as f32 * cw + offset;
                 for g in cluster.glyphs {
-                    // The face is the run's, not a guess: glyph ids are per-font
-                    // namespaces, so a key without it would draw the primary's
-                    // gid N for the fallback's gid N (D7/R3.1).
+                    // The whole key is the run's, not a guess. Glyph ids are a
+                    // per-*face* namespace, and the face is `(entry, slot)` — so
+                    // `slot` has to travel with `id` exactly as `face` does, or the
+                    // atlas rasterizes this id from the wrong face (H-D7/H-R3.1,
+                    // D15). `g.id` came from the shaper built on `style.slot`'s
+                    // face just above, so the two agree by construction.
                     let key = GlyphKey {
                         face: face_index as u16,
+                        slot: style.slot,
                         id: g.id,
-                        bold,
-                        italic,
+                        synth_bold: style.synth_bold,
+                        synth_italic: style.synth_italic,
                     };
                     if let Some(entry) = atlas.get_or_insert_styled(queue, key) {
                         out.push(GlyphInstance {
@@ -1986,7 +2058,11 @@ mod tests {
     /// The primary face of the loaded chain (T2). `None` when no system font is
     /// available, which the GPU-dependent tests below treat as "skip".
     fn primary_face() -> Option<FontFace> {
-        FontSet::load().ok()?.faces().first().cloned()
+        FontSet::load()
+            .ok()?
+            .families()
+            .first()
+            .map(|f| f.regular().clone())
     }
 
     /// The loaded fallback chain (T2/T3) — what `Atlas::new` now takes. `None`
@@ -2231,14 +2307,18 @@ mod tests {
             return;
         };
         let atlas = Atlas::new(&device, &fonts, 32.0).expect("atlas");
-        let latin = atlas.resolve('A').expect("the primary covers 'A'");
+        let latin = atlas
+            .resolve('A', false, false)
+            .expect("the primary covers 'A'");
         assert_eq!(latin.face, 0, "Latin must keep using the primary face");
         assert_ne!(latin.id, 0);
         if atlas.is_degraded() {
             eprintln!("skipping the fallback half: no Hangul face on this machine");
             return;
         }
-        let hangul = atlas.resolve('한').expect("some face covers U+D55C");
+        let hangul = atlas
+            .resolve('한', false, false)
+            .expect("some face covers U+D55C");
         assert_ne!(hangul.face, 0, "Hangul must come from a fallback face");
         assert_ne!(hangul.id, 0, "and from a real glyph, not .notdef (R0.2)");
     }
@@ -2255,11 +2335,15 @@ mod tests {
         // A private-use codepoint no system font maps.
         let uncovered = '\u{F8FF0}';
         if !atlas.is_degraded() {
-            assert_eq!(atlas.resolve(uncovered), None, "R2.4: nothing to draw");
+            assert_eq!(
+                atlas.resolve(uncovered, false, false),
+                None,
+                "R2.4: nothing to draw"
+            );
         }
         atlas.degrade_for_test();
         assert_eq!(
-            atlas.resolve(uncovered),
+            atlas.resolve(uncovered, false, false),
             Some(GlyphKey::plain(0)),
             "R2.5: degraded mode keeps the primary .notdef"
         );
@@ -2278,7 +2362,9 @@ mod tests {
             eprintln!("skipping: no fallback face on this machine");
             return;
         }
-        let primary = atlas.resolve('A').expect("the primary covers 'A'");
+        let primary = atlas
+            .resolve('A', false, false)
+            .expect("the primary covers 'A'");
         let same_id_elsewhere = GlyphKey { face: 1, ..primary };
         let before = atlas.cached_len();
         let a = atlas.get_or_insert_styled(&queue, primary);
@@ -2335,37 +2421,148 @@ mod tests {
         assert!(inst.iter().all(|g| g.size[0] > 0.0 && g.size[1] > 0.0));
     }
 
+    /// A `RunStyle` naming only a chain entry — the shape every pre-style test
+    /// meant when it wrote `Some(0)`.
+    fn plain_run(face: usize) -> Option<RunStyle> {
+        Some(RunStyle {
+            face,
+            slot: StyleSlot::Regular,
+            synth_bold: false,
+            synth_italic: false,
+        })
+    }
+
+    /// Glyph instances for one line of text, optionally bolded via SGR (T4).
+    fn styled_instances(
+        atlas: &mut Atlas,
+        queue: &wgpu::Queue,
+        fonts: &FontSet,
+        bold: bool,
+        text: &str,
+    ) -> Vec<GlyphInstance> {
+        let mut t = term_core::Terminal::new(8, 1, term_core::Color(0xFFFFFF), term_core::Color(0));
+        if bold {
+            t.advance(b"\x1b[1m");
+        }
+        t.advance(text.as_bytes());
+        let snap = t.snapshot();
+        build_glyph_instances(atlas, queue, fonts, true, (20.0, 40.0), 32.0, &snap)
+    }
+
+    #[test]
+    fn bold_hangul_is_shaped_and_rasterized_from_the_bold_face() {
+        // R0.1 end to end, through the production path rather than the resolver.
+        // Before T4 this test could not distinguish anything: the run was shaped
+        // from the regular face either way and only the synthesis flag differed.
+        let (Some((device, queue)), Some(fonts)) = (headless(), fonts()) else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let mut atlas = Atlas::new(&device, &fonts, 32.0).expect("atlas");
+        if atlas.is_degraded() {
+            eprintln!("skipping: no Hangul fallback on this machine");
+            return;
+        }
+        assert_eq!(
+            atlas.resolve('한', true, false).map(|k| k.slot),
+            Some(StyleSlot::Bold),
+            "precondition: bold 한 must resolve to a real bold face, or this test \
+             proves nothing"
+        );
+
+        let plain = styled_instances(&mut atlas, &queue, &fonts, false, "한");
+        let bold = styled_instances(&mut atlas, &queue, &fonts, true, "한");
+        assert!(!plain.is_empty() && !bold.is_empty(), "both must draw");
+
+        // Different faces ⇒ different rasterized bitmaps ⇒ different atlas rects.
+        assert_ne!(
+            (plain[0].uv0, plain[0].uv1),
+            (bold[0].uv0, bold[0].uv1),
+            "bold must come from a different face's outline, not the same glyph"
+        );
+        // R4.3: and it must not move. Cell width is wcwidth's, not the font's, and
+        // Hangul advances are identical between the two faces (D16).
+        // R4.3: bolding must not *move* the character, only thicken it. Asserting
+        // equal `pos[0]` would be wrong — a heavier glyph has a wider bitmap and a
+        // smaller left bearing, so its origin legitimately shifts. What must hold
+        // is that it grows **symmetrically** about the same centre: measured here,
+        // plain is 26px wide at x=7.16 and bold is 28px at x=6.16, so both centre
+        // on 20.16. A bold glyph drifting inside its cell would show up as a
+        // centre that moved.
+        let centre = |g: &GlyphInstance| g.pos[0] + g.size[0] / 2.0;
+        assert!(
+            (centre(&plain[0]) - centre(&bold[0])).abs() < 0.01,
+            "bold must grow about the same centre, not drift: plain centre {}, \
+             bold centre {}",
+            centre(&plain[0]),
+            centre(&bold[0])
+        );
+        assert!(
+            bold[0].size[0] > plain[0].size[0],
+            "and the real bold face must actually be wider"
+        );
+    }
+
+    #[test]
+    fn a_row_mixing_styles_still_places_every_glyph_on_its_own_column() {
+        // R4.1: the run now breaks at the style boundary, so this row shapes as
+        // several runs instead of one. Placement is anchored per cluster at
+        // `col * cw`, so splitting must not move anything.
+        let (Some((device, queue)), Some(fonts)) = (headless(), fonts()) else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let mut atlas = Atlas::new(&device, &fonts, 32.0).expect("atlas");
+        let mut t = term_core::Terminal::new(8, 1, term_core::Color(0xFFFFFF), term_core::Color(0));
+        t.advance(b"a\x1b[1mb\x1b[0mc");
+        let snap = t.snapshot();
+        let inst =
+            build_glyph_instances(&mut atlas, &queue, &fonts, true, (20.0, 40.0), 32.0, &snap);
+        assert_eq!(inst.len(), 3, "three visible cells, three quads");
+        let xs: Vec<f32> = inst.iter().map(|g| g.pos[0]).collect();
+        assert!(
+            xs.windows(2).all(|w| w[1] > w[0]),
+            "glyphs must stay in column order across run boundaries: {xs:?}"
+        );
+    }
+
     #[test]
     fn split_runs_groups_consecutive_same_face() {
-        // R4.1: maximal runs — the same face returning later starts a NEW run, it
+        // H-R4.1: maximal runs — the same face returning later starts a NEW run, it
         // does not rejoin the earlier one (shaping is per contiguous span).
-        let faces = [Some(0), Some(0), Some(1), Some(1), Some(0)];
+        let styles = [
+            plain_run(0),
+            plain_run(0),
+            plain_run(1),
+            plain_run(1),
+            plain_run(0),
+        ];
         assert_eq!(
-            split_runs(&faces),
+            split_runs(&styles),
             vec![
                 Run {
-                    face: Some(0),
+                    style: plain_run(0),
                     start_char: 0,
                     end_char: 2
                 },
                 Run {
-                    face: Some(1),
+                    style: plain_run(1),
                     start_char: 2,
                     end_char: 4
                 },
                 Run {
-                    face: Some(0),
+                    style: plain_run(0),
                     start_char: 4,
                     end_char: 5
                 },
             ]
         );
-        // The R0.3 shape: an all-primary row is ONE run over the whole row, so it
-        // is shaped exactly as the single-font path shaped it.
+        // The H-R0.3 shape: an all-primary unstyled row is ONE run over the whole
+        // row, so it is shaped exactly as the single-font path shaped it.
         assert_eq!(
-            split_runs(&[Some(0); 5]),
+            split_runs(&[plain_run(0); 5]),
             vec![Run {
-                face: Some(0),
+                style: plain_run(0),
                 start_char: 0,
                 end_char: 5
             }]
@@ -2375,14 +2572,124 @@ mod tests {
 
     #[test]
     fn split_runs_isolates_uncovered_chars() {
-        // R4.2: `None` (no face covers it) is a face value like any other — such
-        // chars group together and the caller emits nothing for them (D5).
-        let runs = split_runs(&[Some(0), None, None, Some(1)]);
+        // H-R4.2: `None` (no face covers it) is a value like any other — such chars
+        // group together and the caller emits nothing for them (H-D5).
+        let runs = split_runs(&[plain_run(0), None, None, plain_run(1)]);
         assert_eq!(runs.len(), 3);
-        assert_eq!(runs[1].face, None);
+        assert_eq!(runs[1].style, None);
         assert_eq!((runs[1].start_char, runs[1].end_char), (1, 3));
         // Two different covered faces never merge just because neither is `None`.
-        assert_eq!(split_runs(&[Some(1), Some(2)]).len(), 2);
+        assert_eq!(split_runs(&[plain_run(1), plain_run(2)]).len(), 2);
+    }
+
+    #[test]
+    fn ligatures_shape_identically_from_a_styled_face() {
+        // R4.4/D17. Splitting runs by slot means a bold run is shaped by a
+        // *different font file face* than its regular neighbour. If that face
+        // carried a different ligature set, `!=` would collapse to one glyph in
+        // one weight and stay two in the other, and the two lines would no longer
+        // align column-for-column. Measured here rather than assumed.
+        let Some(fonts) = fonts() else {
+            eprintln!("skipping: no font");
+            return;
+        };
+        let mut ctx = ShapeContext::new();
+        let features = [("liga", 1u16), ("calt", 1u16)];
+        // Counted, because a test that compares nothing must not report success.
+        // Skipping when the *font* is absent is legitimate; skipping when the font
+        // loaded and its bold slot is empty is the bug this suite exists to catch,
+        // so that case asserts instead of continuing (same rule as
+        // `bold_faces.rs::pair`, which this test originally failed to follow).
+        let mut compared = 0;
+        for (label, family_index, text) in [
+            ("Menlo", 0usize, "!= => -> <= fi fl ff"),
+            ("Gothic", 1usize, "한글 볼드 테스트"),
+        ] {
+            let Some(family) = fonts.families().get(family_index) else {
+                continue; // no such chain entry on this machine — a real skip
+            };
+            let bold_face = family.slot(StyleSlot::Bold).unwrap_or_else(|| {
+                panic!(
+                    "{label} loaded but has no real bold face — the style probe has \
+                     regressed to synthesis (real slots: {:?})",
+                    family.real_slots()
+                )
+            });
+            compared += 1;
+            let mut shape = |face: &crate::FontFace| -> (usize, usize, f32) {
+                let font = FontRef::from_index(&face.data, face.index).expect("face");
+                let mut s = ctx
+                    .builder(font)
+                    .size(32.0)
+                    .features(features.iter().copied())
+                    .build();
+                s.add_str(text);
+                let (mut clusters, mut glyphs, mut adv) = (0, 0, 0.0f32);
+                s.shape_with(|c| {
+                    clusters += 1;
+                    glyphs += c.glyphs.len();
+                    adv += c.glyphs.iter().map(|g| g.advance).sum::<f32>();
+                });
+                (clusters, glyphs, adv)
+            };
+            let regular = shape(family.regular());
+            let bold = shape(bold_face);
+            assert_eq!(
+                (regular.0, regular.1),
+                (bold.0, bold.1),
+                "{label}: regular and bold must produce the same cluster/glyph \
+                 structure for {text:?}"
+            );
+            assert!(
+                (regular.2 - bold.2).abs() < 0.01,
+                "{label}: total advance must match ({} vs {})",
+                regular.2,
+                bold.2
+            );
+        }
+        assert!(
+            compared > 0,
+            "no family was actually compared — this test asserted nothing"
+        );
+    }
+
+    #[test]
+    fn split_runs_breaks_where_the_slot_changes_not_just_the_face() {
+        // D4/R4.1 — the T4 change. These three chars are all on chain entry 0, so
+        // the old face-only key made them ONE run and shaped them with one face.
+        // They need three shapers: bold, regular, bold-italic are three different
+        // font files' worth of glyph ids.
+        let styled = |slot, sb, si| {
+            Some(RunStyle {
+                face: 0,
+                slot,
+                synth_bold: sb,
+                synth_italic: si,
+            })
+        };
+        let runs = split_runs(&[
+            styled(StyleSlot::Bold, false, false),
+            styled(StyleSlot::Regular, false, false),
+            styled(StyleSlot::BoldItalic, false, false),
+        ]);
+        assert_eq!(runs.len(), 3, "same face, three slots, three runs");
+
+        // And the subtle one: same *requested* style, different *resolved* slot.
+        // Italic text containing a char the italic face lacks splits there, because
+        // that char alone shapes from the regular face with a shear (D7/R3.2).
+        let runs = split_runs(&[
+            styled(StyleSlot::Italic, false, false),
+            styled(StyleSlot::Regular, false, true), // the hole
+            styled(StyleSlot::Italic, false, false),
+        ]);
+        assert_eq!(runs.len(), 3, "a coverage hole breaks the run");
+
+        // Synthesis differences split too, so a run's GlyphKey is constant.
+        let runs = split_runs(&[
+            styled(StyleSlot::Regular, false, false),
+            styled(StyleSlot::Regular, true, false),
+        ]);
+        assert_eq!(runs.len(), 2);
     }
 
     #[test]
@@ -2444,7 +2751,11 @@ mod tests {
             eprintln!("skipping: no GPU/font");
             return;
         };
-        let face = fonts.faces().first().cloned().expect("a primary face");
+        let face = fonts
+            .families()
+            .first()
+            .map(|f| f.regular().clone())
+            .expect("a primary face");
         let mut atlas = Atlas::new(&device, &fonts, 32.0).expect("atlas");
         let mut t =
             term_core::Terminal::new(12, 2, term_core::Color(0xFFFFFF), term_core::Color(0));
@@ -2497,8 +2808,9 @@ mod tests {
                     let key = GlyphKey {
                         face: 0,
                         id: g.id,
-                        bold,
-                        italic,
+                        slot: StyleSlot::Regular,
+                        synth_bold: bold,
+                        synth_italic: italic,
                     };
                     if let Some(entry) = atlas.get_or_insert_styled(&queue, key) {
                         want.push(GlyphInstance {
@@ -2648,7 +2960,9 @@ mod tests {
         // The sibling text path resolves box characters to a real rasterized glyph
         // — a UV *rect*, where a procedural quad collapses to one sampled point.
         for ch in ['─', '│', '█'] {
-            let key = atlas.resolve(ch).expect("the primary covers the range");
+            let key = atlas
+                .resolve(ch, false, false)
+                .expect("the primary covers the range");
             let entry = atlas
                 .get_or_insert_styled(&queue, key)
                 .unwrap_or_else(|| panic!("{ch:?} must rasterize for the text layers"));
@@ -2872,16 +3186,27 @@ mod tests {
             let RowChars { chars, char_col } = row_chars(snapshot, row);
             // Pre-change behaviour: no interception, so a box char the primary
             // covers joins the surrounding face-0 run instead of splitting it.
-            let faces: Vec<Option<usize>> = chars
+            let styles: Vec<Option<RunStyle>> = chars
                 .iter()
-                .map(|&c| atlas.resolve(c).map(|key| key.face as usize))
+                .enumerate()
+                .map(|(i, &c)| {
+                    let (bold, italic) = cell_style(snapshot, char_col[i], row);
+                    atlas.resolve(c, bold, italic).map(|key| RunStyle {
+                        face: key.face as usize,
+                        slot: key.slot,
+                        synth_bold: key.synth_bold,
+                        synth_italic: key.synth_italic,
+                    })
+                })
                 .collect();
             let baseline = row as f32 * ch + ascent;
-            for run in split_runs(&faces) {
-                let Some(face_index) = run.face else { continue };
+            for run in split_runs(&styles) {
+                let Some(style) = run.style else { continue };
+                let face_index = style.face;
                 let Some(font) = fonts
-                    .faces()
+                    .families()
                     .get(face_index)
+                    .and_then(|family| family.slot(style.slot))
                     .and_then(|face| FontRef::from_index(&face.data, face.index))
                 else {
                     continue;
@@ -2914,14 +3239,7 @@ mod tests {
                     if procedural {
                         return;
                     }
-                    let (color, bold, italic) = match snapshot.cell(col, row) {
-                        Some(c) => (
-                            glyph_color(c),
-                            c.attrs.contains(CellAttrs::BOLD),
-                            c.attrs.contains(CellAttrs::ITALIC),
-                        ),
-                        None => ([1.0; 3], false, false),
-                    };
+                    let color = snapshot.cell(col, row).map_or([1.0; 3], glyph_color);
                     let adv: f32 = cluster.glyphs.iter().map(|g| g.advance).sum();
                     let offset = center_offset(face_index, cell_span(snapshot, col, row), cw, adv);
                     let mut pen = col as f32 * cw + offset;
@@ -2929,8 +3247,9 @@ mod tests {
                         let key = GlyphKey {
                             face: face_index as u16,
                             id: g.id,
-                            bold,
-                            italic,
+                            slot: style.slot,
+                            synth_bold: style.synth_bold,
+                            synth_italic: style.synth_italic,
                         };
                         if let Some(entry) = atlas.get_or_insert_styled(queue, key) {
                             out.push(GlyphInstance {
@@ -2981,7 +3300,7 @@ mod tests {
         );
         for &c in &box_chars {
             assert!(
-                atlas.resolve(c).is_some(),
+                atlas.resolve(c, false, false).is_some(),
                 "{input:?}: the primary face does not cover {c:?}, so the reference \
                  run would split anyway and this comparison proves nothing"
             );
@@ -3202,8 +3521,9 @@ mod tests {
                             GlyphKey {
                                 face: 0,
                                 id: gid,
-                                bold,
-                                italic,
+                                slot: StyleSlot::Regular,
+                                synth_bold: bold,
+                                synth_italic: italic,
                             },
                         );
                     }
@@ -3352,7 +3672,9 @@ mod tests {
         // The face a Hangul syllable resolves to must not be the primary — that is
         // the whole point of the fallback chain (a tab title like `~/문서/프로젝트`
         // used to render as `.notdef` boxes).
-        let key = atlas.resolve('한').expect("한 resolves to some face");
+        let key = atlas
+            .resolve('한', false, false)
+            .expect("한 resolves to some face");
         assert_ne!(key.face, 0, "Hangul must come from a fallback face");
         assert_ne!(key.id, 0, "and must not be .notdef");
 
@@ -3402,8 +3724,9 @@ mod tests {
                 let key = GlyphKey {
                     face: 0,
                     id: gid,
-                    bold,
-                    italic,
+                    slot: StyleSlot::Regular,
+                    synth_bold: bold,
+                    synth_italic: italic,
                 };
                 let _ = atlas.get_or_insert_styled(&queue, key); // must never panic
             }

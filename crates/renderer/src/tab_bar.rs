@@ -87,7 +87,8 @@ pub(crate) fn layout_line(
     mut emit: impl FnMut(f32, GlyphEntry),
 ) {
     for (c, pen) in pen_layout(s, start_x, cell_w) {
-        if let Some(key) = ctx.atlas.resolve(c) {
+        // Tab-bar text carries no SGR style of its own (D3/R3.5).
+        if let Some(key) = ctx.atlas.resolve(c, false, false) {
             if let Some(e) = ctx.atlas.get_or_insert_styled(ctx.queue, key) {
                 emit(pen, e);
             }
