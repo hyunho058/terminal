@@ -161,6 +161,57 @@ idle behaviour. See G1 for what the caches do and do not buy against it.
   table-plus-promotion behaviour with nothing to say about it. Two counters reading 0 for a long
   time is the signal to suspect the gate first. The fallback is byte-identical to the pre-feature
   path, which is why the failure is quiet rather than wrong — and why it needs to be written down.
+- **G7** A Screen Recording (TCC) grant **does not survive a rebuild**, so region-capture's
+  chord stops working after every `cargo build --release` until the user re-grants.
+  Measured 2026-09-24 on macOS 26.6.2 (25G83), a clean before/after with one variable:
+  the bundle built at 10:27 was granted and captured fine; the bundle rebuilt at 15:48
+  from the same source tree was refused twice, with the same dialog and the same
+  `could not create image from rect` on stderr. This closes `specs/region-capture`'s **A1**,
+  and the answer is the pessimistic one the spec anticipated.
+  **Why**: `scripts/bundle-app.sh` builds an unsigned, un-notarized bundle by explicit
+  non-goal, so the binary is only *ad-hoc* signed. TCC then binds the grant to the code
+  hash (`CDHash`), which every source change moves. The bundle **identifier** is stable
+  (`app-b6f169459d22e7a1` across the rebuild) and that is a trap — it is not what TCC keys
+  on, and reading it as reassurance is how this gap was mis-called once already.
+  **Confirmed a fourth time, and this is how the debugging went wrong.** The bundle in
+  `/Applications` was installed at 17:12 and granted; its binary was then overwritten at
+  19:15 by the next `cargo build` before the chord was tried again. Six separate causes
+  were proposed and eliminated over two days — bundle recreation, a signing identity, a
+  stale process, responsible-process attribution, the build directory, duplicate bundle
+  identifiers — and every one of those eliminations was performed *after a rebuild that
+  had already voided the grant*. The variable under test was never the one being changed.
+  **The remedy named first here was tried and it did not work.** A self-signed
+  code-signing certificate was created in the login keychain and `bundle-app.sh` pointed
+  at it; `spctl` then rejected the bundle, the trust settings were user-level only (no
+  `sudo`), and the grant still did not bind. The bundle was reverted to ad-hoc. A stable
+  signing identity is still the shape of the fix, but a self-signed cert in a login
+  keychain is *not* a working instance of it — do not spend the afternoon again.
+  **The oracle to use instead of inference.** `capture::log_screen_capture_access` calls
+  `CGPreflightScreenCaptureAccess()` at startup and logs whether *this process* holds the
+  grant. It was validated against a controlled negative: a shell with no grant reports
+  `NOT-GRANTED` and fails both `screencapture -x file` and `-x -c` with `could not create
+  image from display`. Read that line first; it answers in one line what four retracted
+  theories could not.
+  **Working around it today**: re-grant after every `cargo build --release`, or use
+  `Cmd+Shift+4` then `Cmd+V` — image-paste writes the PNG and types its path, which is
+  the same end state the chord produces.
+  **A2 is closed by the same session and in the other direction**: the grant IS required.
+  With it the chord works; without it every invocation form is refused — a file target and
+  `-c` alike, from a bare binary, an `.app` bundle and unrelated shells. Apple's own signed
+  binary performing the capture is not sufficient on its own. The clipboard destination is
+  **not** a way around the grant, which is worth stating because it looked like one: under
+  `-c` no file is ever written, so `verdict` reports `NoFile` whether the capture succeeded
+  or was refused, and a refused clipboard capture is indistinguishable from a working one
+  in the log.
+  **Two traps in `screencapture` itself, since between them they cost the session.** First,
+  `-d` is *"display errors to the user graphically"* — it takes no argument, and the file is
+  the bare positional `file` in `screencapture [-flags] file`. Reading `-d <path>` as a
+  destination flag is wrong and the argv in `capture_args` only looks like it has one.
+  Second, the refusal does not name itself: `-d` raises a dialog reading "Screenshots are
+  not allowed.", which names no permission, no application and no remedy, and
+  `screencapture` carries ten `ScreenshotError` cases whose stderr strings do not map
+  one-to-one onto it. `capture.rs`'s `tracing::warn!` on the no-file path
+  exists because of this; without it the chord just silently does nothing.
 - **G2** ~~Inline-image protocol undecided~~ — **resolved**: the Kitty graphics-APC
   protocol shipped (`term-core::image::parse_graphics_apc`).
 - **G3** ~~Glyph atlas not yet wired into the shader~~ — **resolved**: glyphs render

@@ -44,9 +44,23 @@ dominated the day, and which the clipboard swap did not affect either way:
   "Screenshots are not allowed." and names no permission, application or remedy — so D2's
   "explained by Apple's own dialog, naming the right permission" does not hold. A
   `tracing::warn!` on the no-file path is what reports it now.
-- **A1 remains unmeasured**: the grant was made against an ad-hoc-signed bundle whose
-  identity is recomputed by every `cargo build --release`. Whether it survives a rebuild
-  is still unknown, and is the next cheap thing to measure.
+- **A1 is now MEASURED, 2026-09-24, and the answer is no.** The grant does **not** survive
+  a rebuild. Clean before/after, one variable: the bundle built at 10:27 was granted and
+  captured fine; the same source tree rebuilt at 15:48 was refused twice. TCC binds an
+  ad-hoc-signed app's grant to its `CDHash`, which every source change moves — so the chord
+  dies on every `cargo build --release` until the user re-grants. The bundle *identifier* is
+  stable across rebuilds and is a trap: it is not what TCC keys on. Recorded as **G7** in
+  `docs/architecture.md`. The remedy — a stable signing identity for `bundle-app.sh` — is a
+  build change, not a feature change, and remains its own piece of work as the original
+  Post-work note said — but **the obvious instance of it was tried and failed**: a
+  self-signed certificate in the login keychain made `spctl` reject the bundle and the
+  grant still did not bind. See `docs/architecture.md` G7 before attempting it again.
+- **The oracle that should have come first.** `capture::log_screen_capture_access` calls
+  `CGPreflightScreenCaptureAccess()` once at startup and logs whether *this process* holds
+  the grant. Six causes were proposed and retracted before anything asked that question,
+  and each retraction was itself invalid: every one of those tests ran against a bundle
+  rebuilt after the grant, so it re-measured A1 rather than the variable it named. The
+  diagnostic is the durable part of that mistake — the rest was a day.
 
 ## Goal
 Add a capture function to the terminal: one key chord runs an interactive region

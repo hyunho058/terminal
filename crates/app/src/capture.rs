@@ -216,6 +216,42 @@ const BUDGET: Duration = Duration::from_secs(300);
 /// the watcher thread — never the UI thread — twenty wakeups a second.
 const TICK: Duration = Duration::from_millis(50);
 
+extern "C" {
+    /// Does **this process** hold the macOS Screen Recording (TCC) grant?
+    ///
+    /// `CGPreflightScreenCaptureAccess` is public CoreGraphics API (10.15+), declared here
+    /// rather than pulled in as a crate because C1 forbids a new dependency and the
+    /// framework is already linked — `otool -L` shows CoreGraphics on the binary today.
+    /// It only *asks*; the requesting variant (`CGRequestScreenCaptureAccess`) would pop a
+    /// prompt, which is not this function's job.
+    ///
+    /// **Why this exists at all.** Four separate causes were named and retracted while
+    /// debugging a refused capture (2026-09-23/24), and every one of them was an inference
+    /// about *someone else's* state: the dialog text, the bundle identity, the permission,
+    /// an stderr-to-enum mapping. Through all of it nothing ever asked the one question with
+    /// a definite answer — whether this process has the grant. `screencapture` is a child,
+    /// so its failure conflates "the app is not permitted" with "something else went wrong",
+    /// and no amount of reading its output separates the two. This does.
+    fn CGPreflightScreenCaptureAccess() -> bool;
+}
+
+/// Logged once at startup, and the first thing to look at when the chord does nothing.
+pub(crate) fn log_screen_capture_access() {
+    // Safe: no arguments, no pointers, returns a plain bool.
+    let granted = unsafe { CGPreflightScreenCaptureAccess() };
+    if granted {
+        tracing::info!("capture: Screen Recording granted to this process");
+    } else {
+        tracing::warn!(
+            "capture: Screen Recording NOT granted to this process — Cmd+Shift+G will be \
+             refused. Grant it in System Settings > Privacy & Security > Screen & System \
+             Audio Recording, then relaunch. The grant binds to the binary's code hash, \
+             not its bundle id, so an unsigned build loses it on EVERY rebuild and must be \
+             re-granted (docs/architecture.md G7)."
+        );
+    }
+}
+
 /// A spawned `screencapture`, as the watcher sees it.
 ///
 /// A trait rather than `std::process::Child` because `screencapture -i` waits for a
@@ -631,6 +667,89 @@ mod tests {
         let args = capture_args(Path::new("/a/b/c.png"));
         assert_eq!(args.len(), 4);
         assert_eq!(args[3], OsString::from("/a/b/c.png"));
+    }
+
+    #[test]
+    fn the_startup_diagnostic_actually_asks_the_os() {
+        // **G7's oracle, pinned.** `cargo mutants` generates exactly one mutant for
+        // `log_screen_capture_access` — replace its body with `()` — and no behavioural
+        // test can kill it: the function's only effect is a log line, and this repo has
+        // no test-side `tracing` capture (`tabsession.rs` records the same constraint,
+        // and reaches for a source pin for the same reason). A source pin does kill it,
+        // because `cargo mutants` rewrites the file this `include_str!` reads.
+        //
+        // What it protects is not a nicety. Four causes were named and retracted while
+        // debugging a refused capture because nothing ever asked the OS whether this
+        // process holds the grant; a silently no-op'd diagnostic puts that day back.
+        //
+        // Comments are stripped before matching (L3): the first version of this file's
+        // sibling guard was satisfied by a `// TODO` naming the symbol it looked for.
+        let src = include_str!("capture.rs");
+        let body = src
+            .split_once("pub(crate) fn log_screen_capture_access() {")
+            .expect("the startup diagnostic exists")
+            .1
+            .split_once("\n}")
+            .expect("its body ends")
+            .0
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("CGPreflightScreenCaptureAccess()"),
+            "the diagnostic stopped asking the OS; it now reports a constant, which is \
+             worse than reporting nothing: {body}"
+        );
+        assert!(
+            body.contains("tracing::warn!") && body.contains("tracing::info!"),
+            "the diagnostic must distinguish the two states — one branch reporting both \
+             is a line that always says the same thing: {body}"
+        );
+    }
+
+    #[test]
+    fn the_denial_message_names_the_rebuild_cause() {
+        // R8.1/G7 — the warning is the only channel the user ever sees, and the single
+        // fact that resolves their problem is that an unsigned build loses the grant on
+        // every rebuild. Six causes were eliminated over two days without it, each
+        // eliminated *after* a rebuild had already voided the grant under test. A
+        // message naming only "System Settings" sends them to re-grant and no further.
+        let src = include_str!("capture.rs");
+        let body = src
+            .split_once("pub(crate) fn log_screen_capture_access() {")
+            .expect("the startup diagnostic exists")
+            .1
+            .split_once("\n}")
+            .expect("its body ends")
+            .0;
+        assert!(
+            body.contains("rebuild"),
+            "the denial message must name the rebuild, or it points at the setting and \
+             not at the cause: {body}"
+        );
+    }
+
+    #[test]
+    fn the_startup_diagnostic_is_wired_into_startup() {
+        // **The join, not the halves** — the function above is pinned and `App::start`
+        // is exercised elsewhere, and the one line connecting them is the least-tested
+        // code in this feature (the same shape that left every completed capture
+        // stranded with the whole suite green). Deleting the call leaves the diagnostic
+        // perfectly correct and never run.
+        let src = include_str!("terminal_app.rs");
+        let stripped = src
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            stripped
+                .matches("capture::log_screen_capture_access()")
+                .count(),
+            1,
+            "the startup diagnostic must be called exactly once from terminal_app.rs"
+        );
     }
 
     #[test]

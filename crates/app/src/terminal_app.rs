@@ -448,6 +448,8 @@ impl App {
         };
 
         tracing::info!(cols, rows, "terminal started: zsh spawned, grid ready");
+        // The first thing to check when Cmd+Shift+G does nothing (region-capture).
+        crate::capture::log_screen_capture_access();
         let mut running = Running {
             window,
             renderer,
