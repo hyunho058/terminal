@@ -19,7 +19,7 @@
 //! registered the `tabmeta` pump, the tests here asserted a set of four, and
 //! deleting that one line stopped the sidebar's git branch and agent status from
 //! ever refreshing with the entire suite green. The pump now travels in the value
-//! (`feature_registrations` takes the worker's handle), and the five-overlay shape
+//! (`feature_registrations` takes the worker's handle), and the six-overlay shape
 //! is asserted below.
 //!
 //! These tests run the set all the way into the **live registries**, not just to
@@ -49,10 +49,10 @@ fn priorities(overlays: &[Box<dyn Overlay>]) -> Vec<i32> {
 fn every_feature_extension_is_registered() {
     assert_eq!(
         feature_overlays(None, no_deadline()).len(),
-        4,
+        5,
         "the overlay set changed — rename, ai-monitor, image presenter, selection \
-         presenter. If a feature was added, assert its priority below too; if one \
-         was removed, say so here."
+         presenter, region capture. If a feature was added, assert its priority below \
+         too; if one was removed, say so here."
     );
     assert_eq!(feature_handlers().len(), 2, "Cmd+V paste and Cmd+C copy");
 }
@@ -73,14 +73,14 @@ fn the_registered_set_reaches_the_live_registries() {
     let mut set = feature_registrations(None, None);
     assert_eq!(
         set.counts(),
-        (2, 4),
-        "the assembled set changed — 2 handlers (Cmd+V, Cmd+C), 4 overlays"
+        (2, 5),
+        "the assembled set changed — 2 handlers (Cmd+V, Cmd+C), 5 overlays"
     );
 
     let (router, host, layers) = set.install();
     assert_eq!(
         host.priorities(),
-        vec![200, 100, 0, 0],
+        vec![200, 100, 0, 0, 0],
         "the overlays that reached the host, in the order it offers keys to them"
     );
     assert_eq!(
@@ -90,7 +90,7 @@ fn the_registered_set_reaches_the_live_registries() {
     );
     assert_eq!(
         layers.len(),
-        4,
+        5,
         "every overlay contributes a DrawLayer; one that reaches the host without \
          its layer eats keys and draws nothing"
     );
@@ -121,18 +121,18 @@ fn the_metadata_pump_joins_the_set_the_app_runs() {
     let mut set = feature_registrations(None, Some(handle));
     assert_eq!(
         set.counts(),
-        (2, 5),
+        (2, 6),
         "the pump did not join the assembled set"
     );
 
     let (_, host, layers) = set.install();
     assert_eq!(
         host.priorities(),
-        vec![200, 100, 0, 0, i32::MIN],
+        vec![200, 100, 0, 0, 0, i32::MIN],
         "the pump must reach the host, and must sit behind every real overlay so \
          it can never take a key from one"
     );
-    assert_eq!(layers.len(), 5, "the pump's no-op layer went missing");
+    assert_eq!(layers.len(), 6, "the pump's no-op layer went missing");
 }
 
 /// D8a.1: an open rename field owns the keyboard, so it must sit ahead of the
@@ -144,9 +144,11 @@ fn the_rename_field_outranks_the_ai_monitor_panel() {
     let prios = priorities(&overlays);
     assert_eq!(
         prios,
-        vec![200, 100, 0, 0],
+        vec![200, 100, 0, 0, 0],
         "registration priorities changed; keyboard ownership between features \
-         depends on this order (D8a.1)"
+         depends on this order (D8a.1). region-capture sits at 0, BELOW the rename \
+         field — its D1 'an open rename field swallows the chord' is only true \
+         while it does."
     );
 }
 
@@ -176,6 +178,27 @@ fn no_extension_starts_visible() {
         assert!(
             !o.visible(),
             "overlay #{i} (priority {}) is visible before anything opened it",
+            o.priority()
+        );
+    }
+}
+
+/// R10.4: the new background-write seam is inert for everything that was already here.
+///
+/// `Overlay::take_pending_write` was added for region-capture and defaults to `None`,
+/// which is what let it arrive without touching rename, the ai-monitor, or either
+/// presenter. Asserted on the **registered** set rather than on hand-built stubs,
+/// because that is the set the running app dispatches through — and because a capture
+/// overlay that somehow started with bytes queued would put them on a PTY at the first
+/// wake, before any chord was pressed.
+#[test]
+fn no_registered_overlay_starts_with_bytes_for_a_pty() {
+    for (i, o) in feature_overlays(None, no_deadline()).iter_mut().enumerate() {
+        assert_eq!(
+            o.take_pending_write(),
+            None,
+            "overlay #{i} (priority {}) had bytes queued for a shell before anything \
+             happened",
             o.priority()
         );
     }

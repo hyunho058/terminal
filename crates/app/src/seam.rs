@@ -79,6 +79,13 @@ pub struct AppCtx<'a> {
     /// history they were looking at, with nothing at the call site to hint at it. Add an
     /// `AppCtx::write_silent()` that bypasses [`WriteProbe`] instead. (Not built yet: it
     /// would be dead code until the first such handler exists.)
+    ///
+    /// **This is no longer the only route to a tab's PTY** (region-capture A5).
+    /// [`Overlay::take_pending_write`] adds a second one, for background work that
+    /// finishes long after the keypress that started it and so cannot hold this
+    /// borrow at all. It is narrow — the UI thread, one drain point, `&mut` still
+    /// proving a single author — but a reader asking "who can write to a shell?"
+    /// must be sent there from here, not left to find a defaulted trait method.
     pub writer: &'a mut dyn Write,
     /// Number of open tabs.
     pub tab_count: usize,
@@ -299,6 +306,36 @@ pub trait Overlay {
     fn poll(&mut self) -> bool {
         false
     }
+    /// Bytes this overlay has produced for one **named** tab's shell, taken on the
+    /// way out (region-capture D10). Default: none, so no existing overlay changes
+    /// (R10.4).
+    ///
+    /// The one thing [`AppCtx::writer`] structurally cannot reach: background work.
+    /// That writer is a `&'a mut dyn Write` borrow — neither `Send` nor `'static` —
+    /// so no thread can hold it, and [`Overlay::poll`] returns a bare `bool` with no
+    /// context to carry a result out. A screen capture finishes seconds after the
+    /// chord that started it, on a thread, for a tab that may no longer be active; it
+    /// had no path to a PTY at all before this.
+    ///
+    /// Called by the app immediately after [`OverlayHost::poll_all`], which is where
+    /// `poll` has just drained the overlay's own channel — so the sequence is
+    /// "background work lands in the overlay, then the overlay hands out what must be
+    /// typed". The write itself happens on the UI thread, at that one point, through
+    /// `Session::write`.
+    ///
+    /// A [`TabId`], never an index, for the reason [`AppRequest`] gives: the roster
+    /// can shift between the press and the delivery, and an index would then name a
+    /// different tab (D6). A tab that has since closed simply is not found, and the
+    /// bytes are dropped (R7.7).
+    ///
+    /// **The cost, named rather than implied** (region-capture A5): this makes it
+    /// *possible* for any future overlay to put bytes on a tab's PTY, so the
+    /// "user-originated bytes only" invariant on [`AppCtx::writer`] now depends partly
+    /// on overlays honouring it. It stays narrow — one defined point, on the UI
+    /// thread, and `&mut` still proves a single author — but it is wider than it was.
+    fn take_pending_write(&mut self) -> Option<(TabId, Vec<u8>)> {
+        None
+    }
     /// The active tab changed; re-point anything cwd-derived (ai-monitor R3.1).
     /// Carries the new tab's shell pid alongside its cwd, since the two together are
     /// what identify a session. Default: no-op.
@@ -494,6 +531,23 @@ impl OverlayHost {
         changed
     }
 
+    /// Collect one pending PTY write from each overlay (region-capture D10, R7.4).
+    ///
+    /// An aggregator rather than a loop at the call site because `overlays` is private
+    /// — the same reason [`poll_all`](Self::poll_all) is one.
+    ///
+    /// **One per overlay per drain, not drained to exhaustion**, and that is a
+    /// decision: the capture is single-flight (D7), so a second value cannot be
+    /// waiting, and every outcome sends its own wake — so anything that did queue gets
+    /// its own pass here. A `while let` would instead hand a misbehaving overlay an
+    /// unbounded loop on the UI thread.
+    pub(crate) fn take_pending_writes(&mut self) -> Vec<(TabId, Vec<u8>)> {
+        self.overlays
+            .iter_mut()
+            .filter_map(|o| o.take_pending_write())
+            .collect()
+    }
+
     /// Tell every overlay the active tab changed (ai-monitor re-point, R3.1).
     pub fn notify_active_changed(
         &mut self,
@@ -642,6 +696,221 @@ pub enum OverlayCommand {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- region-capture D10 / R10.4, R7.4: the background-write seam ----
+
+    /// An overlay with nothing to hand out — every overlay that existed before
+    /// region-capture, expressed as a type.
+    struct Mute;
+    impl Overlay for Mute {
+        fn priority(&self) -> i32 {
+            0
+        }
+        fn visible(&self) -> bool {
+            false
+        }
+        fn on_key(&mut self, _: &KeyInput, _: &mut AppCtx) -> Handled {
+            Handled::Passthrough
+        }
+    }
+
+    /// An overlay that publishes one write, once — the capture's shape.
+    struct Publishes(Option<(TabId, Vec<u8>)>);
+    impl Overlay for Publishes {
+        fn priority(&self) -> i32 {
+            0
+        }
+        fn visible(&self) -> bool {
+            false
+        }
+        fn on_key(&mut self, _: &KeyInput, _: &mut AppCtx) -> Handled {
+            Handled::Passthrough
+        }
+        fn take_pending_write(&mut self) -> Option<(TabId, Vec<u8>)> {
+            self.0.take()
+        }
+    }
+
+    #[test]
+    fn r10_4_the_new_seam_method_is_inert_by_default() {
+        // The whole reason it is defaulted: adding it must change no existing
+        // overlay, and `Mute` does not implement it at all.
+        let mut m = Mute;
+        assert_eq!(m.take_pending_write(), None);
+    }
+
+    #[test]
+    fn a_host_of_silent_overlays_hands_out_nothing() {
+        // The drain must be free for every wake that is not a capture — and there
+        // are many, since tabmeta and the ai-monitor share this event.
+        let mut host = OverlayHost::default();
+        host.register(Box::new(Mute));
+        host.register(Box::new(Mute));
+        assert!(host.take_pending_writes().is_empty());
+    }
+
+    #[test]
+    fn the_host_collects_a_publishing_overlay_from_among_silent_ones() {
+        // R7.4's producer half: the aggregator exists because `overlays` is private,
+        // and it must find the one overlay with something to say.
+        let mut host = OverlayHost::default();
+        host.register(Box::new(Mute));
+        host.register(Box::new(Publishes(Some((
+            TabId(4),
+            b"/tmp/c.png ".to_vec(),
+        )))));
+        host.register(Box::new(Mute));
+        assert_eq!(
+            host.take_pending_writes(),
+            vec![(TabId(4), b"/tmp/c.png ".to_vec())]
+        );
+    }
+
+    #[test]
+    fn a_taken_write_is_not_handed_out_twice() {
+        // `take`, not `peek`: a second drain on the same value would type the path
+        // again. Every wake through the OverlayPending arm calls this.
+        let mut host = OverlayHost::default();
+        host.register(Box::new(Publishes(Some((TabId(1), b"x ".to_vec())))));
+        assert_eq!(host.take_pending_writes().len(), 1);
+        assert!(
+            host.take_pending_writes().is_empty(),
+            "the same capture was delivered twice"
+        );
+    }
+
+    #[test]
+    fn r7_4_the_wake_arm_drains_pending_writes_after_poll_all() {
+        // **The call site, which nothing else reaches.** The tests above prove the
+        // aggregator collects; `tabs::deliver` proves the routing lands. Neither
+        // touches the three lines that JOIN them, in `terminal_app`'s `OverlayPending`
+        // arm — and those need an `AppInner`, so no test can call them.
+        //
+        // Measured, which is why this exists: deleting that block left **the entire
+        // workspace suite green — nothing failed anywhere** — while every completed
+        // capture sat in the overlay's `pending` slot forever. (Stated without a count
+        // on purpose: a suite total moves with every commit, and CLAUDE.md records what
+        // happens when one is written down — three different totals for the same
+        // `session.rs` run ended up in this repo at once.) That is exactly the failure CLAUDE.md's golden-frame
+        // exemplar was written about — every observable reports a decision, and stays
+        // correct while nothing reaches the screen.
+        //
+        // Order is asserted, not just presence: the drain must come AFTER `poll_all`,
+        // because `poll_all` is the call in which the overlay moves its channel into
+        // the slot this then empties. Drained first, every capture arrives one wake
+        // late — and on a quiet tab there may never be a next wake.
+        let src = include_str!("terminal_app.rs");
+        let (production, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("terminal_app.rs has a test module to split on");
+        let code = production
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // **Exactly one production site**, the same discipline the `poll_all()` guard
+        // keeps. Without it the search below is satisfied by an occurrence anywhere
+        // later in the file, so moving the drain into some other function would leave
+        // this green — which is the failure mode this whole test exists to prevent.
+        assert_eq!(
+            code.matches("take_pending_writes()").count(),
+            1,
+            "the drain is reached from more than one site, or from none"
+        );
+        // The arm, BOUNDED. `split(..).nth(1)` alone runs to the end of the file and so
+        // is not the arm at all; the match arm ends at the next one, and
+        // `OverlayPending` is the last variant, so the enclosing `match` closes it.
+        let arm = code
+            .split("UserEvent::OverlayPending =>")
+            .nth(1)
+            .expect("the wake arm exists")
+            .split("\n            }")
+            .next()
+            .expect("the arm closes");
+        let poll_at = arm
+            .find("poll_all()")
+            .expect("the wake arm still calls poll_all");
+        let drain_at = arm.find("take_pending_writes()").expect(
+            "the wake arm no longer drains pending writes; a completed capture now \
+             never reaches a PTY, and every other test stays green",
+        );
+        assert!(
+            drain_at > poll_at,
+            "the drain runs before poll_all, so a capture is collected one wake late"
+        );
+        assert!(
+            arm.contains("deliver_to_tab"),
+            "the drained bytes are collected but never delivered"
+        );
+    }
+
+    #[test]
+    fn r9_delivery_snaps_the_originating_tab_by_the_input_rule() {
+        // D13 / R9. Asserted structurally because the alternative is unreachable:
+        // `snap_after_input` lives on `AppInner`, which needs a window and an
+        // `EventLoopProxy`, and macOS builds one only on the main thread.
+        //
+        // Two things are pinned, and they are different mistakes. The SNAP: it must be
+        // `snap_after_input`, not `snap_on_output` — the output rule is gated on
+        // `SNAP_FLOOR` (3), so a viewport scrolled further back than three rows would
+        // not move, and the user would never see where the path landed. An earlier
+        // draft of D13 claimed output does not snap at all, which is false; what is
+        // true is that it snaps only near the bottom, and a capture must snap always,
+        // because the user did originate it by pressing the chord.
+        //
+        // The TARGET: it must be the `id` handed in, not the active tab. The capture
+        // was started for one tab and may complete while another is in front (R9.2).
+        // Comments stripped, for the reason `capture.rs`'s registration guard now
+        // strips them: a guard a comment can satisfy is not a guard.
+        let src = include_str!("terminal_app.rs");
+        let body = src
+            .split_once("fn deliver_to_tab(")
+            .expect("the drain's delivery function exists")
+            .1
+            .split_once("\n    }")
+            .expect("its body ends")
+            .0
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("snap_after_input(id)"),
+            "delivery must snap by the INPUT rule, on the named tab: {body}"
+        );
+        assert!(
+            !body.contains("snap_on_output") && !body.contains("snap_active_after_input"),
+            "delivery snapped the floor-gated output rule, or the active tab: {body}"
+        );
+    }
+
+    #[test]
+    fn r11_2_no_exit_hook_is_claimed_that_does_not_exist() {
+        // D12 — the honest consequence, asserted rather than described. There is no
+        // `ApplicationHandler::exiting` impl, so a capture in flight at app exit is
+        // ABANDONED: the process exits, the watcher thread dies with it, and
+        // `screencapture` is reparented and keeps its crosshair until the user
+        // presses Esc (which dismisses it, writing nothing).
+        //
+        // This test exists because the earlier draft of D12 said the child is killed
+        // on exit. That was unimplementable — the `Child` lives on the watcher thread
+        // and the UI thread holds no handle — and a comment claiming it would have
+        // outlived the reader who believed it.
+        let src = include_str!("terminal_app.rs");
+        let (production, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("terminal_app.rs has a test module to split on");
+        let code = production
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("fn exiting"),
+            "an `exiting` hook appeared; D12 says a capture in flight is abandoned, \
+             so if this is now a kill path the decision must be re-argued first"
+        );
+    }
 
     // ---- ai-monitor-panel-scroll T7 / R5.6: what an overlay's refusal routes to ----
 
