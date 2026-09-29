@@ -2159,6 +2159,11 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
+        // The last tab closed and the loop is on its way out; an event already queued in
+        // this iteration has nothing left to act on (`Tabs::is_empty`).
+        if inner.tabs.is_empty() {
+            return;
+        }
         match event {
             UserEvent::PtyOutput(id) => {
                 // Advance the originating tab's grid; redraw only if active (R1.2).
@@ -2393,6 +2398,11 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
+        // As in `user_event`: after the last tab closes, a queued redraw or input event would
+        // reach `Tabs::active` on an empty set. `exit()` was already called by the close.
+        if inner.tabs.is_empty() {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
 
@@ -3010,6 +3020,44 @@ fn next_composition_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- closing the last tab: no event runs against an empty tab set ----
+
+    #[test]
+    fn every_event_entry_point_stops_once_the_last_tab_is_gone() {
+        // Closing the last tab clears the set and calls `event_loop.exit()`, but winit still
+        // delivers what was already queued in that iteration. Measured: a debug build closed
+        // on its last tab panicked `index out of bounds: the len is 0 but the index is 0` at
+        // `Tabs::active` (exit 101). Both handlers need a live window, so no test can call
+        // them; this pins the guard at the head of each, the precedent `seam.rs` set for the
+        // `OverlayPending` arm. `Tabs::is_empty`'s own contract is tested in `tabs.rs`.
+        let src = include_str!("terminal_app.rs");
+        let (production, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("terminal_app.rs has a test module to split on");
+        let code = production
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let head = "let Some(inner) = self.inner.as_mut() else { return; }; \
+                    if inner.tabs.is_empty() { return; } match event {";
+        for handler in ["fn user_event(", "fn window_event("] {
+            let body = code
+                .split_once(handler)
+                .unwrap_or_else(|| panic!("{handler} exists"))
+                .1;
+            let start = body.find('{').expect("a body") + 1;
+            assert!(
+                body[start..].trim_start().starts_with(head),
+                "{handler} must stop on an empty tab set before touching it: {}",
+                &body[start..start + 200]
+            );
+        }
+    }
 
     // ---- agent-card-status D7 / D4: one stored dialog level, read by band and card ----
 

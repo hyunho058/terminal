@@ -59,9 +59,11 @@ impl Tabs {
     pub fn len(&self) -> usize {
         self.sessions.len()
     }
-    /// Paired with `len` (clippy) — the tab set is never empty in practice
-    /// (closing the last tab exits the app).
-    #[allow(dead_code)]
+    /// Whether the last tab has closed. Closing it asks the event loop to exit, but winit
+    /// still delivers the events already queued in that iteration — a PTY wake, a metadata
+    /// publication, the continuous redraw — and every one of them would reach
+    /// [`active`](Tabs::active), which indexes the empty set and panics. So both event
+    /// entry points (`terminal_app`'s `user_event` and `window_event`) stop here first.
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }
@@ -671,8 +673,11 @@ mod tests {
             return;
         };
         let only = tabs.active().id;
+        assert!(!tabs.is_empty(), "a live tab set is not empty");
         assert!(!tabs.close(only), "the same contract as close_active (D4)");
         assert_eq!(tabs.len(), 0);
+        // What the event handlers stop on: the app is exiting from here on.
+        assert!(tabs.is_empty());
     }
 
     #[test]
