@@ -362,3 +362,415 @@ fn a_bold_hangul_syllable_that_synthesis_would_erode_stays_solid() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The sidebar's weather cards (sidebar-weather-cards T8)
+// ---------------------------------------------------------------------------
+//
+// Every other card test reads `build_card`'s output or `compose_count` — decisions
+// again. These read the frame: a card whose fill never reached the screen, a glow
+// dropped by the draw order, or a `≡` drawn on every card all leave those green.
+
+use renderer::sidebar_card::CardStatus;
+use renderer::sidebar_icons::PixelIcon;
+use renderer::sidebar_row::{MetaSource, RowMeta, SidebarRow, TabBar, TabBarModel};
+use renderer::sidebar_shapes::sample_gradient;
+use renderer::sidebar_text::CardFace;
+use renderer::sidebar_theme::{AgentSkin, CardMetrics, SkinFill};
+use std::rc::Rc;
+
+/// One card of a sidebar frame: skin, title, status.
+type Card = (AgentSkin, &'static str, CardStatus);
+
+/// The four cards R0.1 names, in row order.
+const CARDS: [Card; 4] = [
+    (AgentSkin::Claude, "claude", CardStatus::Working),
+    (
+        AgentSkin::Antigravity,
+        "gravity",
+        CardStatus::WaitingForInput,
+    ),
+    (AgentSkin::Codex, "codex", CardStatus::Ready),
+    (AgentSkin::Generic, "zsh", CardStatus::Shell),
+];
+const ACTIVE: usize = 0;
+const HOVERED: usize = 1;
+
+/// Per-channel tolerance for "is this colour", in 8-bit sRGB (R16.1).
+const TOL: f32 = 6.0;
+
+/// The metadata of a fixed card table: each row's skin and status, by row index.
+struct Cards(&'static [Card]);
+impl MetaSource for Cards {
+    fn generation(&self) -> u64 {
+        1
+    }
+    fn fill(&self, rows: &[SidebarRow], out: &mut Vec<RowMeta>) {
+        out.clear();
+        out.extend(rows.iter().enumerate().map(|(i, r)| RowMeta {
+            skin: self.0[i].0,
+            status: self.0[i].2,
+            line1: r.title.clone(),
+            cwd_display: "~/work".into(),
+            ..RowMeta::default()
+        }));
+    }
+}
+
+/// A renderer with the sidebar layer installed and the four cards in its model — `None`
+/// when GPU tests are opted out of (R16.6). The card rects exist only once a frame has
+/// been drawn; read them afterwards with [`card_rects`].
+fn sidebar_renderer(scale: f64) -> Option<Renderer> {
+    sidebar_renderer_of(scale, &CARDS, Some(HOVERED))
+}
+
+/// [`sidebar_renderer`] over any card table, card [`ACTIVE`] selected and `hovered`
+/// under the pointer — the same skip-or-fail policy, through `testing::headless_scaled`.
+fn sidebar_renderer_of(
+    scale: f64,
+    cards: &'static [Card],
+    hovered: Option<usize>,
+) -> Option<Renderer> {
+    let (w, h) = sidebar_frame(scale);
+    let mut r = renderer::testing::headless_scaled(
+        w,
+        h,
+        scale,
+        &Config::default(),
+        "the sidebar golden frames",
+    )?;
+    let (bar, handle) = TabBar::new();
+    handle.set(TabBarModel {
+        titles: cards
+            .iter()
+            .enumerate()
+            .map(|(i, &(_, title, _))| SidebarRow {
+                tab_id: i as u64 + 1,
+                title: title.into(),
+                ..SidebarRow::default()
+            })
+            .collect(),
+        active: ACTIVE,
+        ..TabBarModel::default()
+    });
+    handle.set_meta_source(Rc::new(Cards(cards)));
+    handle.set_hovered(hovered);
+    r.add_layer(Box::new(bar));
+    Some(r)
+}
+
+/// The frame a sidebar capture renders into: the shared one at 1×, and at 2× one tall
+/// enough for four 208px cards and their gaps.
+fn sidebar_frame(scale: f64) -> (u32, u32) {
+    if scale > 1.0 {
+        (1400, 1000)
+    } else {
+        (FRAME_W, FRAME_H)
+    }
+}
+
+fn card_rects() -> Vec<[f32; 4]> {
+    card_rects_of(CARDS.len())
+}
+
+/// The first `n` card rects of the layout the last frame published.
+fn card_rects_of(n: usize) -> Vec<[f32; 4]> {
+    let lay = renderer::sidebar_row::TabModelHandle::shared()
+        .layout()
+        .expect("the sidebar published its layout");
+    (0..n)
+        .map(|i| lay.card_rect(i).expect("every card is on screen"))
+        .collect()
+}
+
+/// The fill a card in `i`'s state paints: the brighter one when hovered or selected.
+fn fill_of(i: usize) -> SkinFill {
+    let skin = CARDS[i].0.card();
+    if i == ACTIVE || i == HOVERED {
+        skin.hover
+    } else {
+        skin.default
+    }
+}
+
+/// Linear → 8-bit sRGB, as the `Bgra8UnormSrgb` target stores it.
+fn srgb8(c: f32) -> f32 {
+    let c = c.clamp(0.0, 1.0);
+    let s = if c <= 0.003_130_8 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    };
+    s * 255.0
+}
+
+/// The body gradient at pixel `(px, py)` of a card at `rect` — the shader's own
+/// projection (`sidebar_shapes.wgsl`), evaluated at the pixel's centre.
+fn gradient_at(fill: &SkinFill, rect: [f32; 4], px: u32, py: u32) -> [f32; 3] {
+    let rel = [px as f32 + 0.5 - rect[0], py as f32 + 0.5 - rect[1]];
+    let ext = fill.dir[0].abs() * rect[2] + fill.dir[1].abs() * rect[3];
+    let t = (rel[0] * fill.dir[0] + rel[1] * fill.dir[1]) / ext.max(1e-6);
+    let c = sample_gradient(fill.stops, fill.mid, t);
+    [srgb8(c[0]), srgb8(c[1]), srgb8(c[2])]
+}
+
+fn within(px: [u8; 4], want: [f32; 3], tol: f32) -> bool {
+    (0..3).all(|k| (f32::from(px[k]) - want[k]).abs() <= tol)
+}
+
+fn differs(a: [u8; 4], b: [u8; 4]) -> bool {
+    (0..3).any(|k| (i32::from(a[k]) - i32::from(b[k])).abs() > TOL as i32)
+}
+
+fn centre(rect: [f32; 4]) -> (u32, u32) {
+    (
+        (rect[0] + rect[2] * 0.5) as u32,
+        (rect[1] + rect[3] * 0.5) as u32,
+    )
+}
+
+/// Every pixel assertion R0.1 and R16.1–R16.5 make, over one frame captured at `scale`.
+fn assert_cards(frame: &CapturedFrame, rects: &[[f32; 4]], scale: f64) {
+    let m = CardMetrics::DEFAULT.scaled(scale);
+    // The panel, clear of every card and of the glow's 3-logical ring: left of the
+    // 14-logical inset at either scale.
+    let panel = |y: u32| frame.pixel(4, y);
+
+    // R0.1 / R16.1 — each body is its own skin's gradient, and no two are alike.
+    let bodies: Vec<[u8; 4]> = rects
+        .iter()
+        .enumerate()
+        .map(|(i, &rect)| {
+            let (cx, cy) = centre(rect);
+            let got = frame.pixel(cx, cy);
+            let want = gradient_at(&fill_of(i), rect, cx, cy);
+            assert!(
+                within(got, want, TOL),
+                "card {i} ({:?}) body {got:?} is not its skin's gradient {want:?}",
+                CARDS[i].0
+            );
+            assert!(differs(got, panel(cy)), "card {i} body is the panel colour");
+            got
+        })
+        .collect();
+    for a in 0..bodies.len() {
+        for b in a + 1..bodies.len() {
+            assert!(
+                differs(bodies[a], bodies[b]),
+                "cards {a} and {b} read back alike: {:?} / {:?}",
+                bodies[a],
+                bodies[b]
+            );
+        }
+    }
+
+    for (i, &rect) in rects.iter().enumerate() {
+        let (_, cy) = centre(rect);
+
+        // R16.2 — 2px outside the right edge at mid-height: only the selected card glows.
+        let gx = (rect[0] + rect[2] + 2.0) as u32;
+        let glows = differs(frame.pixel(gx, cy), panel(cy));
+        assert_eq!(glows, i == ACTIVE, "card {i}: glow drawn = {glows}");
+
+        // R16.3 — the `≡` button's centre: only the hovered card's backplate shows.
+        let b = renderer::sidebar_card::menu_button(rect, scale);
+        let (bx, by) = ((b[0] + b[2] * 0.5) as u32, (b[1] + b[3] * 0.5) as u32);
+        let plain = within(
+            frame.pixel(bx, by),
+            gradient_at(&fill_of(i), rect, bx, by),
+            TOL,
+        );
+        assert_eq!(
+            !plain,
+            i == HOVERED,
+            "card {i}: the button area reads {:?}",
+            frame.pixel(bx, by)
+        );
+
+        // R16.4 — the title band carries ink over the body.
+        let left = rect[0] + m.border + m.pad_x;
+        let top = rect[1] + m.border + m.pad_y;
+        let title_w = CARDS[i].1.chars().count() as f32 * CardFace::Title.column_px(scale);
+        let mut ink = 0;
+        for y in top as u32..(top + CardFace::Title.line_px(scale)) as u32 {
+            for x in left as u32..(left + title_w) as u32 {
+                let body = gradient_at(&fill_of(i), rect, x, y);
+                if !within(frame.pixel(x, y), body, 40.0) {
+                    ink += 1;
+                }
+            }
+        }
+        assert!(ink >= 20, "card {i}: the title band has {ink} ink pixels");
+    }
+
+    // R16.5 / D17 — each agent icon reaches the screen: one cell of each, sampled at its
+    // centre, carries its table colour. The crab's cell (0,4) is R16.5's; the others are
+    // cells no later cell paints over (the Codex and terminal tables overlap).
+    // Keyed on the skin, not on `PixelIcon::for_skin`: the mapping is part of what is
+    // under test, and asking it which icon to expect would agree with any wrong answer.
+    // Each cell's colour appears at that position in no other icon.
+    for (i, &rect) in rects.iter().enumerate() {
+        let (icon, (col, row), rgb) = match CARDS[i].0 {
+            AgentSkin::Claude => (PixelIcon::Claude, (0.0, 4.0), [230.0, 113.0, 78.0]), // #e6714e
+            AgentSkin::Antigravity => (PixelIcon::Antigravity, (5.0, 0.0), [255.0, 140.0, 0.0]), // #ff8c00
+            AgentSkin::Codex => (PixelIcon::Codex, (2.0, 1.0), [244.0, 239.0, 230.0]), // #f4efe6
+            AgentSkin::Generic => (PixelIcon::Terminal, (2.0, 5.0), [21.0, 19.0, 15.0]), // #15130f
+        };
+        let c = icon.cell_px(scale);
+        let [iw, _] = icon.extent(scale);
+        let top = if icon == PixelIcon::Claude {
+            m.icon_top_claude
+        } else {
+            m.icon_top_other
+        };
+        let ox = (rect[0] + rect[2] - m.border - m.pad_x - iw).round();
+        let oy = (rect[1] + m.border + m.pad_y + top).round();
+        let (px, py) = ((ox + (col + 0.5) * c) as u32, (oy + (row + 0.5) * c) as u32);
+        let got = frame.pixel(px, py);
+        assert!(
+            within(got, rgb, TOL),
+            "card {i}: {icon:?}'s cell ({col},{row}) at ({px},{py}) reads {got:?}, not {rgb:?}"
+        );
+    }
+}
+
+/// R0.1 and R16.1–R16.5 at `scale`; R16.6 is the `?` — it skips only through
+/// `testing::headless_scaled`.
+fn four_skinned_cards_at(scale: f64) {
+    let Some(mut r) = sidebar_renderer(scale) else {
+        return;
+    };
+    let (_, frame) = render(&mut r, b"");
+    let rects = card_rects();
+    assert_eq!(rects.len(), 4);
+    for rect in &rects {
+        assert!(
+            rect[0] >= 0.0 && rect[1] >= 0.0 && rect[1] + rect[3] <= frame.height() as f32,
+            "card {rect:?} is inside the frame"
+        );
+        assert_eq!(rect[3], 104.0 * scale as f32, "R1.1 at {scale}×");
+    }
+    assert_cards(&frame, &rects, scale);
+}
+
+#[test]
+fn four_skinned_cards_reach_the_screen() {
+    four_skinned_cards_at(1.0);
+}
+
+#[test]
+fn four_skinned_cards_reach_a_retina_screen() {
+    // The Requirements' default scale: 2×, where the crab is drawn at 85×50 and every
+    // metric is doubled.
+    four_skinned_cards_at(2.0);
+}
+
+#[test]
+fn a_cached_sidebar_frame_is_the_same_frame() {
+    // R17.3 — the second capture re-submits the resident instances (D20). If the cache
+    // drew nothing, or drew a pass short, the pixels would differ; the full assertion
+    // set runs on it as well, so a second frame that is identically blank also fails.
+    // That the second capture takes the cache path at all is asserted where it can be
+    // observed, `sidebar_row`'s `a_steady_frame_composes_nothing_and_writes_no_buffer`
+    // (`compose_count` is test-only, invisible from here).
+    let Some(mut r) = sidebar_renderer(2.0) else {
+        return;
+    };
+    let (_, first) = render(&mut r, b"");
+    let (_, second) = render(&mut r, b"");
+    assert!(
+        first.pixels() == second.pixels(),
+        "the cached frame differs from the composed one"
+    );
+    assert_cards(&second, &card_rects(), 2.0);
+}
+
+// ---------------------------------------------------------------------------
+// The no-status card (agent-card-status T1)
+// ---------------------------------------------------------------------------
+//
+// `build_card`'s unit test (R5.4) proves a `Hidden` card *composes* no status. This
+// proves none reaches the screen: a status drawn by some other path, or a `Hidden`
+// that fell through to another status's look, leaves every decision-level test green.
+
+/// R5.5's frame: one `Working` card and one with no status. The second is Codex's — an
+/// agent agent-card-status D3 always hides — so the two also differ in skin, as they
+/// would on a real sidebar.
+const STATUS_CARDS: [Card; 2] = [
+    (AgentSkin::Claude, "claude", CardStatus::Working),
+    (AgentSkin::Codex, "codex", CardStatus::Hidden),
+];
+
+/// What each [`STATUS_CARDS`] row's status-icon box must hold: that icon's colour in
+/// 8-bit sRGB, or nothing but the card's body. Written out rather than read from
+/// `SidebarTheme`, whose `status_working_fg` is what this checks — a colour taken from
+/// the code under test would agree with any wrong answer (the mock's `#ffd9bd`).
+const STATUS_INK: [Option<[f32; 3]>; 2] = [Some([255.0, 217.0, 189.0]), None];
+
+/// R5.5 at `scale`.
+fn a_no_status_card_carries_no_status_ink_at(scale: f64) {
+    // Nothing hovered, so the no-status card is in its default state and its body is
+    // the default gradient everywhere the box reaches.
+    let Some(mut r) = sidebar_renderer_of(scale, &STATUS_CARDS, None) else {
+        return;
+    };
+    let (_, frame) = render(&mut r, b"");
+    let rects = card_rects_of(STATUS_CARDS.len());
+    let m = CardMetrics::DEFAULT.scaled(scale);
+    let meta_line = CardFace::Meta.line_px(scale);
+
+    for (i, &rect) in rects.iter().enumerate() {
+        // The status icon's box — the padding box's bottom-left, the 13-logical
+        // `Working` icon centred on the meta line (D21) — widened by a pixel each way
+        // for its antialiasing, and taken identically in both cards.
+        let size = m.zone_icon_lg;
+        let x0 = rect[0] + m.border + m.pad_x;
+        let y0 = rect[1] + rect[3] - m.border - m.pad_y - meta_line + (meta_line - size) * 0.5;
+        let xs = (x0 as u32 - 1)..((x0 + size).ceil() as u32 + 1);
+        let ys = (y0 as u32 - 1)..((y0 + size).ceil() as u32 + 1);
+        let pixels: Vec<(u32, u32)> = ys.flat_map(|y| xs.clone().map(move |x| (x, y))).collect();
+
+        match STATUS_INK[i] {
+            Some(rgb) => {
+                let hits = pixels
+                    .iter()
+                    .filter(|&&(x, y)| within(frame.pixel(x, y), rgb, TOL))
+                    .count();
+                assert!(
+                    hits >= 4,
+                    "{scale}× card {i} ({:?}): {hits} pixels of its status box read {rgb:?}",
+                    STATUS_CARDS[i].2
+                );
+            }
+            None => {
+                let body = STATUS_CARDS[i].0.card().default;
+                let ink: Vec<_> = pixels
+                    .iter()
+                    .filter(|&&(x, y)| {
+                        !within(frame.pixel(x, y), gradient_at(&body, rect, x, y), TOL)
+                    })
+                    .map(|&(x, y)| ((x, y), frame.pixel(x, y)))
+                    .collect();
+                assert!(
+                    ink.is_empty(),
+                    "{scale}× card {i} ({:?}): {} of its status box's {} pixels carry ink, \
+                     first {:?}",
+                    STATUS_CARDS[i].2,
+                    ink.len(),
+                    pixels.len(),
+                    &ink[..ink.len().min(6)]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_no_status_card_carries_no_status_ink() {
+    a_no_status_card_carries_no_status_ink_at(1.0);
+}
+
+#[test]
+fn a_no_status_card_carries_no_status_ink_on_a_retina_screen() {
+    a_no_status_card_carries_no_status_ink_at(2.0);
+}

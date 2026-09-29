@@ -889,6 +889,7 @@ mod tests {
             scale_factor: 1.0,
             snapshot: &snap,
             atlas: &mut atlas,
+            fonts: &fonts,
         };
         layer.record(&mut ctx);
         assert!(layer.gpu.is_some(), "recording must build the pipelines");
@@ -928,6 +929,7 @@ mod tests {
         queue: &wgpu::Queue,
         view: &wgpu::TextureView,
         atlas: &mut crate::atlas::Atlas,
+        fonts: &crate::FontSet,
         snap: &term_core::GridSnapshot,
         sidebar: &common::config::SidebarConfig,
     ) {
@@ -948,6 +950,7 @@ mod tests {
             scale_factor: 1.0,
             snapshot: snap,
             atlas,
+            fonts,
         };
         layer.record(&mut ctx);
     }
@@ -985,6 +988,7 @@ mod tests {
             &queue,
             &view,
             &mut atlas,
+            &fonts,
             &snap,
             &sidebar_cfg,
         );
@@ -1005,6 +1009,7 @@ mod tests {
             &queue,
             &view,
             &mut swapped,
+            &fonts,
             &snap,
             &sidebar_cfg,
         );
@@ -1050,6 +1055,7 @@ mod tests {
             &queue,
             &view,
             &mut atlas,
+            &fonts,
             &snap,
             &sidebar_cfg,
         );
@@ -1066,6 +1072,7 @@ mod tests {
                 &queue,
                 &view,
                 &mut atlas,
+                &fonts,
                 &snap,
                 &sidebar_cfg,
             );

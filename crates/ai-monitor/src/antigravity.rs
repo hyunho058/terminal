@@ -21,6 +21,11 @@ use serde_json::Value;
 
 use crate::{looks_like_session_id, Resolved};
 
+/// The sidebar card's activity signal for a resolved transcript (`agent-card-status` D10):
+/// its last meaningful step, classified into Claude's [`crate::activity::LastMessage`].
+mod tail;
+pub use tail::tail_state;
+
 /// How much of `history.jsonl` one lookup reads, from the **end**.
 ///
 /// The file is small (43 lines when measured) but it is appended live and unbounded, and

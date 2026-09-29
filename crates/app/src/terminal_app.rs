@@ -1146,92 +1146,41 @@ impl Running {
                 )
             })
             .collect();
-        let states: Vec<(TabId, AgentState)> = base
-            .into_iter()
-            .map(|(id, state, has_agent)| {
-                if !has_agent {
-                    tracing::debug!(tab = id.0, ?state, "waiting-scan: no agent on tab");
-                    return (id, state);
-                }
-                let detected = self.tab_shows_blocking_prompt(id);
-                // The one diagnostic that has paid for itself here: when an agent tab is
-                // scanned and NOT detected, dump what was on screen. Guessing at which
-                // layer was wrong cost two wrong fixes; the tail text says directly whether
-                // the dialog was absent, scrolled, or merely unmatched.
-                //
-                // Explicitly gated rather than relying on the macro's field laziness: this
-                // runs per PTY chunk, and `tab_scan_tail` builds a String. An eager
-                // evaluation here would be a real cost in release builds with logging off.
-                if tracing::enabled!(tracing::Level::DEBUG) {
-                    let tail = self.tab_scan_tail(id);
-                    tracing::debug!(
-                        tab = id.0,
-                        ?state,
-                        detected,
-                        active = (id == active),
-                        tail = %tail,
-                        "waiting-scan"
-                    );
-                }
-                if detected {
-                    (id, AgentState::Waiting)
-                } else {
-                    (id, state)
-                }
-            })
-            .collect();
+        // Every tab's level is re-read and stored on its session, and the band is fed each
+        // state through the same override its card resolves with (agent-card-status D4/D7).
+        let scan = self.tabs.rescan_dialogs(base, active);
         let changed = self
             .waiting
-            .on_agent_states(&states, active, Instant::now());
+            .on_agent_states(&scan.states, active, Instant::now());
+        // A flip changes that tab's card, a background tab's included — so its row is patched
+        // in place. Not `sync_tab_model`: this also runs on a metadata publication, and
+        // rebuilding the rows through `Tabs::titles` would re-send the roster to the worker,
+        // reopening the publish → derive → publish path card-live-cwd D1/R5.2 closed.
+        let flipped = patch_dialog_rows(&self.tab_model, &scan.flipped);
         if tracing::enabled!(tracing::Level::DEBUG) {
             tracing::debug!(
-                ?states,
+                states = ?scan.states,
                 active = active.0,
                 changed,
+                flipped,
                 items = self.waiting.items().len(),
                 "waiting-model"
             );
         }
-        changed
+        changed || flipped
     }
 
-    /// The exact text the prompt matcher saw for `id`, condensed to one line for a log.
-    /// Debug-only aid; never called unless the `debug` level is enabled.
-    fn tab_scan_tail(&mut self, id: TabId) -> String {
-        let Some(s) = self.tabs.by_id_mut(id) else {
-            return "<no session>".into();
-        };
-        let off = s.terminal.view_offset();
-        let tail = s.terminal.viewport_tail_text(crate::prompt::TAIL_ROWS);
-        let last: Vec<&str> = tail.lines().rev().take(6).collect();
-        let last: Vec<&str> = last.into_iter().rev().collect();
-        format!("off={off} | {}", last.join(" ⏎ "))
-    }
-
-    /// Whether tab `id`'s visible screen currently shows a prompt that blocks on a human
-    /// (see [`crate::prompt`]).
+    /// Tab `id`'s view just returned to the live bottom (agent-card-status D7(b)): re-read
+    /// the level it held while scrolled back from the live screen — once, through the same
+    /// single-tab path PTY output uses, so the band is fed in the same step as the card.
     ///
-    /// Deliberately a **level**, not an event: it is re-evaluated on every trigger, so
-    /// answering the prompt makes the dialog disappear and the tab leaves `Waiting` through
-    /// the existing falling edge. Nothing to latch, expire, or replay.
-    ///
-    /// Uses `viewport_tail_text` rather than a full snapshot: this runs per PTY chunk, and
-    /// cloning the grid at that rate would be the G1 idle-CPU debt all over again.
-    fn tab_shows_blocking_prompt(&mut self, id: TabId) -> bool {
-        self.tabs
-            .by_id_mut(id)
-            .map(|s| {
-                // Only the LIVE bottom can hold a live dialog. A tab parked in scrollback
-                // is showing history, and history may well contain a dialog that was
-                // answered long ago — reading that as "waiting now" is a false positive
-                // that would not self-clear (nothing scrolls it away). Also skips the scan
-                // entirely for scrolled tabs.
-                s.terminal.view_offset() == 0
-                    && crate::prompt::shows_blocking_prompt(
-                        &s.terminal.viewport_tail_text(crate::prompt::TAIL_ROWS),
-                    )
-            })
-            .unwrap_or(false)
+    /// Without it a dialog answered while the tab was scrolled back would stay `Waiting` on
+    /// both until the agent next drew something; with it, returning to the screen is enough.
+    fn rescan_at_live_bottom(&mut self, id: TabId) {
+        if self.push_agent_states_for(id) {
+            self.refresh_waiting_band();
+            self.redraw();
+        }
     }
 
     /// The ordered waiting items for the sidebar band — T4's read point (D2/R1.5).
@@ -1945,9 +1894,13 @@ impl Running {
                     // `unsigned_abs` so `i32::MIN` cannot overflow the negation.
                     term.scroll_down(n.unsigned_abs() as usize);
                 }
-                let moved = term.view_offset() != before;
-                if moved {
+                let after = term.view_offset();
+                if after != before {
                     self.redraw();
+                }
+                if returned_to_live(before, after) {
+                    let id = self.tabs.active().id;
+                    self.rescan_at_live_bottom(id);
                 }
             }
         }
@@ -1974,6 +1927,13 @@ impl Running {
         };
         if moved && self.tabs.is_active(id) {
             self.redraw();
+        }
+        // agent-card-status D7(b), for a background tab too: the level this tab held while
+        // scrolled back is re-read now that its live screen is showing again. On the
+        // output snap this runs one scan ahead of the PTY arm's own — a 20-row text read,
+        // only when the view was within a notch of the bottom.
+        if moved {
+            self.rescan_at_live_bottom(id);
         }
     }
 
@@ -2208,6 +2168,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // (possibly background) session's PTY (T1 → T3).
                 let mut command_end = None;
                 let mut title_changed = false;
+                let mut card_changed = false;
                 // Sampled INSIDE the closure and BEFORE the drain (terminal-scroll
                 // D12/C8): `scrollback` D2's auto-increment runs in `feed_scroll`, so a
                 // viewport parked at 1 that receives a 10-line burst already reads 11 by
@@ -2223,6 +2184,7 @@ impl ApplicationHandler<UserEvent> for App {
                         let got = s.drain();
                         command_end = s.take_command_end();
                         title_changed = s.take_title_dirty();
+                        card_changed = s.take_command_state_dirty();
                         got
                     })
                     .unwrap_or(false);
@@ -2237,11 +2199,14 @@ impl ApplicationHandler<UserEvent> for App {
                     inner.snap_after_output(id);
                 }
                 // A manual OSC-2 label change refreshes the sidebar rows so the new label
-                // shows immediately — even for a background tab (tab-identity).
-                if title_changed {
+                // shows immediately — even for a background tab (tab-identity). A command
+                // starting or finishing does the same for the card's status
+                // (sidebar-weather-cards D8): `Running` / `Exited N` ride on the rows.
+                let (sync_rows, needs_redraw) =
+                    drain_effects(advanced, is_active, title_changed, card_changed);
+                if sync_rows {
                     inner.sync_tab_model();
                 }
-                let needs_redraw = (advanced && is_active) || title_changed;
                 // Feed the command-end into the waiting model (T3). A background
                 // tab's completion/error must still repaint the sidebar band even
                 // though its grid output does not (so redraw when the set changed).
@@ -2858,6 +2823,38 @@ fn err<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
 /// from that `f32` so no const float cast is involved.
 const SNAP_FLOOR: usize = 3;
 
+/// Patch each flipped tab's row with its new dialog level, answering whether any row
+/// changed (agent-card-status D7) — the card's half of a scan, as the waiting model's
+/// `on_agent_states` is the band's.
+fn patch_dialog_rows(model: &TabModelHandle, flipped: &[(TabId, bool)]) -> bool {
+    flipped.iter().fold(false, |any, &(id, level)| {
+        model.set_blocking_dialog(id.0, level) || any
+    })
+}
+
+/// Whether a viewport move landed on the live bottom from somewhere above it — the wheel's
+/// share of agent-card-status D7(b). A move that started at the bottom returned from
+/// nowhere, and one that stopped short is still history.
+fn returned_to_live(before: usize, after: usize) -> bool {
+    before != 0 && after == 0
+}
+
+/// What one drained PTY chunk asks of the loop: `(sync the sidebar rows, redraw)`.
+///
+/// A label change or a command starting or ending re-syncs the rows — for a background
+/// tab too, since `Running` / `Exited N` ride on them (sidebar-weather-cards D8) — and
+/// either one repaints; grid output repaints only the tab on screen. Pure so the rule is
+/// testable without a window, like [`snap_on_output`].
+fn drain_effects(
+    advanced: bool,
+    is_active: bool,
+    title_changed: bool,
+    card_changed: bool,
+) -> (bool, bool) {
+    let sync_rows = title_changed || card_changed;
+    (sync_rows, (advanced && is_active) || sync_rows)
+}
+
 /// Whether new output should return this viewport to the live bottom, from the offset
 /// **sampled before the drain** (terminal-scroll D12).
 ///
@@ -3013,6 +3010,132 @@ fn next_composition_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- agent-card-status D7 / D4: one stored dialog level, read by band and card ----
+
+    #[test]
+    fn a_scans_flips_are_patched_onto_their_rows() {
+        // agent-card-status R7.6 / R7.7 — every flipped tab's row takes its new level, and a
+        // change is reported when any row moved (a later no-op must not mask an earlier
+        // change); an empty scan, or a flip for a closed tab, changes nothing.
+        // A fresh model: libtest runs each test on its own thread, and the handle is
+        // per-thread.
+        let model = TabModelHandle::shared();
+        model.set(renderer::sidebar_row::TabBarModel {
+            titles: [1, 2]
+                .map(|id| renderer::sidebar_row::SidebarRow {
+                    tab_id: id,
+                    ..Default::default()
+                })
+                .to_vec(),
+            ..Default::default()
+        });
+        let levels =
+            || model.with(|m| m.rows.iter().map(|r| r.blocking_dialog).collect::<Vec<_>>());
+        assert!(!patch_dialog_rows(&model, &[]));
+        assert!(patch_dialog_rows(
+            &model,
+            &[(TabId(1), true), (TabId(9), true)]
+        ));
+        assert_eq!(levels(), vec![true, false]);
+        assert!(patch_dialog_rows(
+            &model,
+            &[(TabId(2), true), (TabId(1), true)]
+        ));
+        assert_eq!(levels(), vec![true, true]);
+        assert!(!patch_dialog_rows(&model, &[(TabId(9), false)]));
+        // Two real flips in one scan: both rows move, not only the first.
+        assert!(patch_dialog_rows(
+            &model,
+            &[(TabId(2), false), (TabId(1), false)]
+        ));
+        assert_eq!(levels(), vec![false, false]);
+    }
+
+    #[test]
+    fn the_dialog_level_is_wired_where_no_test_can_call() {
+        // agent-card-status D4/D7 — the call sites inside `Running`, which needs a window and
+        // so is reachable by no test. The decisions behind them are tested where they live
+        // (`Tabs::rescan_dialogs`, `Session::rescan_dialog`, `patch_dialog_rows`,
+        // `returned_to_live`); this pins the joins, the precedent `seam.rs` set for the
+        // `OverlayPending` arm. Comments are stripped so a join cannot survive as prose.
+        let src = include_str!("terminal_app.rs");
+        let (production, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("terminal_app.rs has a test module to split on");
+        let code = production
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = |sig: &str| -> String {
+            let rest = code
+                .split_once(sig)
+                .unwrap_or_else(|| panic!("{sig} exists"))
+                .1;
+            rest.split_once("\n    }\n")
+                .unwrap_or_else(|| panic!("{sig} closes"))
+                .0
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let push = body("fn push_agent_states_inner(");
+        for join in [
+            "let scan = self.tabs.rescan_dialogs(base, active);",
+            ".on_agent_states(&scan.states, active, Instant::now());",
+            "let flipped = patch_dialog_rows(&self.tab_model, &scan.flipped);",
+        ] {
+            assert!(push.contains(join), "push_agent_states_inner lost `{join}`");
+        }
+        assert!(push.ends_with("changed || flipped"), "its answer: {push}");
+        assert!(
+            !push.contains("sync_tab_model") && !push.contains("titles("),
+            "the scan must not rebuild the rows through the roster path"
+        );
+        let rescan = body("fn rescan_at_live_bottom(");
+        assert_eq!(
+            rescan,
+            "&mut self, id: TabId) { if self.push_agent_states_for(id) { self.refresh_waiting_band(); self.redraw(); }"
+        );
+        let wheel = body("fn wheel_grid(");
+        for join in [
+            "if after != before { self.redraw(); }",
+            "if returned_to_live(before, after) { let id = self.tabs.active().id; self.rescan_at_live_bottom(id); }",
+        ] {
+            assert!(wheel.contains(join), "wheel_grid lost `{join}`");
+        }
+        // The three scan events D7(a) rides on — the pre-existing callers, which the level now
+        // depends on: a PTY chunk, a metadata publication, a tab switch.
+        let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("if advanced && inner.push_agent_states_for(id) {"),
+            "the PTY arm no longer scans its tab"
+        );
+        assert!(
+            body("fn feed_agent_states(").ends_with("self.push_agent_states()"),
+            "a publication no longer scans"
+        );
+        assert!(
+            body("fn after_roster_change(").contains("self.push_agent_states();"),
+            "a tab switch no longer scans"
+        );
+        let snap = body("fn snap_tab_to_live(");
+        assert!(
+            snap.contains("if moved { self.rescan_at_live_bottom(id); }"),
+            "snap_tab_to_live lost its rescan: {snap}"
+        );
+    }
+
+    #[test]
+    fn only_a_move_onto_the_live_bottom_returns_to_live() {
+        // R7.4 — the wheel's share of D7(b): from history to the bottom, and nothing else.
+        assert!(returned_to_live(5, 0));
+        assert!(returned_to_live(1, 0));
+        assert!(!returned_to_live(0, 0), "already live");
+        assert!(!returned_to_live(5, 2), "still history");
+        assert!(!returned_to_live(0, 3), "a move into history");
+    }
 
     // ---- card-live-cwd R3 + R5.2: the waiting band follows the shell, and its rebuild
     //      path sends the metadata worker nothing ----
@@ -3831,6 +3954,27 @@ mod tests {
             !snap_on_output(15),
             "the drifted value fails the floor — which is why it is not re-tested"
         );
+    }
+
+    #[test]
+    fn a_command_state_change_resyncs_and_repaints_even_in_the_background() {
+        // (advanced, is_active, title_changed, card_changed) → (sync rows, redraw).
+        let cases = [
+            ((false, false, false, false), (false, false)),
+            ((true, false, false, false), (false, false)),
+            ((false, true, false, false), (false, false)),
+            ((true, true, false, false), (false, true)),
+            ((false, false, true, false), (true, true)),
+            ((false, false, false, true), (true, true)),
+            ((true, false, false, true), (true, true)),
+        ];
+        for ((adv, active, title, card), want) in cases {
+            assert_eq!(
+                drain_effects(adv, active, title, card),
+                want,
+                "advanced={adv} active={active} title={title} card={card}"
+            );
+        }
     }
 
     /// **R9.3 — the predicate half of the pre-drain rule.** `scrollback` D2 auto-increments

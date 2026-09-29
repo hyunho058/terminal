@@ -251,3 +251,28 @@ idle behaviour. See G1 for what the caches do and do not buy against it.
   regular ones — the pixel half, because the ink-map contract deliberately says
   *which* cells carry ink and not *how much*, and so stays green while bold is a
   ghost.
+- **G8** A sidebar card's agent status now reads two more things this repo cannot pin
+  (`specs/agent-card-status`). Recorded beside G5's A1/A2 and G6 because it is the same
+  *kind* of fact — another program's output, read as data, with nobody to tell us when it
+  changes:
+
+  - **Antigravity's transcript vocabulary.** The card's Antigravity state classifies the
+    last step of `brain/<id>/.system_generated/logs/transcript.jsonl` by its `type`
+    (`PLANNER_RESPONSE`, `USER_INPUT`, the result kinds), its `tool_calls` names
+    (`ask_question` blocks on the user; eight named tools are "foreground") and its `status`
+    (`RUNNING` = a background task). Every list is **closed**, so a rename degrades toward
+    the recency fallback — `Working` for 10 s after the last write, then `Ready` — and never
+    toward a false `Waiting for input`. A renamed `ask_question` would lose its `Waiting`
+    the same way. **"Antigravity never reads Waiting any more" should be read as "check
+    the step names first".**
+  - **Both agents' dialog wording and layout.** `prompt.rs` matches Claude Code's permission
+    dialog by two of its question, footer and chooser lines, and the Antigravity CLI's by its
+    question row with the first choice (`1. Yes, …`) as the next non-blank row. Antigravity's
+    footer is deliberately **not** a marker: `agy` draws `esc to cancel` under every running
+    turn, so it says nothing about a dialog. A wording or layout change reads as "not
+    detected": the card falls back to the log state, which cannot see a pending permission
+    (`Working`). The oracle for that case is
+    the `waiting-scan` debug line (`RUST_LOG=app=debug`), which dumps the matcher's whole
+    20-row input byte for byte — it is how the Antigravity fixture was captured, and it
+    answers "was the dialog absent, scrolled, or merely unmatched" in one line. The
+    workspace-trust dialog is not matched at all until it is captured the same way.

@@ -143,7 +143,19 @@ impl CellGeometry {
 /// the only machine that sets the variable — left a broken font pipeline reported
 /// by nothing at all.
 pub fn headless(width: u32, height: u32, cfg: &Config, what: &str) -> Option<Renderer> {
-    match Renderer::new_headless(width, height, 1.0, cfg) {
+    headless_scaled(width, height, 1.0, cfg, what)
+}
+
+/// [`headless`] at a backing `scale_factor` — the same skip-or-fail policy, so a 2×
+/// (Retina) golden frame does not copy it.
+pub fn headless_scaled(
+    width: u32,
+    height: u32,
+    scale_factor: f64,
+    cfg: &Config,
+    what: &str,
+) -> Option<Renderer> {
+    match Renderer::new_headless(width, height, scale_factor, cfg) {
         Ok(r) => Some(r),
         Err(RendererError::NoFont(tried)) => panic!(
             "no usable monospace font (tried {tried}). This is the font pipeline \
@@ -161,5 +173,23 @@ pub fn headless(width: u32, height: u32, cfg: &Config, what: &str) -> Option<Ren
                  Set SKIP_GPU_TESTS=1 to opt out deliberately."
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_present_gpu_is_handed_a_renderer_not_a_skip() {
+        // The other half of the policy: unless a machine opts out, the pixel tests get a
+        // renderer or fail. A `headless` that answered `None` here would turn every
+        // golden frame into a silent pass.
+        if std::env::var_os("SKIP_GPU_TESTS").is_some() {
+            return;
+        }
+        let cfg = common::config::Config::default();
+        let r = super::headless_scaled(64, 64, 2.0, &cfg, "the policy test")
+            .expect("a renderer, or a panic naming why not");
+        assert_eq!(r.scale_factor(), 2.0);
+        assert!(super::headless(64, 64, &cfg, "the policy test").is_some());
     }
 }

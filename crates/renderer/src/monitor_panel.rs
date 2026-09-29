@@ -967,6 +967,7 @@ mod tests {
                 scale_factor: 1.0,
                 snapshot: &snap,
                 atlas,
+                fonts: &fonts,
             };
             layer.record(&mut ctx);
         };
@@ -1060,6 +1061,7 @@ mod tests {
                 scale_factor: 1.0,
                 snapshot: &snap,
                 atlas,
+                fonts: &fonts,
             };
             layer.record(&mut ctx);
         };
@@ -1167,6 +1169,7 @@ mod tests {
                 scale_factor: 1.0,
                 snapshot: &snap,
                 atlas,
+                fonts: &fonts,
             };
             layer.record(&mut ctx);
         };
@@ -1368,6 +1371,7 @@ mod tests {
                 scale_factor: 1.0,
                 snapshot: &snap,
                 atlas,
+                fonts: &fonts,
             };
             layer.record(&mut ctx);
         };
@@ -1441,6 +1445,7 @@ mod tests {
                     scale_factor: 1.0,
                     snapshot: &snap,
                     atlas: &mut atlas,
+                    fonts: &fonts,
                 };
                 layer.record(&mut ctx);
             }
@@ -1516,6 +1521,7 @@ mod tests {
                 scale_factor: 1.0,
                 snapshot: &snap,
                 atlas,
+                fonts: &fonts,
             };
             layer.record(&mut ctx);
         };
@@ -1653,6 +1659,7 @@ mod tests {
                 scale_factor: 1.0,
                 snapshot: &snap,
                 atlas: &mut atlas,
+                fonts: &fonts,
             };
             layer.record(&mut ctx);
         }
@@ -1757,6 +1764,7 @@ mod tests {
                 scale_factor: 1.0,
                 snapshot: &snap,
                 atlas: &mut atlas,
+                fonts: &fonts,
             };
             layer.record(&mut ctx);
             assert!(

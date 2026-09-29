@@ -1719,7 +1719,11 @@ impl SessionTelemetry {
 /// `CONVERSATION_HISTORY`, `SYSTEM_MESSAGE`, `ERROR_MESSAGE`), which is why the orphan
 /// counter is gated on membership: counting those would make `orphan_tool_results`
 /// read as a parser fault on every well-formed transcript.
-const AG_RESULT_STEPS: &[&str] = &[
+///
+/// Also the closed set the sidebar's tail reader classifies as a tool result
+/// (`agent-card-status` D1, `antigravity::tail_state`) — one list, so the panel and the
+/// card cannot disagree about which steps are results.
+pub(crate) const AG_RESULT_STEPS: &[&str] = &[
     "VIEW_FILE",
     "CODE_ACTION",
     "GREP_SEARCH",

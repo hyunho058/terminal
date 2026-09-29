@@ -204,6 +204,15 @@ impl Terminal {
         self.grid.take_command_end()
     }
 
+    /// Whether the shell is running a foreground command: the last OSC 133 marker was
+    /// a command start with no well-formed command end after it (sidebar-weather-cards
+    /// D8). A state read, not a drain — the app mirrors it every `advance`. Like
+    /// [`take_command_end`](Terminal::take_command_end) it is a raw shell fact; what
+    /// "running" means for the UI is the app's policy.
+    pub fn command_running(&self) -> bool {
+        self.grid.command_running()
+    }
+
     /// Take the most-recent OSC 0 / OSC 2 window title set since the last take, clearing
     /// it (one-shot drain). Poll it right after [`advance`](Terminal::advance). `None` if
     /// no title arrived; `Some("")` when the title was explicitly cleared (the app then
@@ -282,6 +291,57 @@ mod tests {
         assert_eq!(ev.exit_code, 101);
         assert_eq!(ev.elapsed_ms, 40000);
         assert!(t.take_command_end().is_none(), "one-shot: drains on take");
+    }
+
+    // --- OSC 133 command-start → running state (sidebar-weather-cards D8) ---
+
+    fn term() -> Terminal {
+        Terminal::new(20, 5, Color(0xE0E0E0), Color(0x101010))
+    }
+
+    #[test]
+    fn command_start_sets_running_and_end_clears_it() {
+        // R8.1 — `C` sets the state, a well-formed `D` clears it, and the command-end
+        // one-shot the waiting band consumes still fires exactly once.
+        let mut t = term();
+        assert!(!t.command_running(), "a fresh shell runs nothing");
+        t.advance(b"\x1b]133;C\x07");
+        assert!(t.command_running(), "C → running");
+        assert!(t.command_running(), "reading is not a drain");
+        t.advance(b"\x1b]133;D;0;5\x07");
+        assert!(!t.command_running(), "D → not running");
+        let ev = t.take_command_end().expect("the one-shot still fires");
+        assert_eq!((ev.exit_code, ev.elapsed_ms), (0, 5));
+        assert!(t.take_command_end().is_none(), "and only once");
+    }
+
+    #[test]
+    fn only_the_final_marker_in_a_chunk_counts() {
+        // R8.2 — a fast command puts C then D in one read; typeahead can put the old
+        // D then the new C in one read. Byte order decides, not the drain.
+        let mut t = term();
+        t.advance(b"\x1b]133;C\x07file.txt\r\n\x1b]133;D;0;3\x07");
+        assert!(!t.command_running(), "C…D in one chunk → finished");
+        let mut t = term();
+        t.advance(b"\x1b]133;D;101;40\x07$ \x1b]133;C\x07");
+        assert!(
+            t.command_running(),
+            "D…C in one chunk → the new command runs"
+        );
+    }
+
+    #[test]
+    fn a_malformed_end_leaves_the_running_state_untouched() {
+        // R8.3 — the parser's drop-the-whole-event contract covers the state too.
+        let mut t = term();
+        t.advance(b"\x1b]133;C\x07");
+        t.advance(b"\x1b]133;D;notanumber;5\x07");
+        assert!(t.command_running(), "a garbage D is not an end");
+        assert!(t.take_command_end().is_none(), "and records no event");
+        t.advance(b"\x1b]133;D;7\x07"); // missing elapsed
+        assert!(t.command_running(), "nor is a partial one");
+        t.advance(b"\x1b]133;A\x07"); // another subkind (prompt start)
+        assert!(t.command_running(), "unknown subkinds do not move it");
     }
 
     #[test]

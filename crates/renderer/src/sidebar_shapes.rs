@@ -351,6 +351,11 @@ pub struct SidebarShapePipeline {
     bind_group: wgpu::BindGroup,
     /// Grown across frames by `crate::upload_resident`, never reallocated per frame.
     instances: Option<wgpu::Buffer>,
+    /// How many times `draw` wrote the instance buffer — a test hook, so a caller's
+    /// "a steady frame uploads nothing" can be checked here rather than by its own
+    /// bookkeeping (sidebar-weather-cards R17.1).
+    #[cfg(test)]
+    pub(crate) uploads: u32,
 }
 
 impl SidebarShapePipeline {
@@ -411,6 +416,8 @@ impl SidebarShapePipeline {
             uniform,
             bind_group,
             instances: None,
+            #[cfg(test)]
+            uploads: 0,
         }
     }
 
@@ -467,10 +474,28 @@ impl SidebarShapePipeline {
         );
         let count =
             crate::upload_resident(device, queue, &mut self.instances, shapes, "sidebar-shapes");
+        #[cfg(test)]
+        {
+            self.uploads += 1;
+        }
+        self.pass(encoder, view, count);
+    }
+
+    /// Draw the first `count` instances the last [`draw`](SidebarShapePipeline::draw)
+    /// uploaded, **writing no buffer** — for a caller that knows its shapes are unchanged
+    /// since then (sidebar-weather-cards D20). `count` must not exceed that upload.
+    pub fn redraw(&mut self, ctx: &mut FrameCtx<'_>, count: u32) {
+        self.pass(ctx.encoder, ctx.view, count);
+    }
+
+    /// Record the render pass over the resident instances.
+    fn pass(&self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, count: u32) {
         if count == 0 {
             return;
         }
-        let instances = self.instances.as_ref().expect("resident buffer present");
+        let Some(instances) = self.instances.as_ref() else {
+            return;
+        };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("sidebar-shapes"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {

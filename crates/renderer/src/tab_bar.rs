@@ -84,12 +84,27 @@ pub(crate) fn layout_line(
     s: &str,
     start_x: f32,
     cell_w: f32,
+    emit: impl FnMut(f32, GlyphEntry),
+) {
+    // Tab-bar text carries no SGR style of its own (D3/R3.5).
+    layout_line_in(ctx.atlas, ctx.queue, s, start_x, cell_w, false, emit);
+}
+
+/// [`layout_line`] against a given atlas and weight — the sidebar's card atlases draw
+/// their bold titles through this (sidebar-weather-cards D2/D3), so the column rule and
+/// the fallback-chain resolution still live in exactly one place.
+pub(crate) fn layout_line_in(
+    atlas: &mut crate::atlas::Atlas,
+    queue: &wgpu::Queue,
+    s: &str,
+    start_x: f32,
+    cell_w: f32,
+    bold: bool,
     mut emit: impl FnMut(f32, GlyphEntry),
 ) {
     for (c, pen) in pen_layout(s, start_x, cell_w) {
-        // Tab-bar text carries no SGR style of its own (D3/R3.5).
-        if let Some(key) = ctx.atlas.resolve(c, false, false) {
-            if let Some(e) = ctx.atlas.get_or_insert_styled(ctx.queue, key) {
+        if let Some(key) = atlas.resolve(c, bold, false) {
+            if let Some(e) = atlas.get_or_insert_styled(queue, key) {
                 emit(pen, e);
             }
         }

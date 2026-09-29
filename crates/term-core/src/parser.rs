@@ -350,7 +350,7 @@ impl Perform for Performer<'_> {
     /// `params = [b"133", b"D", b"<exit>", b"<elapsed_ms>"]`.
     ///
     /// The wire contract (emitter + parser both live in this task — keep in sync):
-    /// - Command start: `ESC ] 133 ; C ST`  (recognized, no payload consumed yet)
+    /// - Command start: `ESC ] 133 ; C ST`  (no payload; sets the running state)
     /// - Command end:   `ESC ] 133 ; D ; <exit_code> ; <elapsed_ms> ST`
     ///
     /// `elapsed_ms` is measured shell-side from `EPOCHREALTIME` (spec D19). Both
@@ -378,11 +378,16 @@ impl Perform for Performer<'_> {
         if params.first().copied() != Some(b"133".as_slice()) {
             return;
         }
-        // `D` = command end — the only subkind carrying the exit + elapsed payload
-        // the waiting feature needs. `C` (command start) and any other subkind are
-        // recognized but carry nothing we consume, so they fall through to a no-op.
-        if params.get(1).copied() != Some(b"D".as_slice()) {
-            return;
+        // `C` = command start (sidebar-weather-cards D8): no payload, it only moves
+        // the running state. `D` = command end, the one subkind carrying the exit +
+        // elapsed payload. Any other subkind is recognized and ignored.
+        match params.get(1).copied() {
+            Some(b"C") => {
+                self.grid.record_command_start();
+                return;
+            }
+            Some(b"D") => {}
+            _ => return,
         }
         // Both fields are required; either missing/garbage → drop the whole event
         // and leave prior state untouched (partial params are not a valid marker).

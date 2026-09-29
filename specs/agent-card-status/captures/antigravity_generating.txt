@@ -1,0 +1,14 @@
+
+      ▄▀▀▄        Antigravity CLI 1.2.12
+     ▀▀▀▀▀▀       user@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 3.8 Flash (Medium)
+   ▄▀▀    ▀▀▄     ~/IdeaProjects/terminal
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> Could you explian about this project?
+⣾  Generating...
+───────────────────────────────────────────────────────────────────────────────────
+>
+───────────────────────────────────────────────────────────────────────────────────
+esc to cancel                                             Gemini 3.8 Flash · medium

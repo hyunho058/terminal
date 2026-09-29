@@ -1,6 +1,6 @@
-//! The redesigned left sidebar: rounded two-line cards (line 1 mark + title, line 2
-//! branch icon + branch), an active highlight, per-agent skins — drawn on the
-//! hand-rolled wgpu renderer (SD1). This module holds the real implementation;
+//! The redesigned left sidebar: the weather cards (`sidebar-weather-cards` — title and
+//! folder over status and branch, a pixel agent icon, per-agent skins, hover and
+//! selected states), drawn on the hand-rolled wgpu renderer (SD1). This module holds the real implementation;
 //! [`crate::tab_bar`] is a thin source-compatibility façade over it (D1).
 //!
 //! **The model bus (D3).** Four parties must see one model but only one is handed a
@@ -25,28 +25,27 @@ use bytemuck::{Pod, Zeroable};
 use common::config::SidebarConfig;
 use wgpu::util::DeviceExt;
 
+use crate::sidebar_card::{build_card, card_state, folder_text, CardInput, CardStatus, TextRun};
 use crate::sidebar_icons::{push_icon, Icon};
 use crate::sidebar_layout::OpenMenu;
 use crate::sidebar_shapes::{Fill, SidebarShape, SidebarShapePipeline};
-use crate::sidebar_theme::{linear, AgentSkin, SidebarMetrics, SidebarTheme};
+use crate::sidebar_text::{CardAtlases, CardFace};
+use crate::sidebar_theme::{linear, AgentSkin, CardMetrics, SidebarMetrics, SidebarTheme};
+use crate::tab_bar::char_cols;
 use crate::{DrawLayer, FrameCtx};
 
 /// The z-order of the sidebar layer (above the terminal glyph pass = 0, below overlays).
 pub const TAB_BAR_Z: i32 = 10;
-
-/// Fraction of line 2's width the repo/folder name may claim before the git branch when a
-/// task label took line 1 (tab-identity, R2.2): the repo is the priority identity on
-/// overflow, so it gets the majority share and the branch takes the remainder.
-const REPO_LINE2_WIDTH_SHARE: f32 = 0.55;
 
 // ---------------------------------------------------------------------------
 // Plain-data row + metadata types (SD3 — the renderer never names app types)
 // ---------------------------------------------------------------------------
 
 /// One tab as the app hands it over (D2): a stable id so asynchronous metadata can be
-/// joined to it by id (never by index, D10), plus its title. Deliberately carries only
-/// what `Tabs` owns; branch / mark / skin live in [`RowMeta`], pulled separately.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// joined to it by id (never by index, D10), plus what `Tabs` itself owns — its title
+/// sources and its shell's command state. Branch / status / skin live in [`RowMeta`],
+/// pulled separately.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SidebarRow {
     /// The app's `session::TabId` as a plain `u64` — the renderer must not know app types.
     pub tab_id: u64,
@@ -54,9 +53,9 @@ pub struct SidebarRow {
     /// fallback, not its live folder name (card-live-cwd D2).
     ///
     /// The rows are rebuilt on tab actions, so this string does not follow a `cd`. The live
-    /// folder name arrives on the metadata pull as [`RowMeta::cwd_title`], and both the
-    /// label chain's cwd tier and line 2's repo name read that. This field is what a card
-    /// shows only while its tab is still unpolled, or when no [`MetaSource`] is installed.
+    /// directory arrives on the metadata pull as [`RowMeta::cwd_display`]; this field is
+    /// what a card shows only while its tab is still unpolled, or when no [`MetaSource`]
+    /// is installed.
     pub title: String,
     /// The **user's** sticky title for this tab, if any (sticky-tab-title R1.1). Set only
     /// by an explicit user action — never by the PTY — and outranks every other source on
@@ -67,23 +66,21 @@ pub struct SidebarRow {
     /// `MetaSource::fill`, where the AI-task label is fresh; it ranks below that label
     /// (D12) and is hidden entirely while `label` is set (D3). `None` = none seen.
     pub program: Option<String>,
-}
-
-/// The leading mark on a card's first line (D11/D12), drawn as a foundations icon —
-/// never a font glyph, so it cannot become tofu.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum RowMark {
-    /// No agent — line 1 starts at the padding edge with no mark column.
-    #[default]
-    None,
-    /// An agent is working (the `✳` asterisk).
-    Agent,
-    /// An agent is idle / ready (the `◇` diamond).
-    Ready,
-    /// An agent handed its turn back and is waiting for input (the `⏸` pause, in the
-    /// waiting colour) — the card-side echo of the waiting band (D6). Mapped from
-    /// `AgentState::Waiting` in `sidebar_model::mark_for`.
-    Waiting,
+    /// Whether the tab's shell is running a foreground command — OSC 133 `C` seen with no
+    /// command end since (sidebar-weather-cards D8). UI-thread state from the `Session`,
+    /// so it travels here, on the rows, the way `program` does: the metadata worker that
+    /// fills [`RowMeta`] never sees PTY bytes.
+    pub running: bool,
+    /// The exit code of the tab's last **finished** foreground command, if one has
+    /// finished (D8). Raw: whether it counts as a failure is the app's rule (D12).
+    pub last_exit: Option<i32>,
+    /// Whether the tab's live screen shows a dialog that blocks on the user, as the app
+    /// last read it (agent-card-status D7). UI-thread state like [`running`]: it is read
+    /// off the tab's own grid, which the metadata worker never sees. What it does to the
+    /// card is the app's precedence (D8); this layer only carries it.
+    ///
+    /// [`running`]: SidebarRow::running
+    pub blocking_dialog: bool,
 }
 
 /// One waiting-band signal's visual kind (D6). Renderer-owned so the renderer never
@@ -111,12 +108,14 @@ pub struct WaitingRow {
     pub signal: WaitingSignal,
 }
 
-/// Per-tab metadata pulled from the app each frame (D10). Owned strings + `Copy` marks;
-/// `default()` is a plain card (no branch, no task, no mark, [`AgentSkin::Generic`]).
+/// Per-tab metadata pulled from the app each frame (D10). `default()` is a plain card —
+/// no branch, the `zsh` status, [`AgentSkin::Generic`] — for a tab not yet polled.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowMeta {
     pub branch: Option<String>,
-    pub mark: RowMark,
+    /// The bottom-left status, **already resolved by the app** by the precedence agent >
+    /// running > failed > shell (sidebar-weather-cards D7). The renderer only draws it.
+    pub status: CardStatus,
     pub skin: AgentSkin,
     /// Line 1's text, **already resolved by the app** (sticky-tab-title D7/R1.5) by the
     /// precedence user-title > AI-task > program-OSC title > cwd. The renderer holds no
@@ -124,35 +123,28 @@ pub struct RowMeta {
     /// refreshes live off the metadata generation — which is why the app resolves it in
     /// its `MetaSource::fill` and not when it assembles the rows.
     ///
-    /// Empty for a `default()` row; the layer falls back to the row's cwd title then.
+    /// Empty for a `default()` row; the layer falls back to the row's title then.
     pub line1: String,
-    /// Whether [`line1`](RowMeta::line1) came from something other than the cwd title —
-    /// a user title, an AI task, or a program title. Drives line 2's layout: when line 1
-    /// is custom, the cwd/repo name moves down beside the branch (tab-identity R2.2).
-    /// Decided by the app alongside `line1` so the two can never disagree.
-    pub line1_is_custom: bool,
-    /// The tab's folder name — the basename of its **live** working directory, resolved by
-    /// the app on this same pull (card-live-cwd D1/D6).
+    /// The folder line: the tab's **live** working directory with `$HOME` shown as `~`
+    /// (sidebar-weather-cards D10), resolved by the app on this same pull.
     ///
     /// It travels here rather than on [`SidebarRow`] for the reason `line1` does: the rows
-    /// are assembled on tab actions, while the cwd is republished whenever the shell moves,
-    /// so reading the row's copy left a card naming the directory its tab opened in. The app
-    /// feeds this same string to the label chain's cwd tier, so line 1 and line 2 can never
-    /// name two different folders.
+    /// are assembled on tab actions, while the cwd is republished whenever the shell moves
+    /// (card-live-cwd D1). It comes from the same `TabMeta::cwd` as line 1's cwd tier and
+    /// the same pull as the branch, so the card's folder and branch describe one directory.
     ///
     /// Empty for a `default()` row; the layer falls back to the row's title then.
-    pub cwd_title: String,
+    pub cwd_display: String,
 }
 
 impl Default for RowMeta {
     fn default() -> Self {
         RowMeta {
             branch: None,
-            mark: RowMark::None,
+            status: CardStatus::Shell,
             skin: AgentSkin::Generic,
             line1: String::new(),
-            line1_is_custom: false,
-            cwd_title: String::new(),
+            cwd_display: String::new(),
         }
     }
 }
@@ -277,40 +269,20 @@ pub struct SidebarLayout {
     pub margin_y: f32,
 }
 
-/// The pure card layout (D6/D7). One card height per frame — the branch line is reserved
-/// by `show_branch`, never by per-tab branch presence, so no card jitters when a branch
-/// appears or vanishes (D6). Scales the metrics once; `record` shares that same result
-/// via [`layout_with`] so a frame converts exactly once (R8.6).
+/// The pure card layout (D6/D7). Since sidebar-weather-cards D1 the card height is
+/// **fixed** — 104 logical px, scaled — so neither the terminal font (`geom.cell`) nor the
+/// branch toggle (`geom.show_branch`) moves it any more: a toggle now empties its zone
+/// instead (D13). Cards sit `inset_x` from each edge with a `gap` between them, split as
+/// half above and half below each card so the stride bands still tile (D7).
 pub fn layout(geom: &SidebarGeom, count: usize) -> SidebarLayout {
-    layout_with(geom, count, &SidebarMetrics::DEFAULT.scaled(geom.scale))
-}
-
-/// The pure layout given **already-scaled** metrics — the single `scaled()` result a
-/// frame produces (D6/R8.6), shared between the card geometry here and `record`'s chrome
-/// so nothing converts logical→physical px twice.
-fn layout_with(geom: &SidebarGeom, count: usize, m: &SidebarMetrics) -> SidebarLayout {
-    let meta_ratio = if m.title_px > 0.0 {
-        m.meta_px / m.title_px
-    } else {
-        1.0
-    };
-    let line1_h = geom.cell[1];
-    let line2_h = geom.cell[1] * meta_ratio;
-    let card_h = 2.0 * (m.border_w + m.card_pad_y)
-        + line1_h
-        + if geom.show_branch {
-            m.card_gap + line2_h
-        } else {
-            0.0
-        };
-    let stride = card_h + 2.0 * m.card_margin_y;
+    let c = CardMetrics::DEFAULT.scaled(geom.scale);
     SidebarLayout {
         geom: geom.clone(),
         count,
-        stride,
-        card_h,
-        margin_x: m.card_margin_x,
-        margin_y: m.card_margin_y,
+        stride: c.height + c.gap,
+        card_h: c.height,
+        margin_x: c.inset_x,
+        margin_y: c.gap * 0.5,
     }
 }
 
@@ -333,8 +305,8 @@ impl SidebarLayout {
         Some([x, y, w, self.card_h])
     }
 
-    /// Exact inverse: the card whose **stride band** contains `(x, y)` (D7 — the 3px
-    /// margins are visual, so a click in a margin still selects its card). Horizontally
+    /// Exact inverse: the card whose **stride band** contains `(x, y)` (D7 — the margins
+    /// between cards are visual, so a click in a margin still selects its card). Horizontally
     /// the whole `[0, sidebar_w)` band is live. Returns `None` outside the visible range
     /// (D13), so a click below the last visible card is a no-op, not a phantom hit.
     pub fn card_at(&self, x: f32, y: f32) -> Option<usize> {
@@ -393,32 +365,15 @@ pub fn truncate_to_width(s: &str, advance: f32, max_w: f32, ellipsis: char) -> S
 /// task label fresh. What remains here is the empty-means-no-metadata fallback, so a card
 /// drawn before the first `MetaSource::fill` shows its folder rather than a blank line.
 /// The second argument is the **row's** title (`SidebarRow::title`), deliberately NOT
-/// [`RowMeta::cwd_title`]. They differ: this fallback fires exactly when `RowMeta` is
+/// [`RowMeta::cwd_display`]. They differ: this fallback fires exactly when `RowMeta` is
 /// `default()`, so the live name is empty and the row's assembly-time copy is all there is.
-/// Named `row_title` rather than `cwd_title` because passing the live field here — the
+/// Named `row_title` rather than `cwd_display` because passing the live field here — the
 /// "obvious" consistency edit once both names exist — would blank line 1 on that very row.
 pub(crate) fn card_line1_text<'a>(resolved: &'a str, row_title: &'a str) -> &'a str {
     if resolved.is_empty() {
         row_title
     } else {
         resolved
-    }
-}
-
-/// Line 2's folder name: the **live** cwd title the app pulled with the metadata
-/// (card-live-cwd D1), falling back to the row's assembly-time title.
-///
-/// Same empty-means-no-metadata shape as [`card_line1_text`], but note the direction:
-/// `RowMeta::cwd_title` follows the shell while `SidebarRow::title` was frozen when the rows
-/// were assembled, so live wins whenever it exists.
-///
-/// The fallback is unreachable from the one call site — see the comment there — and is kept
-/// as defence-in-depth. Only the live-wins branch is asserted in tests (R1.4/R1.5).
-pub(crate) fn card_cwd_title<'a>(live: &'a str, row_title: &'a str) -> &'a str {
-    if live.is_empty() {
-        row_title
-    } else {
-        live
     }
 }
 
@@ -448,29 +403,45 @@ pub(crate) fn edit_line_text(
     if max_w <= 0.0 || advance <= 0.0 {
         return String::new();
     }
-    let max_chars = (max_w / advance).floor() as usize;
-    if max_chars == 0 {
+    // Budgeted in display columns, not chars (sidebar-weather-cards D3): a Hangul name is
+    // two columns a syllable, and a char-counted window would overrun the field.
+    let max_cols = (max_w / advance).floor() as usize;
+    if max_cols == 0 {
         return String::new();
     }
     // The caret is a drawn glyph, so it occupies one of the visible columns.
     let mut chars: Vec<char> = text.chars().collect();
     let caret_at = caret.min(chars.len());
     chars.insert(caret_at, EDIT_CARET);
-    if chars.len() <= max_chars {
+    let width = |cs: &[char]| cs.iter().map(|&c| char_cols(c)).sum::<usize>();
+    if width(&chars) <= max_cols {
         return chars.into_iter().collect();
     }
-    // A window of exactly `max_chars`, centred on the caret so there is context on both
-    // sides, clamped to the ends of the string.
-    let half = max_chars / 2;
-    let start = caret_at
-        .saturating_sub(half)
-        .min(chars.len().saturating_sub(max_chars));
-    let end = start + max_chars;
+    // A window of at most `max_cols`, centred on the caret so there is context on both
+    // sides: about half the columns left of it, then fill rightwards, then — at the end
+    // of the string — back-fill leftwards. For one-column text this is exactly the
+    // `max_chars` window centred on the caret and clamped to the ends.
+    let mut start = caret_at;
+    let mut used = char_cols(EDIT_CARET);
+    while start > 0 && used + char_cols(chars[start - 1]) <= max_cols / 2 + 1 {
+        start -= 1;
+        used += char_cols(chars[start]);
+    }
+    let mut end = caret_at + 1;
+    while end < chars.len() && used + char_cols(chars[end]) <= max_cols {
+        used += char_cols(chars[end]);
+        end += 1;
+    }
+    while start > 0 && used + char_cols(chars[start - 1]) <= max_cols {
+        start -= 1;
+        used += char_cols(chars[start]);
+    }
     let mut window: Vec<char> = chars[start..end].to_vec();
-    // Mark each elided side by REPLACING that edge column — never by adding one, which
-    // would push the window over the card's width. The caret is never overwritten: it is
-    // the one glyph that must survive, since a field whose cursor is off-screen is
-    // exactly the failure this windowing exists to prevent.
+    // Mark each elided side by REPLACING that edge glyph — never by adding one, which
+    // would push the window over the card's width (an ellipsis is never wider than the
+    // glyph it replaces). The caret is never overwritten: it is the one glyph that must
+    // survive, since a field whose cursor is off-screen is exactly the failure this
+    // windowing exists to prevent.
     if start > 0 && window[0] != EDIT_CARET {
         window[0] = ellipsis;
     }
@@ -481,26 +452,6 @@ pub(crate) fn edit_line_text(
         }
     }
     window.into_iter().collect()
-}
-
-/// The x-origin (physical px) at which line 2's git-branch icon may start after the repo name,
-/// or `None` when even the icon (`meta_px` wide) would overrun `right_edge` (tab-identity,
-/// R2.2 — the repo has priority, so a branch that can't fit is dropped rather than clipped).
-pub(crate) fn line2_branch_origin(x: f32, meta_px: f32, right_edge: f32) -> Option<f32> {
-    (x + meta_px <= right_edge).then_some(x)
-}
-
-/// The width (physical px) the repo/folder name may claim on line 2 before the git branch
-/// when a task label took line 1 (tab-identity, R2.2): the repo is the priority identity, so
-/// it gets [`REPO_LINE2_WIDTH_SHARE`] of `avail` when a branch follows — never less than one
-/// glyph `advance` so the repo never vanishes entirely — or all of `avail` when there is no
-/// branch. Pure so the repo-first policy is unit-testable without a GPU frame.
-pub(crate) fn repo_line2_budget(avail: f32, advance: f32, has_branch: bool) -> f32 {
-    if has_branch {
-        (avail * REPO_LINE2_WIDTH_SHARE).max(advance)
-    } else {
-        avail.max(0.0)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -618,6 +569,26 @@ impl TabModelHandle {
         m.rows_rev = m.rows_rev.wrapping_add(1);
     }
 
+    /// Set one row's [`SidebarRow::blocking_dialog`] in place, answering whether it changed;
+    /// `rows_rev` is bumped only then (agent-card-status D7). The incremental path for a
+    /// dialog appearing or clearing: it changes one card's status and nothing else about the
+    /// rows, and it can fire on a metadata publication — where rebuilding the rows through
+    /// `Tabs::titles` would also re-send the roster to the metadata worker, which then
+    /// re-derives and may publish again. An unknown `tab_id` (a tab closed between the scan
+    /// and this) changes nothing.
+    pub fn set_blocking_dialog(&self, tab_id: u64, level: bool) -> bool {
+        let mut m = self.0.borrow_mut();
+        let Some(row) = m.rows.iter_mut().find(|r| r.tab_id == tab_id) else {
+            return false;
+        };
+        if row.blocking_dialog == level {
+            return false;
+        }
+        row.blocking_dialog = level;
+        m.rows_rev = m.rows_rev.wrapping_add(1);
+        true
+    }
+
     /// Install the metadata pull source once (D10), from `main.rs`.
     pub fn set_meta_source(&self, source: Rc<dyn MetaSource>) {
         self.0.borrow_mut().meta_source = Some(source);
@@ -718,50 +689,6 @@ pub fn tab_at(x: f32, y: f32, sidebar_w: f32, tab_h: f32, count: usize) -> Optio
 }
 
 // ---------------------------------------------------------------------------
-// Card visual state resolution (D12)
-// ---------------------------------------------------------------------------
-
-/// A card's combined visual state (D12). Selection outranks hover.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CardState {
-    Idle,
-    Hovered,
-    Selected,
-}
-
-/// Resolve a card's `(background fill, border colour)` from its skin + state (D12's
-/// table). A `Generic` idle card returns `None` fill — **no instance is emitted at all**,
-/// keeping the panel continuous and the instance count low.
-fn resolve_card(
-    skin: AgentSkin,
-    state: CardState,
-    theme: &SidebarTheme,
-) -> (Option<Fill>, Option<[f32; 4]>) {
-    match skin {
-        AgentSkin::Generic => match state {
-            CardState::Idle => (None, None),
-            CardState::Hovered => (Some(Fill::solid(linear(theme.card_bg_hover, 1.0))), None),
-            CardState::Selected => (
-                Some(Fill::solid(linear(theme.card_bg_active, 1.0))),
-                Some(linear(theme.card_border_active, 1.0)),
-            ),
-        },
-        AgentSkin::Claude | AgentSkin::Antigravity => {
-            let s = skin.states();
-            let (fill, border) = match state {
-                CardState::Idle => (s.bg, s.dim),
-                CardState::Hovered => (s.hi, s.dim),
-                CardState::Selected => (s.hi, s.border),
-            };
-            (
-                Some(Fill::gradient(fill.stops, fill.mid, fill.dir)),
-                Some(border),
-            )
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // The text pipeline (D9) — a resident-buffer glyph pass over the shared atlas
 // ---------------------------------------------------------------------------
 
@@ -845,6 +772,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Which atlas a text batch samples: the grid's (band, popup, fallback) or one of the
+/// sidebar's own card atlases (sidebar-weather-cards D2).
+#[derive(Clone, Copy)]
+enum TextAtlas<'b> {
+    Grid,
+    Card(&'b crate::atlas::Atlas),
+}
+
 /// The glyph pass. Mirrors foundations' shape-pipeline API; instances ride a resident
 /// buffer (`upload_resident`, never `create_buffer_init` per frame — G1). The bind group
 /// is rebuilt on the key `(format, atlas.epoch())` so a live `apply_config` atlas swap
@@ -867,6 +802,9 @@ struct SidebarTextPipeline {
     /// shipped binary nothing.
     #[cfg(test)]
     rebuilds: u32,
+    /// How many times `draw` wrote the instance buffer — a test hook (R17.1).
+    #[cfg(test)]
+    uploads: u32,
     instances: Option<wgpu::Buffer>,
 }
 
@@ -928,6 +866,8 @@ impl SidebarTextPipeline {
             bind_key: None,
             #[cfg(test)]
             rebuilds: 0,
+            #[cfg(test)]
+            uploads: 0,
             instances: None,
         }
     }
@@ -946,7 +886,7 @@ impl SidebarTextPipeline {
         slot.as_mut().expect("just built")
     }
 
-    fn draw(&mut self, ctx: &mut FrameCtx<'_>, text: &[TextInstance]) {
+    fn draw(&mut self, ctx: &mut FrameCtx<'_>, source: TextAtlas<'_>, text: &[TextInstance]) {
         if text.is_empty() {
             return;
         }
@@ -963,8 +903,9 @@ impl SidebarTextPipeline {
         // * `generation` is deliberately NOT here. It counts evictions *within* one
         //   texture; eviction reuses the same texture, view and sampler, so rebuilding on
         //   a bump would produce a byte-identical bind group. The UV invalidation it
-        //   really signals is repaired by re-issuing instances, which `record` already
-        //   does every frame (D5).
+        //   really signals is repaired by re-issuing instances: every atlas's generation
+        //   is in `record`'s compose key (sidebar-weather-cards D20), so an eviction makes
+        //   the next frame compose and resolve its text again (D5).
         // * `cell` is deliberately NOT here either. `TextUniforms` is `{viewport, _pad}`,
         //   so the cell size never enters the bind group at all.
         // * `format` is retained, but be honest about its status: it is structurally
@@ -973,7 +914,16 @@ impl SidebarTextPipeline {
         //   the comparison can never fire. It is kept purely as defence in case this cache
         //   ever moves outside the format-gated struct — not because it guards anything
         //   reachable now.
-        let key = (ctx.format, ctx.atlas.epoch());
+        //
+        // Since sidebar-weather-cards a pipeline samples one of three atlases — the grid's
+        // or either card atlas (D2) — so the texture and its epoch come from `source`. The
+        // key logic above holds for each: one pipeline per atlas, keyed on that atlas's
+        // own epoch (D18).
+        let (view, sampler, epoch) = match source {
+            TextAtlas::Grid => (ctx.atlas.view(), ctx.atlas.sampler(), ctx.atlas.epoch()),
+            TextAtlas::Card(a) => (a.view(), a.sampler(), a.epoch()),
+        };
+        let key = (ctx.format, epoch);
         if self.bind_key != Some(key) {
             self.bind = Some(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("sidebar-text-bg"),
@@ -985,11 +935,11 @@ impl SidebarTextPipeline {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(ctx.atlas.view()),
+                        resource: wgpu::BindingResource::TextureView(view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::Sampler(ctx.atlas.sampler()),
+                        resource: wgpu::BindingResource::Sampler(sampler),
                     },
                 ],
             }));
@@ -1014,11 +964,28 @@ impl SidebarTextPipeline {
             text,
             "sidebar-text",
         );
+        #[cfg(test)]
+        {
+            self.uploads += 1;
+        }
+        self.pass(ctx, count);
+    }
+
+    /// Draw the first `count` instances the last [`draw`](SidebarTextPipeline::draw)
+    /// uploaded, **writing no buffer** and keeping the bind group it built — for a frame
+    /// whose text and atlases are unchanged since then (sidebar-weather-cards D20).
+    fn redraw(&mut self, ctx: &mut FrameCtx<'_>, count: u32) {
+        self.pass(ctx, count);
+    }
+
+    /// Record the render pass over the resident instances with the cached bind group.
+    fn pass(&self, ctx: &mut FrameCtx<'_>, count: u32) {
         if count == 0 {
             return;
         }
-        let instances = self.instances.as_ref().expect("resident buffer present");
-        let bind = self.bind.as_ref().expect("bind group present");
+        let (Some(instances), Some(bind)) = (self.instances.as_ref(), self.bind.as_ref()) else {
+            return;
+        };
         let mut pass = ctx.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("sidebar-text"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1043,14 +1010,14 @@ impl SidebarTextPipeline {
     }
 }
 
-/// Lay out `text` as glyph instances from `x` at `top` (physical px), scaled by `scale`
-/// (1.0 title, `meta_ratio` sub-line, D5). Truncated to `max_w` with `ellipsis` (D8).
+/// Lay out `text` as grid-atlas glyph instances from `x` at `top` (physical px), scaled
+/// by `scale` (1.0 for a band row, `meta_ratio` for its "+N more" summary, D5).
+/// Truncated to `max_w` with `ellipsis` (D8).
 ///
-/// The title asks the atlas for bold and the sub-line for regular. It no longer says
-/// *synthesized* bold: since `specs/real-bold-faces`, a bold title on a Hangul path
-/// name is drawn from Apple SD Gothic Neo's real weight-700 face, and Latin from
-/// Menlo Bold. Synthesis is now only the fallback for a font that ships no bold
-/// face at all (R5.1/D9).
+/// Since `sidebar-weather-cards` only the waiting band and the card-menu popup draw
+/// through here; card text is resolved from the card atlases by [`push_run`]. A `bold`
+/// request is served from the font's real bold face (`specs/real-bold-faces`), with
+/// synthesis only the fallback for a font that ships none (R5.1/D9).
 #[allow(clippy::too_many_arguments)]
 fn push_glyphs(
     out: &mut Vec<TextInstance>,
@@ -1100,23 +1067,130 @@ fn push_glyphs(
     }
 }
 
+/// Resolve one card text run (sidebar-weather-cards D2/D3) into glyph instances from
+/// `atlas`, laid out by display column: `col` px per column, the line box's baseline at
+/// the same `0.8 × line` the other sidebar text uses. The atlas is rasterized at the
+/// run's own size, so glyphs are placed at scale 1 — never stretched.
+fn push_run(
+    out: &mut Vec<TextInstance>,
+    atlas: &mut crate::atlas::Atlas,
+    queue: &wgpu::Queue,
+    run: &TextRun,
+    col: f32,
+    line: f32,
+) {
+    let baseline = run.top + line * 0.8;
+    crate::tab_bar::layout_line_in(atlas, queue, &run.text, run.x, col, run.bold, |pen, e| {
+        out.push(TextInstance {
+            rect: [pen + e.left, baseline - e.top, e.px_w, e.px_h],
+            uv0: e.uv0,
+            uv1: e.uv1,
+            color: run.color,
+        });
+    });
+}
+
 // ---------------------------------------------------------------------------
 // The layer (T3 text + T4 chrome)
 // ---------------------------------------------------------------------------
 
-/// The sidebar draw layer (D9). Owns two pipelines — foundations' shape pipeline for the
-/// panel/cards/marks/icons and the local text pipeline for titles/branches — plus reused
-/// instance + metadata buffers so a steady frame allocates nothing (SD4/D10).
+/// Everything a composed sidebar frame depends on (sidebar-weather-cards D20). Equal
+/// keys mean the shapes and glyph instances last uploaded are exactly what this frame
+/// would compose, so the layer re-submits them instead.
+///
+/// Split in two so a steady frame can be recognised without allocating: the `Copy`
+/// [`KeyScalars`] are compared by value, and the model's band and popup state are
+/// compared in place, under a borrow, against the copies kept here — which are cloned
+/// only when a frame is composed.
+#[derive(Clone, Debug, PartialEq)]
+struct ComposeKey {
+    scalars: KeyScalars,
+    menu: Option<CardMenu>,
+    edit: Option<CardEdit>,
+    waiting: Vec<WaitingRow>,
+}
+
+/// The `Copy` part of a [`ComposeKey`].
+///
+/// The atlases are keyed by `(epoch, generation)`: a new texture needs a new bind group,
+/// and an eviction repacks it under UVs already resolved. The **grid** atlas is in here
+/// too, because the band's and the popup's text sample it and it evicts on terminal
+/// output, not sidebar state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct KeyScalars {
+    rows_rev: u64,
+    meta_gen: u64,
+    /// The installed `MetaSource`'s identity: a new source may restart its generations.
+    source: usize,
+    active: usize,
+    hovered: Option<usize>,
+    list_top: f32,
+    scroll_px: f32,
+    sidebar_w: f32,
+    viewport: [f32; 2],
+    scale: f64,
+    cell: [f32; 2],
+    format: wgpu::TextureFormat,
+    show_branch: bool,
+    show_agent: bool,
+    accent: u32,
+    /// `[grid, title, meta]` — `(epoch, generation)`, `None` for an unbuilt card atlas.
+    atlases: [Option<(u64, u64)>; 3],
+}
+
+/// The sidebar draw layer (D9). Owns six passes — two of foundations' shape pipeline
+/// (the panel/band/cards, then the popup over them) and four of the local text pipeline
+/// (card titles, card meta, fallback card text, then the grid-atlas band and popup text)
+/// — plus reused instance + metadata buffers so a steady frame allocates nothing
+/// (SD4/D10, sidebar-weather-cards D20).
 pub struct TabBar {
     model: TabModelHandle,
+    /// Panel, waiting band and the cards' shapes.
     shape_pipe: Option<SidebarShapePipeline>,
+    /// The open card menu's shapes — a pass of its own, submitted **after** the card text,
+    /// so the popup covers the cards' titles rather than showing them through it.
+    popup_pipe: Option<SidebarShapePipeline>,
+    /// Text drawn from the grid atlas over everything else: the waiting band and the
+    /// popup's items.
     text_pipe: Option<SidebarTextPipeline>,
+    /// Card text whose own atlas could not be built, from the grid atlas at cell size
+    /// (sidebar-weather-cards R2.6). A pass of its own, submitted with the card text and
+    /// **before** the popup, so a degraded card title cannot draw over an open menu.
+    fallback_pipe: Option<SidebarTextPipeline>,
+    /// Card titles, from the 17px title atlas (D2).
+    title_pipe: Option<SidebarTextPipeline>,
+    /// Card folder / status / branch text, from the 12.5px meta atlas (D2).
+    meta_pipe: Option<SidebarTextPipeline>,
+    /// The sidebar's own glyph atlases for card text (D2/D18).
+    cards: CardAtlases,
     shape_buf: Vec<SidebarShape>,
+    popup_buf: Vec<SidebarShape>,
     text_buf: Vec<TextInstance>,
+    title_buf: Vec<TextInstance>,
+    meta_buf: Vec<TextInstance>,
+    fallback_buf: Vec<TextInstance>,
+    run_buf: Vec<TextRun>,
     /// Pulled from the app via `MetaSource`, refreshed only on a generation change (D10).
     meta: Vec<RowMeta>,
     meta_gen: u64,
     rows_rev_seen: u64,
+    /// How many passes the last frame's card-text resolution took: 1 normally, 2 when an
+    /// atlas evicted mid-frame and the runs were re-resolved (D18/R2.5). A test hook.
+    #[cfg(test)]
+    resolve_passes: u8,
+    /// Test-only: evict this card atlas right after the first run is resolved, to drive
+    /// the mid-frame eviction path deterministically (R2.5).
+    #[cfg(test)]
+    evict_during_resolve: Option<CardFace>,
+    /// Test-only: evict the **grid** atlas once composing has resolved text against it,
+    /// to drive the "composing evicted the grid atlas" path (D20).
+    #[cfg(test)]
+    evict_grid_during_compose: bool,
+    /// What the last composed frame depended on (D20); `None` before the first.
+    compose_key: Option<ComposeKey>,
+    /// How many frames were composed rather than re-submitted — a test hook (R17).
+    #[cfg(test)]
+    compose_count: u32,
 }
 
 impl TabBar {
@@ -1128,12 +1202,31 @@ impl TabBar {
             TabBar {
                 model: model.clone(),
                 shape_pipe: None,
+                popup_pipe: None,
                 text_pipe: None,
+                fallback_pipe: None,
+                title_pipe: None,
+                meta_pipe: None,
+                cards: CardAtlases::new(),
                 shape_buf: Vec::new(),
+                popup_buf: Vec::new(),
                 text_buf: Vec::new(),
+                title_buf: Vec::new(),
+                meta_buf: Vec::new(),
+                fallback_buf: Vec::new(),
+                run_buf: Vec::new(),
                 meta: Vec::new(),
                 meta_gen: 0,
                 rows_rev_seen: u64::MAX,
+                #[cfg(test)]
+                resolve_passes: 0,
+                #[cfg(test)]
+                evict_during_resolve: None,
+                #[cfg(test)]
+                evict_grid_during_compose: false,
+                compose_key: None,
+                #[cfg(test)]
+                compose_count: 0,
             },
             model,
         )
@@ -1142,29 +1235,70 @@ impl TabBar {
     /// Refresh `self.meta` from the pulled source, gated on the source generation and the
     /// row revision (D10). The source is called AFTER the model borrow is released (D3's
     /// reentrancy rule), so a `MetaSource` reaching `shared()` cannot double-borrow.
-    fn refresh_meta(
-        &mut self,
-        rows: &[SidebarRow],
-        rows_rev: u64,
-        source: &Option<Rc<dyn MetaSource>>,
-    ) {
+    fn refresh_meta(&mut self, rows_rev: u64, source: &Option<Rc<dyn MetaSource>>) {
         match source {
             Some(src) => {
                 let gen = src.generation();
                 if gen != self.meta_gen || rows_rev != self.rows_rev_seen {
-                    src.fill(rows, &mut self.meta);
+                    // Cloned only on a change (a steady frame allocates nothing), and the
+                    // borrow is released before `fill` (D3's reentrancy rule).
+                    let rows = self.model.with(|m| m.rows.clone());
+                    src.fill(&rows, &mut self.meta);
                     self.meta_gen = gen;
                     self.rows_rev_seen = rows_rev;
                 }
             }
             None => {
-                // No source (renderer tests, pre-install window): plain default cards.
-                if rows_rev != self.rows_rev_seen || self.meta.len() != rows.len() {
-                    self.meta.clear();
-                    self.meta.resize(rows.len(), RowMeta::default());
-                    self.rows_rev_seen = rows_rev;
-                }
+                // No source (renderer tests, pre-install window): plain default cards. A
+                // card with no entry draws `RowMeta::default()`, so there is nothing to
+                // keep — only to drop, should a source's rows ever outlive it.
+                self.meta.clear();
+                self.rows_rev_seen = rows_rev;
             }
+        }
+    }
+}
+
+impl TabBar {
+    /// `(epoch, generation)` of the grid atlas and both card atlases, for [`ComposeKey`].
+    fn atlas_state(&self, ctx: &FrameCtx<'_>) -> [Option<(u64, u64)>; 3] {
+        let card = |face| {
+            self.cards
+                .get(face)
+                .map(|a: &crate::atlas::Atlas| (a.epoch(), a.generation()))
+        };
+        [
+            Some((ctx.atlas.epoch(), ctx.atlas.generation())),
+            card(CardFace::Title),
+            card(CardFace::Meta),
+        ]
+    }
+
+    /// Re-submit last frame's resident instances in the same order `record` draws them,
+    /// writing no buffer (D20). The kept `*_buf` vectors are what those uploads held, so
+    /// their lengths are the counts.
+    fn redraw_cached(&mut self, ctx: &mut FrameCtx<'_>) {
+        if let Some(p) = self.shape_pipe.as_mut() {
+            p.redraw(ctx, self.shape_buf.len() as u32);
+        }
+        if self.cards.get(CardFace::Title).is_some() {
+            if let Some(p) = self.title_pipe.as_mut() {
+                p.redraw(ctx, self.title_buf.len() as u32);
+            }
+        }
+        if self.cards.get(CardFace::Meta).is_some() {
+            if let Some(p) = self.meta_pipe.as_mut() {
+                p.redraw(ctx, self.meta_buf.len() as u32);
+            }
+        }
+        if let Some(p) = self.fallback_pipe.as_mut() {
+            p.redraw(ctx, self.fallback_buf.len() as u32);
+        }
+        if let Some(p) = self.popup_pipe.as_mut() {
+            p.redraw(ctx, self.popup_buf.len() as u32);
+        }
+        if let Some(p) = self.text_pipe.as_mut() {
+            p.redraw(ctx, self.text_buf.len() as u32);
         }
     }
 }
@@ -1181,24 +1315,24 @@ impl DrawLayer for TabBar {
             return;
         }
 
-        // Copy everything out of the model under ONE borrow, then release it (D3) before
-        // touching the (possibly reentrant) metadata source.
-        let (rows, active, hovered, rows_rev, list_top, scroll_px, waiting, menu, edit, source) =
+        // Copy the model's scalars out under ONE borrow, then release it (D3) before
+        // touching the (possibly reentrant) metadata source. The rows and the band and
+        // popup state are not copied yet: a steady frame only compares them in place, and
+        // they are cloned below only for a frame that is composed (D20, "no per-frame
+        // allocation in a steady frame").
+        let (active, hovered, rows_rev, list_top, scroll_px, n_rows, source) =
             self.model.with(|m| {
                 (
-                    m.rows.clone(),
                     m.active,
                     m.hovered,
                     m.rows_rev,
                     m.list_top,
                     m.scroll_px,
-                    m.waiting.clone(),
-                    m.menu.clone(),
-                    m.edit.clone(),
+                    m.rows.len(),
                     m.meta_source.clone(),
                 )
             });
-        self.refresh_meta(&rows, rows_rev, &source);
+        self.refresh_meta(rows_rev, &source);
 
         let show_branch = ctx.sidebar.show_git_branch;
         let show_agent = ctx.sidebar.show_agent_status;
@@ -1225,9 +1359,64 @@ impl DrawLayer for TabBar {
             list_top,
             scroll_px,
         };
-        // Reuse the single `scaled()` result `m` (R8.6) — do not convert a second time.
-        let lay = layout_with(&geom, rows.len(), &m);
+        let lay = layout(&geom, n_rows);
         let vis = lay.visible_range();
+
+        // ---- Compose only on change (sidebar-weather-cards D20). The window redraws at
+        // 60 fps while visible (docs/architecture.md C6); a steady sidebar re-submits last
+        // frame's resident instances rather than composing, resolving and uploading them
+        // all again. The card atlases are made current first, since a rebuild is a change.
+        self.cards.ensure(ctx.device, ctx.fonts, ctx.scale_factor);
+        let scalars = KeyScalars {
+            rows_rev,
+            meta_gen: self.meta_gen,
+            source: source
+                .as_ref()
+                .map_or(0, |s| Rc::as_ptr(s) as *const () as usize),
+            active,
+            hovered,
+            list_top,
+            scroll_px,
+            sidebar_w,
+            viewport: ctx.viewport,
+            scale: ctx.scale_factor,
+            cell,
+            format: ctx.format,
+            show_branch,
+            show_agent,
+            accent: ctx.sidebar.accent,
+            atlases: self.atlas_state(ctx),
+        };
+        let unchanged = self.compose_key.as_ref().is_some_and(|prev| {
+            prev.scalars == scalars
+                && self.model.with(|m| {
+                    prev.waiting == m.waiting && prev.menu == m.menu && prev.edit == m.edit
+                })
+        });
+        if unchanged {
+            self.redraw_cached(ctx);
+            self.model.with_mut(|mm| mm.layout = Some(lay));
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.compose_count += 1;
+        }
+        let (rows, waiting, menu, edit) = self.model.with(|m| {
+            (
+                m.rows.clone(),
+                m.waiting.clone(),
+                m.menu.clone(),
+                m.edit.clone(),
+            )
+        });
+        let mut key = ComposeKey {
+            scalars,
+            menu,
+            edit,
+            waiting,
+        };
+        let (waiting, menu, edit) = (&key.waiting, key.menu.as_ref(), key.edit.as_ref());
 
         let mut shapes = std::mem::take(&mut self.shape_buf);
         let mut text = std::mem::take(&mut self.text_buf);
@@ -1338,245 +1527,179 @@ impl DrawLayer for TabBar {
             }
         }
 
+        // ---- Cards (sidebar-weather-cards). Each is composed by the pure builder
+        // (`sidebar_card::build_card`, D16); this layer only resolves the text runs it
+        // returns through the matching atlas, and submits.
+        let scale = ctx.scale_factor;
+        // A face whose card atlas could not be built draws from the grid atlas at cell
+        // size instead (R2.6) — so it also measures by the grid cell.
+        let title_ok = self.cards.get(CardFace::Title).is_some();
+        let meta_ok = self.cards.get(CardFace::Meta).is_some();
+        let measure = |face: CardFace, ok: bool| {
+            if ok {
+                (face.column_px(scale), face.line_px(scale))
+            } else {
+                (cell[0], cell[1])
+            }
+        };
+        let (title_col, title_line) = measure(CardFace::Title, title_ok);
+        let (meta_col, meta_line) = measure(CardFace::Meta, meta_ok);
+        let menu_row = menu.as_ref().map(|open| open.row);
         let default_meta = RowMeta::default();
-        let icon_gap = m.card_gap;
+        let mut runs = std::mem::take(&mut self.run_buf);
+        runs.clear();
+        let mut edit_zone: Option<[f32; 4]> = None;
         for i in vis {
-            let rect = match lay.card_rect(i) {
-                Some(r) => r,
-                None => continue,
+            let Some(rect) = lay.card_rect(i) else {
+                continue;
             };
             let meta = self.meta.get(i).unwrap_or(&default_meta);
-            let state = if i == active {
-                CardState::Selected
-            } else if hovered == Some(i) {
-                CardState::Hovered
-            } else {
-                CardState::Idle
+            // The rows were read under a later borrow than `n_rows`; a reentrant source
+            // that changed them since is caught by `rows_rev` next frame, not by a panic.
+            let Some(row) = rows.get(i) else {
+                continue;
             };
-            let (fill, border) = resolve_card(meta.skin, state, &theme);
-            if let Some(fill) = fill {
-                let bw = if border.is_some() { m.border_w } else { 0.0 };
-                if let Some(card) = SidebarShape::rounded_box(
-                    rect,
-                    m.card_radius,
-                    bw,
-                    fill,
-                    border.unwrap_or([0.0; 4]),
-                ) {
-                    shapes.push(card);
-                }
-            }
-
-            let inner_x = rect[0] + m.border_w + m.card_pad_x;
-            let inner_top = rect[1] + m.border_w + m.card_pad_y;
-            let right_edge = rect[0] + rect[2] - m.border_w - m.card_pad_x;
-
-            // Line 1: optional mark, then the bold title.
-            let mut title_x = inner_x;
-            if show_agent {
-                let mark = match meta.mark {
-                    RowMark::Agent => Some((Icon::Asterisk, theme.mark_agent_fg)),
-                    RowMark::Ready => Some((Icon::Diamond, theme.mark_ready_fg)),
-                    RowMark::Waiting => Some((Icon::Pause, theme.waiting_fg)),
-                    RowMark::None => None,
-                };
-                if let Some((icon, color)) = mark {
-                    let my = inner_top + (cell[1] - m.mark_px) * 0.5;
-                    push_icon(
-                        &mut shapes,
-                        icon,
-                        inner_x,
-                        my.max(inner_top),
-                        m.mark_px,
-                        color,
-                    );
-                    title_x = inner_x + m.mark_px + icon_gap;
-                }
-            }
-            // Line 1 is resolved app-side (sticky-tab-title D7) by the precedence
-            // user > AI-task > program-OSC > cwd; the renderer draws what it was handed
-            // and owns none of that policy. An empty `line1` means a row with no metadata
-            // yet (`RowMeta::default()`), which falls back to the cwd title.
-            // The per-card menu affordance (sticky-tab-title D4/R3.1) — always drawn, so
-            // the control is discoverable without hovering. Its rect comes from the shared
-            // `menu_button_in` formula fed THIS card's rect, so the drawn button and the
-            // hit-tested one are the same square (SD2).
-            let button = crate::sidebar_layout::menu_button_in(
-                crate::sidebar_layout::Rect {
-                    x: rect[0],
-                    y: rect[1],
-                    w: rect[2],
-                    h: rect[3],
-                },
-                &m,
-                ctx.scale_factor,
-            );
-            push_icon(
-                &mut shapes,
-                Icon::Hamburger,
-                button.x,
-                button.y,
-                button.w,
-                theme.icon_fg,
-            );
-            let title_text = card_line1_text(&meta.line1, rows[i].title.as_str());
-            // Line 1 stops short of the hamburger (sticky-tab-title R3.1) — line 2 keeps
-            // the full width, since the button only occupies the title line.
-            let line1_right = (button.x - icon_gap).min(right_edge);
-            // Is THIS card being renamed (sticky-tab-title R2.1)? Joined by `tab_id`, not
-            // by index, so a roster shift cannot move the editor to another tab.
-            let editing = edit.as_ref().filter(|e| e.tab_id == rows[i].tab_id);
-            if let Some(e) = editing {
-                // A field treatment behind the title line, so the card reads as an input
-                // rather than as a label that mysteriously changed.
-                let field = [
-                    title_x - m.card_gap * 0.5,
-                    inner_top - m.card_gap * 0.25,
-                    (line1_right - title_x + m.card_gap).max(0.0),
-                    cell[1] + m.card_gap * 0.5,
-                ];
-                if let Some(bg) = SidebarShape::rounded_box(
-                    field,
-                    m.card_radius * 0.5,
-                    m.border_w,
-                    Fill::solid(linear(theme.panel_bg, 1.0)),
-                    linear(theme.card_border_active, 1.0),
-                ) {
-                    shapes.push(bg);
-                }
-                // Windowed so the CARET stays visible — including when the user has
-                // arrowed back into the middle of a name longer than the card.
-                let line = edit_line_text(
-                    &e.text,
-                    e.caret,
-                    cell[0],
-                    (line1_right - title_x).max(0.0),
-                    ellipsis,
-                );
-                // Select-all highlight (the state the field opens in): a block behind the
-                // text but NOT behind the trailing caret, so the caret stays legible.
-                // `push_glyphs` advances a fixed `cell[0]` per char, so a char-count width
-                // is exact here rather than an approximation.
-                if e.selected {
-                    let chars = line.chars().count().saturating_sub(1); // drop the caret
-                    if chars > 0 {
-                        let sel = [title_x, inner_top, chars as f32 * cell[0], cell[1]];
-                        if let Some(hl) = SidebarShape::rounded_box(
-                            sel,
-                            m.border_w,
-                            0.0,
-                            Fill::solid(linear(theme.accent, 0.40)),
-                            [0.0; 4],
-                        ) {
-                            shapes.push(hl);
-                        }
-                    }
-                }
-                push_glyphs(
-                    &mut text,
-                    ctx,
-                    &line,
-                    title_x,
-                    inner_top,
-                    cell,
-                    1.0,
-                    true,
-                    linear(theme.title_fg, 1.0),
-                    (line1_right - title_x).max(0.0),
-                    ellipsis,
-                );
-            } else {
-                push_glyphs(
-                    &mut text,
-                    ctx,
-                    title_text,
-                    title_x,
-                    inner_top,
-                    cell,
-                    1.0,
-                    true,
-                    linear(theme.title_fg, 1.0),
-                    (line1_right - title_x).max(0.0),
-                    ellipsis,
-                );
-            }
-
-            // Line 2 (D6-reserved). When a task label took line 1, the repo/folder name
-            // (the cwd title) moves here as the secondary identity, ahead of the git branch
-            // and given width priority on overflow (repo-first, R2.2); otherwise line 2 is
-            // the branch alone, exactly as before.
-            if show_branch {
-                let line2_top = inner_top + cell[1] + m.card_gap;
-                let advance = cell[0] * meta_ratio;
-                let branch = meta.branch.as_deref();
-                let mut x = inner_x;
-                // When line 1 is a custom label (a user title, an AI task, or a program
-                // title), the cwd/repo name moves to line 2 as the secondary identity; a
-                // plain cwd card keeps the branch-only line 2 as before. The app decides
-                // this alongside `line1` so the two can never disagree (sticky-tab-title).
-                let line1_is_custom = meta.line1_is_custom;
-                if line1_is_custom {
-                    let repo_budget = repo_line2_budget(right_edge - x, advance, branch.is_some());
-                    // The LIVE folder name (card-live-cwd D1). The `rows[i].title` fallback is
-                    // unreachable HERE by construction and kept only as defence-in-depth: an
-                    // empty `cwd_title` means a `RowMeta::default()` row (the app's fill
-                    // always resolves one, D2), and `default()` sets `line1_is_custom: false`,
-                    // which this branch already excludes. Deliberately unasserted — a test
-                    // would have to manufacture a state the types cannot produce.
-                    let repo_text = card_cwd_title(&meta.cwd_title, rows[i].title.as_str());
-                    let repo = truncate_to_width(repo_text, advance, repo_budget, ellipsis);
-                    push_glyphs(
-                        &mut text,
-                        ctx,
-                        &repo,
-                        x,
-                        line2_top,
-                        cell,
-                        meta_ratio,
-                        false,
-                        linear(theme.meta_fg, 1.0),
-                        repo_budget,
-                        ellipsis,
-                    );
-                    x += repo.chars().count() as f32 * advance + icon_gap;
-                }
-                // Draw the branch (icon + text) only if at least its icon still fits after the
-                // repo name (R2.2 — the repo has priority; a branch that can't fit is dropped).
-                if let (Some(branch), Some(bx)) =
-                    (branch, line2_branch_origin(x, m.meta_px, right_edge))
-                {
-                    let iy = line2_top + (cell[1] * meta_ratio - m.meta_px) * 0.5;
-                    push_icon(
-                        &mut shapes,
-                        Icon::GitBranch,
-                        bx,
-                        iy.max(line2_top),
-                        m.meta_px,
-                        theme.icon_fg,
-                    );
-                    let branch_x = bx + m.meta_px + icon_gap;
-                    push_glyphs(
-                        &mut text,
-                        ctx,
-                        branch,
-                        branch_x,
-                        line2_top,
-                        cell,
-                        meta_ratio,
-                        false,
-                        linear(theme.meta_fg, 1.0),
-                        (right_edge - branch_x).max(0.0),
-                        ellipsis,
-                    );
-                }
+            // Joined by `tab_id`, not index, so a roster shift cannot move the editor.
+            let editing = edit.as_ref().is_some_and(|e| e.tab_id == row.tab_id);
+            let hovered_here = hovered == Some(i);
+            let card = build_card(&CardInput {
+                rect,
+                skin: meta.skin,
+                state: card_state(i == active, hovered_here),
+                status: meta.status,
+                // Line 1 is resolved app-side (sticky-tab-title D7); an empty one is a row
+                // with no metadata yet, which shows its folder name.
+                title: card_line1_text(&meta.line1, &row.title),
+                folder: folder_text(&meta.cwd_display, &row.title),
+                branch: meta.branch.as_deref(),
+                show_branch,
+                show_status: show_agent,
+                // D11: the pointer is over it, its menu is open, or it is being renamed —
+                // an open popup or field is never left without its anchor.
+                show_menu: hovered_here || menu_row == Some(i) || editing,
+                editing,
+                scale,
+                title_col,
+                title_line,
+                meta_col,
+                meta_line,
+                ellipsis,
+            });
+            shapes.extend_from_slice(&card.shapes);
+            runs.extend(card.runs);
+            if editing {
+                edit_zone = Some(card.title_zone);
             }
         }
 
-        // ---- The open card menu (sticky-tab-title D4/D10/R3.1). Drawn LAST so it layers
-        // over the cards it floats above — shapes and glyphs are each submitted in push
-        // order, so "last" is "on top". Its rect comes from the same `menu_rect_for`
-        // formula the hit-test uses, fed the same button rect, so what the user sees and
-        // what a press resolves to cannot disagree (SD2).
+        // ---- The rename field (sticky-tab-title R2.1) over the title line, at the
+        // title's size (D15): a field box ending exactly at the title budget, so it
+        // always stops short of the `≡` (R14.2), and the text windowed by title columns.
+        if let (Some(e), Some(zone)) = (edit.as_ref(), edit_zone) {
+            let c = CardMetrics::DEFAULT.scaled(scale);
+            let pad = c.title_gap + c.border;
+            if let Some(field) = SidebarShape::rounded_box(
+                [
+                    zone[0] - pad,
+                    zone[1] - pad * 0.5,
+                    zone[2] + pad,
+                    zone[3] + pad,
+                ],
+                c.radius * 0.5,
+                c.border,
+                Fill::solid(linear(theme.panel_bg, 1.0)),
+                linear(theme.card_border_active, 1.0),
+            ) {
+                shapes.push(field);
+            }
+            let line = edit_line_text(&e.text, e.caret, title_col, zone[2], ellipsis);
+            // Select-all highlight (the state the field opens in): behind the text but
+            // not behind the trailing caret, so the caret stays legible.
+            if e.selected {
+                let text_cols = line
+                    .chars()
+                    .filter(|&c| c != EDIT_CARET)
+                    .map(char_cols)
+                    .sum::<usize>();
+                // An empty name has nothing to highlight: its box is zero-wide, which
+                // `rounded_box` declines.
+                if let Some(hl) = SidebarShape::rounded_box(
+                    [zone[0], zone[1], text_cols as f32 * title_col, zone[3]],
+                    c.border,
+                    0.0,
+                    Fill::solid(linear(theme.accent, 0.40)),
+                    [0.0; 4],
+                ) {
+                    shapes.push(hl);
+                }
+            }
+            runs.push(TextRun {
+                face: CardFace::Title,
+                text: line,
+                x: zone[0],
+                top: zone[1],
+                color: linear(theme.card_title_fg, 1.0),
+                bold: true,
+            });
+        }
+
+        // ---- Resolve the card runs to glyph instances. Guarded against an eviction in
+        // the middle of it (D18/R2.5): `pack` evicts when a card atlas fills and
+        // invalidates the UVs already resolved this frame, so a generation that moved
+        // during the pass means the runs are resolved once more, against the repacked
+        // texture, before anything is submitted.
+        let mut title_text = std::mem::take(&mut self.title_buf);
+        let mut meta_text = std::mem::take(&mut self.meta_buf);
+        let mut fallback = std::mem::take(&mut self.fallback_buf);
+        #[cfg(test)]
+        let mut evict_hook = self.evict_during_resolve.take();
+        #[cfg(test)]
+        {
+            self.resolve_passes = 0;
+        }
+        for _pass in 0..2 {
+            title_text.clear();
+            meta_text.clear();
+            fallback.clear();
+            let before = CardFace::ALL.map(|f| self.cards.generation(f));
+            for run in &runs {
+                let (col, line, out) = match run.face {
+                    CardFace::Title => (title_col, title_line, &mut title_text),
+                    CardFace::Meta => (meta_col, meta_line, &mut meta_text),
+                };
+                // The same `get` that measured the face above: a built atlas resolves
+                // here, a missing one falls back to the grid atlas (R2.6).
+                match self.cards.get_mut(run.face) {
+                    Some(atlas) => push_run(out, atlas, ctx.queue, run, col, line),
+                    None => push_run(&mut fallback, ctx.atlas, ctx.queue, run, col, line),
+                }
+                #[cfg(test)]
+                if let Some(face) = evict_hook.take() {
+                    if let Some(atlas) = self.cards.get_mut(face) {
+                        atlas.evict_for_test();
+                    }
+                }
+            }
+            #[cfg(test)]
+            {
+                self.resolve_passes += 1;
+            }
+            if CardFace::ALL.map(|f| self.cards.generation(f)) == before {
+                break;
+            }
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.evict_grid_during_compose) {
+            ctx.atlas.evict_for_test();
+        }
+
+        // ---- The open card menu (sticky-tab-title D4/D10/R3.1), in a shape pass of its
+        // own submitted after the card text, so it layers over the cards it floats above.
+        // Its rect comes from the same `menu_rect_for` formula the hit-test uses, fed the
+        // same button rect, so what the user sees and what a press resolves to cannot
+        // disagree (SD2).
+        let mut popup_shapes = std::mem::take(&mut self.popup_buf);
+        popup_shapes.clear();
         if let Some(menu) = menu {
             if let Some(card) = lay.card_rect(menu.row) {
                 let button = crate::sidebar_layout::menu_button_in(
@@ -1586,7 +1709,6 @@ impl DrawLayer for TabBar {
                         w: card[2],
                         h: card[3],
                     },
-                    &m,
                     ctx.scale_factor,
                 );
                 let popup = crate::sidebar_layout::menu_rect_for(
@@ -1604,7 +1726,7 @@ impl DrawLayer for TabBar {
                     Fill::solid(linear(theme.card_bg_active, 1.0)),
                     linear(theme.card_border_active, 1.0),
                 ) {
-                    shapes.push(bg);
+                    popup_shapes.push(bg);
                 }
                 for (i, label) in menu.items.iter().enumerate() {
                     let item = crate::sidebar_layout::menu_item_in(popup, i, ctx.scale_factor);
@@ -1627,14 +1749,48 @@ impl DrawLayer for TabBar {
             }
         }
 
+        // Submit: cards' shapes, their titles, their meta text, any card text that fell
+        // back to the grid atlas (R2.6), then the popup over all of it, then the grid-atlas
+        // text that belongs on top (the band's rows, the popup's items).
         {
             let sp = SidebarShapePipeline::ensure(&mut self.shape_pipe, ctx);
             sp.draw(ctx, &shapes);
         }
+        if let Some(atlas) = self.cards.get(CardFace::Title) {
+            let tp = SidebarTextPipeline::ensure(&mut self.title_pipe, ctx);
+            tp.draw(ctx, TextAtlas::Card(atlas), &title_text);
+        }
+        if let Some(atlas) = self.cards.get(CardFace::Meta) {
+            let mp = SidebarTextPipeline::ensure(&mut self.meta_pipe, ctx);
+            mp.draw(ctx, TextAtlas::Card(atlas), &meta_text);
+        }
+        if !fallback.is_empty() {
+            let fp = SidebarTextPipeline::ensure(&mut self.fallback_pipe, ctx);
+            fp.draw(ctx, TextAtlas::Grid, &fallback);
+        }
+        if !popup_shapes.is_empty() {
+            let pp = SidebarShapePipeline::ensure(&mut self.popup_pipe, ctx);
+            pp.draw(ctx, &popup_shapes);
+        }
         {
             let tp = SidebarTextPipeline::ensure(&mut self.text_pipe, ctx);
-            tp.draw(ctx, &text);
+            tp.draw(ctx, TextAtlas::Grid, &text);
         }
+        self.title_buf = title_text;
+        self.meta_buf = meta_text;
+        self.fallback_buf = fallback;
+        self.popup_buf = popup_shapes;
+        self.run_buf = runs;
+
+        // What this frame depended on (D20). The card atlases as composing left them — an
+        // eviction there mid-frame was already resolved again (D18). The grid atlas as it
+        // was *before* composing: nothing re-resolves the band's, popup's and fallback
+        // text, so if composing evicted it, the next frame must miss and compose again
+        // against the repacked texture rather than re-submit stale UVs indefinitely.
+        let after = self.atlas_state(ctx);
+        key.scalars.atlases[1] = after[1];
+        key.scalars.atlases[2] = after[2];
+        self.compose_key = Some(key);
 
         // Publish the exact layout we drew, so the hit-test reads these values (D7).
         self.model.with_mut(|mm| mm.layout = Some(lay));
@@ -1668,6 +1824,45 @@ mod tests {
     }
 
     #[test]
+    fn a_dialog_level_is_set_on_its_row_in_place() {
+        // agent-card-status D7 — one row's level changes, the others and the rest of the
+        // model do not, and the row-change gate fires only on an actual change.
+        reset_shared_model();
+        let h = TabModelHandle::shared();
+        h.set(TabBarModel {
+            titles: vec![
+                SidebarRow {
+                    tab_id: 7,
+                    title: "a".into(),
+                    ..Default::default()
+                },
+                SidebarRow {
+                    tab_id: 8,
+                    title: "b".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let rev = || h.with(|m| m.rows_rev);
+        let levels = || h.with(|m| m.rows.iter().map(|r| r.blocking_dialog).collect::<Vec<_>>());
+        let start = rev();
+
+        assert!(h.set_blocking_dialog(8, true), "rising");
+        assert_eq!(levels(), vec![false, true]);
+        assert_eq!(rev(), start + 1);
+
+        assert!(!h.set_blocking_dialog(8, true), "a repeat is not a change");
+        assert_eq!(rev(), start + 1, "and bumps nothing");
+
+        assert!(!h.set_blocking_dialog(99, true), "a closed tab");
+        assert_eq!((levels(), rev()), (vec![false, true], start + 1));
+
+        assert!(h.set_blocking_dialog(8, false), "falling");
+        assert_eq!((levels(), rev()), (vec![false, false], start + 2));
+    }
+
+    #[test]
     fn set_replaces_rows_and_bumps_rev() {
         // R6.2 — set() writes rows/active and bumps the row-change gate.
         reset_shared_model();
@@ -1676,8 +1871,7 @@ mod tests {
             titles: vec![SidebarRow {
                 tab_id: 7,
                 title: "proj".into(),
-                label: None,
-                program: None,
+                ..Default::default()
             }],
             active: 0,
             ..Default::default()
@@ -1706,8 +1900,7 @@ mod tests {
             titles: vec![SidebarRow {
                 tab_id: 1,
                 title: "x".into(),
-                label: None,
-                program: None,
+                ..Default::default()
             }],
             active: 0,
             ..Default::default()
@@ -1739,8 +1932,7 @@ mod tests {
             titles: vec![SidebarRow {
                 tab_id: 3,
                 title: "a".into(),
-                label: None,
-                program: None,
+                ..Default::default()
             }],
             active: 0,
             ..Default::default()
@@ -1771,21 +1963,87 @@ mod tests {
         }
     }
 
+    fn geom2(sidebar_w: f32, cell: [f32; 2], show_branch: bool) -> SidebarGeom {
+        SidebarGeom {
+            sidebar_w,
+            viewport_h: 4000.0,
+            cell,
+            scale: 2.0,
+            show_branch,
+            list_top: 0.0,
+            scroll_px: 0.0,
+        }
+    }
+
     #[test]
-    fn card_height_reserves_the_branch_line_by_config() {
-        // R3 / D6 — the second line is reserved by show_branch, for every card, so a
-        // per-tab branch appearing never changes the stride.
-        let two = layout(&geom(340.0, 2000.0, true), 5);
-        let one = layout(&geom(340.0, 2000.0, false), 5);
-        assert!(
-            two.card_h > one.card_h,
-            "a branch-line card is taller than a one-line card"
+    fn card_height_is_fixed_regardless_of_font_and_toggles() {
+        // sidebar-weather-cards R1.1 — 104 logical at 2× for fonts of 10, 14 and 24pt and
+        // either branch toggle: the height no longer follows the cell or the config (D1).
+        for pt in [10.0_f32, 14.0, 24.0] {
+            let cell = [(pt * 2.0 * 0.6).round(), (pt * 2.0 * 1.2).round()];
+            for show_branch in [true, false] {
+                let l = layout(&geom2(680.0, cell, show_branch), 3);
+                assert_eq!(l.card_h, 208.0, "{pt}pt, branch {show_branch}");
+                assert_eq!(l.stride, 228.0, "104 + the 10 gap, at 2×");
+            }
+        }
+    }
+
+    #[test]
+    fn cards_are_inset_14_and_spaced_10() {
+        // R1.2 — a 340-logical sidebar at 2×.
+        let l = layout(&geom2(680.0, [17.0, 34.0], true), 3);
+        let (a, b) = (l.card_rect(0).expect("0"), l.card_rect(1).expect("1"));
+        assert_eq!((a[0], a[2]), (28.0, 624.0));
+        assert_eq!(b[1] - a[1], (104.0 + 10.0) * 2.0);
+        assert_eq!(b[1] - (a[1] + a[3]), 20.0, "a 10-logical gap between cards");
+    }
+
+    /// The hit-test's input for the same sidebar the row layer laid out.
+    fn hit_input(l: &SidebarLayout) -> crate::sidebar_layout::SidebarLayoutInput {
+        crate::sidebar_layout::SidebarLayoutInput {
+            sidebar_w: l.geom.sidebar_w,
+            viewport: [l.geom.sidebar_w + 800.0, l.geom.viewport_h],
+            scale: l.geom.scale,
+            row_h: l.card_h,
+            row_count: l.count,
+            waiting_count: 0,
+            metrics: SidebarMetrics::DEFAULT.scaled(l.geom.scale),
+            open_menu: None,
+        }
+    }
+
+    #[test]
+    fn the_hit_test_reads_the_drawn_geometry() {
+        // R1.3 / R11.4 — the app's hit-test (`sidebar_layout`) and the row layer agree on
+        // every card rect and every `≡` rect, and a point in the gap under a card belongs
+        // to its stride band.
+        let mut g = geom2(680.0, [17.0, 34.0], true);
+        let probe = hit_input(&layout(&g, 4));
+        g.list_top = crate::sidebar_layout::list_viewport(&probe).y;
+        let l = layout(&g, 4);
+        let inp = hit_input(&l);
+        for i in 0..4 {
+            let drawn = l.card_rect(i).expect("in range");
+            let hit = crate::sidebar_layout::row_rect(i, 0.0, &inp);
+            assert_eq!([hit.x, hit.y, hit.w, hit.h], drawn, "card {i}");
+            let plate = crate::sidebar_card::menu_button(drawn, 2.0);
+            let b = crate::sidebar_layout::menu_button_rect(i, 0.0, &inp);
+            assert_eq!([b.x, b.y, b.w, b.h], plate, "button {i}");
+        }
+        let a = l.card_rect(0).expect("0");
+        let gap = a[1] + a[3] + 1.0;
+        assert_eq!(
+            l.card_at(300.0, gap),
+            Some(0),
+            "the gap below a card is its own"
         );
-        assert_eq!(two.stride, two.card_h + 6.0, "stride adds both 3px margins");
-        // Height is independent of count — one card height per frame.
-        let two_many = layout(&geom(340.0, 2000.0, true), 40);
-        assert_eq!(two.card_h, two_many.card_h);
-        assert_eq!(two.stride, two_many.stride);
+        let b = l.card_rect(1).expect("1");
+        assert_eq!(
+            l.card_at(300.0, b[1] - 1.0),
+            Some(1),
+            "the gap above a card too"
+        );
     }
 
     #[test]
@@ -1820,8 +2078,8 @@ mod tests {
         let l = layout(&geom(340.0, 200.0, true), 20);
         let vis = l.visible_range();
         assert_eq!(vis.start, 0);
-        // 200px viewport / ~67px stride ⇒ 3 cards visible.
-        assert!(vis.end >= 3 && vis.end <= 4, "got {vis:?}");
+        // 200px viewport / 114px stride (104 + 10 at 1×) ⇒ 2 cards visible.
+        assert_eq!(vis.end, 2, "got {vis:?}");
         assert!(vis.end < l.count, "most cards are culled");
         // A click deep past the viewport bottom is a no-op (D13).
         assert_eq!(l.card_at(170.0, 190.0 + 5.0 * l.stride), None);
@@ -1843,30 +2101,6 @@ mod tests {
         // tab_at delegates: a point in band 2 → Some(2) (tab_h arg ignored).
         assert_eq!(tab_at(170.0, 2.5 * stride, 340.0, 0.0, 4), Some(2));
         reset_shared_model();
-    }
-
-    #[test]
-    fn d12_card_state_table() {
-        // R1.x / D12 — the six combinations resolve as the table says; a Generic idle
-        // card emits no instance (None fill).
-        let t = SidebarTheme::DEFAULT;
-        assert!(resolve_card(AgentSkin::Generic, CardState::Idle, &t)
-            .0
-            .is_none());
-        let (f, b) = resolve_card(AgentSkin::Generic, CardState::Hovered, &t);
-        assert!(f.is_some() && b.is_none(), "generic hover: bg, no border");
-        let (f, b) = resolve_card(AgentSkin::Generic, CardState::Selected, &t);
-        assert!(f.is_some() && b.is_some(), "generic selected: bg + border");
-        // Agent cards always carry a skin fill + border, idle border is the dim tint.
-        for skin in [AgentSkin::Claude, AgentSkin::Antigravity] {
-            for state in [CardState::Idle, CardState::Hovered, CardState::Selected] {
-                let (f, b) = resolve_card(skin, state, &t);
-                assert!(
-                    f.is_some() && b.is_some(),
-                    "{skin:?} {state:?} draws a card"
-                );
-            }
-        }
     }
 
     #[test]
@@ -1944,6 +2178,48 @@ mod tests {
     }
 
     #[test]
+    fn the_window_is_exact_at_the_tail_and_in_the_middle() {
+        // The shapes above, pinned: 8 columns centred on the caret, back-filled leftwards
+        // when the caret is at the end, each cut edge replaced (never extended) by `…`.
+        let long = "Frontend-service-worker";
+        assert_eq!(edit_line_text(long, 23, 10.0, 80.0, '…'), "…worker▏");
+        assert_eq!(edit_line_text(long, 12, 10.0, 80.0, '…'), "…ser▏vi…");
+        assert_eq!(edit_line_text(long, 0, 10.0, 80.0, '…'), "▏Fronte…");
+    }
+
+    #[test]
+    fn a_wide_glyph_is_measured_before_it_is_taken() {
+        // D3: each step asks whether the NEXT glyph fits, by its own width. Two columns
+        // hold the caret and nothing else — `가` would take the field to three.
+        assert_eq!(edit_line_text("가", 1, 10.0, 20.0, '…'), "▏");
+        // Three columns: `a` fits beside the caret, `가` in front of it does not.
+        assert_eq!(edit_line_text("가a", 2, 10.0, 30.0, '…'), "…▏");
+    }
+
+    #[test]
+    fn no_caret_position_overflows_the_field_by_columns() {
+        // D3/R14.3: the field's budget is display COLUMNS. Every caret position, every
+        // width from one column to past the whole string, over mixed-width names.
+        for name in [
+            "가a나b다",
+            "ab가나cd",
+            "한글이름",
+            "a가",
+            "Front-가나다-end",
+        ] {
+            let n = name.chars().count();
+            for caret in 0..=n {
+                for cols in 1..=16usize {
+                    let out = edit_line_text(name, caret, 10.0, cols as f32 * 10.0, '…');
+                    let used: usize = out.chars().map(char_cols).sum();
+                    assert!(used <= cols, "{name:?} caret {caret} in {cols}: {out:?}");
+                    assert!(out.contains(EDIT_CARET), "{name:?} caret {caret}: {out:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn edit_line_degenerate_widths_do_not_panic() {
         assert_eq!(edit_line_text("abc", 3, 10.0, 0.0, '…'), "");
         assert_eq!(edit_line_text("abc", 3, 0.0, 100.0, '…'), "");
@@ -1969,87 +2245,6 @@ mod tests {
         // A row drawn before the app's first `MetaSource::fill` has `RowMeta::default()`,
         // whose `line1` is empty. That must show the folder, never a blank line.
         assert_eq!(card_line1_text("", "terminal"), "terminal");
-    }
-
-    #[test]
-    fn line2_draws_the_pulled_folder_name_not_the_assembled_row_title() {
-        // card-live-cwd R1.4 — the live name the app pulled wins over the row's copy, which
-        // was frozen when the rows were assembled and does not follow a `cd`. This is the
-        // renderer half of the fix; the app half is `sidebar_model::row_meta`.
-        assert_eq!(card_cwd_title("web", "api"), "web");
-        // Only the live-wins branch is asserted, deliberately (R1.5). The empty branch is
-        // unreachable at the one call site — it needs a `RowMeta::default()` row, whose
-        // `line1_is_custom: false` means line 2 never draws a folder name at all.
-    }
-
-    #[test]
-    fn repo_budget_prioritizes_repo_when_branch_present() {
-        // R2.2 — with a branch to follow, the repo/folder name gets the majority share.
-        let avail = 100.0;
-        let b = repo_line2_budget(avail, 8.0, true);
-        assert_eq!(b, avail * REPO_LINE2_WIDTH_SHARE);
-        assert!(
-            b > 0.0 && b < avail,
-            "repo takes a majority but leaves room for the branch"
-        );
-    }
-
-    #[test]
-    fn repo_budget_takes_full_width_without_branch() {
-        // R2.2 — no branch → the repo/folder name may use the whole line.
-        assert_eq!(repo_line2_budget(100.0, 8.0, false), 100.0);
-        // Negative avail (degenerate) clamps to 0, never panics.
-        assert_eq!(repo_line2_budget(-5.0, 8.0, false), 0.0);
-    }
-
-    #[test]
-    fn repo_budget_never_below_one_glyph() {
-        // R2.2 robustness — on a very narrow card the repo still keeps at least one glyph
-        // of budget (the advance floor), so it never silently vanishes behind the branch.
-        assert_eq!(repo_line2_budget(4.0, 8.0, true), 8.0);
-    }
-
-    #[test]
-    fn repo_line2_truncates_within_its_budget() {
-        // R1.5 — the repo name on line 2 is elided to fit the budget the policy hands it, so
-        // a long repo name never overruns into the branch segment.
-        let advance = 8.0;
-        let budget = repo_line2_budget(80.0, advance, true); // 44px ⇒ 5 glyphs
-        let drawn = truncate_to_width("very-long-repository-name", advance, budget, '…');
-        assert!(drawn.chars().count() as f32 * advance <= budget);
-        assert!(drawn.ends_with('…'), "a long repo name is elided");
-    }
-
-    #[test]
-    fn line2_branch_fits_when_icon_within_edge() {
-        // R2.2 — the branch icon starts at x when it (meta_px wide) fits before right_edge.
-        assert_eq!(line2_branch_origin(50.0, 10.0, 100.0), Some(50.0));
-        // Exactly flush against the edge still counts as fitting.
-        assert_eq!(line2_branch_origin(90.0, 10.0, 100.0), Some(90.0));
-    }
-
-    #[test]
-    fn line2_branch_dropped_when_icon_overruns_edge() {
-        // R2.2 — once the repo name pushed x past (right_edge - icon), the branch is dropped,
-        // not clipped: repo has priority.
-        assert_eq!(line2_branch_origin(95.0, 10.0, 100.0), None);
-    }
-
-    #[test]
-    fn card_height_is_independent_of_the_task_label() {
-        // R2.3 — the task label is a horizontal, line-1 text swap; card height is governed by
-        // `layout` (show_branch only), which takes no per-tab content, so a labelled card and a
-        // plain card share the exact same stride/height. (Draw uses this same `layout`.)
-        let g = geom(160.0, 600.0, true);
-        let a = layout(&g, 5);
-        let b = layout(&g, 5);
-        assert_eq!(a.card_h, b.card_h);
-        assert_eq!(a.stride, b.stride);
-        // And the reserved height matches the two-line (title + branch) formula, not three.
-        assert!(
-            a.card_h > g.cell[1],
-            "card reserves at least the two card lines"
-        );
     }
 
     // ---- atlas-swap-bind-invalidation: the text bind group's invalidation key ----
@@ -2146,18 +2341,25 @@ mod tests {
         })
     }
 
-    /// Reset the `thread_local!` singleton (R5.4) and put one card in it, so the layer has
-    /// a title to shape and `draw` sees a non-empty instance list.
+    /// Reset the `thread_local!` singleton (R5.4) and put one card in it, plus one waiting
+    /// row. The row is what these tests need: since sidebar-weather-cards the card's own
+    /// text is drawn from the sidebar's card atlases, so the **grid**-atlas text pipeline —
+    /// whose bind key these tests pin — draws only the band and the popup, and would
+    /// otherwise see an empty instance list and never build a bind group at all.
     fn install_one_card() {
         reset_shared_model();
         TabModelHandle::shared().set(TabBarModel {
             titles: vec![SidebarRow {
                 tab_id: 1,
                 title: "project".into(),
-                label: None,
-                program: None,
+                ..Default::default()
             }],
             active: 0,
+            waiting: vec![WaitingRow {
+                tab_id: 2,
+                title: "build".into(),
+                signal: WaitingSignal::Error,
+            }],
             ..Default::default()
         });
     }
@@ -2167,6 +2369,27 @@ mod tests {
         bar: &mut TabBar,
         fx: &SwapFixture,
         atlas: &mut crate::atlas::Atlas,
+    ) -> Option<(wgpu::TextureFormat, u64)> {
+        record_frame_at(bar, fx, atlas, 1.0)
+    }
+
+    /// [`record_frame`] at a chosen backing scale factor.
+    fn record_frame_at(
+        bar: &mut TabBar,
+        fx: &SwapFixture,
+        atlas: &mut crate::atlas::Atlas,
+        scale_factor: f64,
+    ) -> Option<(wgpu::TextureFormat, u64)> {
+        record_frame_in(bar, fx, atlas, scale_factor, 340.0)
+    }
+
+    /// [`record_frame`] at a chosen scale factor and sidebar width.
+    fn record_frame_in(
+        bar: &mut TabBar,
+        fx: &SwapFixture,
+        atlas: &mut crate::atlas::Atlas,
+        scale_factor: f64,
+        left_inset: f32,
     ) -> Option<(wgpu::TextureFormat, u64)> {
         let mut encoder = fx
             .device
@@ -2183,13 +2406,14 @@ mod tests {
                 cell: [8.0, 16.0],
                 top_inset: 0.0,
                 // R5.3: a positive band width, or `record` returns before drawing anything.
-                left_inset: 340.0,
+                left_inset,
                 right_inset: 0.0,
                 format: wgpu::TextureFormat::Rgba8Unorm,
                 sidebar: &fx.sidebar,
-                scale_factor: 1.0,
+                scale_factor,
                 snapshot: &fx.snapshot,
                 atlas,
+                fonts: &fx.fonts,
             };
             bar.record(&mut ctx);
         }
@@ -2282,7 +2506,8 @@ mod tests {
         // R2.4 — eviction reuses the *same* texture (and so the same view and sampler),
         // bumping `generation` only. A rebuild would hand back a byte-identical bind
         // group, so the key must not move. What eviction really invalidates is the UVs,
-        // and those are re-issued every frame by `record` (D5) — no bind-group work.
+        // and those are re-issued by the next composed frame, which the generation in
+        // `record`'s compose key forces (D5, sidebar-weather-cards D20) — no bind-group work.
         let Some(fx) = swap_fixture() else {
             eprintln!("skipping: no GPU/font");
             return;
@@ -2317,5 +2542,722 @@ mod tests {
             Some(1),
             "eviction must not rebuild the bind group at all"
         );
+    }
+
+    // ---- sidebar-weather-cards: the layer's own behaviour (T5) ----
+
+    fn grid_atlas(fx: &SwapFixture) -> crate::atlas::Atlas {
+        crate::atlas::Atlas::new(&fx.device, &fx.fonts, 16.0).expect("atlas")
+    }
+
+    fn install(model: TabBarModel) {
+        reset_shared_model();
+        TabModelHandle::shared().set(model);
+    }
+
+    fn cards(titles: &[&str]) -> Vec<SidebarRow> {
+        titles
+            .iter()
+            .enumerate()
+            .map(|(i, t)| SidebarRow {
+                tab_id: i as u64 + 1,
+                title: (*t).into(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn published(bar: &TabBar) -> SidebarLayout {
+        bar.model.layout().expect("record publishes its layout")
+    }
+
+    #[test]
+    fn card_text_is_drawn_from_the_card_atlases_and_the_band_from_the_grid() {
+        // R2.7 — a card's title changing does not move the grid-atlas text by one
+        // glyph, while the card atlases carry the card text.
+        let Some(fx) = swap_fixture() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let model = |title: &str| TabBarModel {
+            titles: cards(&[title, "api"]),
+            active: 0,
+            waiting: vec![WaitingRow {
+                tab_id: 9,
+                title: "build".into(),
+                signal: WaitingSignal::Error,
+            }],
+            menu: Some(CardMenu {
+                row: 1,
+                items: vec!["Rename".into(), "Close".into()],
+            }),
+            ..Default::default()
+        };
+        let (mut bar, _h) = TabBar::new();
+        let mut atlas = grid_atlas(&fx);
+        install(model("refactor"));
+        record_frame(&mut bar, &fx, &mut atlas);
+        let grid = bar.text_buf.len();
+        assert!(grid > 0, "band + popup text");
+        assert!(
+            !bar.title_buf.is_empty() && !bar.meta_buf.is_empty(),
+            "card text"
+        );
+        install(model("a considerably longer card title"));
+        record_frame(&mut bar, &fx, &mut atlas);
+        assert_eq!(
+            bar.text_buf.len(),
+            grid,
+            "card titles never reach the grid atlas"
+        );
+        reset_shared_model();
+    }
+
+    #[test]
+    fn an_open_menu_or_a_rename_pins_the_button() {
+        // R11.3 — pointer over card 0, card 2's menu open: both draw the `≡`; card 1,
+        // neither hovered nor anchoring anything, does not. Then a rename pins card 1's.
+        let Some(fx) = swap_fixture() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let (mut bar, _h) = TabBar::new();
+        let mut atlas = grid_atlas(&fx);
+        let plate_on = |bar: &TabBar, i: usize| {
+            let rect = published(bar).card_rect(i).expect("visible");
+            let plate = crate::sidebar_card::menu_button(rect, 1.0);
+            bar.shape_buf.iter().any(|s| s.bbox == plate)
+        };
+        install(TabBarModel {
+            titles: cards(&["a", "b", "c"]),
+            active: 1,
+            menu: Some(CardMenu {
+                row: 2,
+                items: vec!["Rename".into()],
+            }),
+            ..Default::default()
+        });
+        TabModelHandle::shared().set_hovered(Some(0));
+        record_frame(&mut bar, &fx, &mut atlas);
+        assert!(plate_on(&bar, 0), "hovered");
+        assert!(plate_on(&bar, 2), "its menu is open");
+        assert!(!plate_on(&bar, 1), "the active card alone shows no button");
+        // The popup itself reaches its own pass, drawn over the card text.
+        assert_eq!(
+            bar.popup_pipe.as_ref().map(|p| p.uploads),
+            Some(1),
+            "the open menu is drawn"
+        );
+
+        TabModelHandle::shared().set_menu(None);
+        TabModelHandle::shared().set_hovered(None);
+        TabModelHandle::shared().set_edit(Some(CardEdit {
+            tab_id: 2,
+            text: "b".into(),
+            caret: 1,
+            selected: false,
+        }));
+        record_frame(&mut bar, &fx, &mut atlas);
+        assert!(plate_on(&bar, 1), "being renamed");
+        assert!(!plate_on(&bar, 0) && !plate_on(&bar, 2));
+        reset_shared_model();
+    }
+
+    #[test]
+    fn the_rename_field_takes_the_title_line_at_title_size() {
+        // R14.1–R14.3 — a Hangul name with the caret at its end: the field's run is the
+        // bold title face, the caret sits after 8 title columns, the box ends 10 short
+        // of the `≡` (1×), and the folder line is still drawn.
+        let Some(fx) = swap_fixture() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let (mut bar, _h) = TabBar::new();
+        let mut atlas = grid_atlas(&fx);
+        install(TabBarModel {
+            titles: cards(&["a", "api"]),
+            active: 1,
+            edit: Some(CardEdit {
+                tab_id: 2,
+                text: "사이드바".into(),
+                caret: 4,
+                selected: false,
+            }),
+            ..Default::default()
+        });
+        record_frame(&mut bar, &fx, &mut atlas);
+        let rect = published(&bar).card_rect(1).expect("visible");
+        let plate = crate::sidebar_card::menu_button(rect, 1.0);
+        let field = bar
+            .run_buf
+            .iter()
+            .find(|r| r.text == format!("사이드바{EDIT_CARET}"))
+            .expect("the field's run");
+        assert_eq!((field.face, field.bold), (CardFace::Title, true));
+        let col = CardFace::Title.column_px(1.0);
+        let caret_pen = crate::tab_bar::pen_layout(&field.text, field.x, col)
+            .last()
+            .expect("caret")
+            .1;
+        assert_eq!(caret_pen, field.x + 8.0 * col, "after 8 title columns");
+        let panel = linear(SidebarTheme::DEFAULT.panel_bg, 1.0);
+        let boxed = bar
+            .shape_buf
+            .iter()
+            .find(|s| s.fill0 == panel && s.bbox[1] < field.top + 1.0 && s.bbox[1] > rect[1])
+            .expect("the field box");
+        assert_eq!(
+            boxed.bbox[0] + boxed.bbox[2],
+            plate[0] - 10.0,
+            "stops before the ≡"
+        );
+        // The whole box, not just its right edge (where the padding cancels): the title
+        // zone grown by `title_gap + border` = 4 each way but the top, which takes half.
+        let line = CardFace::Title.line_px(1.0);
+        assert_eq!(
+            [boxed.bbox[0], boxed.bbox[1], boxed.bbox[3]],
+            [field.x - 4.0, field.top - 2.0, line + 4.0]
+        );
+        assert_eq!(boxed.geom, [8.0, 1.0], "half the card radius, a 1px border");
+        assert!(
+            bar.run_buf
+                .iter()
+                .any(|r| r.text == "api" && r.face == CardFace::Meta),
+            "the folder line stays"
+        );
+        reset_shared_model();
+    }
+
+    #[test]
+    fn a_mid_frame_eviction_is_resolved_again_before_submitting() {
+        // R2.5 — evict the title atlas right after the first run resolves: the layer sees
+        // the generation move, resolves every run once more, and what it keeps is exactly
+        // what a clean frame resolves.
+        let Some(fx) = swap_fixture() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let (mut bar, _h) = TabBar::new();
+        let mut atlas = grid_atlas(&fx);
+        install_one_card();
+        record_frame(&mut bar, &fx, &mut atlas); // warm: builds the card atlases
+        bar.evict_during_resolve = Some(CardFace::Title);
+        bar.compose_key = None; // an unchanged frame would be re-submitted, not composed
+        record_frame(&mut bar, &fx, &mut atlas);
+        assert_eq!(bar.resolve_passes, 2, "the eviction forced a second pass");
+        let evicted: Vec<[f32; 4]> = bar.title_buf.iter().map(|t| t.rect).collect();
+        let evicted_uv: Vec<[f32; 2]> = bar.title_buf.iter().map(|t| t.uv0).collect();
+        bar.compose_key = None;
+        record_frame(&mut bar, &fx, &mut atlas);
+        assert_eq!(bar.resolve_passes, 1, "a clean frame needs one");
+        assert_eq!(
+            bar.title_buf.iter().map(|t| t.rect).collect::<Vec<_>>(),
+            evicted
+        );
+        assert_eq!(
+            bar.title_buf.iter().map(|t| t.uv0).collect::<Vec<_>>(),
+            evicted_uv,
+            "no UV from before the eviction survived"
+        );
+        reset_shared_model();
+    }
+
+    #[test]
+    fn a_scale_change_rebinds_the_card_text() {
+        // R2.3 at the layer — the title pipeline's bind group follows the rebuilt atlas.
+        let Some(fx) = swap_fixture() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let (mut bar, _h) = TabBar::new();
+        let mut atlas = grid_atlas(&fx);
+        install_one_card();
+        record_frame_at(&mut bar, &fx, &mut atlas, 1.0);
+        let key = |bar: &TabBar| bar.title_pipe.as_ref().and_then(|p| p.bind_key);
+        let first = key(&bar).expect("title text was drawn");
+        assert_eq!(Some(first.1), bar.cards.epoch(CardFace::Title));
+        record_frame_at(&mut bar, &fx, &mut atlas, 2.0);
+        let second = key(&bar).expect("still drawn");
+        assert_ne!(first, second, "a new atlas, a new bind group");
+        assert_eq!(Some(second.1), bar.cards.epoch(CardFace::Title));
+        reset_shared_model();
+    }
+
+    // ---- sidebar-weather-cards T6: compose only on change (D20) ----
+
+    /// A metadata source whose generation the test moves by hand.
+    struct Gen(std::cell::Cell<u64>);
+    impl MetaSource for Gen {
+        fn generation(&self) -> u64 {
+            self.0.get()
+        }
+        fn fill(&self, rows: &[SidebarRow], out: &mut Vec<RowMeta>) {
+            out.clear();
+            out.resize(rows.len(), RowMeta::default());
+        }
+    }
+
+    /// Instance-buffer writes per pipeline the layer owns: grid text, title text, meta
+    /// text, shapes, popup shapes, fallback card text. Kept apart, so one pipeline that
+    /// stopped counting cannot hide behind another that still does.
+    fn uploads(bar: &TabBar) -> [u32; 6] {
+        let text = |p: &Option<SidebarTextPipeline>| p.as_ref().map_or(0, |p| p.uploads);
+        let shape = |p: &Option<SidebarShapePipeline>| p.as_ref().map_or(0, |p| p.uploads);
+        [
+            text(&bar.text_pipe),
+            text(&bar.title_pipe),
+            text(&bar.meta_pipe),
+            shape(&bar.shape_pipe),
+            shape(&bar.popup_pipe),
+            text(&bar.fallback_pipe),
+        ]
+    }
+
+    #[test]
+    fn a_steady_frame_composes_nothing_and_writes_no_buffer() {
+        // R17.1 — the second and later identical frames re-submit what is resident.
+        let Some(fx) = swap_fixture() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let (mut bar, _h) = TabBar::new();
+        let mut atlas = grid_atlas(&fx);
+        install_one_card();
+        record_frame(&mut bar, &fx, &mut atlas);
+        let (composed, written) = (bar.compose_count, uploads(&bar));
+        assert_eq!(composed, 1);
+        // One write each — the waiting row's grid text, both card faces, the shapes; no
+        // popup is open and both card atlases built, so those two pipelines never are.
+        assert_eq!(written, [1, 1, 1, 1, 0, 0], "the first frame uploads");
+        for _ in 0..5 {
+            record_frame(&mut bar, &fx, &mut atlas);
+        }
+        assert_eq!(bar.compose_count, composed, "nothing composed");
+        assert_eq!(uploads(&bar), written, "no instance buffer written");
+        assert!(
+            published(&bar).card_rect(0).is_some(),
+            "the layout is still published"
+        );
+        reset_shared_model();
+    }
+
+    #[test]
+    fn every_key_input_recomposes_exactly_once() {
+        // R17.2 — each input, changed alone, costs one composition and then is steady
+        // again; a cache that missed an input would show 0 here, one that keyed on
+        // something unstable would keep counting.
+        let Some(mut fx) = swap_fixture() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let (mut bar, h) = TabBar::new();
+        let mut atlas = grid_atlas(&fx);
+        let source = Rc::new(Gen(std::cell::Cell::new(1)));
+        install(TabBarModel {
+            titles: cards(&["a", "b", "c"]),
+            active: 0,
+            ..Default::default()
+        });
+        h.set_meta_source(source.clone());
+        let (mut scale, mut width) = (1.0, 340.0);
+        record_frame_in(&mut bar, &fx, &mut atlas, scale, width);
+
+        type Change<'c> = Box<dyn FnMut(&mut TabBar, &mut crate::atlas::Atlas) + 'c>;
+        let steps: Vec<(&str, Change)> = vec![
+            ("hovered", Box::new(|_, _| h.set_hovered(Some(1)))),
+            (
+                "active",
+                Box::new(|_, _| {
+                    h.set(TabBarModel {
+                        titles: cards(&["a", "b", "c"]),
+                        active: 2,
+                        ..Default::default()
+                    })
+                }),
+            ),
+            ("meta generation", Box::new(|_, _| source.0.set(2))),
+            ("scroll", Box::new(|_, _| h.set_list_scroll(0.0, 5.0))),
+            (
+                "menu",
+                Box::new(|_, _| {
+                    h.set_menu(Some(CardMenu {
+                        row: 0,
+                        items: vec!["Rename".into()],
+                    }))
+                }),
+            ),
+            (
+                "edit",
+                Box::new(|_, _| {
+                    h.set_edit(Some(CardEdit {
+                        tab_id: 1,
+                        text: "ab".into(),
+                        caret: 1,
+                        selected: false,
+                    }))
+                }),
+            ),
+            (
+                "edit caret",
+                Box::new(|_, _| {
+                    h.set_edit(Some(CardEdit {
+                        tab_id: 1,
+                        text: "ab".into(),
+                        caret: 2,
+                        selected: false,
+                    }))
+                }),
+            ),
+            (
+                "waiting rows",
+                Box::new(|_, _| {
+                    h.set_waiting(vec![WaitingRow {
+                        tab_id: 3,
+                        title: "build".into(),
+                        signal: WaitingSignal::Error,
+                    }])
+                }),
+            ),
+            ("grid atlas generation", Box::new(|_, a| a.evict_for_test())),
+            (
+                "title atlas generation",
+                Box::new(|bar, _| {
+                    bar.cards
+                        .get_mut(CardFace::Title)
+                        .expect("built")
+                        .evict_for_test()
+                }),
+            ),
+            (
+                "meta atlas generation",
+                Box::new(|bar, _| {
+                    bar.cards
+                        .get_mut(CardFace::Meta)
+                        .expect("built")
+                        .evict_for_test()
+                }),
+            ),
+        ];
+        for (what, mut change) in steps {
+            let before = bar.compose_count;
+            change(&mut bar, &mut atlas);
+            record_frame_in(&mut bar, &fx, &mut atlas, scale, width);
+            assert_eq!(bar.compose_count, before + 1, "{what} recomposes once");
+            record_frame_in(&mut bar, &fx, &mut atlas, scale, width);
+            assert_eq!(bar.compose_count, before + 1, "{what} is then steady");
+        }
+        // The frame's own inputs.
+        for (what, s, w) in [("scale", 2.0, 340.0), ("sidebar width", 2.0, 400.0)] {
+            let before = bar.compose_count;
+            (scale, width) = (s, w);
+            record_frame_in(&mut bar, &fx, &mut atlas, scale, width);
+            assert_eq!(bar.compose_count, before + 1, "{what} recomposes once");
+            record_frame_in(&mut bar, &fx, &mut atlas, scale, width);
+            assert_eq!(bar.compose_count, before + 1, "{what} is then steady");
+        }
+        // The config the key carries: both display toggles and the accent.
+        type Toggle = fn(&mut SidebarConfig);
+        let toggles: [(&str, Toggle); 3] = [
+            ("show_git_branch", |c| {
+                c.show_git_branch = !c.show_git_branch
+            }),
+            ("show_agent_status", |c| {
+                c.show_agent_status = !c.show_agent_status
+            }),
+            ("accent", |c| c.accent ^= 0x00FF_FFFF),
+        ];
+        for (what, toggle) in toggles {
+            let before = bar.compose_count;
+            toggle(&mut fx.sidebar);
+            record_frame_in(&mut bar, &fx, &mut atlas, scale, width);
+            assert_eq!(bar.compose_count, before + 1, "{what} recomposes once");
+            record_frame_in(&mut bar, &fx, &mut atlas, scale, width);
+            assert_eq!(bar.compose_count, before + 1, "{what} is then steady");
+        }
+        reset_shared_model();
+    }
+
+    #[test]
+    fn a_card_run_sits_on_its_line_box_baseline() {
+        // D3: a run's glyphs hang from a baseline at 0.8 × its line box below the run's
+        // top, each offset by its own bearing — the same placement the grid text uses.
+        let Some(fx) = swap_fixture() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let mut atlas = grid_atlas(&fx);
+        let key = atlas.resolve('j', false, false).expect("j resolves");
+        let e = atlas
+            .get_or_insert_styled(&fx.queue, key)
+            .expect("j rasterizes");
+        assert!(
+            e.left != 0.0 && e.top != 0.0,
+            "a glyph with both bearings: {e:?}"
+        );
+        let mut out = Vec::new();
+        let run = TextRun {
+            face: CardFace::Title,
+            text: "j".into(),
+            x: 10.0,
+            top: 20.0,
+            color: [1.0; 4],
+            bold: false,
+        };
+        push_run(&mut out, &mut atlas, &fx.queue, &run, 9.0, 25.0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].rect,
+            [10.0 + e.left, 20.0 + 20.0 - e.top, e.px_w, e.px_h]
+        );
+    }
+
+    #[test]
+    fn select_all_highlights_the_name_and_not_the_caret() {
+        // sticky-tab-title R2.1 under D3: the highlight covers the name's display columns
+        // at title size — `사이드바` is 8 — and stops before the caret; an empty name has
+        // no highlight at all.
+        let Some(fx) = swap_fixture() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let accent = linear(SidebarTheme::DEFAULT.accent, 0.40);
+        let highlight = |text: &str| {
+            let (mut bar, _h) = TabBar::new();
+            let mut atlas = grid_atlas(&fx);
+            install(TabBarModel {
+                titles: cards(&["a"]),
+                edit: Some(CardEdit {
+                    tab_id: 1,
+                    text: text.into(),
+                    caret: text.chars().count(),
+                    selected: true,
+                }),
+                ..Default::default()
+            });
+            record_frame(&mut bar, &fx, &mut atlas);
+            let field = bar
+                .run_buf
+                .iter()
+                .find(|r| r.text.ends_with(EDIT_CARET))
+                .expect("the field's run")
+                .clone();
+            let hl: Vec<_> = bar
+                .shape_buf
+                .iter()
+                .filter(|s| s.fill0 == accent)
+                .map(|s| (s.bbox, s.geom))
+                .collect();
+            reset_shared_model();
+            (field, hl)
+        };
+        let col = CardFace::Title.column_px(1.0);
+        let (field, hl) = highlight("사이드바");
+        assert_eq!(
+            hl,
+            vec![(
+                [field.x, field.top, 8.0 * col, CardFace::Title.line_px(1.0)],
+                [1.0, 0.0]
+            )]
+        );
+        assert_eq!(highlight("").1, vec![], "nothing to highlight");
+    }
+
+    #[test]
+    fn a_card_atlas_that_cannot_be_built_degrades_to_the_grid_atlas() {
+        // R2.6 through the layer. The frame's font set has no usable face, so neither card
+        // atlas builds; the grid atlas keeps the real fonts. Card text must still be drawn
+        // — from the grid atlas, measured by the grid cell — in a pass of its own that is
+        // submitted before the popup, and the failed build is not retried per frame.
+        let Some(mut fx) = swap_fixture() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let mut atlas = grid_atlas(&fx);
+        fx.fonts = crate::sidebar_text::broken_fonts();
+        let (mut bar, _h) = TabBar::new();
+        install(TabBarModel {
+            titles: cards(&["alpha"]),
+            menu: Some(CardMenu {
+                row: 0,
+                items: vec!["Rename".into()],
+            }),
+            ..Default::default()
+        });
+        record_frame(&mut bar, &fx, &mut atlas);
+        assert!(bar.cards.get(CardFace::Title).is_none());
+        assert!(bar.cards.get(CardFace::Meta).is_none());
+        assert!(bar.title_buf.is_empty() && bar.meta_buf.is_empty());
+
+        // Every card run, resolved from the grid atlas at the grid cell (8×16 here) and
+        // nothing else: exactly what `push_run` gives at those metrics.
+        let mut want = Vec::new();
+        for run in &bar.run_buf {
+            push_run(&mut want, &mut atlas, &fx.queue, run, 8.0, 16.0);
+        }
+        let rects = |v: &[TextInstance]| v.iter().map(|t| t.rect).collect::<Vec<_>>();
+        assert_eq!(rects(&bar.fallback_buf), rects(&want));
+        // The title band carries ink: the title's five glyphs, each with an area.
+        let title = bar
+            .run_buf
+            .iter()
+            .find(|r| r.face == CardFace::Title)
+            .expect("the title run")
+            .clone();
+        assert_eq!(title.text, "alpha");
+        let inked = bar
+            .fallback_buf
+            .iter()
+            .filter(|t| t.rect[1] < title.top + 16.0 && t.rect[2] > 0.0 && t.rect[3] > 0.0)
+            .count();
+        assert_eq!(inked, 5, "the title band still carries ink");
+
+        // Its own pass, not the grid pass that is drawn over the popup: the grid text
+        // holds the popup's item and nothing of the card's.
+        assert_eq!(uploads(&bar)[5], 1, "the fallback pass is drawn");
+        let mut item = Vec::new();
+        let menu_item = TextRun {
+            face: CardFace::Meta,
+            text: "Rename".into(),
+            x: 0.0,
+            top: 0.0,
+            color: [1.0; 4],
+            bold: false,
+        };
+        push_run(&mut item, &mut atlas, &fx.queue, &menu_item, 8.0, 16.0);
+        assert_eq!(bar.text_buf.len(), item.len(), "only the popup's item");
+
+        // One build attempt, however many frames compose.
+        for hovered in [Some(0), None, Some(0)] {
+            TabModelHandle::shared().set_hovered(hovered);
+            record_frame(&mut bar, &fx, &mut atlas);
+        }
+        assert_eq!(bar.cards.builds(), 1, "not retried per frame");
+        reset_shared_model();
+    }
+
+    #[test]
+    fn a_grid_eviction_while_composing_is_composed_again_next_frame() {
+        // D20 with the grid atlas: the band's text was resolved against it, then composing
+        // evicted it. Keyed on the atlas as composing *left* it, the next frame would hit
+        // and re-submit those stale UVs for as long as the sidebar stayed still. Keyed on
+        // the atlas as composing *found* it, the next frame misses once and is then steady.
+        let Some(fx) = swap_fixture() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let (mut bar, _h) = TabBar::new();
+        let mut atlas = grid_atlas(&fx);
+        install_one_card();
+        bar.evict_grid_during_compose = true;
+        record_frame(&mut bar, &fx, &mut atlas);
+        assert_eq!(bar.compose_count, 1);
+        record_frame(&mut bar, &fx, &mut atlas);
+        assert_eq!(
+            bar.compose_count, 2,
+            "composed again against the repacked atlas"
+        );
+        record_frame(&mut bar, &fx, &mut atlas);
+        assert_eq!(bar.compose_count, 2, "then steady");
+        reset_shared_model();
+    }
+
+    #[test]
+    fn the_source_is_filled_only_when_its_generation_or_the_rows_move() {
+        // D10 under D20: a steady frame never calls `fill` (nor clones the rows for it); a
+        // generation change alone refills, and so does a roster change alone.
+        struct Counting {
+            gen: std::cell::Cell<u64>,
+            fills: std::cell::Cell<u32>,
+        }
+        impl MetaSource for Counting {
+            fn generation(&self) -> u64 {
+                self.gen.get()
+            }
+            fn fill(&self, rows: &[SidebarRow], out: &mut Vec<RowMeta>) {
+                self.fills.set(self.fills.get() + 1);
+                out.clear();
+                out.resize(rows.len(), RowMeta::default());
+            }
+        }
+        let Some(fx) = swap_fixture() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let (mut bar, h) = TabBar::new();
+        let mut atlas = grid_atlas(&fx);
+        install(TabBarModel {
+            titles: cards(&["a", "b"]),
+            ..Default::default()
+        });
+        let src = Rc::new(Counting {
+            gen: std::cell::Cell::new(1),
+            fills: std::cell::Cell::new(0),
+        });
+        h.set_meta_source(src.clone());
+        record_frame(&mut bar, &fx, &mut atlas);
+        assert_eq!(src.fills.get(), 1, "the first frame fills");
+        for _ in 0..3 {
+            record_frame(&mut bar, &fx, &mut atlas);
+        }
+        assert_eq!(src.fills.get(), 1, "a steady frame does not");
+        src.gen.set(2);
+        record_frame(&mut bar, &fx, &mut atlas);
+        assert_eq!(src.fills.get(), 2, "a new generation alone refills");
+        h.set(TabBarModel {
+            titles: cards(&["a", "b", "c"]),
+            ..Default::default()
+        });
+        record_frame(&mut bar, &fx, &mut atlas);
+        assert_eq!(src.fills.get(), 3, "a roster change alone refills");
+        reset_shared_model();
+    }
+
+    #[test]
+    fn the_band_and_popup_state_are_compared_not_just_their_revision() {
+        // D20: every setter bumps `rows_rev`, but the fields are public and `with_mut` is
+        // too. A write that skipped the bump must still recompose — the key holds the
+        // waiting rows, the menu and the rename state themselves. Each changed alone.
+        let Some(fx) = swap_fixture() else {
+            eprintln!("skipping: no GPU/font");
+            return;
+        };
+        let (mut bar, h) = TabBar::new();
+        let mut atlas = grid_atlas(&fx);
+        install(TabBarModel {
+            titles: cards(&["a", "b"]),
+            ..Default::default()
+        });
+        record_frame(&mut bar, &fx, &mut atlas);
+        type Write = fn(&mut SidebarModel);
+        let writes: [(&str, Write); 3] = [
+            ("waiting", |m| {
+                m.waiting = vec![WaitingRow {
+                    tab_id: 2,
+                    title: "b".into(),
+                    signal: WaitingSignal::Waiting,
+                }]
+            }),
+            ("menu", |m| {
+                m.menu = Some(CardMenu {
+                    row: 0,
+                    items: vec!["Rename".into()],
+                })
+            }),
+            ("edit", |m| {
+                m.edit = Some(CardEdit {
+                    tab_id: 1,
+                    text: "a".into(),
+                    caret: 1,
+                    selected: false,
+                })
+            }),
+        ];
+        for (what, write) in writes {
+            let before = bar.compose_count;
+            h.with_mut(write);
+            record_frame(&mut bar, &fx, &mut atlas);
+            assert_eq!(bar.compose_count, before + 1, "{what}, written directly");
+        }
+        reset_shared_model();
     }
 }

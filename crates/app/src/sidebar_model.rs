@@ -3,15 +3,19 @@
 //!
 //! [`SidebarMetaSource`] implements the renderer's [`MetaSource`] pull trait — the layer
 //! calls [`generation`](MetaSource::generation) each frame and [`fill`](MetaSource::fill)
-//! only when it moves (D10), so a steady frame does no work. [`skin_for`] / [`mark_for`]
-//! are the **total, exhaustive** mapping from an app-side agent identity to the renderer's
-//! `AgentSkin` / `RowMark` (D11): adding an `AgentKind` variant fails to compile here, at
-//! the one site that must decide, rather than silently rendering as nothing.
+//! only when it moves (D10), so a steady frame does no work. [`skin_for`] is the **total,
+//! exhaustive** mapping from an app-side agent identity to the renderer's `AgentSkin`
+//! (D11): adding an `AgentKind` variant fails to compile here, at the one site that must
+//! decide, rather than silently rendering as nothing. [`resolve_status`] is the card's
+//! bottom-left status by its precedence (sidebar-weather-cards D7, as amended by
+//! agent-card-status D8), and [`effective_state`] is the one dialog override it shares with
+//! the waiting band (agent-card-status D4).
 
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use renderer::sidebar_row::{MetaSource, RowMark, RowMeta, SidebarRow};
+use renderer::sidebar_card::CardStatus;
+use renderer::sidebar_row::{MetaSource, RowMeta, SidebarRow};
 use renderer::sidebar_theme::AgentSkin;
 
 use crate::session::TabId;
@@ -44,9 +48,12 @@ impl MetaSource for SidebarMetaSource {
         // Refresh the snapshot (a no-op allocation-wise when the generation is unchanged).
         self.handle.sync(&mut self.snap.borrow_mut());
         let snap = self.snap.borrow();
+        // `$HOME` at the point of use, once per fill (sidebar-weather-cards D10), as
+        // `clipboard::pasted_dir` reads it — never cached, so it is never stale.
+        let home = std::env::var_os("HOME").map(PathBuf::from);
         out.clear();
         for row in rows {
-            out.push(row_meta(row, snap.get(TabId(row.tab_id))));
+            out.push(row_meta(row, snap.get(TabId(row.tab_id)), home.as_deref()));
         }
     }
 }
@@ -57,7 +64,11 @@ impl MetaSource for SidebarMetaSource {
 /// Free and pure so the join is unit-testable without a worker thread or a GPU frame —
 /// `TabMetaSnapshot`'s fields are private to its own module, so a test can construct this
 /// function's inputs and not `fill`'s.
-fn row_meta(row: &SidebarRow, meta: Option<&crate::tabmeta::TabMeta>) -> RowMeta {
+fn row_meta(
+    row: &SidebarRow,
+    meta: Option<&crate::tabmeta::TabMeta>,
+    home: Option<&Path>,
+) -> RowMeta {
     let agent = meta.and_then(|m| m.agent.as_ref());
     // Resolve line 1 HERE (sticky-tab-title D7/R1.5): this is the one place that
     // sees all four sources at once with the AI-task label *fresh*. `Tabs::titles`
@@ -71,20 +82,35 @@ fn row_meta(row: &SidebarRow, meta: Option<&crate::tabmeta::TabMeta>) -> RowMeta
     // the row's copy froze the card on the directory its tab opened in, and a bare `cd` never
     // reached it. The row's title remains the answer for the not-yet-polled window, where it
     // is the only one there is (D2).
-    let live_cwd = meta.and_then(|m| folder_name(m.cwd.as_deref()));
+    let live_path = meta.and_then(|m| m.cwd.as_deref());
+    let live_cwd = folder_name(live_path);
     let cwd = live_cwd.as_deref().unwrap_or(&row.title);
-    let (line1, is_custom) =
-        resolve_line1_tier(row.label.as_deref(), task, row.program.as_deref(), cwd);
+    let (line1, _) = resolve_line1_tier(row.label.as_deref(), task, row.program.as_deref(), cwd);
     RowMeta {
         branch: meta.and_then(|m| m.branch.clone()),
-        mark: mark_for(agent),
+        status: resolve_status(agent, row.blocking_dialog, row.running, row.last_exit),
         skin: skin_for(agent),
-        line1_is_custom: is_custom,
         line1: line1.to_string(),
-        // Carried even when line 1 already won it (D6): line 2 draws the folder name only on
-        // a custom card, and which card that is changes as the label sources come and go.
-        // A copy, not a move — `cwd` is a `&str` and `line1` may borrow from it.
-        cwd_title: cwd.to_string(),
+        // The folder line (sidebar-weather-cards D10): the SAME published cwd line 1's cwd
+        // tier and the branch come from, on the same pull, so a card's folder and branch
+        // always describe one directory (card-live-cwd D1). Empty before the first publish;
+        // the card then shows the row's assembly-time folder name (card-live-cwd D2).
+        cwd_display: live_path.map(|p| display_cwd(p, home)).unwrap_or_default(),
+    }
+}
+
+/// The folder line's text for a working directory: `$HOME` shown as `~`, anything else
+/// absolute (sidebar-weather-cards D10) — `~/IdeaProjects/terminal`, `~`, `/opt/homebrew`.
+///
+/// Component-wise, never a string prefix: `/Users/xy` is not under `/Users/x`. A `home`
+/// that is relative, empty or the root is ignored — abbreviating by it would turn every
+/// path into `~/…` and name nothing.
+pub fn display_cwd(cwd: &Path, home: Option<&Path>) -> String {
+    let home = home.filter(|h| h.is_absolute() && h.parent().is_some());
+    match home.and_then(|h| cwd.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => cwd.display().to_string(),
     }
 }
 
@@ -143,34 +169,73 @@ pub fn resolve_line1_tier<'a>(
     }
 }
 
-/// Agent identity → card skin (D11). `Claude`/`Antigravity` carry the mock's two skins;
-/// every other agent and `None` → `Generic` (the plain card). The `match` is exhaustive
-/// with no `_` arm on purpose (R9.3): a new `AgentKind` must be decided here.
+/// Agent identity → card skin (D11). Claude, Antigravity and — since sidebar-weather-cards
+/// D5 — Codex carry skins of their own; Gemini, Aider and `None` → `Generic`, the plain-
+/// shell card. The `match` is exhaustive with no `_` arm on purpose (R9.3): a new
+/// `AgentKind` must be decided here.
 pub fn skin_for(agent: Option<&Agent>) -> AgentSkin {
     match agent.map(|a| a.kind) {
         Some(AgentKind::Claude) => AgentSkin::Claude,
         Some(AgentKind::Antigravity) => AgentSkin::Antigravity,
-        Some(AgentKind::Codex) | Some(AgentKind::Gemini) | Some(AgentKind::Aider) => {
-            AgentSkin::Generic
-        }
+        Some(AgentKind::Codex) => AgentSkin::Codex,
+        Some(AgentKind::Gemini) | Some(AgentKind::Aider) => AgentSkin::Generic,
         None => AgentSkin::Generic,
     }
 }
 
-/// Agent state → the leading mark (D11). Working → `Agent` (`✳`); idle/ready → `Ready`
-/// (`◇`); no agent → `None`. `Unknown` maps to the **present** affordance (`✳`), never
-/// `Ready` (R6.6) — the one thing `Unknown` asserts is that an agent is running.
+/// An agent's state as the band and the card both read it: `Waiting` while a blocking
+/// dialog is on the tab's screen, whatever the log says (agent-card-status D4).
 ///
-/// `Waiting` (input-waiting, D4/D16) maps to its own [`RowMark::Waiting`] (the ⏸ pause in
-/// the waiting colour, D6), so a waiting agent's CARD shows the same affordance as its
-/// waiting-band row — a consistent read across the two zones.
-pub fn mark_for(agent: Option<&Agent>) -> RowMark {
-    match agent.map(|a| a.state) {
-        Some(AgentState::Busy) => RowMark::Agent,
-        Some(AgentState::Waiting) => RowMark::Waiting,
-        Some(AgentState::Unknown) => RowMark::Agent,
-        Some(AgentState::Idle) => RowMark::Ready,
-        None => RowMark::None,
+/// The log cannot see a pending permission — Claude Code appends nothing while its dialog
+/// is up, and Antigravity writes a step only when it completes — while the screen can. The
+/// point of this being ONE function is that the band (`push_agent_states`) and the card
+/// ([`resolve_status`]) cannot disagree about a tab: before it, a Claude tab on a permission
+/// dialog sat in the band while its card read `Working`.
+pub fn effective_state(state: AgentState, blocking_dialog: bool) -> AgentState {
+    if blocking_dialog {
+        AgentState::Waiting
+    } else {
+        state
+    }
+}
+
+/// The card's bottom-left status (sidebar-weather-cards D7, agent-card-status D8), first
+/// match wins:
+///
+/// 1. an agent is present → its [`effective_state`]: a blocking dialog on screen reads
+///    `WaitingForInput` first, then `Busy` → `Working`, `Idle` → `Ready`, `Waiting` →
+///    `WaitingForInput`, and `Unknown` → [`CardStatus::Hidden`] (agent-card-status D3). An
+///    agent started from zsh leaves the shell "running" for its whole session, which is
+///    why the agent outranks that.
+/// 2. the shell is running a foreground command → `Running` (D19: tmux and vim read so for
+///    as long as they run).
+/// 3. the last finished command failed by the band's own rule (D12) → `Exited N`.
+/// 4. otherwise → the plain shell.
+///
+/// `Unknown` hides rather than claiming `Working`: that claim was sidebar-weather-cards
+/// D7's least-wrong option when hiding was not one, and it is exactly what made an
+/// Antigravity card blocked on a permission dialog read "Working". The dialog level is
+/// ignored without an agent — the level is only ever set for an agent's tab (D7), and a
+/// shell that prints dialog-like text must not change its card.
+///
+/// `Running` outranking `Exited` is what makes a rerun "clear on start" with no clearing
+/// logic: the next command's start makes rule 2 win, and its end replaces `last_exit`.
+pub fn resolve_status(
+    agent: Option<&Agent>,
+    blocking_dialog: bool,
+    running: bool,
+    last_exit: Option<i32>,
+) -> CardStatus {
+    match agent.map(|a| effective_state(a.state, blocking_dialog)) {
+        Some(AgentState::Busy) => CardStatus::Working,
+        Some(AgentState::Idle) => CardStatus::Ready,
+        Some(AgentState::Waiting) => CardStatus::WaitingForInput,
+        Some(AgentState::Unknown) => CardStatus::Hidden,
+        None if running => CardStatus::Running,
+        None => match last_exit.filter(|&code| crate::waiting::is_reportable_exit(code)) {
+            Some(code) => CardStatus::Exited(code),
+            None => CardStatus::Shell,
+        },
     }
 }
 
@@ -180,6 +245,33 @@ mod tests {
 
     fn agent(kind: AgentKind, state: AgentState) -> Agent {
         Agent { kind, state }
+    }
+
+    #[test]
+    fn fill_replaces_the_buffer_with_one_meta_per_row_in_order() {
+        // D7 through the real source: before the worker publishes anything, each row's
+        // status still comes from its own command state, one entry per row, in row
+        // order, and whatever the buffer held before is gone.
+        let Some(handle) = crate::tabmeta::TabMetaHandle::spawn(|| {}) else {
+            panic!("the metadata worker could not be spawned");
+        };
+        let source = SidebarMetaSource::new(handle);
+        let rows = [
+            SidebarRow {
+                tab_id: 1,
+                running: true,
+                ..SidebarRow::default()
+            },
+            SidebarRow {
+                tab_id: 2,
+                last_exit: Some(101),
+                ..SidebarRow::default()
+            },
+        ];
+        let mut out = vec![RowMeta::default(); 3];
+        source.fill(&rows, &mut out);
+        let got: Vec<CardStatus> = out.iter().map(|m| m.status).collect();
+        assert_eq!(got, [CardStatus::Running, CardStatus::Exited(101)]);
     }
 
     // -----------------------------------------------------------------------
@@ -224,9 +316,13 @@ mod tests {
         SidebarRow {
             tab_id: 7,
             title: title.to_string(),
-            label: None,
-            program: None,
+            ..Default::default()
         }
+    }
+
+    /// The join with `$HOME` fixed at `/Users/x`, where every `meta_at` path lives.
+    fn row_meta_at_home(row: &SidebarRow, meta: Option<&crate::tabmeta::TabMeta>) -> RowMeta {
+        row_meta(row, meta, Some(Path::new("/Users/x")))
     }
 
     fn meta_at(cwd: &str) -> crate::tabmeta::TabMeta {
@@ -248,9 +344,9 @@ mod tests {
         // the tab sat in `api`; the shell has since moved to `web` and the worker published
         // it. Before this feature the card read `api` for the life of the tab, because
         // nothing re-runs `Tabs::titles` on a `cd`.
-        let m = row_meta(&row_at("api"), Some(&meta_at("/Users/x/web")));
+        let m = row_meta_at_home(&row_at("api"), Some(&meta_at("/Users/x/web")));
         assert_eq!(m.line1, "web");
-        assert_eq!(m.cwd_title, "web");
+        assert_eq!(m.cwd_display, "~/web");
     }
 
     #[test]
@@ -260,10 +356,12 @@ mod tests {
         // would let one card name two directories — the defect one line down.
         let mut row = row_at("api");
         row.label = Some("Frontend".into());
-        let m = row_meta(&row, Some(&meta_at("/Users/x/web")));
+        let m = row_meta_at_home(&row, Some(&meta_at("/Users/x/web")));
         assert_eq!(m.line1, "Frontend", "the user title still wins line 1");
-        assert!(m.line1_is_custom, "so line 2 draws the repo name");
-        assert_eq!(m.cwd_title, "web", "and it is the LIVE folder, not `api`");
+        assert_eq!(
+            m.cwd_display, "~/web",
+            "and the folder line is the LIVE folder"
+        );
     }
 
     #[test]
@@ -275,10 +373,10 @@ mod tests {
         let mut row = row_at("api");
         row.label = Some("Frontend".into());
         row.program = Some("vim - main.rs".into());
-        let before = row_meta(&row, Some(&meta_at("/Users/x/api")));
-        let after = row_meta(&row, Some(&meta_at("/Users/x/web")));
-        assert_eq!(before.cwd_title, "api");
-        assert_eq!(after.cwd_title, "web");
+        let before = row_meta_at_home(&row, Some(&meta_at("/Users/x/api")));
+        let after = row_meta_at_home(&row, Some(&meta_at("/Users/x/web")));
+        assert_eq!(before.cwd_display, "~/api");
+        assert_eq!(after.cwd_display, "~/web");
         assert_eq!(
             after.line1, "Frontend",
             "the name the user set is untouched"
@@ -292,37 +390,41 @@ mod tests {
         // `TabMeta`, so they cannot describe different directories.
         let mut meta = meta_at("/Users/x/web");
         meta.branch = Some("dev".into());
-        let m = row_meta(&row_at("api"), Some(&meta));
-        assert_eq!(m.cwd_title, "web");
+        let m = row_meta_at_home(&row_at("api"), Some(&meta));
+        assert_eq!(m.cwd_display, "~/web");
         assert_eq!(m.branch.as_deref(), Some("dev"));
     }
 
     #[test]
-    fn the_folder_name_is_carried_even_when_line_2_will_not_draw_it() {
-        // R1.3 / D6 — line 2 draws the folder only on a custom card, but which card that is
-        // changes as labels come and go, so the value is always carried rather than
-        // conditionally filled.
-        let m = row_meta(&row_at("api"), Some(&meta_at("/Users/x/web")));
-        assert!(!m.line1_is_custom, "a plain cwd card");
-        assert_eq!(m.cwd_title, "web", "…still carries the folder name");
+    fn the_folder_line_is_carried_for_a_plain_card_too() {
+        // R1.3 / D6, as sidebar-weather-cards D10 left it — the folder line is always drawn,
+        // so the value is always carried, whether or not line 1 is the cwd.
+        let m = row_meta_at_home(&row_at("api"), Some(&meta_at("/Users/x/web")));
+        assert_eq!(m.line1, "web", "a plain cwd card");
+        assert_eq!(m.cwd_display, "~/web", "…still carries its folder line");
     }
 
     #[test]
     fn an_unpolled_tab_shows_the_assembled_title_rather_than_blank() {
         // R2.1 — the not-yet-published window (up to one worker tick on a new tab). The row's
         // own title is the only answer there is, and a blank card is the outcome D2 refuses.
-        let m = row_meta(&row_at("api"), None);
+        let m = row_meta_at_home(&row_at("api"), None);
         assert_eq!(m.line1, "api");
-        assert_eq!(m.cwd_title, "api");
+        // No published cwd → no folder line of its own; the card shows the row's title
+        // there instead (`sidebar_card::folder_text`, R10.4).
+        assert_eq!(m.cwd_display, "");
     }
 
     #[test]
     fn an_unresolvable_cwd_keeps_the_tab_n_fallback() {
         // R2.3 — a dead pid publishes `cwd: None`; the row's `Tab {n}` must survive it.
         let meta = crate::tabmeta::TabMeta::default();
-        let m = row_meta(&row_at("Tab 3"), Some(&meta));
+        let m = row_meta_at_home(&row_at("Tab 3"), Some(&meta));
         assert_eq!(m.line1, "Tab 3");
-        assert_eq!(m.cwd_title, "Tab 3");
+        assert_eq!(
+            m.cwd_display, "",
+            "the card falls back to the row's `Tab 3`"
+        );
     }
 
     #[test]
@@ -343,10 +445,10 @@ mod tests {
 
         // A published cwd (the steady state) and an absent one (the fallback path) — the
         // fallback is where a re-resolve would be most tempting.
-        let live = row_meta(&row_at("api"), Some(&meta_at("/Users/x/web")));
-        let unpolled = row_meta(&row_at("api"), None);
-        assert_eq!(live.cwd_title, "web");
-        assert_eq!(unpolled.cwd_title, "api");
+        let live = row_meta_at_home(&row_at("api"), Some(&meta_at("/Users/x/web")));
+        let unpolled = row_meta_at_home(&row_at("api"), None);
+        assert_eq!(live.cwd_display, "~/web");
+        assert_eq!(unpolled.cwd_display, "");
 
         assert_eq!(
             crate::tabmeta::probe::PROC_CWD.get(),
@@ -361,13 +463,15 @@ mod tests {
     }
 
     #[test]
-    fn two_directories_with_the_same_basename_render_identically() {
-        // R5.3 / D4 — accepted behaviour, pinned so a later contributor does not "fix" the
-        // invisible-change case (`~/a/src` -> `~/b/src`) without reopening the decision.
-        let a = row_meta(&row_at("x"), Some(&meta_at("/Users/x/a/src")));
-        let b = row_meta(&row_at("x"), Some(&meta_at("/Users/x/b/src")));
-        assert_eq!(a.cwd_title, "src");
-        assert_eq!(b.cwd_title, "src");
+    fn two_directories_with_the_same_basename_are_told_apart_by_the_folder_line() {
+        // card-live-cwd R5.3 / D4 pinned `~/a/src` → `~/b/src` as an accepted invisible
+        // change. sidebar-weather-cards D10 reopens it deliberately: line 1 still names the
+        // basename, but the folder line is the path, so the move is now visible.
+        let a = row_meta_at_home(&row_at("x"), Some(&meta_at("/Users/x/a/src")));
+        let b = row_meta_at_home(&row_at("x"), Some(&meta_at("/Users/x/b/src")));
+        assert_eq!((a.line1.as_str(), b.line1.as_str()), ("src", "src"));
+        assert_eq!(a.cwd_display, "~/a/src");
+        assert_eq!(b.cwd_display, "~/b/src");
     }
 
     #[test]
@@ -378,13 +482,13 @@ mod tests {
         row.program = Some("vim - main.rs".into());
         let mut meta = meta_at("/Users/x/web");
         assert_eq!(
-            row_meta(&row, Some(&meta)).line1,
+            row_meta_at_home(&row, Some(&meta)).line1,
             "vim - main.rs",
             "a program title still outranks the (now live) cwd"
         );
         meta.task = Some("refactor the parser".into());
         assert_eq!(
-            row_meta(&row, Some(&meta)).line1,
+            row_meta_at_home(&row, Some(&meta)).line1,
             "refactor the parser",
             "and the task label still outranks the program title"
         );
@@ -506,7 +610,12 @@ mod tests {
             skin_for(Some(&agent(AgentKind::Antigravity, AgentState::Idle))),
             AgentSkin::Antigravity
         );
-        for k in [AgentKind::Codex, AgentKind::Gemini, AgentKind::Aider] {
+        // sidebar-weather-cards R5.1 — Codex has its own skin now.
+        assert_eq!(
+            skin_for(Some(&agent(AgentKind::Codex, AgentState::Busy))),
+            AgentSkin::Codex
+        );
+        for k in [AgentKind::Gemini, AgentKind::Aider] {
             assert_eq!(
                 skin_for(Some(&agent(k, AgentState::Busy))),
                 AgentSkin::Generic
@@ -515,26 +624,203 @@ mod tests {
         assert_eq!(skin_for(None), AgentSkin::Generic);
     }
 
+    // -----------------------------------------------------------------------
+    // sidebar-weather-cards R7 / R10 — the status precedence and the folder line
+    // -----------------------------------------------------------------------
+
+    const ALL_STATES: [AgentState; 4] = [
+        AgentState::Busy,
+        AgentState::Idle,
+        AgentState::Waiting,
+        AgentState::Unknown,
+    ];
+
     #[test]
-    fn mark_mapping_honors_unknown_as_present() {
-        // R6.6 — Unknown is present (✳), never ready (◇).
+    fn an_agents_state_wins_over_everything() {
+        // sidebar-weather-cards R7.1, agent-card-status R5.2 — whatever the shell is doing
+        // (an agent started from zsh keeps it "running" for its whole session), a present
+        // agent with no dialog reports its own state; Unknown states nothing (D3).
+        for (state, want) in [
+            (AgentState::Busy, CardStatus::Working),
+            (AgentState::Unknown, CardStatus::Hidden),
+            (AgentState::Idle, CardStatus::Ready),
+            (AgentState::Waiting, CardStatus::WaitingForInput),
+        ] {
+            let a = agent(AgentKind::Claude, state);
+            assert_eq!(
+                resolve_status(Some(&a), false, true, Some(101)),
+                want,
+                "{state:?}"
+            );
+            assert_eq!(
+                resolve_status(Some(&a), false, false, None),
+                want,
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dialog_outranks_every_agent_state() {
+        // agent-card-status R5.1 — the screen sees a pending permission the log cannot, so
+        // it outranks whatever the log says, for every kind of agent.
+        for kind in [AgentKind::Claude, AgentKind::Antigravity, AgentKind::Codex] {
+            for state in ALL_STATES {
+                let a = agent(kind, state);
+                assert_eq!(
+                    resolve_status(Some(&a), true, false, None),
+                    CardStatus::WaitingForInput,
+                    "{kind:?} {state:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn without_an_agent_a_dialog_changes_nothing() {
+        // agent-card-status R5.3 — a shell that prints dialog-like text keeps its card.
+        for dialog in [false, true] {
+            assert_eq!(
+                resolve_status(None, dialog, true, None),
+                CardStatus::Running
+            );
+            assert_eq!(
+                resolve_status(None, dialog, false, Some(2)),
+                CardStatus::Exited(2)
+            );
+            assert_eq!(resolve_status(None, dialog, false, None), CardStatus::Shell);
+        }
+    }
+
+    #[test]
+    fn the_effective_state_is_the_dialog_override() {
+        // agent-card-status R8.1 — `Waiting` with a dialog, the state untouched without.
+        for state in ALL_STATES {
+            assert_eq!(
+                effective_state(state, true),
+                AgentState::Waiting,
+                "{state:?}"
+            );
+            assert_eq!(effective_state(state, false), state, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn the_row_join_reads_the_rows_dialog_level() {
+        // agent-card-status R8.3 — the level rides on the row (D7), the agent on the
+        // metadata; the card reads the same stored level the band was fed.
+        let mut meta = meta_at("/Users/x/api");
+        meta.agent = Some(agent(AgentKind::Antigravity, AgentState::Busy));
+        let mut row = row_at("api");
         assert_eq!(
-            mark_for(Some(&agent(AgentKind::Claude, AgentState::Busy))),
-            RowMark::Agent
+            row_meta_at_home(&row, Some(&meta)).status,
+            CardStatus::Working
+        );
+        row.blocking_dialog = true;
+        assert_eq!(
+            row_meta_at_home(&row, Some(&meta)).status,
+            CardStatus::WaitingForInput
+        );
+    }
+
+    #[test]
+    fn running_outranks_a_remembered_failure() {
+        // R7.2 / D19 — the rerun clears `Exited` on start, with no clearing logic.
+        assert_eq!(
+            resolve_status(None, false, true, Some(101)),
+            CardStatus::Running
+        );
+        assert_eq!(resolve_status(None, false, true, None), CardStatus::Running);
+    }
+
+    #[test]
+    fn a_failed_last_command_shows_its_code() {
+        // R7.3.
+        assert_eq!(
+            resolve_status(None, false, false, Some(101)),
+            CardStatus::Exited(101)
         );
         assert_eq!(
-            mark_for(Some(&agent(AgentKind::Claude, AgentState::Idle))),
-            RowMark::Ready
+            resolve_status(None, false, false, Some(2)),
+            CardStatus::Exited(2)
         );
         assert_eq!(
-            mark_for(Some(&agent(AgentKind::Aider, AgentState::Unknown))),
-            RowMark::Agent
+            resolve_status(None, false, false, Some(-1)),
+            CardStatus::Exited(-1)
         );
-        // Waiting (D16) maps to its own dedicated ⏸ mark (D6/T4).
+    }
+
+    #[test]
+    fn ignored_codes_and_no_history_read_as_the_shell() {
+        // R7.4 / D12 — the band's ignore-list: success, grep's no-match, Ctrl-C.
+        for code in [0, 1, 130] {
+            assert_eq!(
+                resolve_status(None, false, false, Some(code)),
+                CardStatus::Shell,
+                "{code}"
+            );
+        }
+        assert_eq!(resolve_status(None, false, false, None), CardStatus::Shell);
+    }
+
+    #[test]
+    fn the_row_join_resolves_the_status_from_the_rows_command_state() {
+        // D8 → D7 — `running` / `last_exit` ride on the row, the agent on the metadata.
+        let mut row = row_at("api");
+        row.last_exit = Some(101);
         assert_eq!(
-            mark_for(Some(&agent(AgentKind::Claude, AgentState::Waiting))),
-            RowMark::Waiting
+            row_meta_at_home(&row, Some(&meta_at("/Users/x/api"))).status,
+            CardStatus::Exited(101)
         );
-        assert_eq!(mark_for(None), RowMark::None);
+        row.running = true;
+        assert_eq!(
+            row_meta_at_home(&row, Some(&meta_at("/Users/x/api"))).status,
+            CardStatus::Running
+        );
+        let mut meta = meta_at("/Users/x/api");
+        meta.agent = Some(agent(AgentKind::Codex, AgentState::Busy));
+        let m = row_meta_at_home(&row, Some(&meta));
+        assert_eq!((m.status, m.skin), (CardStatus::Working, AgentSkin::Codex));
+    }
+
+    #[test]
+    fn home_is_abbreviated_component_wise() {
+        // R10.1.
+        let home = Some(Path::new("/Users/x"));
+        assert_eq!(
+            display_cwd(Path::new("/Users/x/IdeaProjects/terminal"), home),
+            "~/IdeaProjects/terminal"
+        );
+        assert_eq!(display_cwd(Path::new("/Users/x"), home), "~");
+        assert_eq!(
+            display_cwd(Path::new("/Users/x/"), home),
+            "~",
+            "a trailing slash"
+        );
+        assert_eq!(
+            display_cwd(Path::new("/Users/xy/p"), home),
+            "/Users/xy/p",
+            "a string prefix is not a component prefix"
+        );
+        assert_eq!(
+            display_cwd(Path::new("/Users/x/a"), Some(Path::new("/Users/x/"))),
+            "~/a",
+            "a HOME with a trailing slash still matches"
+        );
+    }
+
+    #[test]
+    fn no_home_or_outside_home_stays_absolute() {
+        // R10.2 — and a degenerate HOME abbreviates nothing.
+        let p = Path::new("/opt/homebrew");
+        assert_eq!(display_cwd(p, Some(Path::new("/Users/x"))), "/opt/homebrew");
+        assert_eq!(display_cwd(Path::new("/Users/x/a"), None), "/Users/x/a");
+        for bad in ["", "/", "Users/x"] {
+            assert_eq!(
+                display_cwd(Path::new("/Users/x/a"), Some(Path::new(bad))),
+                "/Users/x/a",
+                "HOME={bad:?} is ignored"
+            );
+        }
     }
 }
