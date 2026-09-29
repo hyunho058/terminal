@@ -70,6 +70,11 @@ struct Deriver {
     agent_of: fn(u32) -> Option<super::agent::Detected>,
     cwd_of: fn(u32) -> Option<PathBuf>,
     start_ms_of: fn(u32) -> Option<u64>,
+    /// Antigravity's per-pid resolution and tail (agent-card-status D11), and where they
+    /// read from — injected on the same terms as the three reads above, so a test drives an
+    /// Antigravity tab over a temp tree and never the real `~/.gemini`.
+    antigravity_memo: super::antigravity::Memo,
+    antigravity: super::antigravity::Sources,
 }
 
 impl Deriver {
@@ -86,6 +91,8 @@ impl Deriver {
             agent_of: super::agent::agent_of_pid,
             cwd_of: super::proc::cwd_of_pid,
             start_ms_of: super::proc::start_ms_of_pid,
+            antigravity_memo: super::antigravity::Memo::default(),
+            antigravity: super::antigravity::Sources::real(),
         }
     }
 
@@ -158,7 +165,7 @@ impl Deriver {
             // `agent`, `task` — and `activity`'s log reads — stay behind their existing toggle.
             // Turning the display off still stops the `.git` I/O and the log reads; only the
             // walk itself, and only for the active tab, is now unconditional.
-            Some(super::agent::Detected { kind, .. }) if self.enabled_agent => {
+            Some(super::agent::Detected { kind, pid }) if self.enabled_agent => {
                 // The tab's own agent process, paired with its start time — the identity
                 // that lets resolution name this tab's session instead of ranking the
                 // project directory. One `proc_pidinfo` on a pid the walk just touched; it
@@ -178,7 +185,7 @@ impl Deriver {
                     pid,
                     start_ms: (self.start_ms_of)(pid),
                 });
-                let (state, task) = self.activity(kind, cwd.as_deref(), claude, tick, now);
+                let (state, task) = self.activity(kind, pid, cwd.as_deref(), claude, tick, now);
                 (Some(Agent { kind, state }), task)
             }
             _ => (None, None),
@@ -193,9 +200,10 @@ impl Deriver {
         }
     }
 
-    /// The activity state **and** the tab-identity label for a detected agent. Only Claude
-    /// has a log source (D7); every other agent — and a Claude whose log cannot be resolved —
-    /// is `Unknown` with no label (R6.5).
+    /// The activity state **and** the tab-identity label for a detected agent. Claude and
+    /// Antigravity have a log source (D7; agent-card-status D11); every other agent — and a
+    /// session whose log cannot be resolved — is `Unknown` with no label (R6.5), which the
+    /// card shows as no status (agent-card-status D3).
     ///
     /// Resolution runs once and both readings come from the same `Found`, replacing the old
     /// arrangement where the caller re-derived the label from a shared cwd map key and a
@@ -203,11 +211,26 @@ impl Deriver {
     fn activity(
         &mut self,
         kind: AgentKind,
+        pid: u32,
         cwd: Option<&Path>,
         claude: Option<super::ClaudeId>,
         tick: u64,
         now: SystemTime,
     ) -> (AgentState, Option<String>) {
+        // agent-card-status D11 — the walk's own `agy` pid, which names its transcript
+        // through the lock it holds. Not the published `agent_pid`: that stays Claude-only
+        // (D9 above), and widening it would re-point the panel on every tick. No label: the
+        // card's line 1 keeps its other sources for an Antigravity tab, as before.
+        if kind == AgentKind::Antigravity {
+            let state = super::antigravity::state(
+                &mut self.antigravity_memo,
+                &self.antigravity,
+                pid,
+                tick,
+                now,
+            );
+            return (state, None);
+        }
         if kind != AgentKind::Claude {
             return (AgentState::Unknown, None);
         }
@@ -685,6 +708,10 @@ mod tests {
         // `tab()`'s git half — deliberate, since `steady_state_repo_derivation_does_no_git_read`
         // already owns that against a real repo.
         d.enabled_git = false;
+        // Hermetic for Antigravity too: no root, so an `agy` tab in these tests is `Unknown`
+        // without a probe of the real process table or a read of the real `~/.gemini`. The
+        // tests that exercise Antigravity install their own temp root and fakes.
+        d.antigravity.root = None;
         d
     }
 
@@ -1379,6 +1406,169 @@ mod tests {
         with_fake_tree(&mut d);
         let m = d.tab(&tp(900_101), 0, now, true);
         assert_eq!(m.agent_pid, Some(agent_pid(900_101)));
+    }
+
+    // ---- agent-card-status T3: an Antigravity tab's state comes from its own transcript ----
+
+    use super::super::antigravity::fake;
+
+    /// A deriver whose every tab runs an `agy` (at the walk's usual offset) holding
+    /// `conversation_of`'s lock, over a temp Antigravity root holding `transcripts`.
+    fn antigravity_deriver(
+        tag: &str,
+        kind: AgentKind,
+        conversation_of: fn(u32) -> Option<String>,
+        transcripts: &[(&str, &str)],
+    ) -> Deriver {
+        let (projects, sessions) = fixture_roots(tag);
+        let mut d = deriver_at(projects, sessions);
+        d.cwd_of = |_| Some(PathBuf::from(THE_CWD));
+        d.agent_of = match kind {
+            AgentKind::Antigravity => |pid| {
+                Some(super::super::agent::Detected {
+                    kind: AgentKind::Antigravity,
+                    pid: pid + AGENT_PID_OFFSET,
+                })
+            },
+            AgentKind::Codex => |pid| {
+                Some(super::super::agent::Detected {
+                    kind: AgentKind::Codex,
+                    pid: pid + AGENT_PID_OFFSET,
+                })
+            },
+            AgentKind::Gemini => |pid| {
+                Some(super::super::agent::Detected {
+                    kind: AgentKind::Gemini,
+                    pid: pid + AGENT_PID_OFFSET,
+                })
+            },
+            AgentKind::Aider => |pid| {
+                Some(super::super::agent::Detected {
+                    kind: AgentKind::Aider,
+                    pid: pid + AGENT_PID_OFFSET,
+                })
+            },
+            AgentKind::Claude => panic!("a Claude tab is not an Antigravity-path fixture"),
+        };
+        d.antigravity = super::super::antigravity::Sources {
+            root: Some(fake::root(tag, transcripts)),
+            conversation_of,
+            tail_of: fake::read,
+        };
+        d
+    }
+
+    #[test]
+    fn an_antigravity_tab_publishes_its_transcripts_state() {
+        // R0.3 / R4.1 / R4.6 — a finished Antigravity turn reads Waiting, as a Claude
+        // `end_turn` does; the state is the transcript the lock names; and the pid the probe
+        // used is still not published (the panel's re-point compare stays Claude-only).
+        // `tab()` walks tmux and proc paths that bump the global cost counters, so this holds
+        // the lock the cost tests measure under (`probe::serial`).
+        let _g = super::super::probe::serial();
+        fake::reset();
+        let mut d = antigravity_deriver(
+            "ag-publish",
+            AgentKind::Antigravity,
+            fake::holds_c,
+            &[
+                (fake::CONV_C, fake::FINISHED),
+                (fake::CONV_D, fake::DISPATCHED),
+            ],
+        );
+        let m = d.tab(&tp(900_101), 0, SystemTime::now(), true);
+        assert_eq!(
+            m.agent,
+            Some(Agent {
+                kind: AgentKind::Antigravity,
+                state: AgentState::Waiting
+            })
+        );
+        assert_eq!(m.agent_pid, None);
+        assert_eq!((fake::probes(), fake::reads()), (1, 1));
+    }
+
+    #[test]
+    fn agents_without_a_reader_are_not_probed() {
+        // R4.7 — Codex, Gemini and Aider have no session reader: no probe, no read, and a
+        // state the card shows as no status.
+        // `tab()` walks tmux and proc paths that bump the global cost counters, so this holds
+        // the lock the cost tests measure under (`probe::serial`).
+        let _g = super::super::probe::serial();
+        for kind in [AgentKind::Codex, AgentKind::Gemini, AgentKind::Aider] {
+            fake::reset();
+            let mut d = antigravity_deriver(
+                "ag-noreader",
+                kind,
+                fake::holds_c,
+                &[(fake::CONV_C, fake::FINISHED)],
+            );
+            let m = d.tab(&tp(900_101), 0, SystemTime::now(), true);
+            assert_eq!(
+                m.agent,
+                Some(Agent {
+                    kind,
+                    state: AgentState::Unknown
+                })
+            );
+            assert_eq!((fake::probes(), fake::reads()), (0, 0), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn the_agent_toggle_off_stops_the_antigravity_probe() {
+        // R4.8 — the active tab is still walked (the panel needs its pid), but with
+        // `show_agent_status` off nothing about its session is probed or read.
+        // `tab()` walks tmux and proc paths that bump the global cost counters, so this holds
+        // the lock the cost tests measure under (`probe::serial`).
+        let _g = super::super::probe::serial();
+        fake::reset();
+        let mut d = antigravity_deriver(
+            "ag-toggle",
+            AgentKind::Antigravity,
+            fake::holds_c,
+            &[(fake::CONV_C, fake::FINISHED)],
+        );
+        d.enabled_agent = false;
+        let m = d.tab(&tp(900_101), 0, SystemTime::now(), true);
+        assert_eq!(m.agent, None);
+        assert_eq!((fake::probes(), fake::reads()), (0, 0));
+    }
+
+    #[test]
+    fn an_idle_antigravity_tab_costs_a_probe_per_ttl_and_publishes_nothing() {
+        // R9.1 — after the first refresh, a tab whose lock and transcript do not move is
+        // re-probed once per TTL, never re-read, and derives the same `TabMeta` every time —
+        // so `publish_if_changed` has nothing to publish and nothing wakes the UI thread.
+        // `tab()` walks tmux and proc paths that bump the global cost counters, so this holds
+        // the lock the cost tests measure under (`probe::serial`).
+        let _g = super::super::probe::serial();
+        fake::reset();
+        let mut d = antigravity_deriver(
+            "ag-idle",
+            AgentKind::Antigravity,
+            fake::holds_c,
+            &[(fake::CONV_C, fake::FINISHED)],
+        );
+        let now = SystemTime::now();
+        let first = d.tab(&tp(900_101), 0, now, true);
+        // Anchor the baseline: the first refresh really resolved and read the transcript, so
+        // "nothing more" below is measured against a tab that has a state to keep.
+        assert_eq!(
+            first.agent,
+            Some(Agent {
+                kind: AgentKind::Antigravity,
+                state: AgentState::Waiting
+            })
+        );
+        assert_eq!((fake::probes(), fake::reads()), (1, 1));
+        fake::reset();
+        let ttl = super::super::activity::RESOLVE_TTL_TICKS;
+        for tick in 1..=3 * ttl {
+            assert_eq!(d.tab(&tp(900_101), tick, now, true), first, "tick {tick}");
+        }
+        assert_eq!(fake::probes(), 3, "one probe per TTL");
+        assert_eq!(fake::reads(), 0, "an unchanged transcript is never re-read");
     }
 
     #[test]

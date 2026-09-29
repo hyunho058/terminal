@@ -33,6 +33,14 @@ const COMPLETION_THRESHOLD_MS: u64 = 30_000;
 /// other non-zero code is an error. This ignore-list lives in the app (D21).
 const ERROR_IGNORE: [i32; 3] = [0, 1, 130];
 
+/// Whether a finished command's exit code counts as a failure worth showing — outside
+/// [`ERROR_IGNORE`]. The **one** rule both the waiting band (an Error signal) and the
+/// sidebar card (`Exited N`, sidebar-weather-cards D12) read, so the two can never
+/// disagree about whether a command failed.
+pub(crate) fn is_reportable_exit(code: i32) -> bool {
+    !ERROR_IGNORE.contains(&code)
+}
+
 /// Why a session needs attention. Precedence for a session with several pending
 /// signals is Error > Waiting > Completion (spec D17) — encoded by the check order
 /// in [`TabPending::displayed`], not by this enum's declaration order.
@@ -217,7 +225,7 @@ impl WaitingState {
 /// ignored. Error is checked first so it wins over Completion for the same event
 /// (a long-running command that also errored — D14/R6.3).
 fn classify(end: CommandEnd) -> Option<WaitingKind> {
-    if !ERROR_IGNORE.contains(&end.exit_code) {
+    if is_reportable_exit(end.exit_code) {
         Some(WaitingKind::Error)
     } else if end.exit_code == 0 && end.elapsed_ms >= COMPLETION_THRESHOLD_MS {
         Some(WaitingKind::Completion)
@@ -230,6 +238,25 @@ fn classify(end: CommandEnd) -> Option<WaitingKind> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn the_band_and_the_card_share_one_exit_rule() {
+        // sidebar-weather-cards R7.5 — the function is true exactly for {-1, 2, 101},
+        // and the band raises an Error for exactly those codes.
+        let codes = [-1, 0, 1, 2, 101, 130];
+        let reported: Vec<i32> = codes
+            .into_iter()
+            .filter(|&c| is_reportable_exit(c))
+            .collect();
+        assert_eq!(reported, vec![-1, 2, 101]);
+        for code in codes {
+            let band_error = classify(CommandEnd {
+                exit_code: code,
+                elapsed_ms: 10,
+            }) == Some(WaitingKind::Error);
+            assert_eq!(band_error, is_reportable_exit(code), "exit {code}");
+        }
+    }
 
     fn cmd(exit_code: i32, elapsed_ms: u64) -> CommandEnd {
         CommandEnd {

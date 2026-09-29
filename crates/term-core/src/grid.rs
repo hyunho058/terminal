@@ -242,6 +242,13 @@ pub struct Grid {
     /// from `GridSnapshot` — the renderer never reads it, exactly like
     /// `app_cursor_keys` (spec D21).
     command_end: Option<CommandEnd>,
+    /// Whether the shell is running a foreground command: set by an OSC 133 `C`
+    /// (command start), cleared by a well-formed `D` (command end), in byte order
+    /// (sidebar-weather-cards D8). A **state**, not a one-shot event like
+    /// `command_end`: the app reads the value the stream left it at, so a chunk
+    /// carrying `C…D` (a fast `ls`) or `D…C` (typeahead) resolves by order alone.
+    /// Untouched by RIS — it is the shell's state, not a terminal mode.
+    command_running: bool,
     /// Most-recent OSC 0 / OSC 2 window-title set by the shell or user
     /// (`ESC ] 2 ; <title> ST`) — the tab-identity manual-label hook. Transient,
     /// one-shot like `command_end`: the app drains it via
@@ -345,6 +352,7 @@ impl Grid {
                 pending_wrap: false,
             },
             command_end: None,
+            command_running: false,
             osc_title: None,
         }
     }
@@ -1059,6 +1067,19 @@ impl Grid {
     /// one waiting item per session).
     pub fn record_command_end(&mut self, event: CommandEnd) {
         self.command_end = Some(event);
+        self.command_running = false;
+    }
+
+    /// Record an OSC 133 command-start marker (parser → grid): the shell is now
+    /// running a foreground command until the next command end.
+    pub fn record_command_start(&mut self) {
+        self.command_running = true;
+    }
+
+    /// Whether a foreground command is running — the last OSC 133 marker was a `C`
+    /// with no well-formed `D` after it. Not drained by reading.
+    pub fn command_running(&self) -> bool {
+        self.command_running
     }
 
     /// Take the most-recent OSC 133 command-end event, clearing it (one-shot

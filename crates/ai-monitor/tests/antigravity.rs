@@ -9,7 +9,9 @@
 use ai_monitor::antigravity::Probed;
 use std::path::{Path, PathBuf};
 
+use ai_monitor::activity::{LastMessage, TailState, PROMPT_SCAN_CAP, TAIL_CAP};
 use ai_monitor::antigravity;
+use serde_json::{json, Value};
 
 const PARENT: &str = "4de5fc70-2d8a-44c2-8e25-a6901c93fb86";
 const SUBAGENT: &str = "ed14342c-1111-4222-8333-a44444444444";
@@ -560,5 +562,621 @@ fn a_path_that_is_not_a_transcript_names_no_conversation() {
         antigravity::conversation_id_of(&good).as_deref(),
         Some(PARENT),
         "the canonical layout still resolves — otherwise the guards above prove nothing"
+    );
+}
+
+// ---- agent-card-status: the sidebar's tail reader (R1, R2) --------------------------------
+//
+// `antigravity::tail_state` classifies a transcript's last meaningful step into Claude's
+// `LastMessage`, so the app's unchanged `state_from` maps both agents with one rule (D10).
+// Every case writes its own transcript into a temp directory; none reads the real corpus.
+
+/// Write `bytes` as a transcript file named for `tag`, and return its path.
+fn write_bytes(tag: &str, bytes: &[u8]) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("ai-monitor-agy-tail-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let path = dir.join(format!("{tag}.jsonl"));
+    std::fs::write(&path, bytes).expect("write transcript");
+    path
+}
+
+/// `steps` as `agy` appends them: one JSON object per line, `step_index` numbered in order.
+fn steps_bytes(steps: &[Value]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, s) in steps.iter().enumerate() {
+        let mut s = s.clone();
+        s["step_index"] = json!(i);
+        out.extend_from_slice(s.to_string().as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+fn write_steps(tag: &str, steps: &[Value]) -> PathBuf {
+    write_bytes(tag, &steps_bytes(steps))
+}
+
+fn read(path: &Path) -> TailState {
+    antigravity::tail_state(path).expect("an existing readable transcript always has a state")
+}
+
+fn last_of(tag: &str, steps: &[Value]) -> Option<LastMessage> {
+    read(&write_steps(tag, steps)).last
+}
+
+/// A step of `kind` in the envelope every measured step carries.
+fn step(kind: &str) -> Value {
+    json!({"source": "MODEL", "type": kind, "status": "DONE",
+           "created_at": "2026-09-28T07:19:00Z"})
+}
+
+fn with_status(mut s: Value, status: &str) -> Value {
+    s["status"] = json!(status);
+    s
+}
+
+fn user_input() -> Value {
+    let mut s = step("USER_INPUT");
+    s["source"] = json!("USER_EXPLICIT");
+    s["content"] = json!("<USER_REQUEST>\ndo the thing\n</USER_REQUEST>");
+    s
+}
+
+/// A `PLANNER_RESPONSE` dispatching `names`, in one `tool_calls` array.
+fn dispatch(names: &[&str]) -> Value {
+    let mut s = step("PLANNER_RESPONSE");
+    s["tool_calls"] = names
+        .iter()
+        .map(|n| json!({"name": n, "args": {"toolAction": "\"Doing it\""}}))
+        .collect::<Vec<_>>()
+        .into();
+    s
+}
+
+/// A tool-less `PLANNER_RESPONSE`: the model's reply.
+fn reply() -> Value {
+    let mut s = step("PLANNER_RESPONSE");
+    s["content"] = json!("It is `ROWS_CAP` in atlas.rs.");
+    s
+}
+
+/// A foreground dispatch and its result, repeated until they total at least `bytes`.
+fn foreground_work(bytes: usize) -> Vec<Value> {
+    let mut result = step("VIEW_FILE");
+    result["content"] = json!(format!("Created At: …\n{}", "x".repeat(2000)));
+    let pair = [dispatch(&["view_file"]), result];
+    // Every pair serialises to the same size (bar a digit of `step_index`), so count pairs
+    // rather than re-serialising the whole run on every iteration.
+    let pairs = bytes.div_ceil(steps_bytes(&pair).len());
+    pair.iter().cycle().take(2 * pairs).cloned().collect()
+}
+
+const RESULT_KINDS: [&str; 9] = [
+    "GENERIC",
+    "RUN_COMMAND",
+    "VIEW_FILE",
+    "LIST_DIRECTORY",
+    "GREP_SEARCH",
+    "CODE_ACTION",
+    "FIND",
+    "INVOKE_SUBAGENT",
+    "ASK_QUESTION",
+];
+
+const BOOKKEEPING_KINDS: [&str; 4] = [
+    "CHECKPOINT",
+    "SYSTEM_MESSAGE",
+    "CONVERSATION_HISTORY",
+    "ERROR_MESSAGE",
+];
+
+const ALLOW_LIST: [&str; 8] = [
+    "run_command",
+    "view_file",
+    "list_dir",
+    "grep_search",
+    "find_by_name",
+    "write_to_file",
+    "replace_file_content",
+    "ask_question",
+];
+
+// ---- R1: the last meaningful step --------------------------------------------------------
+
+#[test]
+fn r1_1_a_reply_after_foreground_work_is_a_finished_turn() {
+    let steps = [
+        user_input(),
+        dispatch(&["run_command"]),
+        step("RUN_COMMAND"),
+        dispatch(&["view_file"]),
+        step("VIEW_FILE"),
+        reply(),
+    ];
+    assert_eq!(
+        last_of("r1-1-foreground", &steps),
+        Some(LastMessage::AssistantEndTurn)
+    );
+    // The shortest finished turn: a question answered with no tool at all.
+    assert_eq!(
+        last_of("r1-1-direct", &[user_input(), reply()]),
+        Some(LastMessage::AssistantEndTurn)
+    );
+}
+
+/// The real-format fixture ends in a reply (step 16) whose turn, since the `USER_INPUT` at
+/// step 13, dispatched only `grep_search`.
+#[test]
+fn r1_1_the_real_fixture_ends_in_a_finished_turn() {
+    let path = write_bytes(
+        "r1-1-fixture",
+        include_bytes!("fixtures/antigravity_transcript.jsonl"),
+    );
+    assert_eq!(read(&path).last, Some(LastMessage::AssistantEndTurn));
+}
+
+#[test]
+fn r1_2_an_ask_question_dispatch_asks_the_user() {
+    assert_eq!(
+        last_of("r1-2-ask", &[user_input(), dispatch(&["ask_question"])]),
+        Some(LastMessage::AssistantAsksUser)
+    );
+    // "Include", not "is only": one blocking call in the batch blocks the batch, in
+    // either order.
+    for (tag, calls) in [
+        ("r1-2-ask-last", ["run_command", "ask_question"]),
+        ("r1-2-ask-first", ["ask_question", "view_file"]),
+    ] {
+        assert_eq!(
+            last_of(tag, &[user_input(), dispatch(&calls)]),
+            Some(LastMessage::AssistantAsksUser),
+            "{calls:?}"
+        );
+    }
+    // A pending question is a question whatever ran before it: D13 governs replies only.
+    let after_background = [
+        user_input(),
+        dispatch(&["manage_task"]),
+        with_status(step("GENERIC"), "RUNNING"),
+        dispatch(&["ask_question"]),
+    ];
+    assert_eq!(
+        last_of("r1-2-ask-after-bg", &after_background),
+        Some(LastMessage::AssistantAsksUser)
+    );
+}
+
+#[test]
+fn r1_3_any_other_dispatch_is_busy() {
+    // Allow-listed or not, measured or not: a dispatch is work in flight. Names that only
+    // resemble the blocking tool stay busy — the match is exact.
+    for name in [
+        "run_command",
+        "view_file",
+        "manage_task",
+        "invoke_subagent",
+        "frobnicate",
+        "ask_question_v2",
+        "ASK_QUESTION",
+        "Ask_Question",
+    ] {
+        assert_eq!(
+            last_of(&format!("r1-3-{name}"), &[user_input(), dispatch(&[name])]),
+            Some(LastMessage::AssistantBusy),
+            "{name}"
+        );
+    }
+    // A call whose name cannot be read is not a blocking call.
+    let mut nameless = step("PLANNER_RESPONSE");
+    nameless["tool_calls"] = json!([{"args": {}}]);
+    assert_eq!(
+        last_of("r1-3-nameless", &[user_input(), nameless]),
+        Some(LastMessage::AssistantBusy)
+    );
+}
+
+#[test]
+fn r1_4_every_result_kind_is_a_tool_result_in_any_status() {
+    for kind in RESULT_KINDS {
+        for status in ["DONE", "RUNNING", "ERROR"] {
+            let steps = [
+                user_input(),
+                dispatch(&["run_command"]),
+                with_status(step(kind), status),
+            ];
+            assert_eq!(
+                last_of(&format!("r1-4-{kind}-{status}"), &steps),
+                Some(LastMessage::UserToolResult),
+                "{kind} {status}"
+            );
+        }
+    }
+}
+
+#[test]
+fn r1_5_a_user_input_is_a_prompt() {
+    assert_eq!(
+        last_of("r1-5", &[user_input(), reply(), user_input()]),
+        Some(LastMessage::UserPrompt)
+    );
+}
+
+#[test]
+fn r1_6_bookkeeping_after_the_deciding_step_is_skipped() {
+    // All four, in the order the CLI can write them after a turn.
+    let mut steps = vec![user_input(), reply()];
+    steps.extend(BOOKKEEPING_KINDS.map(step));
+    assert_eq!(
+        last_of("r1-6-all", &steps),
+        Some(LastMessage::AssistantEndTurn)
+    );
+    // And each on its own, so every entry of the list is load-bearing.
+    for kind in BOOKKEEPING_KINDS {
+        assert_eq!(
+            last_of(
+                &format!("r1-6-{kind}"),
+                &[user_input(), reply(), step(kind)]
+            ),
+            Some(LastMessage::AssistantEndTurn),
+            "{kind} after a reply"
+        );
+        assert_eq!(
+            last_of(
+                &format!("r1-6-dispatch-{kind}"),
+                &[user_input(), dispatch(&["run_command"]), step(kind)]
+            ),
+            Some(LastMessage::AssistantBusy),
+            "{kind} after a dispatch"
+        );
+    }
+}
+
+#[test]
+fn r1_7_an_unlisted_step_kind_is_no_robust_signal() {
+    assert_eq!(
+        last_of("r1-7-alone", &[user_input(), step("SOME_NEW_KIND")]),
+        None
+    );
+    // It decides rather than being skipped: the finished reply behind it is not reached.
+    assert_eq!(
+        last_of(
+            "r1-7-after-reply",
+            &[user_input(), reply(), step("SOME_NEW_KIND")]
+        ),
+        None
+    );
+}
+
+#[test]
+fn r1_8_a_last_line_longer_than_the_tail_is_no_robust_signal() {
+    let mut long = step("RUN_COMMAND");
+    long["content"] = json!("y".repeat(2 * TAIL_CAP as usize));
+    let bytes = steps_bytes(&[user_input(), reply(), long]);
+    let path = write_bytes("r1-8-long", &bytes);
+    let state = read(&path);
+    assert_eq!(state.last, None);
+    assert_eq!(state.len, bytes.len() as u64);
+}
+
+#[test]
+fn r1_8_an_empty_transcript_is_a_state_with_no_signal() {
+    let state = read(&write_bytes("r1-8-empty", b""));
+    assert_eq!(state.last, None);
+    assert_eq!(state.len, 0);
+}
+
+/// The newest record is never skipped to classify an older one. A half-written line, or a
+/// complete line that is not a step, is newer than the reply behind it — reading the reply
+/// would be a stale Waiting.
+#[test]
+fn r1_8_an_unreadable_newest_line_is_not_skipped() {
+    let newest: [(&str, &[u8]); 3] = [
+        (
+            "half-written",
+            br#"{"step_index": 9, "source": "MODEL", "type": "PLANNER_RE"#,
+        ),
+        (
+            "corrupt",
+            b"{\"step_index\": 9, \"type\": \"RUN_COMMAND\"}}\n",
+        ),
+        ("no-kind", b"{\"step_index\": 9, \"status\": \"DONE\"}\n"),
+    ];
+    for (what, tail) in newest {
+        for (before, expect_if_skipped) in [
+            (reply(), LastMessage::AssistantEndTurn),
+            (dispatch(&["run_command"]), LastMessage::AssistantBusy),
+        ] {
+            let mut bytes = steps_bytes(&[user_input(), before]);
+            bytes.extend_from_slice(tail);
+            let path = write_bytes(&format!("r1-8-{what}-{expect_if_skipped:?}"), &bytes);
+            assert_eq!(
+                read(&path).last,
+                None,
+                "{what} newest line must not fall through to {expect_if_skipped:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn blank_lines_are_not_steps() {
+    let mut bytes = steps_bytes(&[user_input(), reply()]);
+    bytes.extend_from_slice(b"\n  \n");
+    let path = write_bytes("blank-lines", &bytes);
+    assert_eq!(read(&path).last, Some(LastMessage::AssistantEndTurn));
+}
+
+#[test]
+fn r1_9_the_reader_reports_mtime_len_and_never_a_user_role() {
+    let mut long = step("RUN_COMMAND");
+    long["content"] = json!("y".repeat(2 * TAIL_CAP as usize));
+    let no_signal: [(&str, Vec<u8>); 5] = [
+        ("r1-9-empty", Vec::new()),
+        (
+            "r1-9-unlisted",
+            steps_bytes(&[user_input(), step("SOME_NEW_KIND")]),
+        ),
+        ("r1-9-long", steps_bytes(&[user_input(), long])),
+        (
+            "r1-9-background",
+            steps_bytes(&[
+                user_input(),
+                with_status(step("RUN_COMMAND"), "RUNNING"),
+                reply(),
+            ]),
+        ),
+        ("r1-9-no-user-input", steps_bytes(&[reply()])),
+    ];
+    for (tag, bytes) in no_signal {
+        let path = write_bytes(tag, &bytes);
+        let meta = std::fs::metadata(&path).expect("stat");
+        let state = read(&path);
+        assert_eq!(state.last, None, "{tag}");
+        // `state_from` reads `role` only now, and `"user"` would hold the tab Busy for
+        // 100 s instead of D1's 10 s window.
+        assert_ne!(state.role, "user", "{tag}");
+        assert_eq!(state.len, bytes.len() as u64, "{tag}");
+        assert_eq!(state.len, meta.len(), "{tag}");
+        assert_eq!(state.mtime, meta.modified().expect("mtime"), "{tag}");
+    }
+    // The same facts ride along with a robust signal.
+    let path = write_steps("r1-9-signal", &[user_input(), reply()]);
+    let meta = std::fs::metadata(&path).expect("stat");
+    let state = read(&path);
+    assert_eq!(state.last, Some(LastMessage::AssistantEndTurn));
+    assert_eq!(state.len, meta.len());
+    assert_eq!(state.mtime, meta.modified().expect("mtime"));
+}
+
+#[test]
+fn r1_9_only_an_unreadable_transcript_has_no_state() {
+    assert_eq!(
+        antigravity::tail_state(Path::new("/no/such/transcript.jsonl")),
+        None
+    );
+    // Opens, but cannot be read as a file.
+    let dir = std::env::temp_dir().join(format!("ai-monitor-agy-tail-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    assert_eq!(antigravity::tail_state(&dir), None);
+}
+
+// ---- R2: a reply after background work (D13, D14) ----------------------------------------
+
+#[test]
+fn r2_1_a_background_task_since_the_user_input_is_no_robust_signal() {
+    for kind in ["RUN_COMMAND", "GENERIC"] {
+        let steps = [
+            user_input(),
+            dispatch(&["run_command"]),
+            with_status(step(kind), "RUNNING"),
+            reply(),
+        ];
+        assert_eq!(last_of(&format!("r2-1-{kind}"), &steps), None, "{kind}");
+    }
+}
+
+/// "Since the last user input" is a boundary: background work in an earlier turn does not
+/// make this turn's reply ambiguous.
+#[test]
+fn r2_1_background_work_before_the_last_user_input_does_not_count() {
+    let steps = [
+        user_input(),
+        dispatch(&["invoke_subagent"]),
+        step("INVOKE_SUBAGENT"),
+        with_status(step("RUN_COMMAND"), "RUNNING"),
+        reply(),
+        user_input(),
+        dispatch(&["grep_search"]),
+        step("GREP_SEARCH"),
+        reply(),
+    ];
+    assert_eq!(
+        last_of("r2-1-earlier-turn", &steps),
+        Some(LastMessage::AssistantEndTurn)
+    );
+}
+
+#[test]
+fn r2_2_a_subagent_since_the_user_input_is_no_robust_signal() {
+    // The result step alone, with no `invoke_subagent` dispatch beside it, so this is the
+    // step-kind condition and not the allow-list's.
+    assert_eq!(
+        last_of(
+            "r2-2-subagent",
+            &[user_input(), step("INVOKE_SUBAGENT"), reply()]
+        ),
+        None
+    );
+}
+
+/// The fixture's first reply (step 12) is the measured shape D13 exists for: a turn that
+/// defined and invoked a subagent, then narrated.
+#[test]
+fn r2_2_the_real_fixtures_reply_after_a_subagent_is_no_robust_signal() {
+    let fixture = include_str!("fixtures/antigravity_transcript.jsonl");
+    let through_step_12: String = fixture.lines().take(13).map(|l| format!("{l}\n")).collect();
+    assert!(through_step_12
+        .lines()
+        .last()
+        .is_some_and(|l| l.contains("\"step_index\": 12")));
+    let path = write_bytes("r2-2-fixture", through_step_12.as_bytes());
+    assert_eq!(read(&path).last, None);
+}
+
+#[test]
+fn r2_3_a_dispatch_outside_the_allow_list_is_no_robust_signal() {
+    // The two cases R2.3 names, then every background tool measured.
+    for name in [
+        "manage_task",
+        "frobnicate",
+        "invoke_subagent",
+        "define_subagent",
+        "manage_subagents",
+        "send_message",
+        "schedule",
+    ] {
+        let steps = [user_input(), dispatch(&[name]), step("GENERIC"), reply()];
+        assert_eq!(last_of(&format!("r2-3-{name}"), &steps), None, "{name}");
+    }
+    // Every call in a batch must be allow-listed, not just one of them.
+    let mixed = [
+        user_input(),
+        dispatch(&["run_command", "manage_task"]),
+        step("RUN_COMMAND"),
+        step("GENERIC"),
+        reply(),
+    ];
+    assert_eq!(last_of("r2-3-mixed", &mixed), None);
+    // A call whose name cannot be read is an unmeasured tool.
+    let mut nameless = step("PLANNER_RESPONSE");
+    nameless["tool_calls"] = json!([{"args": {}}]);
+    assert_eq!(
+        last_of(
+            "r2-3-nameless",
+            &[user_input(), nameless, step("GENERIC"), reply()]
+        ),
+        None
+    );
+}
+
+#[test]
+fn r2_4_the_allow_list_reads_as_foreground() {
+    // One dispatch of each, and nothing else.
+    let mut steps = vec![user_input()];
+    for name in ALLOW_LIST {
+        steps.push(dispatch(&[name]));
+        steps.push(step("GENERIC"));
+    }
+    steps.push(reply());
+    assert_eq!(
+        last_of("r2-4-all", &steps),
+        Some(LastMessage::AssistantEndTurn)
+    );
+    // Each on its own, so every entry of the list is load-bearing.
+    for name in ALLOW_LIST {
+        let steps = [user_input(), dispatch(&[name]), step("GENERIC"), reply()];
+        assert_eq!(
+            last_of(&format!("r2-4-{name}"), &steps),
+            Some(LastMessage::AssistantEndTurn),
+            "{name}"
+        );
+    }
+}
+
+/// A step the back-scan cannot check cannot be ruled foreground.
+#[test]
+fn a_step_the_back_scan_cannot_read_is_no_robust_signal() {
+    let mut bytes = steps_bytes(&[user_input(), dispatch(&["view_file"])]);
+    bytes.extend_from_slice(b"{\"step_index\": 2, \"type\": \"VIEW_FI\n");
+    bytes.extend_from_slice(&steps_bytes(&[reply()]));
+    assert_eq!(read(&write_bytes("unreadable-in-span", &bytes)).last, None);
+
+    let mut odd = step("PLANNER_RESPONSE");
+    odd["tool_calls"] = json!({"name": "view_file"});
+    assert_eq!(
+        last_of(
+            "odd-tool-calls-in-span",
+            &[user_input(), odd, step("VIEW_FILE"), reply()]
+        ),
+        None
+    );
+}
+
+/// `tool_calls` present but not an array: which half of the step is intact is a guess.
+#[test]
+fn a_planner_response_with_malformed_tool_calls_is_no_robust_signal() {
+    let mut odd = step("PLANNER_RESPONSE");
+    odd["tool_calls"] = json!({"name": "ask_question"});
+    assert_eq!(last_of("odd-tool-calls", &[user_input(), odd]), None);
+}
+
+/// An empty `tool_calls` dispatched nothing, so it is a reply — held to D13 like any other.
+#[test]
+fn a_planner_response_with_empty_tool_calls_is_a_reply() {
+    let mut empty = step("PLANNER_RESPONSE");
+    empty["tool_calls"] = json!([]);
+    assert_eq!(
+        last_of("empty-tool-calls", &[user_input(), empty.clone()]),
+        Some(LastMessage::AssistantEndTurn)
+    );
+    assert_eq!(
+        last_of(
+            "empty-tool-calls-after-bg",
+            &[user_input(), with_status(step("GENERIC"), "RUNNING"), empty]
+        ),
+        None
+    );
+}
+
+#[test]
+fn r2_5_the_back_scan_reaches_a_user_input_beyond_the_tail() {
+    let work = foreground_work(64 * 1024);
+    let mut steps = vec![user_input()];
+    steps.extend(work.clone());
+    steps.push(reply());
+    let bytes = steps_bytes(&steps);
+    let from_user_input_to_end = bytes.len() - steps_bytes(&[user_input()]).len();
+    assert!(
+        from_user_input_to_end as u64 > TAIL_CAP && (bytes.len() as u64) < PROMPT_SCAN_CAP,
+        "the user input lies beyond the tail and within the back-scan window"
+    );
+    assert_eq!(
+        read(&write_bytes("r2-5-foreground", &bytes)).last,
+        Some(LastMessage::AssistantEndTurn)
+    );
+
+    // The same span with a background task at its far end — outside the tail, so only the
+    // back-scan can see it.
+    let mut steps = vec![user_input(), with_status(step("RUN_COMMAND"), "RUNNING")];
+    steps.extend(work);
+    steps.push(reply());
+    let bytes = steps_bytes(&steps);
+    let after_running = bytes.len() - steps_bytes(&steps[..2]).len();
+    assert!(
+        after_running as u64 > TAIL_CAP,
+        "the RUNNING step ends before the tail begins"
+    );
+    assert_eq!(read(&write_bytes("r2-5-running", &bytes)).last, None);
+}
+
+#[test]
+fn r2_6_no_user_input_within_the_window_is_no_robust_signal() {
+    // The user input exists, but more than PROMPT_SCAN_CAP of foreground work follows it.
+    let mut steps = vec![user_input()];
+    steps.extend(foreground_work(PROMPT_SCAN_CAP as usize + 16 * 1024));
+    steps.push(reply());
+    let after_user_input = steps_bytes(&steps).len() - steps_bytes(&steps[..1]).len();
+    assert!(
+        after_user_input as u64 > PROMPT_SCAN_CAP,
+        "the user input ends before the back-scan window begins"
+    );
+    assert_eq!(last_of("r2-6-beyond-window", &steps), None);
+    // And a transcript that holds none at all.
+    assert_eq!(
+        last_of(
+            "r2-6-none",
+            &[dispatch(&["view_file"]), step("VIEW_FILE"), reply()]
+        ),
+        None
     );
 }

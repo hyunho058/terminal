@@ -47,11 +47,11 @@ const BUSY_WINDOW: Duration = Duration::from_secs(10);
 const STALE_LIMIT: Duration = Duration::from_secs(100);
 /// A memoised log path is re-resolved after this many ticks (≈10 s), so a newly-started
 /// session is picked up (R6.8).
-const RESOLVE_TTL_TICKS: u64 = 20;
+pub(super) const RESOLVE_TTL_TICKS: u64 = 20;
 /// An entry untouched for this many ticks (≈60 s) is reclaimed.
-const MEMO_TTL_TICKS: u64 = 120;
+pub(super) const MEMO_TTL_TICKS: u64 = 120;
 /// Hard cap on each memo; oldest-touched evicted first.
-const MEMO_MAX: usize = 64;
+pub(super) const MEMO_MAX: usize = 64;
 
 /// Pure: the activity rule (D7 + D16). The `last` meaningful-message classification is the
 /// precise input-waiting signal and wins when present. TWO classifications mean the agent

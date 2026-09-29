@@ -75,6 +75,26 @@ pub struct Session {
     /// [`drain`]: Session::drain
     /// [`take_command_end`]: Session::take_command_end
     command_end: Option<CommandEnd>,
+    /// The last command end seen on this PTY, **not** consumed by anyone — what the
+    /// sidebar card reads for `Exited N` (sidebar-weather-cards D8). Separate from
+    /// [`command_end`](Session::command_end) on purpose: that one is the waiting band's
+    /// one-shot, and a take that emptied the card's copy would blank its status.
+    last_end: Option<CommandEnd>,
+    /// Whether the shell is running a foreground command — mirrored from the terminal's
+    /// OSC 133 state on every [`drain`](Session::drain) (D8).
+    command_running: bool,
+    /// Set when [`command_running`](Session::command_running) or the last exit **code**
+    /// changed — the two inputs of the card's status — and cleared by
+    /// [`take_command_state_dirty`](Session::take_command_state_dirty), so the event loop
+    /// resyncs the row exactly as it does for a visible title change (D8). A repeat of the
+    /// same failing code changes nothing on the card and sets nothing.
+    command_dirty: bool,
+    /// Whether this tab's live screen shows a dialog that blocks on the user — a **level**,
+    /// set only by the event loop's scan (agent-card-status D7) and read by both the
+    /// waiting band and the card, so the two cannot disagree (D4). Held while the view is
+    /// scrolled back (the scrolled view is history, not the live screen) and false while
+    /// the tab has no agent.
+    blocking_dialog: bool,
     _reader: JoinHandle<()>,
 }
 
@@ -124,6 +144,10 @@ impl Session {
             program_title: String::new(),
             title_dirty: false,
             command_end: None,
+            last_end: None,
+            command_running: false,
+            command_dirty: false,
+            blocking_dialog: false,
             _reader: reader_thread,
         })
     }
@@ -141,6 +165,19 @@ impl Session {
         // slow waiting-model poll (T3) can't miss one (spec R4.6).
         if let Some(ev) = self.terminal.take_command_end() {
             self.command_end = Some(ev);
+            // The card's copy (sidebar-weather-cards D8): kept, never taken. Dirty only
+            // when the code moves — that, not the event, is what the card shows.
+            if self.last_end.map(|e| e.exit_code) != Some(ev.exit_code) {
+                self.command_dirty = true;
+            }
+            self.last_end = Some(ev);
+        }
+        // Mirror the terminal's running state as the stream left it (D8): a `C…D` in one
+        // chunk reads as finished, a `D…C` as running, because only the final value is read.
+        let running = self.terminal.command_running();
+        if running != self.command_running {
+            self.command_running = running;
+            self.command_dirty = true;
         }
         // Pull any OSC 0/2 title a *program* set on this PTY — zsh's precmd, vim, ssh
         // (sticky-tab-title D3). This is never the user's channel: it lands in
@@ -170,6 +207,63 @@ impl Session {
     /// [`TabId`] and feeds the waiting model (T3); `None` if none pending.
     pub fn take_command_end(&mut self) -> Option<CommandEnd> {
         self.command_end.take()
+    }
+
+    /// The last command end seen on this PTY, if any — **not** consumed by reading, unlike
+    /// [`take_command_end`](Session::take_command_end) (sidebar-weather-cards D8).
+    pub fn last_end(&self) -> Option<CommandEnd> {
+        self.last_end
+    }
+
+    /// Whether the shell is running a foreground command (OSC 133 `C` with no end since).
+    pub fn command_running(&self) -> bool {
+        self.command_running
+    }
+
+    /// Whether the card's status inputs changed since the last check, clearing the flag.
+    /// The event loop resyncs the tab model when this is true, beside
+    /// [`take_title_dirty`](Session::take_title_dirty).
+    pub fn take_command_state_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.command_dirty)
+    }
+
+    /// Whether this tab's live screen last showed a blocking dialog (agent-card-status D7).
+    pub fn blocking_dialog(&self) -> bool {
+        self.blocking_dialog
+    }
+
+    /// Store the dialog level a scan produced, answering whether it **changed** — the one
+    /// thing that obliges the event loop to resync the card's row (D7). A repeat of the
+    /// same level, which every PTY chunk of a busy agent produces, costs nothing.
+    pub fn set_blocking_dialog(&mut self, level: bool) -> bool {
+        let changed = self.blocking_dialog != level;
+        self.blocking_dialog = level;
+        changed
+    }
+
+    /// Re-read this tab's dialog level on a scan event (agent-card-status D7) and store it:
+    /// `(level, changed)`. The rule is [`next_dialog_level`]; this feeds it the tab's own
+    /// facts and, only when the rule asks, its live screen.
+    ///
+    /// Deliberately a **level**, not an event: it is re-evaluated on every trigger, so
+    /// answering the prompt makes the dialog disappear and the tab leaves `Waiting` through
+    /// the existing falling edge. Nothing to latch, expire, or replay.
+    ///
+    /// Uses `viewport_tail_text` rather than a full snapshot: this runs per PTY chunk, and
+    /// cloning the grid at that rate would be the G1 idle-CPU debt all over again.
+    pub fn rescan_dialog(&mut self, has_agent: bool) -> (bool, bool) {
+        let terminal = &self.terminal;
+        let level = next_dialog_level(
+            has_agent,
+            terminal.view_offset() == 0,
+            self.blocking_dialog,
+            || {
+                crate::prompt::shows_blocking_prompt(
+                    &terminal.viewport_tail_text(crate::prompt::TAIL_ROWS),
+                )
+            },
+        );
+        (level, self.set_blocking_dialog(level))
     }
 
     /// Write bytes to this session's shell.
@@ -330,6 +424,30 @@ fn published_or(
     }
 }
 
+/// A tab's dialog level after a scan event (agent-card-status D7(a)/(c)). Pure, so each
+/// case is testable without a window:
+///
+/// - **no agent** → `false`: a shell printing dialog-like text is never waiting, and an
+///   agent that left takes its level with it (D7c);
+/// - **an agent at the live bottom** → the `scan`;
+/// - **an agent scrolled back** → the level it `held`, and the screen is **not** scanned.
+///   The scrolled view is history, which may hold a dialog answered long ago, so it cannot
+///   raise the level; and it cannot clear it either, because an agent blocked on a dialog
+///   draws nothing more — clearing here would lose it until something else woke the tab.
+///   Returning to the bottom re-reads it (D7b, the event loop's `rescan_at_live_bottom`).
+fn next_dialog_level(
+    has_agent: bool,
+    at_live_bottom: bool,
+    held: bool,
+    scan: impl FnOnce() -> bool,
+) -> bool {
+    match (has_agent, at_live_bottom) {
+        (false, _) => false,
+        (true, true) => scan(),
+        (true, false) => held,
+    }
+}
+
 /// Normalize a user title on its way in (sticky-tab-title R2.3): a blank or whitespace-only
 /// name is not a name — it is the user clearing the tab back to its auto label. Applied at
 /// the single setter so every entry point (the rename chord, the card menu, anything later)
@@ -385,6 +503,10 @@ mod tests {
             program_title: String::new(),
             title_dirty: false,
             command_end: None,
+            last_end: None,
+            command_running: false,
+            command_dirty: false,
+            blocking_dialog: false,
             _reader: std::thread::spawn(|| {}),
         };
         Some((session, tx))
@@ -536,6 +658,55 @@ mod tests {
             })
         );
         assert_eq!(s.take_command_end(), None, "and it is consumed");
+    }
+
+    #[test]
+    fn the_cards_last_end_survives_the_waiting_bands_take() {
+        // sidebar-weather-cards R8.4 — the band consumes its one-shot; the card's copy
+        // stays, and the running state mirrors the terminal's.
+        let Some((mut s, tx)) = session_with_feed() else {
+            return;
+        };
+        assert_eq!((s.last_end(), s.command_running()), (None, false));
+        feed(&mut s, &tx, b"\x1b]133;C\x07");
+        assert!(s.command_running(), "C → running");
+        assert!(s.take_command_state_dirty(), "a change the card shows");
+        feed(&mut s, &tx, b"\x1b]133;D;101;40\x07");
+        assert!(!s.command_running(), "D → finished");
+        let _ = s.take_command_end(); // the waiting path takes its one-shot …
+        assert_eq!(
+            s.last_end(),
+            Some(CommandEnd {
+                exit_code: 101,
+                elapsed_ms: 40
+            }),
+            "… and the card's copy is still there"
+        );
+        assert!(s.take_command_state_dirty());
+        assert!(!s.take_command_state_dirty(), "the flag clears on take");
+    }
+
+    #[test]
+    fn a_repeat_of_the_same_failure_does_not_resync() {
+        // D8 — the dirty flag tracks what the card shows: a fast rerun that fails the
+        // same way (C…D in one chunk) changes neither input.
+        let Some((mut s, tx)) = session_with_feed() else {
+            return;
+        };
+        feed(&mut s, &tx, b"\x1b]133;C\x07out\x1b]133;D;2;5\x07");
+        assert!(s.take_command_state_dirty(), "the first failure shows");
+        feed(&mut s, &tx, b"\x1b]133;C\x07out\x1b]133;D;2;7\x07");
+        assert!(
+            !s.take_command_state_dirty(),
+            "the same code again changes nothing"
+        );
+        assert_eq!(
+            s.last_end().map(|e| e.elapsed_ms),
+            Some(7),
+            "but the copy is fresh"
+        );
+        feed(&mut s, &tx, b"\x1b]133;C\x07\x1b]133;D;0;1\x07");
+        assert!(s.take_command_state_dirty(), "a different code does");
     }
 
     #[test]
@@ -702,6 +873,90 @@ mod tests {
         // drain must not flag the tab dirty and cost a pointless redraw.
         assert!(program_title_is_visible(None));
         assert!(!program_title_is_visible(Some("Frontend")));
+    }
+
+    #[test]
+    fn a_live_agent_tab_takes_the_scan() {
+        // R7.1 — at the live bottom the level is whatever the screen says, both ways.
+        assert!(next_dialog_level(true, true, false, || true), "rising");
+        assert!(!next_dialog_level(true, true, true, || false), "falling");
+    }
+
+    #[test]
+    fn a_scrolled_back_agent_tab_holds_its_level_unscanned() {
+        // R7.2 — the scrolled view is history: it neither raises nor clears the level, and
+        // the screen is not read at all.
+        for held in [false, true] {
+            let level = next_dialog_level(true, false, held, || {
+                panic!("a scrolled-back tab must not be scanned")
+            });
+            assert_eq!(level, held);
+        }
+    }
+
+    #[test]
+    fn a_tab_without_an_agent_has_no_level() {
+        // R7.3 / R7.5 — dialog-like text in a shell is never waiting, and an agent that left
+        // takes a held `true` with it; the screen is not read.
+        for (at_bottom, held) in [(true, false), (true, true), (false, true)] {
+            assert!(!next_dialog_level(false, at_bottom, held, || {
+                panic!("a tab without an agent must not be scanned")
+            }));
+        }
+    }
+
+    #[test]
+    fn a_real_dialog_sets_the_level_and_scrolling_back_holds_it() {
+        // agent-card-status R7.1 / R7.2 / R7.4 / R7.5 through a real grid: the captured
+        // Antigravity dialog raises the level at the live bottom; scrolled back, the level
+        // holds even after the dialog is answered off-screen; back at the bottom it clears;
+        // and a tab without an agent never holds one.
+        let Some((mut s, tx)) = session_with_feed() else {
+            return;
+        };
+        for i in 0..60 {
+            feed(&mut s, &tx, format!("earlier output {i}\r\n").as_bytes());
+        }
+        let dialog = crate::prompt::REAL_ANTIGRAVITY_DIALOG.replace('\n', "\r\n");
+        feed(&mut s, &tx, dialog.as_bytes());
+        assert_eq!(s.rescan_dialog(true), (true, true), "live dialog");
+
+        s.terminal.scroll_up(5);
+        assert_eq!(s.rescan_dialog(true), (true, false), "scrolled back: held");
+        // Answered while the user reads history: the live screen moves on.
+        feed(&mut s, &tx, b"\x1b[2J\x1b[H");
+        feed(&mut s, &tx, b"\xe2\x97\x8f Bash(ls -la)\r\n");
+        s.terminal.scroll_up(5);
+        assert_ne!(s.terminal.view_offset(), 0, "still reading history");
+        assert_eq!(s.rescan_dialog(true), (true, false), "still held");
+
+        s.terminal.scroll_to_bottom();
+        assert_eq!(
+            s.rescan_dialog(true),
+            (false, true),
+            "back at the bottom: cleared"
+        );
+
+        // The dialog again, then the agent leaves: the level goes with it.
+        feed(&mut s, &tx, dialog.as_bytes());
+        assert_eq!(s.rescan_dialog(true), (true, true));
+        assert_eq!(s.rescan_dialog(false), (false, true), "no agent, no level");
+    }
+
+    #[test]
+    fn the_dialog_level_reports_only_a_change() {
+        // agent-card-status R7.6 — a flip in either direction is what resyncs the card's
+        // row; the same level again, which every chunk of a busy agent produces, is not.
+        let Some((mut s, _tx)) = session_with_feed() else {
+            return;
+        };
+        assert!(!s.blocking_dialog(), "a new tab shows no dialog");
+        assert!(s.set_blocking_dialog(true), "rising");
+        assert!(s.blocking_dialog());
+        assert!(!s.set_blocking_dialog(true), "a repeat is not a change");
+        assert!(s.set_blocking_dialog(false), "falling");
+        assert!(!s.blocking_dialog());
+        assert!(!s.set_blocking_dialog(false), "a repeat is not a change");
     }
 
     /// Validate the `proc_pidinfo` struct layout: our own pid must resolve to our

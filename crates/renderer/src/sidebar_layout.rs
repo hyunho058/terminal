@@ -21,7 +21,7 @@
 //! `inp.metrics` arrives already scaled (R6.9); and [`restore_button_rect`] takes a scale
 //! alone, so the collapsed affordance is reachable with no published card layout (D7).
 
-use crate::sidebar_theme::SidebarMetrics;
+use crate::sidebar_theme::{CardMetrics, SidebarMetrics};
 
 /// Tokens the mock defines for surfaces only this feature draws (D15). Logical px,
 /// multiplied by `scale` at the single point of use. **Destination note:** the two
@@ -115,10 +115,6 @@ pub struct OpenMenu {
 
 /// Card-menu layout tokens, logical px (scaled at the point of use, like [`tokens`]).
 pub mod menu {
-    /// The hamburger's touch/hit square, logical px — the icon plus its padding.
-    pub const BUTTON_PX: f32 = 22.0;
-    /// Gap between the hamburger's right edge and the card's inner right edge.
-    pub const BUTTON_INSET: f32 = 2.0;
     /// The popup's width, logical px — wide enough for "Reset to auto".
     pub const WIDTH: f32 = 150.0;
     /// One menu item's height, logical px.
@@ -343,9 +339,10 @@ pub fn list_viewport(inp: &SidebarLayoutInput) -> Rect {
     }
 }
 
-/// Per-card vertical stride (card height + both vertical margins, D6).
+/// Per-card vertical stride: the card's height plus the 10px gap to the next
+/// (sidebar-weather-cards D1).
 pub fn row_stride(inp: &SidebarLayoutInput) -> f32 {
-    inp.row_h + 2.0 * inp.metrics.card_margin_y
+    inp.row_h + CardMetrics::DEFAULT.scaled(inp.scale).gap
 }
 
 /// Total scrollable content height (D6).
@@ -384,42 +381,40 @@ pub fn scroll_to_reveal(index: usize, s: f32, inp: &SidebarLayoutInput) -> f32 {
     clamp_scroll(target, inp)
 }
 
-/// The **drawn** rect of card `i` at scroll `s` — inset by `card_margin_y` inside its
-/// stride band (D8). Not a bijection with [`row_at`] (the margins belong to the nearer
-/// card); the two agree on centres and coverage (R6).
+/// The **drawn** rect of card `i` at scroll `s` — inset by half the inter-card gap inside
+/// its stride band (D8), and by the card inset from each side. The same
+/// `CardMetrics` the row layer's `sidebar_row::layout` reads, so the hit-tested card is
+/// the drawn one (sidebar-weather-cards D1, SD2). Not a bijection with [`row_at`] (the
+/// margins belong to the nearer card); the two agree on centres and coverage (R6).
 pub fn row_rect(i: usize, s: f32, inp: &SidebarLayoutInput) -> Rect {
+    let c = CardMetrics::DEFAULT.scaled(inp.scale);
     let stride = row_stride(inp);
     let band_top = list_viewport(inp).y + i as f32 * stride - s;
     Rect {
-        x: inp.metrics.card_margin_x,
-        y: band_top + inp.metrics.card_margin_y,
-        w: (inp.sidebar_w - 2.0 * inp.metrics.card_margin_x).max(0.0),
+        x: c.inset_x,
+        y: band_top + c.gap * 0.5,
+        w: (inp.sidebar_w - 2.0 * c.inset_x).max(0.0),
         h: inp.row_h,
     }
 }
 
-/// The hamburger's rect **inside a given card rect** (sticky-tab-title R3.1): a square at
-/// the card's top-right, within the card padding, vertically centred on line 1.
+/// The `≡` button's rect **inside a given card rect** (sticky-tab-title R3.1): since
+/// sidebar-weather-cards D11 a 26-logical backplate left of the agent icon's slot —
+/// `sidebar_card::menu_button`, called here so there is still ONE formula for where the
+/// button sits inside a card (SD2). It is skin-independent by construction, which is
+/// what lets this module — which knows no card's skin — hit-test it exactly.
 ///
 /// Takes the card rect rather than an index because the two callers reach a card rect by
 /// different routes — the hit-test via [`row_rect`], the row layer via its own published
-/// `SidebarLayout::card_rect` — and this keeps ONE formula for where the button sits
-/// inside a card (SD2). Feed it either; they already agree on card rects, and now the
-/// button cannot drift from the card it belongs to.
-pub fn menu_button_in(card: Rect, metrics: &SidebarMetrics, scale: f64) -> Rect {
-    let side = menu::BUTTON_PX * scale as f32;
-    let inset = menu::BUTTON_INSET * scale as f32;
-    Rect {
-        x: card.x + card.w - metrics.card_pad_x - side + inset,
-        y: card.y + metrics.card_pad_y + (metrics.title_px - side) * 0.5,
-        w: side,
-        h: side,
-    }
+/// `SidebarLayout::card_rect` — and they already agree on card rects.
+pub fn menu_button_in(card: Rect, scale: f64) -> Rect {
+    let [x, y, w, h] = crate::sidebar_card::menu_button([card.x, card.y, card.w, card.h], scale);
+    Rect { x, y, w, h }
 }
 
 /// The hamburger's rect on card `i` — the hit-test's route into [`menu_button_in`].
 pub fn menu_button_rect(i: usize, s: f32, inp: &SidebarLayoutInput) -> Rect {
-    menu_button_in(row_rect(i, s, inp), &inp.metrics, inp.scale)
+    menu_button_in(row_rect(i, s, inp), inp.scale)
 }
 
 /// The popup's rect for a given hamburger rect (sticky-tab-title R3.1/R3.2) — the shared

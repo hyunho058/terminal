@@ -11,6 +11,17 @@ use term_core::Color;
 
 use crate::session::{Session, TabId, WakeSource};
 
+/// What one scan of the tabs' screens produced ([`Tabs::rescan_dialogs`]).
+#[derive(Debug, PartialEq, Eq)]
+pub struct DialogScan {
+    /// Each scanned tab's state as the waiting band must see it — a dialog on screen reads
+    /// `Waiting` whatever the log says (agent-card-status D4).
+    pub states: Vec<(TabId, crate::tabmeta::AgentState)>,
+    /// The tabs whose stored dialog level flipped on this scan, with the new level — the
+    /// only rows whose card status the scan changed (D7).
+    pub flipped: Vec<(TabId, bool)>,
+}
+
 /// All open tabs plus the active index and the next id to hand out.
 pub struct Tabs {
     sessions: Vec<Session>,
@@ -259,9 +270,81 @@ impl Tabs {
                     program: Some(s.program_title())
                         .filter(|t| !t.is_empty())
                         .map(str::to_string),
+                    // sidebar-weather-cards D8 — the shell's command state, UI-thread
+                    // facts the metadata worker never sees, so they ride on the row.
+                    running: s.command_running(),
+                    last_exit: s.last_end().map(|e| e.exit_code),
+                    // agent-card-status D7 — the screen-derived dialog level, the card's
+                    // share of the one level the waiting band is also fed from (D4).
+                    blocking_dialog: s.blocking_dialog(),
                 }
             })
             .collect()
+    }
+
+    /// Re-read the dialog level of every tab in `base` — `(tab, log state, has an agent)`, as
+    /// the event loop assembles it from the metadata snapshot — and return what the waiting
+    /// band must be fed plus which rows' levels flipped (agent-card-status D4, D7).
+    ///
+    /// Here rather than in the event loop so the whole scan is testable without a window:
+    /// each tab's level comes from its own [`Session::rescan_dialog`], and the band sees each
+    /// state through the same [`effective_state`] override the card resolves its status
+    /// with — which is what keeps the two from disagreeing about a tab. A tab that closed
+    /// between the snapshot and the scan has no level.
+    ///
+    /// [`effective_state`]: crate::sidebar_model::effective_state
+    pub fn rescan_dialogs(
+        &mut self,
+        base: Vec<(TabId, crate::tabmeta::AgentState, bool)>,
+        active: TabId,
+    ) -> DialogScan {
+        let mut flipped = Vec::new();
+        let states = base
+            .into_iter()
+            .map(|(id, state, has_agent)| {
+                let level = match self.by_id_mut(id) {
+                    Some(s) => {
+                        let (level, changed) = s.rescan_dialog(has_agent);
+                        if changed {
+                            flipped.push((id, level));
+                        }
+                        // The one diagnostic that has paid for itself here: when an agent
+                        // tab is scanned, dump what was on screen. Guessing at which layer
+                        // was wrong cost two wrong fixes; the tail text says directly
+                        // whether the dialog was absent, scrolled, or merely unmatched — and
+                        // it is how a real dialog becomes a detector fixture (D12).
+                        //
+                        // An if/else on `has_agent` rather than a combined condition: the
+                        // branch only chooses a log line, and a `&&`/`!` there would be a
+                        // mutation no test can see. Explicitly gated on the level rather than
+                        // relying on the macro's field laziness: this runs per PTY chunk, and
+                        // the dump builds a String.
+                        if has_agent {
+                            if tracing::enabled!(tracing::Level::DEBUG) {
+                                let tail = crate::prompt::scan_dump(
+                                    s.terminal.view_offset(),
+                                    &s.terminal.viewport_tail_text(crate::prompt::TAIL_ROWS),
+                                );
+                                tracing::debug!(
+                                    tab = id.0,
+                                    ?state,
+                                    level,
+                                    active = (id == active),
+                                    tail = %tail,
+                                    "waiting-scan"
+                                );
+                            }
+                        } else {
+                            tracing::debug!(tab = id.0, ?state, "waiting-scan: no agent on tab");
+                        }
+                        level
+                    }
+                    None => false,
+                };
+                (id, crate::sidebar_model::effective_state(state, level))
+            })
+            .collect();
+        DialogScan { states, flipped }
     }
 
     /// The active tab's live working directory (ai-monitor log resolution).
@@ -751,6 +834,197 @@ mod tests {
         // mid-turn", never as "keep whatever I last saw".
         let empty = crate::tabmeta::TabMetaSnapshot::default();
         assert_eq!(tabs.active_agent_state(&empty), None);
+    }
+
+    #[test]
+    fn a_background_tabs_command_state_reaches_its_row() {
+        // sidebar-weather-cards R8.5 — a tab that is NOT active starts a command and then
+        // fails: each change is flagged for a resync and lands on that tab's row, while
+        // the active tab's row is untouched. The OSC 133 bytes go straight into the
+        // terminal, then `drain` — the same path the reader thread's chunks take — so the
+        // shell's timing is not part of the test.
+        let Some(mut tabs) = tabs_with(2) else {
+            return;
+        };
+        let all = ids(&tabs);
+        let (bg, fg) = (all[0], all[1]);
+        assert_eq!(tabs.active().id, fg, "the second tab is the active one");
+        let snap = crate::tabmeta::TabMetaSnapshot::default();
+        let row = |tabs: &Tabs, id: TabId| {
+            let r = tabs.titles(&snap).into_iter().find(|r| r.tab_id == id.0);
+            let r = r.expect("row");
+            (r.running, r.last_exit)
+        };
+        assert_eq!(row(&tabs, bg), (false, None), "an idle shell");
+
+        let s = tabs.by_id_mut(bg).expect("tab");
+        s.terminal.advance(b"\x1b]133;C\x07");
+        s.drain();
+        assert!(s.take_command_state_dirty(), "the loop resyncs on this");
+        assert_eq!(row(&tabs, bg), (true, None), "running");
+
+        let s = tabs.by_id_mut(bg).expect("tab");
+        s.terminal.advance(b"\x1b]133;D;101;40\x07");
+        s.drain();
+        let _ = s.take_command_end(); // the waiting band's take changes nothing here
+        assert!(s.take_command_state_dirty());
+        assert_eq!(row(&tabs, bg), (false, Some(101)), "finished, failed");
+        assert_eq!(row(&tabs, fg), (false, None), "the active tab is untouched");
+    }
+
+    #[test]
+    fn a_scan_feeds_the_band_the_effective_state_and_names_the_flips() {
+        // agent-card-status R8.2 / R7.3 / R7.6 over real sessions: the tab showing a dialog
+        // is handed to the band as Waiting over a Busy log, the one without keeps its log
+        // state, a tab without an agent never gets a level whatever its screen shows, and
+        // only a level that moved is reported as a flip.
+        use crate::tabmeta::AgentState::{Busy, Idle, Unknown, Waiting};
+        let Some(mut tabs) = tabs_with(3) else {
+            return;
+        };
+        let all = ids(&tabs);
+        let (a, b, c) = (all[0], all[1], all[2]);
+        let dialog = crate::prompt::REAL_ANTIGRAVITY_DIALOG.replace('\n', "\r\n");
+        for id in [a, c] {
+            tabs.by_id_mut(id)
+                .expect("tab")
+                .terminal
+                .advance(dialog.as_bytes());
+        }
+        let base = || vec![(a, Busy, true), (b, Idle, true), (c, Unknown, false)];
+        let active = tabs.active().id;
+
+        let scan = tabs.rescan_dialogs(base(), active);
+        assert_eq!(scan.states, vec![(a, Waiting), (b, Idle), (c, Unknown)]);
+        assert_eq!(scan.flipped, vec![(a, true)]);
+        // Fed to the real waiting model, as the event loop does, with none of them active:
+        // the dialog tab is the band's one item (R0.1's band half).
+        let mut band = crate::waiting::WaitingState::new();
+        let elsewhere = crate::session::TabId(u64::MAX);
+        band.on_agent_states(&scan.states, elsewhere, std::time::Instant::now());
+        assert_eq!(
+            band.items().iter().map(|i| i.tab_id).collect::<Vec<_>>(),
+            vec![a]
+        );
+
+        let again = tabs.rescan_dialogs(base(), active);
+        assert_eq!(again.states, scan.states);
+        assert_eq!(again.flipped, vec![], "the same level again is not a flip");
+
+        // Answered (R0.2 / R7.4's band half): the screen moves on, the level falls, and the
+        // same waiting model drops the tab.
+        tabs.by_id_mut(a)
+            .expect("tab")
+            .terminal
+            .advance(b"\x1b[2J\x1b[H\xe2\x97\x8f Bash(ls -la)\r\n");
+        let answered = tabs.rescan_dialogs(base(), active);
+        assert_eq!(answered.states[0], (a, Busy));
+        assert_eq!(answered.flipped, vec![(a, false)]);
+        band.on_agent_states(&answered.states, elsewhere, std::time::Instant::now());
+        assert!(band.items().is_empty(), "the tab left the band");
+    }
+
+    #[test]
+    fn a_claude_permission_dialog_reads_waiting_on_its_card() {
+        // agent-card-status R0.4 — Claude's own captured dialog, through the same bytes →
+        // level → row → card chain, over a log that reads Busy (Claude writes nothing while
+        // its dialog is up).
+        let Some(mut tabs) = tabs_with(1) else {
+            return;
+        };
+        let id = ids(&tabs)[0];
+        let dialog = crate::prompt::REAL_DIALOG.replace('\n', "\r\n");
+        tabs.by_id_mut(id)
+            .expect("tab")
+            .terminal
+            .advance(dialog.as_bytes());
+        let active = tabs.active().id;
+        let scan = tabs.rescan_dialogs(vec![(id, crate::tabmeta::AgentState::Busy, true)], active);
+        assert_eq!(scan.flipped, vec![(id, true)]);
+        let snap = crate::tabmeta::TabMetaSnapshot::default();
+        let row = tabs.titles(&snap).into_iter().next().expect("row");
+        let busy = crate::tabmeta::Agent {
+            kind: crate::tabmeta::AgentKind::Claude,
+            state: crate::tabmeta::AgentState::Busy,
+        };
+        assert_eq!(
+            crate::sidebar_model::resolve_status(
+                Some(&busy),
+                row.blocking_dialog,
+                row.running,
+                row.last_exit
+            ),
+            renderer::sidebar_card::CardStatus::WaitingForInput
+        );
+    }
+
+    #[test]
+    fn a_background_tabs_dialog_level_reaches_its_row() {
+        // agent-card-status R7.7 / R8.3 — the level the scan stored on a tab that is NOT
+        // active lands on that tab's row, which is what its card resolves from; the active
+        // tab's row is untouched.
+        let Some(mut tabs) = tabs_with(2) else {
+            return;
+        };
+        let all = ids(&tabs);
+        let (bg, fg) = (all[0], all[1]);
+        let snap = crate::tabmeta::TabMetaSnapshot::default();
+        let level = |tabs: &Tabs, id: TabId| {
+            let r = tabs.titles(&snap).into_iter().find(|r| r.tab_id == id.0);
+            r.expect("row").blocking_dialog
+        };
+        assert!(!level(&tabs, bg), "no dialog yet");
+
+        assert!(tabs.by_id_mut(bg).expect("tab").set_blocking_dialog(true));
+        assert!(level(&tabs, bg), "the dialog is on the row");
+        assert!(!level(&tabs, fg), "the active tab is untouched");
+
+        assert!(tabs.by_id_mut(bg).expect("tab").set_blocking_dialog(false));
+        assert!(!level(&tabs, bg), "answered");
+    }
+
+    #[test]
+    fn an_antigravity_dialog_on_a_background_tab_reads_waiting_on_its_card() {
+        // agent-card-status R0.1 / R0.2 / R7.7, without a window: the captured dialog's bytes
+        // reach a background tab's grid, its scan stores the level, the row carries it, and
+        // the card resolves WaitingForInput over a log that reads Busy — the observed bug's
+        // exact situation. Answering returns the card to Working.
+        let Some(mut tabs) = tabs_with(2) else {
+            return;
+        };
+        let bg = ids(&tabs)[0];
+        assert_ne!(tabs.active().id, bg, "a background tab");
+        let snap = crate::tabmeta::TabMetaSnapshot::default();
+        let busy = crate::tabmeta::Agent {
+            kind: crate::tabmeta::AgentKind::Antigravity,
+            state: crate::tabmeta::AgentState::Busy,
+        };
+        let card = |tabs: &Tabs| {
+            let r = tabs.titles(&snap).into_iter().find(|r| r.tab_id == bg.0);
+            let r = r.expect("row");
+            crate::sidebar_model::resolve_status(
+                Some(&busy),
+                r.blocking_dialog,
+                r.running,
+                r.last_exit,
+            )
+        };
+        assert_eq!(card(&tabs), renderer::sidebar_card::CardStatus::Working);
+
+        let s = tabs.by_id_mut(bg).expect("tab");
+        let dialog = crate::prompt::REAL_ANTIGRAVITY_DIALOG.replace('\n', "\r\n");
+        s.terminal.advance(dialog.as_bytes());
+        assert_eq!(s.rescan_dialog(true), (true, true));
+        assert_eq!(
+            card(&tabs),
+            renderer::sidebar_card::CardStatus::WaitingForInput
+        );
+
+        let s = tabs.by_id_mut(bg).expect("tab");
+        s.terminal
+            .advance(b"\x1b[2J\x1b[H\xe2\x97\x8f Bash(ls -la)\r\n  total 48\r\n");
+        assert_eq!(s.rescan_dialog(true), (false, true));
+        assert_eq!(card(&tabs), renderer::sidebar_card::CardStatus::Working);
     }
 
     #[test]

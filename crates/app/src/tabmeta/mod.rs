@@ -15,6 +15,7 @@
 //! vocabulary (the intent-grep in T1's gate checks for exactly those symbols).
 
 mod activity;
+mod antigravity;
 // `pub(crate)` since ai-monitor-antigravity T4: `tabsession` asks which agent a tab is
 // running so the overlay can pick the matching watcher, and the classification tables
 // (including the auto-updater's `agy.<id>.old` rename) already live here. Re-deriving them
@@ -135,7 +136,7 @@ pub enum AgentState {
     /// `AskUserQuestion` (`ai_monitor::activity::LastMessage::AssistantAsksUser`). Never
     /// produced by the recency fallback — a false "waiting" is the worst failure. The
     /// waiting-band feature (T4) renders the input-waiting affordance for this; earlier
-    /// features treat it as an attention state (see `sidebar_model::mark_for`).
+    /// features treat it as an attention state (see `sidebar_model::resolve_status`).
     Waiting,
     Idle,
     Unknown,

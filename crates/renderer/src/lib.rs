@@ -23,11 +23,13 @@ pub mod monitor_panel;
 pub mod monitor_scroll;
 pub mod preedit_layer;
 pub mod selection_layer;
+pub mod sidebar_card;
 pub mod sidebar_header;
 pub mod sidebar_icons;
 pub mod sidebar_layout;
 pub mod sidebar_row;
 pub mod sidebar_shapes;
+pub mod sidebar_text;
 pub mod sidebar_theme;
 pub mod tab_bar;
 pub mod testing;
@@ -158,6 +160,10 @@ pub struct FrameCtx<'a> {
     pub scale_factor: f64,
     pub snapshot: &'a GridSnapshot,
     pub atlas: &'a mut Atlas,
+    /// The font fallback chain `atlas` was built from. A layer that rasterizes text at
+    /// a size of its own — the sidebar's card atlases (sidebar-weather-cards D2) —
+    /// builds from the same chain, so it gets the same fonts and real bold faces.
+    pub fonts: &'a FontSet,
 }
 
 /// A pluggable draw layer (SD3/D4 seam). The terminal glyph pass is the implicit
@@ -1069,6 +1075,7 @@ impl Renderer {
                 scale_factor: self.scale_factor,
                 snapshot,
                 atlas: &mut self.atlas,
+                fonts: &self.fonts,
             };
             for layer in &mut layers {
                 layer.record(&mut ctx);
@@ -3567,6 +3574,42 @@ mod tests {
     }
 
     #[test]
+    fn draw_to_hands_layers_the_renderers_own_font_set() {
+        // sidebar-weather-cards R2.2 — through the real frame path, not a hand-built
+        // FrameCtx: the set a layer sees is the one the renderer's atlas came from, so a
+        // layer building atlases of its own (the sidebar's card atlases) gets the same
+        // fonts and bold faces as the grid.
+        let Some(mut r) =
+            crate::testing::headless(64, 64, &common::config::Config::default(), "R2.2")
+        else {
+            return;
+        };
+        let identity = |fonts: &FontSet| {
+            fonts
+                .families()
+                .iter()
+                .map(|f| std::sync::Arc::as_ptr(&f.regular().data) as usize)
+                .collect::<Vec<_>>()
+        };
+        type Seen = std::rc::Rc<std::cell::RefCell<Vec<usize>>>;
+        struct Spy(Seen, fn(&FontSet) -> Vec<usize>);
+        impl DrawLayer for Spy {
+            fn z_order(&self) -> i32 {
+                50
+            }
+            fn record(&mut self, ctx: &mut FrameCtx<'_>) {
+                *self.0.borrow_mut() = (self.1)(ctx.fonts);
+            }
+        }
+        let seen: Seen = Default::default();
+        r.add_layer(Box::new(Spy(seen.clone(), identity)));
+        let t = term_core::Terminal::new(4, 1, term_core::Color(0xFFFFFF), term_core::Color(0));
+        r.capture(&t.snapshot()).expect("capture");
+        assert!(!seen.borrow().is_empty(), "the layer recorded");
+        assert_eq!(*seen.borrow(), identity(&r.fonts));
+    }
+
+    #[test]
     fn registered_layer_record_is_invoked() {
         // R4.2: a registered layer's `record` fires when the frame's layer loop
         // runs — drives the real FrameCtx + loop headlessly, without a surface.
@@ -3623,6 +3666,7 @@ mod tests {
             scale_factor: 1.0,
             snapshot: &snap,
             atlas: &mut atlas,
+            fonts: &fonts,
         };
         for layer in &mut layers {
             layer.record(&mut ctx);
@@ -3695,6 +3739,7 @@ mod tests {
             scale_factor: 1.0,
             snapshot: &snap,
             atlas: &mut atlas,
+            fonts: &fonts,
         };
         let mut pens = Vec::new();
         crate::tab_bar::layout_line(&mut ctx, "한a", 0.0, cw, |pen, _entry| pens.push(pen));
