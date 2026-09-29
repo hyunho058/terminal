@@ -1551,6 +1551,561 @@ fn task_results_never_enter_the_completed_tools_ring() {
     assert!(s.tools.is_empty());
 }
 
+// ---- ai-monitor-absorbed-notifications R1/R2: the attachment carrier ----------
+//
+// A notification that arrives mid-turn is absorbed into the running turn and written as
+// a `queued_command` attachment instead of a bare-string `user` record. Before this
+// carrier was read, every agent notified that way stayed LIVE for good.
+
+/// 2026-08-19T00:24:21.000Z — the end the attachment tests report.
+const T_END: u64 = T0 + 1_461_000;
+
+/// A `queued_command` attachment carrying `prompt`, in the shape Claude Code writes an
+/// absorbed notification: `attachment.timestamp` repeats the top-level one, and the
+/// top-level one is what the fold reads.
+fn attachment(prompt: serde_json::Value, ts: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "attachment",
+        "timestamp": ts,
+        "attachment": {
+            "type": "queued_command",
+            "prompt": prompt,
+            "commandMode": "task-notification",
+            "timestamp": ts,
+        },
+    })
+}
+
+fn attachment_line(prompt: &str, ts: &str) -> String {
+    attachment(serde_json::Value::from(prompt), ts).to_string()
+}
+
+/// Assert that appending `extra` to `base` changes nothing but the clock, which every
+/// timestamped line moves. The whole snapshot is compared, so a stray counter, ring
+/// entry or skill fails this as surely as a completed agent does.
+fn assert_inert(base: &str, extra: &str) {
+    let without = fold(base);
+    let mut with = fold(&format!("{base}\n{extra}"));
+    with.last_event_ms = without.last_event_ms;
+    assert_eq!(with, without, "{extra}");
+}
+
+#[test]
+fn an_absorbed_attachment_ends_the_agent_it_names() {
+    // R1.1 — the carrier the fold could not see. Joined on `task-id` exactly as the
+    // bare-string arm joins, and ended at the record's own timestamp.
+    let s = fold(&format!(
+        "{}\n{}",
+        async_launch("a1", "agent-11"),
+        attachment_line(
+            &notification("agent-11", "completed", "swept 4 files"),
+            "2026-08-19T00:24:21.000Z"
+        )
+    ));
+    let a = &s.subagents[0];
+    assert!(a.completed, "the attachment is an ending");
+    assert_eq!(a.end_ms, Some(T_END));
+    assert!(a.ended_ok);
+}
+
+#[test]
+fn the_command_mode_is_not_part_of_the_gate() {
+    // R1.2 — D1: `commandMode` discriminates nothing today and would re-break silently
+    // on a rename, so neither its absence nor a new value may stop the ending.
+    let prompt = serde_json::Value::from(notification("agent-11", "completed", "done"));
+    let absent = {
+        let mut v = attachment(prompt.clone(), "2026-08-19T00:24:21.000Z");
+        v["attachment"]
+            .as_object_mut()
+            .expect("an object")
+            .remove("commandMode");
+        v
+    };
+    let renamed = {
+        let mut v = attachment(prompt, "2026-08-19T00:24:21.000Z");
+        v["attachment"]["commandMode"] = "background-task".into();
+        v
+    };
+    for line in [absent, renamed] {
+        let s = fold(&format!("{}\n{line}", async_launch("a1", "agent-11")));
+        assert!(s.subagents[0].completed, "{line}");
+        assert_eq!(s.subagents[0].end_ms, Some(T_END), "{line}");
+    }
+}
+
+#[test]
+fn another_attachment_kind_with_a_notification_prompt_is_inert() {
+    // R1.3 — the type gate. Only `queued_command` is a carrier; the same `prompt` under
+    // any other kind is someone quoting a notification, not delivering one.
+    let mut line = attachment(
+        notification("agent-11", "completed", "done").into(),
+        "2026-08-19T00:24:21.000Z",
+    );
+    line["attachment"]["type"] = "hook_success".into();
+    assert_inert(&async_launch("a1", "agent-11"), &line.to_string());
+}
+
+#[test]
+fn a_queued_command_without_a_string_prompt_is_inert() {
+    // R1.4 — absent, null, array and object: none is a notification, none is an
+    // error, and none may panic. `parse_errors` counts only lines that are not JSON.
+    let block = notification("agent-11", "completed", "done");
+    let absent = {
+        let mut v = attachment(serde_json::Value::Null, "2026-08-19T00:24:21.000Z");
+        v["attachment"]
+            .as_object_mut()
+            .expect("an object")
+            .remove("prompt");
+        v
+    };
+    let others = [
+        serde_json::Value::Null,
+        serde_json::json!([block.clone()]),
+        serde_json::json!({ "text": block }),
+    ]
+    .map(|p| attachment(p, "2026-08-19T00:24:21.000Z"));
+    for line in std::iter::once(absent).chain(others) {
+        assert_inert(&async_launch("a1", "agent-11"), &line.to_string());
+    }
+}
+
+#[test]
+fn a_prompt_that_quotes_the_block_inside_a_reminder_is_inert() {
+    // R1.5 — starts-with, not contains, on this carrier too. This is the shape of the
+    // record's own `rendered` field: the same block, wrapped.
+    let wrapped = format!(
+        "<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\n\n{}\n</system-reminder>",
+        notification("agent-11", "completed", "done")
+    );
+    assert_inert(
+        &async_launch("a1", "agent-11"),
+        &attachment_line(&wrapped, "2026-08-19T00:24:21.000Z"),
+    );
+}
+
+#[test]
+fn leading_whitespace_before_the_tag_is_tolerated_on_the_attachment_too() {
+    // R1.6 — the parse trims leading whitespace; this carrier inherits that rather than
+    // growing a stricter rule of its own.
+    let padded = format!("\n  {}", notification("agent-11", "completed", "done"));
+    let s = fold(&format!(
+        "{}\n{}",
+        async_launch("a1", "agent-11"),
+        attachment_line(&padded, "2026-08-19T00:24:21.000Z")
+    ));
+    assert!(s.subagents[0].completed);
+}
+
+#[test]
+fn a_malformed_attachment_notification_moves_nothing() {
+    // R1.7 — tagged, but no `<task-id>`: the shape a truncated write leaves. It ends no
+    // agent and, with a command wrapper quoted in its body, registers no skill.
+    let malformed = "<task-notification>\n\
+         <status>completed</status>\n\
+         <result>the agent ran <command-name>/deploy</command-name> for me</result>\n\
+         </task-notification>";
+    assert_inert(
+        &async_launch("a1", "agent-11"),
+        &attachment_line(malformed, "2026-08-19T00:24:21.000Z"),
+    );
+}
+
+#[test]
+fn an_attachment_for_an_id_with_no_card_creates_nothing() {
+    // R1.8 — the measured residue on this carrier is background `Bash` tasks, which
+    // have no card. Ignored and uncounted, exactly as on the bare-string arm (D8).
+    assert_inert(
+        &async_launch("a1", "agent-11"),
+        &attachment_line(
+            &notification("bk1goe5ix", "failed", "exit 144"),
+            "2026-08-19T00:24:21.000Z",
+        ),
+    );
+}
+
+#[test]
+fn status_maps_to_ended_ok_on_the_attachment_carrier() {
+    // R1.9 — `failed` is a failure; an absent `<status>` is the absence of a reading,
+    // never a reading of failure (D13, the rule the bare-string arm already follows).
+    let failed = fold(&format!(
+        "{}\n{}",
+        async_launch("a1", "agent-11"),
+        attachment_line(
+            &notification("agent-11", "failed", "boom"),
+            "2026-08-19T00:24:21.000Z"
+        )
+    ));
+    assert!(failed.subagents[0].completed);
+    assert!(!failed.subagents[0].ended_ok);
+
+    let no_status = "<task-notification>\n\
+         <task-id>agent-11</task-id>\n\
+         <summary>done</summary>\n\
+         </task-notification>";
+    let silent = fold(&format!(
+        "{}\n{}",
+        async_launch("a1", "agent-11"),
+        attachment_line(no_status, "2026-08-19T00:24:21.000Z")
+    ));
+    assert!(silent.subagents[0].completed);
+    assert!(silent.subagents[0].ended_ok);
+}
+
+#[test]
+fn a_timestampless_attachment_completes_without_erasing_an_end() {
+    // R1.10 — the `ts.is_some()` guard holds on the new carrier: a missing or
+    // unparseable timestamp is the absence of a reading, and must not blank an end the
+    // bare-string arm already recorded.
+    let prompt = serde_json::Value::from(notification("agent-11", "completed", "again"));
+    let missing = {
+        let mut v = attachment(prompt.clone(), "unused");
+        let o = v.as_object_mut().expect("an object");
+        o.remove("timestamp");
+        v["attachment"]
+            .as_object_mut()
+            .expect("an object")
+            .remove("timestamp");
+        v
+    };
+    let unparseable = attachment(prompt, "not-a-date");
+    for line in [missing, unparseable] {
+        let s = fold(&format!(
+            "{}\n{}\n{line}",
+            async_launch("a1", "agent-11"),
+            bare_string_line(
+                &notification("agent-11", "completed", "first"),
+                "2026-08-19T00:24:21.000Z"
+            ),
+        ));
+        assert!(s.subagents[0].completed, "{line}");
+        assert_eq!(s.subagents[0].end_ms, Some(T_END), "{line}");
+    }
+}
+
+#[test]
+fn an_attachment_is_neither_a_tool_call_nor_a_skill() {
+    // R1.11 — it ends an agent and does nothing else: no call counter moves, and a
+    // command wrapper quoted in its `<result>` is not a command invocation.
+    let base = async_launch("a1", "agent-11");
+    let line = attachment_line(
+        &notification(
+            "agent-11",
+            "completed",
+            "the agent ran <command-name>/deploy</command-name> for me",
+        ),
+        "2026-08-19T00:24:21.000Z",
+    );
+    let without = fold(&base);
+    let with = fold(&format!("{base}\n{line}"));
+    assert!(
+        with.subagents[0].completed,
+        "the attachment still did its job"
+    );
+    assert_eq!(with.tool_calls, without.tool_calls);
+    assert_eq!(with.total_tool_calls, without.total_tool_calls);
+    assert_eq!(with.failed_tool_calls, without.failed_tool_calls);
+    assert!(
+        !with.skills.iter().any(|k| k.name == "deploy"),
+        "{:?}",
+        with.skills
+    );
+}
+
+#[test]
+fn queue_operation_records_do_not_end_an_agent() {
+    // R2.1 — the third carrier stays unread (Non-goals). Every absorbed notification
+    // also has an attachment, so reading the queue would add a double-completion source
+    // and no coverage.
+    let block = notification("agent-11", "completed", "done");
+    let enqueue = serde_json::json!({
+        "type": "queue-operation", "operation": "enqueue",
+        "timestamp": "2026-08-19T00:24:21.000Z", "content": block,
+    });
+    let remove = serde_json::json!({
+        "type": "queue-operation", "operation": "remove", "reason": "absorbed_mid_turn",
+        "timestamp": "2026-08-19T00:24:22.000Z", "content": block,
+    });
+    assert_inert(
+        &async_launch("a1", "agent-11"),
+        &format!("{enqueue}\n{remove}"),
+    );
+}
+
+#[test]
+fn an_agent_notified_by_both_carriers_ends_once_at_the_later_notification() {
+    // R2.2 — a resumed agent can be notified once per leg, by either carrier. That is a
+    // re-notification, not a duplicate: one entry, ended at the latest notice.
+    //
+    // The attachment is deliberately the LATER one. With the bare string last, the
+    // bare-string arm alone would produce this end and the test would pass with the
+    // attachment carrier deleted — it did, when this was first written that way.
+    let s = fold(&format!(
+        "{}\n{}\n{}",
+        async_launch("a1", "agent-11"),
+        bare_string_line(
+            &notification("agent-11", "completed", "first leg"),
+            "2026-08-19T00:10:00.000Z"
+        ),
+        attachment_line(
+            &notification("agent-11", "completed", "second leg"),
+            "2026-08-19T00:24:21.000Z"
+        ),
+    ));
+    let entries: Vec<_> = s
+        .subagents
+        .iter()
+        .filter(|a| a.agent_id.as_deref() == Some("agent-11"))
+        .collect();
+    assert_eq!(entries.len(), 1, "{:?}", s.subagents);
+    assert!(entries[0].completed);
+    assert_eq!(entries[0].end_ms, Some(T_END));
+}
+
+// ---- ai-monitor-absorbed-notifications R4: the clock never runs backwards -----
+//
+// Lines are not written in timestamp order, so `last_event_ms` is the latest timestamp
+// seen rather than the last one folded. The stamps below are the real ones from
+// session 903790a2: a `remove` at 02:29:38.020Z followed by the absorbed attachment it
+// removed, stamped 9.5 hours earlier.
+
+/// 2026-09-28T02:29:38.020Z
+const REMOVE_MS: u64 = 1_790_562_578_020;
+
+#[test]
+fn an_earlier_stamped_line_does_not_lower_the_clock() {
+    // R4.1 — any record type; the rule belongs to the clock, not to attachments.
+    let s = fold(concat!(
+        r#"{"type":"queue-operation","operation":"remove","timestamp":"2026-09-28T02:29:38.020Z"}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2026-09-27T17:02:08.163Z","message":{"id":"late"}}"#,
+    ));
+    assert_eq!(s.last_event_ms, Some(REMOVE_MS));
+}
+
+#[test]
+fn an_earlier_created_at_does_not_lower_the_antigravity_clock() {
+    // R4.2 — the same late-write shape in the other dialect: a `PLANNER_RESPONSE`
+    // written after a tool step stamped seconds later. The step still folds.
+    let s = ag_fold(concat!(
+        r#"{"step_index":1,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-08-14T03:00:05Z"}"#,
+        "\n",
+        r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-08-14T03:00:02Z"}"#,
+    ));
+    assert_eq!(s.last_event_ms, Some(AG_T0 + 5_000));
+    assert_eq!(s.turns_assistant, 1, "the late step still counted");
+}
+
+#[test]
+fn a_later_stamp_still_advances_the_clock_in_both_dialects() {
+    // R4.3 — max must not freeze forward progress, by as little as one millisecond.
+    let claude = fold(concat!(
+        r#"{"type":"assistant","timestamp":"2026-09-28T02:29:38.020Z","message":{"id":"a"}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2026-09-28T02:29:38.021Z","message":{"id":"b"}}"#,
+    ));
+    assert_eq!(claude.last_event_ms, Some(REMOVE_MS + 1));
+
+    let ag = ag_fold(&format!(
+        "{}\n{}",
+        ag_step(5, "USER_INPUT", ""),
+        ag_step(6, "USER_INPUT", "")
+    ));
+    assert_eq!(ag.last_event_ms, Some(AG_T0 + 6 * 60_000));
+}
+
+#[test]
+fn the_first_event_stays_first_line_wins() {
+    // R4.4 — pinned so the non-goal cannot drift in quietly. A resumed log replays
+    // history stamped before its first line; which of the two is "the start" has no
+    // single right answer, and this spec does not choose one (G2).
+    let s = fold(concat!(
+        r#"{"type":"assistant","timestamp":"2026-09-28T02:29:38.020Z","message":{"id":"a"}}"#,
+        "\n",
+        r#"{"type":"user","timestamp":"2026-09-28T02:28:38.020Z","message":{"content":"replayed"}}"#,
+    ));
+    assert_eq!(s.first_event_ms, Some(REMOVE_MS));
+    assert_eq!(s.last_event_ms, Some(REMOVE_MS));
+}
+
+// ---- ai-monitor-absorbed-notifications R0/R4/R5: the 903790a2 fixture ----------
+//
+// A SEPARATE fixture, for the reason `context_command.jsonl` is one: `session.jsonl` is
+// asserted whole. This one is excerpted from the session where every background agent
+// stayed LIVE — its records' order, ids and timestamps are the real ones; only prose
+// is trimmed.
+
+const ABSORBED: &str = include_str!("fixtures/absorbed_notifications.jsonl");
+
+/// The nine agents the session launched, and the `timestamp` of the `queued_command`
+/// attachment that notified each — the `end_ms` each must read.
+const NINE: [(&str, u64); 9] = [
+    ("afd416a8f7546697f", 1_790_482_508_124), // 2026-09-27T04:15:08.124Z
+    ("a247b7427fa150b0d", 1_790_482_821_050), // 2026-09-27T04:20:21.050Z
+    ("adfbed2bb27982ba3", 1_790_482_929_879), // 2026-09-27T04:22:09.879Z
+    ("a9a2ad3f29d169432", 1_790_523_771_182), // 2026-09-27T15:42:51.182Z
+    ("a365b66b6c3ae93e3", 1_790_526_113_575), // 2026-09-27T16:21:53.575Z
+    ("a3428c6053180c66b", 1_790_527_058_556), // 2026-09-27T16:37:38.556Z
+    ("a532c4219ce60ec6d", 1_790_563_428_839), // 2026-09-28T02:43:48.839Z
+    ("ae2e7100cb930ae73", 1_790_577_716_392), // 2026-09-28T06:41:56.392Z
+    ("acbbc9c3f6509c951", 1_790_578_357_869), // 2026-09-28T06:52:37.869Z
+];
+
+fn agent<'a>(s: &'a TelemetrySnapshot, id: &str) -> &'a ai_monitor::telemetry::Subagent {
+    s.subagents
+        .iter()
+        .find(|a| a.agent_id.as_deref() == Some(id))
+        .unwrap_or_else(|| panic!("no entry for {id}: {:?}", s.subagents))
+}
+
+/// The index of the first fixture line `hit` accepts. Cuts are found by CONTENT, never by
+/// line number, so re-trimming the fixture cannot silently move one.
+fn line_where(hit: impl Fn(&str) -> bool) -> usize {
+    ABSORBED
+        .lines()
+        .position(hit)
+        .expect("the fixture holds that line")
+}
+
+/// The fixture folded up to and including the first line `hit` accepts.
+fn fold_through(hit: impl Fn(&str) -> bool) -> TelemetrySnapshot {
+    let end = line_where(hit);
+    fold(
+        &ABSORBED
+            .lines()
+            .take(end + 1)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// The attachment that notified `task_id`.
+fn is_attachment_for(task_id: &str) -> impl Fn(&str) -> bool + '_ {
+    move |l| l.contains(r#""type":"queued_command""#) && l.contains(task_id)
+}
+
+#[test]
+fn the_reported_session_folds_to_nine_finished_agents() {
+    // R0.1 / R0.2 — the goal, on the session it was reported from. Before this carrier
+    // was read, all nine read `completed: false` for good.
+    let s = fold(ABSORBED);
+    assert_eq!(s.subagents.len(), 9, "{:?}", s.subagents);
+    for (id, end) in NINE {
+        let a = agent(&s, id);
+        assert!(a.completed, "{id} is finished");
+        assert_eq!(a.end_ms, Some(end), "{id} ends at its attachment's stamp");
+        assert!(a.ended_ok, "{id} said <status>completed</status>");
+    }
+}
+
+#[test]
+fn only_the_attachments_end_the_fixture_agents() {
+    // R0.3 — the fixture is not vacuous: strip the `queued_command` lines and every
+    // agent is back to the LIVE state the real log produced before the fix.
+    let without: Vec<_> = ABSORBED
+        .lines()
+        .filter(|l| !l.contains(r#""type":"queued_command""#))
+        .collect();
+    let s = fold(&without.join("\n"));
+    assert_eq!(s.subagents.len(), 9);
+    for (id, _) in NINE {
+        let a = agent(&s, id);
+        assert!(!a.completed, "{id} has nothing else to end it");
+        assert_eq!(a.end_ms, None, "{id}");
+    }
+}
+
+#[test]
+fn the_fixture_records_that_quote_the_tag_are_inert() {
+    // R1.12 — a `hook_success` quoting the tag in `stdout`, and a `prompt_snapshot`
+    // quoting it in a tool description: real records that mention a notification
+    // without delivering one.
+    let quoting = |l: &&str| l.contains(r#""hook_success""#) || l.contains(r#""prompt_snapshot""#);
+    let quotes = ABSORBED.lines().filter(quoting).collect::<Vec<_>>();
+    assert!(
+        quotes.iter().any(|l| l.contains("<task-notification>")),
+        "the fixture really does hold quoting records"
+    );
+    let with = fold(ABSORBED);
+    let without = fold(
+        &ABSORBED
+            .lines()
+            .filter(|l| !quoting(l))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    assert_eq!(with.subagents, without.subagents);
+    assert_eq!(with.skills, without.skills);
+}
+
+#[test]
+fn the_clock_holds_across_the_nine_hour_late_attachment() {
+    // R4.5 — `bw40b21kz`'s attachment is stamped 17:02:08.163 but written after a
+    // `remove` at 02:29:38.020 the next day. Last-wins put the session 9.5 hours in the
+    // past here.
+    let s = fold_through(is_attachment_for("bw40b21kz"));
+    assert_eq!(s.last_event_ms, Some(REMOVE_MS));
+}
+
+#[test]
+fn the_clock_holds_across_the_late_written_assistant_lines() {
+    // R4.6 — an `assistant` message stamped at its stream start (16:38) but written
+    // after an `enqueue` at 17:02:08.164. Last-wins held the clock 23 minutes back for
+    // as long as the session then waited. `toolu_01Wv…` is the last of those lines.
+    let s = fold_through(|l| l.contains("toolu_01WvPdotWzSCSwspFkHsJK2J"));
+    assert_eq!(s.last_event_ms, Some(1_790_528_528_164));
+}
+
+#[test]
+fn one_late_line_ends_an_agent_in_the_past_and_leaves_the_clock_alone() {
+    // R4.7 — D6 on a real card. `a532…`'s attachment follows its own `remove`
+    // (02:44:10.891) but carries the arrival stamp (02:43:48.839). The same `ts` is the
+    // agent's end and is ignored by the clock.
+    let s = fold_through(is_attachment_for("a532c4219ce60ec6d"));
+    assert_eq!(
+        agent(&s, "a532c4219ce60ec6d").end_ms,
+        Some(1_790_563_428_839)
+    );
+    assert_eq!(s.last_event_ms, Some(1_790_563_450_891));
+}
+
+#[test]
+fn the_absorbed_fixture_parses_cleanly() {
+    // R5.1
+    assert_eq!(fold(ABSORBED).parse_errors, 0);
+}
+
+#[test]
+fn the_absorbed_fixture_holds_the_sequences_the_clock_tests_cut() {
+    // R5.2 — R4.5-R4.7 are only meaningful if these lines are present and in this
+    // order. Checked here so a re-trim that loses one fails loudly rather than letting
+    // a prefix fold pass by accident.
+    let enqueue = line_where(|l| {
+        l.contains(r#""operation":"enqueue""#) && l.contains("2026-09-27T17:02:08.164Z")
+    });
+    let late: Vec<_> = ABSORBED
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| {
+            l.contains(r#""type":"assistant""#) && l.contains(r#""timestamp":"2026-09-27T16:38"#)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let bw = line_where(is_attachment_for("bw40b21kz"));
+    assert_eq!(late.len(), 3, "three late-written assistant lines");
+    assert!(
+        late.iter().all(|&i| enqueue < i && i < bw),
+        "{enqueue} < {late:?} < {bw}"
+    );
+
+    let remove =
+        line_where(|l| l.contains(r#""operation":"remove""#) && l.contains("a532c4219ce60ec6d"));
+    assert_eq!(
+        remove + 1,
+        line_where(is_attachment_for("a532c4219ce60ec6d")),
+        "the remove immediately precedes the attachment it removed"
+    );
+}
+
 // ---- R8 robustness -----------------------------------------------------------
 
 #[test]

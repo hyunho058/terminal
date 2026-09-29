@@ -256,6 +256,24 @@ is in a function this spec touches** (`apply_claude`, `apply_antigravity`,
 tests, and narrowing can only *add* survivors, so 43 is an upper bound for the file and the
 check is conservative for "zero survivors in touched code".
 
+### Mutation result (2026-09-28, after the change — T6)
+- **R6.1, diff-scoped:** `--in-diff` over `git diff main -- crates/ai-monitor/src/telemetry.rs`
+  (same narrowing) → **7 mutants: 7 caught, 0 missed** (2 min). They are `observe_ts`→`()`,
+  `apply_claude`→`()`, deleting the `"attachment"` arm, deleting the bare-string arm,
+  `apply_antigravity`→`()`, `on_attachment`→`()`, and `!=`→`==` in `on_attachment`'s type gate.
+- **R6.2, whole file:** the baseline command → **395 mutants: 43 missed, 340 caught, 8
+  unviable, 4 timeouts** (58 min). 43 ≤ 43. The survivor set is **identical** to the
+  baseline's once line numbers are stripped, so this change added none and removed none.
+  The four extra mutants are all caught; they are the new code's.
+- Besides mutation, every new guard was **falsified by hand** and restored in the same
+  command:
+  - deleting the attachment arm turned 8 tests red;
+  - disabling the type gate turned R1.3 red;
+  - reverting `observe_ts` to last-wins turned R4.1, R4.2, R4.4, R4.5, R4.6 and R4.7 red.
+  - R2.2 was first written with the bare-string notification last, and stayed green with the
+    arm deleted. It was reordered so the attachment is the later notification, and now
+    fails without it.
+
 ## Decisions
 
 **Complexity: Simple (1 signal — the external log's record semantics).** The two halves of the
