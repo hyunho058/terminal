@@ -349,7 +349,11 @@ pub struct TelemetrySnapshot {
     /// mid-session, so the newest reading is the true one.
     pub context_window_reading: Option<ContextWindowReading>,
     // time (D3) — the app derives uptime/idle from these
+    /// The timestamp of the first line that carried one (first-wins).
     pub first_event_ms: Option<u64>,
+    /// The LATEST timestamp any line carried, not the last line's: a line stamped earlier
+    /// than this never lowers it. Lines are written out of timestamp order, so
+    /// last-wins used to drag the session into the past (see `observe_ts`).
     pub last_event_ms: Option<u64>,
     // activity, newest-first
     pub tools: Vec<CompletedTool>,
@@ -487,7 +491,10 @@ pub struct SessionTelemetry {
     /// `restarted()`: a file that shrank is most likely a different session, and a
     /// window read from the old one would outlive its evidence.
     context_window_reading: Option<ContextWindowReading>,
+    /// First-wins; written only by `observe_ts`.
     first_event_ms: Option<u64>,
+    /// The latest timestamp seen, never lowered by an earlier-stamped line; written only
+    /// by `observe_ts`.
     last_event_ms: Option<u64>,
 
     tools: VecDeque<CompletedTool>,
@@ -596,6 +603,30 @@ impl SessionTelemetry {
         }
     }
 
+    /// Fold one parseable timestamp into the session clock, for both dialects
+    /// (ai-monitor-absorbed-notifications D5).
+    ///
+    /// `last_event_ms` is the LATEST timestamp seen, not the last one folded. Lines are
+    /// not written in timestamp order: an absorbed task-notification is appended hours
+    /// after the stamp it carries, an `assistant` message is stamped when its stream
+    /// began, and Antigravity writes a `PLANNER_RESPONSE` after the tool steps it
+    /// dispatched. Under last-wins each of those dragged the clock into the past, and
+    /// with it the pill, the IDLE tile and the footer. Every large regression measured
+    /// had a genuine event as the value it undid, and both resolvers
+    /// (`last_event_in_tail`, `last_step_in_tail`) already took the max.
+    ///
+    /// The price, accepted by name: a line stamped in the FUTURE now holds the clock
+    /// until real activity passes it, where last-wins would have self-corrected on the
+    /// next line. The fold reads no clock, so it cannot tell "stamped ahead" from "just
+    /// happened" and cannot bound this; a bound would belong to the app (spec G1).
+    ///
+    /// `first_event_ms` stays first-wins: moving it to the minimum is a separate
+    /// question with no single right answer for a resumed log (spec G2).
+    fn observe_ts(&mut self, t: u64) {
+        self.first_event_ms.get_or_insert(t);
+        self.last_event_ms = self.last_event_ms.max(Some(t));
+    }
+
     // ---- Claude Code (D1-D12) -------------------------------------------------
 
     fn apply_claude(&mut self, v: &Value) {
@@ -606,8 +637,7 @@ impl SessionTelemetry {
             .and_then(Value::as_str)
             .and_then(parse_ts);
         if let Some(t) = ts {
-            self.first_event_ms.get_or_insert(t);
-            self.last_event_ms = Some(t);
+            self.observe_ts(t);
         }
 
         if self.session_id.is_none() {
@@ -659,6 +689,18 @@ impl SessionTelemetry {
             // on 2026-09-12. A count written here as bare present tense is wrong within a
             // day — the spec makes the same point about its own tables.
             Some("system") => self.on_system(v),
+            // The second carrier of a task-notification: one that arrives mid-turn is
+            // absorbed into the running turn and written as a `queued_command`
+            // attachment, never as a bare-string `user` record. Dispatched here on the
+            // record's `type`, like `system` above, because an attachment has no
+            // `message` for the content match below to reach.
+            //
+            // `ts` is the record's own timestamp, not the clock. The attachment is
+            // appended when the turn absorbs it (hours later, at the extreme) but keeps
+            // the stamp of the notification's arrival, so it is the agent's real end
+            // even though it is older than the line before it (ai-monitor-absorbed-
+            // notifications D3/D6).
+            Some("attachment") => self.on_attachment(v, ts),
             _ => {}
         }
         match v.pointer("/message/content") {
@@ -679,8 +721,10 @@ impl SessionTelemetry {
             // Both content forms occur in the wild; the TS reference checks only
             // this one and would miss the array form above.
             Some(Value::String(s)) => {
-                // A task-notification lands here, as a bare string, and is the ONLY
-                // signal a background agent ever ends by. It gets its own branch and
+                // A task-notification delivered between turns lands here, as a bare
+                // string. It is one of the two signals a background agent ends by; the
+                // other is the `queued_command` attachment a notification becomes when
+                // it arrives mid-turn (`on_attachment`). It gets its own branch and
                 // stops: routing it on to `scan_command_name` would let a command
                 // wrapper quoted in its free-text body register a phantom skill.
                 //
@@ -741,8 +785,7 @@ impl SessionTelemetry {
             .and_then(Value::as_str)
             .and_then(parse_ts);
         if let Some(t) = ts {
-            self.first_event_ms.get_or_insert(t);
-            self.last_event_ms = Some(t);
+            self.observe_ts(t);
         }
 
         let content = v.get("content").and_then(Value::as_str);
@@ -1429,6 +1472,36 @@ impl SessionTelemetry {
                 },
                 TOOLS_CAP,
             ),
+        }
+    }
+
+    /// Read a `queued_command` attachment as a task-notification
+    /// (ai-monitor-absorbed-notifications D1/D2).
+    ///
+    /// Gated on `attachment.type` and on nothing else the record says about itself.
+    /// `commandMode` is deliberately NOT read: every observed value is
+    /// `task-notification`, so it discriminates nothing today, and a rename upstream
+    /// would silently bring back the permanent LIVE ghosts this path exists to end.
+    /// A silent format shift is how those ghosts arose in the first place.
+    ///
+    /// `rendered` / `renderedInHumanTurn` are never read. They carry the same block, but
+    /// wrapped inside a `<system-reminder>`, so they would only ever fail the starts-with
+    /// gate; `hook_success` and `prompt_snapshot` records quote the tag the same way.
+    ///
+    /// No outer starts-with test, unlike the bare-string arm. That arm needs one only to
+    /// return before `scan_command_name` when the parse fails; nothing here falls through
+    /// to prose, so `parse_task_notification`'s own gate is the whole check, and a
+    /// second copy could be deleted with no observable change.
+    fn on_attachment(&mut self, v: &Value, ts: Option<u64>) {
+        if v.pointer("/attachment/type").and_then(Value::as_str) != Some(QUEUED_COMMAND) {
+            return;
+        }
+        if let Some(n) = v
+            .pointer("/attachment/prompt")
+            .and_then(Value::as_str)
+            .and_then(parse_task_notification)
+        {
+            self.on_task_notification(&n, ts);
         }
     }
 
@@ -2254,6 +2327,10 @@ fn parse_task_created(s: &str) -> Option<(String, String)> {
 
 /// The opening tag of a background task's completion notification.
 const TASK_NOTIFICATION_TAG: &str = "<task-notification>";
+
+/// The `attachment.type` of a notification absorbed mid-turn. The only attachment kind
+/// that carries a `prompt` field at all (114/114 measured 2026-09-28).
+const QUEUED_COMMAND: &str = "queued_command";
 
 /// Read a bare-string `message.content` as a task-notification, or `None` (D12).
 ///

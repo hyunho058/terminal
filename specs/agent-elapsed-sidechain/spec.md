@@ -487,6 +487,10 @@ survived a full review cycle:
   population, mostly duplicates of notifications already handled, so widening needs its own
   measurement of double-completion and timestamp disagreement. Recorded as a follow-up, not
   a defect of this change.
+- **Taken up 2026-09-28** by `specs/ai-monitor-absorbed-notifications/spec.md`, which made
+  that measurement (zero notifications carried twice; attachment stamps within 2 ms of their
+  `enqueue`) and now reads the `queued_command` attachment carrier. The `queue-operation`
+  carrier stays unread.
 
 ### D10: `on_tool_result` takes the top-level line as a distinct parameter
 - **Status**: assumed
@@ -605,7 +609,9 @@ survived a full review cycle:
   ghosts had a notification in `attachment` and `queue-operation` records, 0 had none. So
   this gap is *recoverable* by widening the carrier set, not inherent to the data — see D9's
   correction for why that widening is a follow-up with its own measurement rather than a
-  line-change here.
+  line-change here. **2026-09-28:** closed for the attachment carrier by
+  `specs/ai-monitor-absorbed-notifications/spec.md`; an agent notified mid-turn now ends at
+  its attachment's timestamp.
 - **A sync agent's card can jump long after it finished** (D11 sub-decision) — a background
   resume notifying hours later rewrites its elapsed from e.g. `4s ◯` to `2h13m ◯`.
   Intended, and the mechanism behind D4's 30-agent coverage gain, but surprising in the UI
