@@ -269,3 +269,70 @@ fn shell_output_reaches_actual_pixels() {
          something other than drawn content"
     );
 }
+
+/// selection-scroll-anchor R5.8: `Session::drain` settles the selection once after its
+/// chunk loop, so shell output that repaints a selected row clears the selection without
+/// the caller settling anything itself.
+///
+/// The selection is made on a blank row well below the prompt, *after* the command line
+/// has been echoed, and a drain with nothing new must keep it. The command then moves
+/// the cursor onto that row and prints there. So the clear can only have come from the
+/// command's output, through `drain`. As in the test above, the marker is assembled
+/// from a variable so the echo cannot contain it.
+///
+/// Falsified: with the `settle_selection` call removed from `drain`, the final
+/// assertion fails.
+#[test]
+fn draining_output_that_repaints_a_selected_row_clears_the_selection() {
+    let Some(mut session) = live_session() else {
+        return;
+    };
+    // 0-based row 12 is the `13` in the CUP below, far from the prompt on row 0 or 1.
+    const ROW: u16 = 12;
+    const MARKER: &str = "OVERWRITE";
+
+    type_text(&mut session, "m=OVER; printf '\\033[13;1H%sWRITE' \"$m\"");
+    let text = grid_until(&mut session, "%sWRITE");
+    assert!(
+        text.contains("%sWRITE"),
+        "the command line was never echoed within {SHELL_TIMEOUT:?}. Grid was:\n{text}"
+    );
+
+    let t = &mut session.terminal;
+    let row: String = t
+        .snapshot()
+        .to_text()
+        .lines()
+        .nth(usize::from(ROW))
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        row.trim().is_empty(),
+        "precondition: row {ROW} is blank before the command runs, read {row:?}"
+    );
+    let (anchor, focus) = (t.point_at(0, ROW), t.point_at(8, ROW));
+    t.set_selection(anchor, focus);
+
+    // A drain that brings nothing new settles too, and must keep a selection whose
+    // text has not changed.
+    session.drain();
+    assert!(
+        session.terminal.selection().is_some(),
+        "a settle over unchanged text cleared the selection"
+    );
+
+    press_enter(&mut session);
+    let text = grid_until(&mut session, MARKER);
+    assert!(
+        text.contains(MARKER),
+        "the command's output never reached the grid within {SHELL_TIMEOUT:?}. \
+         Grid was:\n{text}"
+    );
+    assert_eq!(
+        session.terminal.selection(),
+        None,
+        "output repainted the selected row and `drain` returned, but the selection \
+         is still set: `Session::drain` did not settle it. Grid was:\n{text}"
+    );
+    assert_eq!(session.terminal.selection_text(), None);
+}

@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use term_core::{Color, CommandEnd, Pty, Terminal};
 
@@ -160,6 +161,11 @@ impl Session {
             self.terminal.advance(&bytes);
             got = true;
         }
+        // Once per drain, never per chunk (selection-scroll-anchor D5): a frame larger than
+        // one 1024-byte PTY read arrives in pieces, and a check between them would clear a
+        // selection over text the frame was only half-way through repainting. The terminal
+        // owns the rule; the clock is read here because `term-core` keeps none.
+        self.terminal.settle_selection(Instant::now());
         // After advancing, pull any OSC 133 command-end the shell emitted on this
         // session's PTY. Keeps a still-unconsumed event if none is newer, so a
         // slow waiting-model poll (T3) can't miss one (spec R4.6).
