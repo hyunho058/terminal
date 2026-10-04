@@ -48,6 +48,7 @@ pub(crate) mod card_menu;
 pub(crate) mod clipboard;
 pub(crate) mod copy;
 pub(crate) mod dashboard;
+pub(crate) mod drag;
 pub(crate) mod hyperlink;
 pub(crate) mod input;
 pub(crate) mod overlay;
