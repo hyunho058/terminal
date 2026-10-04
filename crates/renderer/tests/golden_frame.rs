@@ -774,3 +774,250 @@ fn a_no_status_card_carries_no_status_ink() {
 fn a_no_status_card_carries_no_status_ink_on_a_retina_screen() {
     a_no_status_card_carries_no_status_ink_at(2.0);
 }
+
+// ---------------------------------------------------------------------------
+// The selection tint follows its text (selection-scroll-anchor T5, D8)
+// ---------------------------------------------------------------------------
+//
+// `selection_layer.rs`'s unit tests map a hand-built snapshot to rects, so they
+// cannot see where `GridSnapshot::from_grid` *put* the selection: a projection that
+// left the highlight on the old screen row, or dropped it while scrolled back, keeps
+// every one of them green. These read the frame instead, through `Renderer::capture`
+// with the real `SelectionLayer` registered, after the content under the selection
+// has moved.
+
+use renderer::selection_layer::SelectionLayer;
+use std::collections::HashMap;
+use std::ops::RangeInclusive;
+
+/// The columns of the selected word. Every row of the fixture reads
+/// `NN alpha alpha`, so this is the first `alpha`.
+const SELECTED: RangeInclusive<u16> = 3..=7;
+
+/// The first column of the row's second `alpha` — an unselected cell holding the
+/// **same character** as the first selected cell, on every row of the fixture.
+const TWIN: u16 = 9;
+
+/// Line `i` of the fixture: a two-digit label, then the same word twice.
+///
+/// The label makes each row's text distinct, so the fixture can check that the
+/// text it selected really moved (a precondition, not the assertion under test);
+/// the word twice gives every row an unselected reference identical to the
+/// selected one.
+fn selection_line(i: u16) -> String {
+    format!("{:02} alpha alpha", i % 100)
+}
+
+/// The dominant colour of one cell: its most common pixel value.
+///
+/// This is how the tests below measure the **tint and not the glyph**. A cell's
+/// background — tinted or not — is one exact value over every pixel the glyph
+/// leaves alone, while the glyph's own pixels are antialiased across many distinct
+/// values and cover a minority of the cell. So the mode is the cell's background,
+/// whatever the font: a substitution (Menlo for SF Mono), a different weight or an
+/// OS antialiasing change moves the glyph's pixels, not the mode. Comparing whole
+/// cells pixel for pixel would not have that property, and sampling one fixed pixel
+/// (a corner) bets on where some font's descender or overhang is not.
+fn cell_mode(frame: &CapturedFrame, geo: &CellGeometry, col: u16, row: u16) -> [u8; 4] {
+    let (x0, y0, x1, y1) = geo.cell_rect(col, row, frame);
+    let mut counts: HashMap<[u8; 4], u32> = HashMap::new();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            *counts.entry(frame.pixel(x, y)).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|&(_, n)| n)
+        .map(|(px, _)| px)
+        .expect("a cell inside the frame has pixels")
+}
+
+/// Every grid cell whose dominant colour differs from an unselected cell **of the
+/// same row** — the row's [`TWIN`] — by more than the ink threshold.
+///
+/// Every row is compared against its own reference, as D8 asks, so nothing here
+/// assumes what colour the tint or the theme is. The reference could itself be lit
+/// by a defect that tints whole rows, which would make that row read as untinted
+/// against itself; so each reference is also required to read as the frame's
+/// background, and a row whose reference does not is a failure, never a pass.
+///
+/// The whole grid is scanned, not just the two rows the requirement names: a tint
+/// that landed on the right row *and* on another one is as wrong as a missing one.
+fn tinted_cells(frame: &CapturedFrame, geo: &CellGeometry, moment: &str) -> Vec<(u16, u16)> {
+    let bg = frame.modal_pixel();
+    let mut tinted = Vec::new();
+    for row in 0..geo.rows() {
+        let reference = cell_mode(frame, geo, TWIN, row);
+        assert!(
+            !is_ink(reference, bg),
+            "{moment}: the unselected reference cell ({TWIN},{row}) reads {reference:?}, \
+             not the background {bg:?} — row {row} is lit where nothing is selected"
+        );
+        for col in 0..geo.cols() {
+            if is_ink(cell_mode(frame, geo, col, row), reference) {
+                tinted.push((col, row));
+            }
+        }
+    }
+    tinted
+}
+
+/// The tint covers exactly the selected word on `row`, and no cell anywhere else.
+///
+/// `moved_from` is the row the text left, named in the failure because "the tint
+/// stayed where the text was" is the defect this feature exists to fix. The count
+/// is asserted on its own first so that a frame where nothing at all was compared
+/// — no tint found anywhere — reads as a failure that says so, not as a pass.
+fn assert_tint_on(found: &[(u16, u16)], row: u16, moved_from: Option<u16>, moment: &str) {
+    let width = SELECTED.count();
+    let on_row: Vec<u16> = found
+        .iter()
+        .filter(|&&(_, r)| r == row)
+        .map(|&(c, _)| c)
+        .collect();
+    let elsewhere: Vec<(u16, u16)> = found.iter().copied().filter(|&(_, r)| r != row).collect();
+    let mut stray_rows: Vec<u16> = elsewhere.iter().map(|&(_, r)| r).collect();
+    stray_rows.dedup();
+
+    if let Some(from) = moved_from {
+        let stale: Vec<u16> = elsewhere
+            .iter()
+            .filter(|&&(_, r)| r == from)
+            .map(|&(c, _)| c)
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "{moment}: row {from}, where the selected text WAS, still carries the tint at \
+             cols {stale:?}; the text is now on row {row}, which has it at cols {on_row:?}"
+        );
+    }
+    assert_eq!(
+        on_row.len(),
+        width,
+        "{moment}: {} tinted cells on row {row}, where the selected text is; the selection \
+         is {width} cells wide. Cols tinted there: {on_row:?}; tint elsewhere on rows \
+         {stray_rows:?}",
+        on_row.len()
+    );
+    assert_eq!(
+        on_row,
+        SELECTED.collect::<Vec<_>>(),
+        "{moment}: the tint on row {row} is on the wrong columns"
+    );
+    assert!(
+        elsewhere.is_empty(),
+        "{moment}: the tint also reached rows {stray_rows:?}, where nothing is selected: \
+         {elsewhere:?}"
+    );
+}
+
+/// A renderer with [`SelectionLayer`] registered, and a terminal at its grid size
+/// whose every row is full, with `alpha` on viewport row 2 selected through the
+/// content API exactly as the app's drag does (`point_at` at the moment the cell is
+/// learned, then `set_selection`). `None` only when GPU tests are opted out of.
+fn selected_on_row_2() -> Option<(Renderer, Terminal)> {
+    let cfg = Config::default();
+    let mut r = headless(&cfg)?;
+    r.add_layer(Box::new(SelectionLayer::new()));
+    let (cols, rows) = r.grid_size();
+    // D8's "rows ≥ 4": row 2 must exist, and so must a row below it to scroll up.
+    assert!(
+        rows >= 4 && cols > TWIN + 5,
+        "the {FRAME_W}x{FRAME_H} frame yields a {cols}x{rows} grid, too small for the fixture"
+    );
+    let mut t = Terminal::new(
+        cols,
+        rows,
+        Color(cfg.theme.foreground),
+        Color(cfg.theme.background),
+    );
+    // `rows` lines and `rows - 1` line breaks: every row is filled and nothing has
+    // scrolled yet, so the next line break moves the whole screen up by one.
+    let screen: Vec<String> = (0..rows).map(selection_line).collect();
+    t.advance(screen.join("\r\n").as_bytes());
+    assert_eq!(t.history_len(), 0, "the fixture fills the screen exactly");
+
+    let (first, last) = (*SELECTED.start(), *SELECTED.end());
+    let (anchor, focus) = (t.point_at(first, 2), t.point_at(last, 2));
+    t.set_selection(anchor, focus);
+    Some((r, t))
+}
+
+/// The fixture's own check that the text moved as the test claims: `line` is on
+/// viewport `row`. A precondition — it reads the snapshot's cells, never its
+/// `selection`, which is what the pixels are asserting.
+fn assert_text_on_row(snap: &GridSnapshot, row: u16, line: u16) {
+    let text = snap.to_text();
+    assert_eq!(
+        text.lines().nth(usize::from(row)),
+        Some(selection_line(line).as_str()),
+        "fixture: line {line:02} should be on viewport row {row}"
+    );
+}
+
+/// R8.1 — one line of output scrolls the full screen by one, and the tint goes with
+/// its text from row 2 to row 1.
+///
+/// Captured once **before** the output as well: that frame shows the measurement
+/// finds the tint on row 2 at all, so the second frame's "row 1, not row 2" is a
+/// move and not a highlight that was never where the test thinks it started.
+#[test]
+fn output_moves_the_selection_tint_with_its_text() {
+    let Some((mut r, mut t)) = selected_on_row_2() else {
+        return;
+    };
+    let geo = CellGeometry::of(&r);
+
+    let before = t.snapshot();
+    assert_text_on_row(&before, 2, 2);
+    let frame = r.capture(&before).expect("read the rendered frame back");
+    assert_tint_on(
+        &tinted_cells(&frame, &geo, "before output"),
+        2,
+        None,
+        "before output",
+    );
+
+    let (_, rows) = r.grid_size();
+    t.advance(format!("\r\n{}", selection_line(rows)).as_bytes());
+    assert_eq!(
+        t.history_len(),
+        1,
+        "fixture: one line scrolled into history"
+    );
+    let after = t.snapshot();
+    assert_text_on_row(&after, 1, 2);
+    let frame = r.capture(&after).expect("read the rendered frame back");
+    assert_tint_on(
+        &tinted_cells(&frame, &geo, "after one line of output"),
+        1,
+        Some(2),
+        "after one line of output",
+    );
+}
+
+/// R8.2 — from R8.1's state, scrolling the viewport back one line puts the text on
+/// row 2 again, and the tint with it. This is the frame the old "live bottom only"
+/// projection (selection-model D9) drew with no highlight at all.
+#[test]
+fn scrolling_back_moves_the_selection_tint_back() {
+    let Some((mut r, mut t)) = selected_on_row_2() else {
+        return;
+    };
+    let geo = CellGeometry::of(&r);
+    let (_, rows) = r.grid_size();
+    t.advance(format!("\r\n{}", selection_line(rows)).as_bytes());
+
+    t.scroll_up(1);
+    assert_eq!(t.view_offset(), 1, "fixture: scrolled back one line");
+    let snap = t.snapshot();
+    assert_text_on_row(&snap, 2, 2);
+    let frame = r.capture(&snap).expect("read the rendered frame back");
+    assert_tint_on(
+        &tinted_cells(&frame, &geo, "scrolled back one line"),
+        2,
+        Some(1),
+        "scrolled back one line",
+    );
+}
