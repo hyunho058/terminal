@@ -283,7 +283,9 @@ mod tests {
         if !feed.is_empty() {
             t.advance(feed);
         }
-        t.set_selection(sel);
+        let anchor = t.point_at(sel.anchor.0, sel.anchor.1);
+        let focus = t.point_at(sel.focus.0, sel.focus.1);
+        t.set_selection(anchor, focus);
         t.snapshot()
     }
 

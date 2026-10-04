@@ -6,7 +6,7 @@
 
 use crate::grid::{Cell, Color, Cursor, Grid};
 use crate::image::Placement;
-use crate::selection::Selection;
+use crate::selection::{Point, Selection};
 
 /// An immutable, cheaply-clonable view of the visible grid at one instant.
 #[derive(Clone, Debug, PartialEq)]
@@ -26,10 +26,17 @@ pub struct GridSnapshot {
     /// Populated only at the live bottom; empty while scrolled into history (a
     /// first cut — images render in the live view).
     pub images: Vec<Placement>,
-    /// The live drag selection (viewport cell range), or `None`. Populated only at
-    /// the live bottom (`view_offset == 0`) — like `images`, a selection is not
-    /// shown while scrolled into history. The renderer reads this to highlight;
-    /// [`selection_text`](GridSnapshot::selection_text) extracts its text.
+    /// The drag selection as **viewport** cells, or `None` when no part of it is on
+    /// screen. The renderer reads this to highlight.
+    ///
+    /// The grid stores the selection as content points; this is their projection
+    /// into the current viewport, made at **every** `view_offset`
+    /// (selection-scroll-anchor D2, which reverses selection-model D9's "live bottom
+    /// only"): the highlight moves with its text and stays visible in scrollback.
+    /// The part above or below the viewport is clipped, so the span here is exactly
+    /// the visible part of the selection. Its text is read from the grid, not from
+    /// here — [`crate::Terminal::selection_text`] — because the visible snapshot
+    /// cannot return a selection that has partly scrolled off-screen.
     pub selection: Option<Selection>,
 }
 
@@ -66,9 +73,12 @@ impl GridSnapshot {
             Vec::new()
         };
 
-        // A selection is a live-viewport concept: shown only at the live bottom,
-        // absent while scrolled into history (D9 — same policy as images).
-        let selection = if offset == 0 { grid.selection() } else { None };
+        // The stored content span, projected into this viewport at every offset
+        // (selection-scroll-anchor D2) — unlike images, which stay live-only.
+        let selection = grid.selection().and_then(|sel| {
+            let (start, end) = sel.normalized();
+            project_selection(start, end, grid.top_line(), cols, rows)
+        });
 
         GridSnapshot {
             cols,
@@ -121,70 +131,214 @@ impl GridSnapshot {
         self.cell(col, row).map(Cell::is_blank).unwrap_or(true)
     }
 
-    /// Extract the selected cell range as text (`None` when there is no selection).
-    ///
-    /// Walks the linear span (start row from `start.col`; interior rows full-width;
-    /// end row up to `end.col`), skipping double-width continuation cells and
-    /// `trim_end`-ing each row segment — the same shape as [`to_text`]. Rows are
-    /// joined with `\n`, **except** a soft-wrapped row joins the next with no
-    /// separator: a row is treated as soft-wrapped iff its last column (`cols-1`)
-    /// holds a non-blank, non-continuation cell (the D8 heuristic; its known
-    /// limitations — a full-width hard line, and a CJK margin-wrap that leaves the
-    /// last column blank — are accepted). Never panics on inverted/edge coords.
-    ///
-    /// [`to_text`]: GridSnapshot::to_text
-    pub fn selection_text(&self) -> Option<String> {
-        let sel = self.selection?;
-        if self.cols == 0 || self.rows == 0 {
-            return Some(String::new());
-        }
-        let (start, end) = sel.normalized(); // ((col, row), (col, row))
-        let last_row = self.rows - 1;
-        let last_col = self.cols - 1;
-        let s_row = start.1.min(last_row);
-        let e_row = end.1.min(last_row);
-
-        let mut out = String::new();
-        for row in s_row..=e_row {
-            let first = if row == s_row { start.0 } else { 0 }.min(last_col);
-            let last = if row == e_row { end.0 } else { last_col }.min(last_col);
-            // `first > last` only when out-of-range rows collapse onto one grid row
-            // (column ordering, valid per-row, no longer holds) — `first..=last` is
-            // then an empty range; guard the capacity math against underflow (R3.6).
-            let mut line = String::with_capacity((last.saturating_sub(first) + 1) as usize);
-            for col in first..=last {
-                match self.cell(col, row) {
-                    // The wide leader already carries the glyph — drop its spacer.
-                    Some(c) if c.is_continuation() => {}
-                    Some(c) => line.push(c.ch),
-                    None => line.push(' '),
-                }
-            }
-            out.push_str(line.trim_end());
-            // Join to the next selected row: newline unless this row soft-wraps.
-            if row < e_row && !self.row_soft_wraps(row) {
-                out.push('\n');
-            }
-        }
-        Some(out)
-    }
-
-    /// D8 soft-wrap heuristic: a row is treated as soft-wrapped into the next iff
-    /// its last column holds a non-blank, non-continuation cell.
+    /// D8 soft-wrap heuristic for one snapshot row — see [`soft_wraps`], which this
+    /// delegates to.
     ///
     /// `pub(crate)` so the sibling [`crate::links`] module can stitch a URL across
     /// a wrap using the **same** rule copy uses (hyperlinks D5) — one heuristic, not
-    /// two that could drift.
+    /// two that could drift. A row past the bottom has no cells and never wraps.
     pub(crate) fn row_soft_wraps(&self, row: u16) -> bool {
-        if self.cols == 0 {
-            return false;
-        }
-        match self.cell(self.cols - 1, row) {
-            Some(c) => !c.is_blank() && !c.is_continuation(),
-            None => false,
-        }
+        let cols = self.cols as usize;
+        let start = row as usize * cols;
+        let cells = self.cells.get(start..start + cols).unwrap_or(&[]);
+        soft_wraps(cells, self.cols)
     }
+}
+
+/// The D8 soft-wrap rule, over one row's cells read at width `cols`: the row is
+/// treated as soft-wrapped into the next iff its last column (`cols - 1`) holds a
+/// non-blank, non-continuation cell.
+///
+/// A free function over a row slice (selection-scroll-anchor D6) so the grid's
+/// extractor, which reads history rows that are not in any snapshot, and
+/// [`GridSnapshot::row_soft_wraps`], which hyperlinks use, apply **one** rule. A
+/// row shorter than `cols` (a history row captured narrower) has blank padding at
+/// the last column, so it does not wrap — matching what the snapshot shows. Known
+/// limitations, accepted by selection-model D8: a full-width hard line reads as
+/// wrapped, and a CJK margin-wrap that leaves the last column blank reads as hard.
+pub(crate) fn soft_wraps(row: &[Cell], cols: u16) -> bool {
+    let Some(last) = usize::from(cols).checked_sub(1) else {
+        return false;
+    };
+    row.get(last)
+        .is_some_and(|c| !c.is_blank() && !c.is_continuation())
+}
+
+/// Project a stored content span into a `cols × rows` viewport whose row 0 shows
+/// content line `top` (selection-scroll-anchor D2). `start <= end` in reading order.
+///
+/// Line `L` sits on viewport row `L - top`, computed **signed** so a line above or
+/// below the viewport cannot underflow. A start above the viewport clips to
+/// `(0, 0)` and an end below it clips to `(cols - 1, rows - 1)`, which keeps the
+/// linear-span rule: the clipped span is exactly the visible part of the stream.
+/// `None` iff the span ends above the viewport or starts below it; otherwise at
+/// least one cell is visible.
+pub(crate) fn project_selection(
+    start: Point,
+    end: Point,
+    top: u64,
+    cols: u16,
+    rows: u16,
+) -> Option<Selection> {
+    let last_row = i128::from(rows) - 1;
+    let start_row = i128::from(start.line) - i128::from(top);
+    let end_row = i128::from(end.line) - i128::from(top);
+    if end_row < 0 || start_row > last_row {
+        return None;
+    }
+    // Each `as u16` below is reached only for a row in `0..=last_row`, which fits
+    // because `rows` is a `u16`.
+    let anchor = if start_row < 0 {
+        (0, 0) // starts above the viewport
+    } else {
+        (start.col, start_row as u16)
+    };
+    let focus = if end_row > last_row {
+        (cols - 1, rows - 1) // ends below the viewport
+    } else {
+        (end.col, end_row as u16)
+    };
+    Some(Selection { anchor, focus })
 }
 
 /// Marker so downstream code can name the color type without reaching into `grid`.
 pub type SnapshotColor = Color;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grid::CellAttrs;
+
+    fn pt(line: u64, col: u16) -> Point {
+        Point { line, col }
+    }
+
+    fn sel(anchor: (u16, u16), focus: (u16, u16)) -> Option<Selection> {
+        Some(Selection { anchor, focus })
+    }
+
+    fn cell(ch: char) -> Cell {
+        Cell {
+            ch,
+            fg: Color(0),
+            bg: Color(0),
+            attrs: CellAttrs::NONE,
+        }
+    }
+
+    // --- project_selection (selection-scroll-anchor D2) ---
+
+    #[test]
+    fn a_span_inside_the_viewport_projects_unclipped() {
+        // D2 — line L sits on viewport row L - top, at its own column.
+        assert_eq!(
+            project_selection(pt(101, 2), pt(102, 7), 100, 10, 3),
+            sel((2, 1), (7, 2))
+        );
+        // Row 0 at a non-zero column is not mistaken for "above the viewport".
+        assert_eq!(
+            project_selection(pt(100, 3), pt(100, 5), 100, 10, 3),
+            sel((3, 0), (5, 0))
+        );
+    }
+
+    #[test]
+    fn a_start_above_clips_to_the_origin() {
+        // selection-scroll-anchor R2.4 — (top − 2, 5) .. (top + 1, 3) → (0,0)–(3,1).
+        assert_eq!(
+            project_selection(pt(98, 5), pt(101, 3), 100, 10, 3),
+            sel((0, 0), (3, 1))
+        );
+    }
+
+    #[test]
+    fn an_end_below_clips_to_the_last_cell() {
+        // selection-scroll-anchor R2.5 — start on row 1 col 4, end below row 2.
+        assert_eq!(
+            project_selection(pt(101, 4), pt(105, 0), 100, 10, 3),
+            sel((4, 1), (9, 2))
+        );
+        // Ending exactly on the last row is not clipped.
+        assert_eq!(
+            project_selection(pt(101, 4), pt(102, 6), 100, 10, 3),
+            sel((4, 1), (6, 2))
+        );
+    }
+
+    #[test]
+    fn a_span_wholly_outside_projects_to_none_and_an_edge_touch_does_not() {
+        // selection-scroll-anchor R2.6.
+        assert_eq!(project_selection(pt(90, 0), pt(99, 9), 100, 10, 3), None);
+        assert_eq!(project_selection(pt(103, 0), pt(110, 0), 100, 10, 3), None);
+        assert_eq!(
+            project_selection(pt(99, 4), pt(100, 0), 100, 10, 3),
+            sel((0, 0), (0, 0)),
+            "ending at (top, 0) is one visible cell"
+        );
+        assert_eq!(
+            project_selection(pt(102, 8), pt(102, 9), 100, 10, 3),
+            sel((8, 2), (9, 2)),
+            "starting on the last row is visible"
+        );
+    }
+
+    #[test]
+    fn projection_never_underflows_at_the_extremes() {
+        // D2 — the row arithmetic is signed: a line far above or below `top`, or a
+        // `top` near u64::MAX, must neither panic nor wrap into the viewport.
+        assert_eq!(project_selection(pt(0, 0), pt(1, 0), u64::MAX, 10, 3), None);
+        assert_eq!(
+            project_selection(pt(u64::MAX - 1, 0), pt(u64::MAX, 0), 0, 10, 3),
+            None
+        );
+        assert_eq!(
+            project_selection(pt(0, 4), pt(u64::MAX, 2), 5, 10, 3),
+            sel((0, 0), (9, 2)),
+            "covers the whole viewport from far above to far below"
+        );
+        // `top + rows - 1` would overflow in u64 here.
+        assert_eq!(
+            project_selection(pt(u64::MAX, 1), pt(u64::MAX, 3), u64::MAX - 1, 10, 3),
+            sel((1, 1), (3, 1))
+        );
+    }
+
+    // --- soft_wraps (the D8 rule as a free function, selection-scroll-anchor D6) ---
+
+    #[test]
+    fn soft_wraps_reads_the_last_column_at_the_given_width() {
+        let row: Vec<Cell> = "abcde".chars().map(cell).collect();
+        assert!(soft_wraps(&row, 5), "a filled last column wraps");
+        assert!(!soft_wraps(&row, 6), "past the row's end is blank padding");
+        assert!(
+            soft_wraps(&row, 3),
+            "a wider row is read at the current width"
+        );
+        assert!(!soft_wraps(&row, 0), "a zero width never wraps");
+
+        let blank_end: Vec<Cell> = "ab ".chars().map(cell).collect();
+        assert!(
+            !soft_wraps(&blank_end, 3),
+            "a blank last column is a hard break"
+        );
+
+        let mut wide_end: Vec<Cell> = "ab".chars().map(cell).collect();
+        wide_end.push(cell(Cell::CONTINUATION));
+        assert!(
+            !soft_wraps(&wide_end, 3),
+            "a continuation in the last column is not a wrap"
+        );
+    }
+
+    #[test]
+    fn row_soft_wraps_delegates_per_row() {
+        // The snapshot method reads row `r`'s own cells, not row 0's.
+        let mut t = crate::Terminal::new(5, 3, Color(0xE0E0E0), Color(0x101010));
+        t.advance(b"ab\r\nfghij\r\nk");
+        let snap = t.snapshot();
+        assert!(!snap.row_soft_wraps(0), "row 0 ends blank");
+        assert!(snap.row_soft_wraps(1), "row 1 fills its last column");
+        assert!(!snap.row_soft_wraps(2));
+        assert!(!snap.row_soft_wraps(3), "a row past the bottom never wraps");
+    }
+}

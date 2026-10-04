@@ -66,7 +66,6 @@ use crate::session::{Session, TabId, WakeSource};
 use crate::tabmeta::{AgentState, TabMetaSnapshot};
 use crate::tabs::Tabs;
 use crate::waiting::{WaitingKind, WaitingState};
-use term_core::Selection;
 
 /// Custom event: something happened off the UI thread that needs a wake.
 #[derive(Debug, Clone, Copy)]
@@ -2007,14 +2006,13 @@ impl Running {
         let menu_was_open = self.open_menu.is_some();
         // Seam data for handlers, read from the active tab BEFORE the mutable
         // `writer` borrow (D9): bracketed-paste mode (text-paste) + the selection
-        // text (copy-clipboard). The full-grid `snapshot()` clone is paid ONLY when
-        // a selection actually exists, so the common keystroke stays cheap.
+        // text (copy-clipboard). The text comes from the grid, not a snapshot
+        // (selection-scroll-anchor D6): it reads scrollback + live by line, so it
+        // returns a selection that has partly scrolled off-screen, and it clones no
+        // grid. With no selection it returns `None` at once, so the common keystroke
+        // stays cheap.
         let bracketed = self.tabs.active().terminal.bracketed_paste();
-        let selection_text = if self.tabs.active().terminal.selection().is_some() {
-            self.tabs.active().terminal.snapshot().selection_text()
-        } else {
-            None
-        };
+        let selection_text = self.tabs.active().terminal.selection_text();
         // The seam's writer is wrapped in a `WriteProbe` at both dispatch points
         // (terminal-scroll D4): a handler that sends the user's bytes to the shell —
         // Cmd+V paste is the shipped example — must snap a scrolled-back viewport, and
@@ -2441,11 +2439,16 @@ impl ApplicationHandler<UserEvent> for App {
                             inner.drag_moved = true;
                         }
                         if inner.drag_moved {
-                            let sel = Selection {
-                                anchor: inner.drag_anchor,
-                                focus,
-                            };
-                            inner.tabs.active_mut().terminal.set_selection(sel);
+                            // Stop-gap (selection-scroll-anchor T1): both cells become
+                            // content points here, at move time, so each move selects
+                            // the same viewport cells the pre-anchor code did. That
+                            // re-reads the press cell on every move; converting the
+                            // anchor once at press time (D3) is T3's drag state machine.
+                            let (ac, ar) = inner.drag_anchor;
+                            let terminal = &mut inner.tabs.active_mut().terminal;
+                            let anchor = terminal.point_at(ac, ar);
+                            let focus = terminal.point_at(focus.0, focus.1);
+                            terminal.set_selection(anchor, focus);
                             inner.redraw();
                         }
                     }

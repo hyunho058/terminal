@@ -8,7 +8,8 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::image::{Decoded, ImageLayer};
 use crate::scrollback::{History, DEFAULT_HISTORY_LIMIT};
-use crate::selection::Selection;
+use crate::selection::{ContentSelection, Point};
+use crate::snapshot::soft_wraps;
 
 /// A packed `0xRRGGBB` color. UI-agnostic: the renderer converts to whatever the
 /// GPU needs.
@@ -192,11 +193,13 @@ pub struct Grid {
     mouse_button_event: bool,
     mouse_any_event: bool,
     mouse_encoding: MouseEncoding,
-    /// The live drag selection (anchor/focus viewport cells), or `None`. Carried to
-    /// the renderer on `GridSnapshot.selection` and extracted to text via
-    /// `GridSnapshot::selection_text`. Cleared on `resize` (coords are dimension-
-    /// bound); when to clear it on new output/scroll is the app's policy.
-    selection: Option<Selection>,
+    /// The drag selection as two content [`Point`]s (selection-scroll-anchor D2), or
+    /// `None`. Content-anchored, so it follows its text through terminal-owned
+    /// scrolling. The renderer sees it projected into viewport cells on
+    /// `GridSnapshot.selection` (at every `view_offset`); its text comes from
+    /// [`selection_text`](Grid::selection_text), which reads history + live by line.
+    /// Cleared on `resize` (D7: no rewrap, so line content is dimension-bound).
+    selection: Option<ContentSelection>,
     /// Inline-image placements anchored to cells (image-paste D2, SD5).
     images: ImageLayer,
     /// DECSTBM top/bottom margins — the inclusive row range scrolling is confined
@@ -355,6 +358,23 @@ impl Grid {
             command_running: false,
             osc_title: None,
         }
+    }
+
+    /// A grid whose scrollback keeps at most `limit` rows — **test-only**, so a
+    /// test can drive eviction in a few lines instead of 100 000
+    /// (selection-scroll-anchor R1.4/R4.5). Production grids always use
+    /// [`DEFAULT_HISTORY_LIMIT`].
+    #[cfg(test)]
+    pub(crate) fn with_history_limit(
+        cols: u16,
+        rows: u16,
+        fg: Color,
+        bg: Color,
+        limit: usize,
+    ) -> Self {
+        let mut grid = Grid::new(cols, rows, fg, bg);
+        grid.history = History::new(limit);
+        grid
     }
 
     pub fn cols(&self) -> u16 {
@@ -984,17 +1004,112 @@ impl Grid {
         self.mouse_encoding
     }
 
-    /// Set the live drag selection (anchor/focus viewport cells).
-    pub fn set_selection(&mut self, selection: Selection) {
-        self.selection = Some(selection);
+    /// Set the drag selection from two content points (selection-scroll-anchor D3).
+    /// `anchor` is where the drag began, `focus` its current end; either order is
+    /// accepted. Build them with [`point_at`](Grid::point_at) at the moment the cell
+    /// is learned.
+    pub fn set_selection(&mut self, anchor: Point, focus: Point) {
+        self.selection = Some(ContentSelection { anchor, focus });
     }
     /// Clear any selection.
     pub fn clear_selection(&mut self) {
         self.selection = None;
     }
-    /// The current selection, if any.
-    pub fn selection(&self) -> Option<Selection> {
+    /// The stored selection (content points, as set), if any.
+    pub fn selection(&self) -> Option<ContentSelection> {
         self.selection
+    }
+
+    /// Rows that have aged out of the scrollback cap since this grid was created
+    /// (selection-scroll-anchor D1). History row `i` is content line
+    /// `evicted() + i`.
+    pub fn evicted(&self) -> u64 {
+        self.history.evicted()
+    }
+
+    /// The content line of live row 0: `evicted + history_len` (D1).
+    fn live_top_line(&self) -> u64 {
+        self.history.evicted() + self.history.len() as u64
+    }
+
+    /// The content line shown on viewport row 0 at the current `view_offset`
+    /// (selection-scroll-anchor D2's `top`). `view_offset` never exceeds
+    /// `history_len` (every writer clamps it), so this cannot underflow.
+    pub(crate) fn top_line(&self) -> u64 {
+        self.live_top_line() - self.view_offset as u64
+    }
+
+    /// The content [`Point`] under viewport cell `(col, row)` at the current
+    /// `view_offset` (selection-scroll-anchor D3): line `top + row`, same column.
+    ///
+    /// Pure arithmetic, deliberately unclamped: a cell outside the viewport maps to
+    /// a line outside it, which the snapshot projection then clips or drops.
+    pub fn point_at(&self, col: u16, row: u16) -> Point {
+        Point {
+            line: self.top_line() + u64::from(row),
+            col,
+        }
+    }
+
+    /// The cells of content line `line` — a retained history row at the width it
+    /// was **captured** at, or a live row at the current width — or `None` when the
+    /// line has been evicted or lies below the live bottom.
+    pub(crate) fn line(&self, line: u64) -> Option<&[Cell]> {
+        let idx = line.checked_sub(self.history.evicted())?;
+        let hist = self.history.len() as u64;
+        if idx < hist {
+            return self.history_row(usize::try_from(idx).ok()?);
+        }
+        let cols = self.cols as usize;
+        let start = usize::try_from(idx - hist).ok()?.checked_mul(cols)?;
+        self.cells.get(start..start.checked_add(cols)?)
+    }
+
+    /// The stored selection's text, read from history + live **by line number**
+    /// (selection-scroll-anchor D6), or `None` when there is no selection.
+    ///
+    /// This is the one extractor: it returns the whole selection even when part of
+    /// it has scrolled off-screen, which the visible snapshot cannot. It walks the
+    /// linear span (the start line from `start.col`, interior lines full-width, the
+    /// end line up to `end.col`), skipping double-width continuation cells and
+    /// `trim_end`-ing each line segment — the same shape as
+    /// [`GridSnapshot::to_text`](crate::GridSnapshot::to_text). Lines are joined with
+    /// `\n`, **except** that a soft-wrapped line joins the next with no separator,
+    /// by the D8 rule shared with hyperlinks ([`soft_wraps`]).
+    ///
+    /// Every line is read through the **current** `cols`: a history row captured
+    /// wider is cut at the right margin and one captured narrower is padded blank,
+    /// matching what the snapshot shows. A line that is no longer retained reads as
+    /// blank, and a span reaching past the live bottom stops there. Never panics on
+    /// out-of-range points.
+    pub fn selection_text(&self) -> Option<String> {
+        let (start, end) = self.selection?.normalized();
+        let last_col = self.cols - 1;
+        let bottom = self.live_top_line() + u64::from(self.rows) - 1;
+        let end_line = end.line.min(bottom);
+
+        let mut out = String::new();
+        for line in start.line..=end_line {
+            let cells = self.line(line);
+            let first = if line == start.line { start.col } else { 0 }.min(last_col);
+            let last = if line == end.line { end.col } else { last_col }.min(last_col);
+            let mut segment = String::new();
+            for col in first..=last {
+                match cells.and_then(|r| r.get(col as usize)) {
+                    // The wide leader already carries the glyph — drop its spacer.
+                    Some(c) if c.is_continuation() => {}
+                    Some(c) => segment.push(c.ch),
+                    None => segment.push(' '),
+                }
+            }
+            out.push_str(segment.trim_end());
+            // Join to the next selected line: newline unless this line soft-wraps.
+            let wraps = cells.is_some_and(|r| soft_wraps(r, self.cols));
+            if line < end_line && !wraps {
+                out.push('\n');
+            }
+        }
+        Some(out)
     }
 
     /// The last `rows` non-blank-terminated rows of the visible viewport as text.
@@ -1317,7 +1432,9 @@ impl Grid {
         self.cells = next;
         self.cursor.col = self.cursor.col.min(cols - 1);
         self.cursor.row = self.cursor.row.min(rows - 1);
-        // A selection's coords are dimension-bound; a resize invalidates it (D9).
+        // A selection is dimension-bound: with no rewrap (architecture G4), a line's
+        // columns mean something else at the new width, so a resize clears it
+        // (selection-model D9, kept by selection-scroll-anchor D7/R7.1).
         self.selection = None;
         // A deferred wrap is dimension-bound too: the last column just moved, so a
         // retained flag would fire a stray wrap on a cursor no longer at the margin

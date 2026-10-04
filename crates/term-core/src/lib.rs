@@ -31,7 +31,7 @@ pub use image::{Decoded, ImageLayer, Placement};
 pub use links::{link_at, LinkSpan};
 pub use pty::Pty;
 pub use scrollback::History;
-pub use selection::Selection;
+pub use selection::{ContentSelection, Point, Selection};
 pub use snapshot::GridSnapshot;
 
 use parser::Processor;
@@ -50,6 +50,24 @@ impl Terminal {
     pub fn new(cols: u16, rows: u16, fg: Color, bg: Color) -> Self {
         Terminal {
             grid: Grid::new(cols, rows, fg, bg),
+            processor: Processor::new(),
+        }
+    }
+
+    /// A terminal whose scrollback keeps at most `limit` rows — **test-only**, so a
+    /// test can evict history in a few lines (selection-scroll-anchor R1.4/R4.5).
+    /// `#[cfg(test)]`, so it is reachable from this crate's unit tests only, not
+    /// from `tests/`.
+    #[cfg(test)]
+    pub(crate) fn with_history_limit(
+        cols: u16,
+        rows: u16,
+        fg: Color,
+        bg: Color,
+        limit: usize,
+    ) -> Self {
+        Terminal {
+            grid: Grid::with_history_limit(cols, rows, fg, bg, limit),
             processor: Processor::new(),
         }
     }
@@ -116,6 +134,15 @@ impl Terminal {
         self.grid.history_len()
     }
 
+    /// Rows that have aged out of the scrollback cap since this terminal was
+    /// created (selection-scroll-anchor D1). Monotonic. Together with
+    /// [`history_len`](Terminal::history_len) it fixes the content line numbering:
+    /// history row `i` is line `evicted() + i`, live row `r` is line
+    /// `evicted() + history_len() + r`.
+    pub fn evicted(&self) -> u64 {
+        self.grid.evicted()
+    }
+
     /// Whether the alternate screen is active (`?1049h`).
     pub fn alt_screen(&self) -> bool {
         self.grid.alt_screen()
@@ -172,12 +199,29 @@ impl Terminal {
         self.grid.pending_wrap()
     }
 
-    /// Set the live drag selection (the app drives this from the mouse — see the
-    /// `selection-input` feature). Carried to the renderer via
-    /// [`snapshot`](Terminal::snapshot); its text is read via
-    /// [`GridSnapshot::selection_text`](crate::GridSnapshot::selection_text).
-    pub fn set_selection(&mut self, selection: Selection) {
-        self.grid.set_selection(selection);
+    /// The content [`Point`] under viewport cell `(col, row)` at the current
+    /// scrollback offset (selection-scroll-anchor D3): line `top + row`, where `top`
+    /// is the line on viewport row 0, and the same column.
+    ///
+    /// Convert a cell **when the app learns it** — the press anchor at press time,
+    /// the focus at move time — because the content under a cell moves with output
+    /// and with the wheel. Unclamped: a cell outside the viewport maps to a line
+    /// outside it.
+    pub fn point_at(&self, col: u16, row: u16) -> Point {
+        self.grid.point_at(col, row)
+    }
+
+    /// Set the drag selection from two content points (the app drives this from
+    /// the mouse — see the `selection-input` feature). `anchor` is where the drag
+    /// began, `focus` its current end, in either order. Build both with
+    /// [`point_at`](Terminal::point_at).
+    ///
+    /// Anchored to content, so it moves with its text through terminal-owned
+    /// scrolling. The renderer sees it projected into viewport cells on
+    /// [`snapshot`](Terminal::snapshot)'s `selection`; its text is read with
+    /// [`selection_text`](Terminal::selection_text).
+    pub fn set_selection(&mut self, anchor: Point, focus: Point) {
+        self.grid.set_selection(anchor, focus);
     }
 
     /// Clear any drag selection.
@@ -185,9 +229,20 @@ impl Terminal {
         self.grid.clear_selection();
     }
 
-    /// The current drag selection, if any.
-    pub fn selection(&self) -> Option<Selection> {
+    /// The stored drag selection — the two content points as last set — if any.
+    pub fn selection(&self) -> Option<ContentSelection> {
         self.grid.selection()
+    }
+
+    /// The selection's text, read from scrollback + live by line number, or `None`
+    /// when there is no selection (selection-scroll-anchor D6).
+    ///
+    /// This is what Cmd+C copies. It returns the **whole** selection, including any
+    /// part that has scrolled off-screen, which a [`GridSnapshot`] — the visible
+    /// rows only — cannot. Lines join with `\n` except across a soft wrap, by the
+    /// same rule hyperlinks use.
+    pub fn selection_text(&self) -> Option<String> {
+        self.grid.selection_text()
     }
 
     /// Take the most-recent OSC 133 command-end event parsed from the shell's
@@ -352,6 +407,86 @@ mod tests {
             t.take_command_end().is_none(),
             "garbage → no event, no panic"
         );
+    }
+
+    // --- Content lines through eviction (selection-scroll-anchor D1) ---
+    //
+    // These need `with_history_limit`, which is `#[cfg(test)]`, so they live here
+    // rather than in `tests/selection.rs`.
+
+    /// The text of content line `line`, or `None` once it is evicted or below the
+    /// live bottom — read straight from the grid's line lookup.
+    fn line_of(t: &Terminal, line: u64) -> Option<String> {
+        let cells = t.grid.line(line)?;
+        let text: String = cells
+            .iter()
+            .filter(|c| !c.is_continuation())
+            .map(|c| c.ch)
+            .collect();
+        Some(text.trim_end().to_string())
+    }
+
+    #[test]
+    fn eviction_keeps_line_numbers_on_their_text() {
+        // selection-scroll-anchor R1.4 — history limit 2. Line numbers are
+        // recorded while retained; each eviction grows `evicted` by exactly one and
+        // leaves every retained line reading the same text.
+        let mut t = Terminal::with_history_limit(10, 2, Color(0xE0E0E0), Color(0x101010), 2);
+        t.advance(b"l0\r\nl1\r\nl2\r\nl3"); // history [l0, l1] (full), live [l2, l3]
+        assert_eq!((t.evicted(), t.history_len()), (0, 2));
+        assert_eq!(line_of(&t, 1).as_deref(), Some("l1"));
+
+        t.advance(b"\r\nl4"); // l2 enters history, l0 is evicted
+        assert_eq!(t.evicted(), 1, "one row evicted");
+        assert_eq!(
+            line_of(&t, 0),
+            None,
+            "the evicted line is gone, not re-pointed"
+        );
+        assert_eq!(
+            line_of(&t, 1).as_deref(),
+            Some("l1"),
+            "L still reads its text"
+        );
+        assert_eq!(
+            line_of(&t, 2).as_deref(),
+            Some("l2"),
+            "entered history unchanged"
+        );
+        assert_eq!(line_of(&t, 4).as_deref(), Some("l4"), "a live line");
+        assert_eq!(line_of(&t, 5), None, "below the live bottom");
+
+        t.advance(b"\r\nl5\r\nl6"); // two more evictions: l1, l2
+        assert_eq!(t.evicted(), 3, "grew by exactly the rows evicted");
+        assert_eq!(line_of(&t, 2), None);
+        assert_eq!(line_of(&t, 3).as_deref(), Some("l3"));
+        assert_eq!(line_of(&t, 6).as_deref(), Some("l6"));
+    }
+
+    #[test]
+    fn point_at_counts_evicted_rows() {
+        // selection-scroll-anchor R1.2 with eviction under way: live row r is line
+        // `evicted + history_len + r`, and scrolled back the same line stays on the
+        // same text.
+        let mut t = Terminal::with_history_limit(10, 3, Color(0xE0E0E0), Color(0x101010), 2);
+        t.advance(b"l0\r\nl1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6");
+        let (e, h) = (t.evicted(), t.history_len() as u64);
+        assert_eq!((e, h), (2, 2), "precondition: eviction under way");
+        assert_eq!(
+            t.point_at(4, 1),
+            Point {
+                line: e + h + 1,
+                col: 4
+            }
+        );
+        assert_eq!(line_of(&t, e + h + 1).as_deref(), Some("l5"));
+        t.scroll_up(2);
+        assert_eq!(
+            t.point_at(0, 0),
+            Point { line: e, col: 0 },
+            "oldest retained"
+        );
+        assert_eq!(line_of(&t, e).as_deref(), Some("l2"));
     }
 
     #[test]
