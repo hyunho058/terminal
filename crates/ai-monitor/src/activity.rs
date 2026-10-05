@@ -238,17 +238,39 @@ fn last_meaningful(text: &str) -> Option<LastMessage> {
 /// tools whose only possible resolution is human input — `AskUserQuestion` puts a question
 /// to the user, `ExitPlanMode` asks them to approve a plan.
 ///
+/// **Under Claude Code 2.1.28x these entries do not fire.** That version writes an assistant
+/// `tool_use` record to the log only once the tool *returns*, so while one of these dialogs
+/// is open its call is not on disk at all, and [`last_meaningful`] lands on whatever came
+/// before it — typically the previous tool's `tool_result`, which reads `Busy`. Measured
+/// 2026-10-04: an `AskUserQuestion` dialog stayed on screen for 10+ minutes with the log's
+/// mtime frozen and no record for it in the file, and a 0.6 s `Bash` call was absent from its
+/// own log while it ran, then appeared together with its `tool_result`. A record's
+/// `timestamp` is when it was *created*, not when it was *written*, which is why the corpus
+/// sample below could not have shown this. These dialogs can only be caught on screen, which
+/// is the job of the rules in `crates/app/src/prompt.rs` (`shows_blocking_prompt`).
+///
+/// The entries are kept on purpose. They are harmless: a pending call is never on disk, and
+/// once it is written its `tool_result` follows immediately, so they cannot fire wrongly.
+/// And they come back to life, unchanged, if a Claude Code version writes pending calls
+/// again. [`LastMessage::AssistantAsksUser`] itself is live regardless: Antigravity reaches it
+/// through its own list (`BLOCKING_TOOLS` in `antigravity/tail.rs`, `ask_question`), because
+/// Antigravity writes the dispatching step before the answer.
+///
 /// This list is deliberately closed and exact-matched. It must never grow to cover tools
 /// that merely *tend* to be slow or that a permission prompt *might* gate (`Bash`, `Edit`,
 /// …): those resolve on their own in the common case, and a wrong entry here manufactures a
 /// false "waiting" — the worst failure this module can produce. A new entry needs the same
 /// bar: blocking on a human is the tool's definition, not a mode it sometimes enters.
 ///
-/// Evidence bar per entry: `AskUserQuestion` is **log-verified** — every record sampled
-/// (400+ across the author's `~/.claude/projects/**/*.jsonl`) carries `stop_reason:
-/// "tool_use"` with the name in a `tool_use` block, with no exceptions; in the sampled
-/// session the answering line landed 99 s later. That corpus is private and mutating, so
-/// the shape is the reproducible claim here, not any exact count.
+/// Evidence bar per entry: for `AskUserQuestion` the record's **shape** is log-verified,
+/// and *when it reaches disk* is not. Every record sampled (400+ across the author's
+/// `~/.claude/projects/**/*.jsonl`) carries `stop_reason: "tool_use"` with the name in a
+/// `tool_use` block, with no exceptions. But the sample read records that had already been
+/// written, so it could not say whether one is present while its question is pending — and
+/// under 2.1.28x it is not (above). The "answering line landed 99 s later" once cited here
+/// compared two `timestamp`s, i.e. creation times, so it never showed the call on disk
+/// during those 99 s. That corpus is private and mutating, so the shape is the reproducible
+/// claim here, not any exact count.
 /// `ExitPlanMode` is **by construction** — no real `tool_use` record was available to
 /// sample, and under auto-accept-plan it can resolve without a person. Both directions of
 /// that uncertainty are safe: a wrong shape simply never matches and the turn reads `Busy`.
@@ -383,8 +405,10 @@ mod tests {
     /// The real `AskUserQuestion` record shape, transcribed verbatim from a live session
     /// log (`~/.claude/projects/**/*.jsonl`): `stop_reason: "tool_use"` — indistinguishable
     /// from any other tool call by stop reason alone — with the tool name in a `tool_use`
-    /// content block. In that log the answering `user` line landed 99 s later, so this
-    /// record really is the newest one while the human decides.
+    /// content block. These tests pin how the classifier reads that *shape*. They do not show
+    /// a path that fires live for Claude: under Claude Code 2.1.28x this record is not on disk
+    /// while the human decides, and is written only with the answer right behind it (see
+    /// [`BLOCKING_TOOLS`]).
     const ASK_USER_QUESTION_LINE: &str = concat!(
         r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","#,
         r#""content":[{"type":"tool_use","id":"toolu_01","name":"AskUserQuestion","#,

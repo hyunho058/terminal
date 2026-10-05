@@ -1,0 +1,20 @@
+❯ Use the AskUserQuestion tool ONCE with THREE questions in one call: fruit
+  (Apple/Banana/Cherry), colour (Red/Green/Blue), size (Small/Medium/Large). Do nothing
+  else.
+
+────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Fruit  ☒ Colour  ☒ Size  ✔ Submit  →
+
+Review your answers
+
+ ● Which fruit should the example use?
+   → Apple
+ ● Which colour should the example use?
+   → Red
+ ● Which size should the example use?
+   → Small
+
+Ready to submit your answers?
+
+❯ 1. Submit answers
+  2. Cancel

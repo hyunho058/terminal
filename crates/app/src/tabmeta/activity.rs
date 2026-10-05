@@ -1744,6 +1744,9 @@ mod tests {
         // ROOT-CAUSE regression: an agent blocked on AskUserQuestion used to read Busy
         // (its stop_reason is "tool_use"), so `waiting.rs` never saw a rising edge and the
         // sidebar never surfaced the question. End-to-end: real jsonl shape → Waiting.
+        // This pins the record's SHAPE only: under Claude Code 2.1.28x the record is not on
+        // disk while the question is open, so this is not a live Claude path — see
+        // `pending_question_session_reads_busy`.
         let _g = super::super::probe::serial();
         let body = format!("{CONVO_PREFIX}{ASK_USER_QUESTION_LINE}\n");
         assert_eq!(
@@ -1765,6 +1768,62 @@ mod tests {
             state_of_fixture("d16-answered", "/proj/d16-answered", &body),
             AgentState::Busy
         );
+    }
+
+    /// The log tail of a Claude Code 2.1.28x session with an `AskUserQuestion` dialog open on
+    /// screen, in the shape measured on 2026-10-04 (`claude-ask-dialog-waiting` Research),
+    /// content stripped: the previous `Edit` call, its `tool_result`, then eight role-less
+    /// lines — a `hook_success` attachment, five metadata records, and two more attachments.
+    /// The question's own `tool_use` is absent: it is not written until the tool returns.
+    const PENDING_QUESTION_TAIL: &str = concat!(
+        r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","#,
+        r#""content":[{"type":"tool_use","id":"toolu_10","name":"Edit","input":{}}]}}"#,
+        "\n",
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","#,
+        r#""tool_use_id":"toolu_10","content":""}]},"toolUseResult":{"filePath":""}}"#,
+        "\n",
+        r#"{"type":"attachment","attachment":{"type":"hook_success","hookEvent":"PostToolUse"}}"#,
+        "\n",
+        r#"{"type":"last-prompt","lastPrompt":""}"#,
+        "\n",
+        r#"{"type":"ai-title","aiTitle":""}"#,
+        "\n",
+        r#"{"type":"mode","mode":"normal"}"#,
+        "\n",
+        r#"{"type":"permission-mode","permissionMode":"auto"}"#,
+        "\n",
+        r#"{"type":"atis-latch","atis":""}"#,
+        "\n",
+        r#"{"type":"attachment","attachment":{"type":"total_tokens_reminder","text":""}}"#,
+        "\n",
+        r#"{"type":"attachment","attachment":{"type":"deferred_tools_record","entries":[]}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn pending_question_session_reads_busy() {
+        // R6.1 of `claude-ask-dialog-waiting` — THE reason the question/plan screen rules in
+        // `prompt.rs` exist. With the dialog up, the pending AskUserQuestion is not on disk,
+        // the role-less lines after the last tool_result are skipped, and so the newest
+        // meaningful message is the previous Edit's tool_result: UserToolResult → Busy, and
+        // the card reads Working for as long as the human takes to answer. No log rule can
+        // turn this into Waiting; only the screen can.
+        let _g = super::super::probe::serial();
+        let root = projects_root("d16-pending");
+        let cwd = Path::new("/proj/d16-pending");
+        let log = write_log(&root, cwd, "s1", PENDING_QUESTION_TAIL.as_bytes());
+        let ts = tail_state(&log).expect("tail");
+        assert_eq!(
+            ts.last,
+            Some(LastMessage::UserToolResult),
+            "the previous tool's result, not the open question"
+        );
+        // Ten minutes on, as measured: the log's mtime stayed frozen while the dialog was up.
+        // That is past STALE_LIMIT, where the recency fallback says Idle, so Busy here can
+        // only come from `last` — not from a freshly written file.
+        let mut memo = ActivityMemo::new();
+        let now = ts.mtime + Duration::from_secs(600);
+        assert_eq!(ranked(&mut memo, &root, cwd, 0, now), AgentState::Busy);
     }
 
     #[test]

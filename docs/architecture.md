@@ -275,4 +275,33 @@ idle behaviour. See G1 for what the caches do and do not buy against it.
     the `waiting-scan` debug line (`RUST_LOG=app=debug`), which dumps the matcher's whole
     20-row input byte for byte — it is how the Antigravity fixture was captured, and it
     answers "was the dialog absent, scrolled, or merely unmatched" in one line. The
-    workspace-trust dialog is not matched at all until it is captured the same way.
+    workspace-trust dialog is not matched at all until it is captured the same way. (The
+    debug line goes to **stdout**: `common::logging` keeps `fmt::layer()`'s default writer, so
+    `2> file` catches nothing.)
+  - **Claude Code's question, review and plan screens**
+    (`specs/claude-ask-dialog-waiting`). Three more of Claude Code's layouts, each matched
+    by its own pair of rows from real captures (2.1.289):
+    - the `AskUserQuestion` dialog: a footer starting `Enter to select` and ending `Esc to
+      cancel`, on one row or wrapped onto two, with `N. Chat about this` as the nearest
+      non-blank row above it;
+    - its review screen, drawn before the answers are sent: `Ready to submit your answers?`
+      over exactly `1. Submit answers`;
+    - `ExitPlanMode`'s approval: `Claude has written up a plan and is ready to execute.
+      Would you like to proceed?`, on one row or two, over `1. …`. It needs at least 47
+      columns; at 46 the question takes three rows.
+
+    A change to those words, or any non-blank row drawn between the chat row and the
+    footer, reads as "not detected", and the card falls back to the log's `Working`. **"A
+    question dialog reads Working" should be read as "check the `waiting-scan` line for the
+    footer and chat rows"** (or the question and first-choice rows). Two layouts are known
+    and unmatched: a question dialog drawn without its footer block (the binary's `Nt`
+    condition, never seen in a capture) and the `Exit plan mode?` variant.
+  - **When Claude Code writes a `tool_use`.** Claude Code 2.1.28x writes an assistant
+    `tool_use` to the session log only once the tool **returns**. While a question or plan
+    dialog is up, its call is not on disk, so the log reads the previous tool's
+    `tool_result` (`Busy`) and **no log rule can see a pending dialog**. That is why the
+    screen rules above exist, and why `BLOCKING_TOOLS`'s Claude entries stay quiet. They are
+    kept for a version that writes pending calls again. The oracle is the log's mtime: it
+    stays frozen while a dialog is up (measured: 10+ minutes on a live `AskUserQuestion`). A
+    record's `timestamp` is when it was created, not when it was written, so reading the
+    file afterwards cannot show this. Check it live.

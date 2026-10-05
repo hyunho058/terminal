@@ -130,11 +130,22 @@ pub enum AgentState {
     /// consuming, a fresh human prompt it is about to answer, or a recent append).
     Busy,
     /// The agent handed control back to the human — waiting for MY input (D4/D16 of
-    /// `left-sidebar-waiting-area`). Produced by exactly two precise log signals: the last
-    /// meaningful message is an assistant `stop_reason == "end_turn"` (the turn is over), or
-    /// it is an assistant turn calling a tool that blocks on a person, such as
-    /// `AskUserQuestion` (`ai_monitor::activity::LastMessage::AssistantAsksUser`). Never
-    /// produced by the recency fallback — a false "waiting" is the worst failure. The
+    /// `left-sidebar-waiting-area`). From the log it is produced by exactly two precise
+    /// signals: the last meaningful message is an assistant `stop_reason == "end_turn"` (the
+    /// turn is over), or it is an assistant turn calling a tool that blocks on a person
+    /// (`ai_monitor::activity::LastMessage::AssistantAsksUser`).
+    ///
+    /// Only Antigravity reaches that second signal today, through its `ask_question`
+    /// dispatch. Claude Code 2.1.28x writes a `tool_use` to the log only once the tool
+    /// returns, so a pending `AskUserQuestion` or `ExitPlanMode` is never on disk: the log
+    /// typically reads the previous tool's `tool_result`, which is `Busy`. A Claude question
+    /// or plan dialog can reach `Waiting` only from the **screen**:
+    /// `prompt::shows_blocking_prompt` sets the session's `blocking_dialog` level, and
+    /// `sidebar_model::effective_state` reads `Waiting` while it is up, whatever this field
+    /// says — that is what the card and the band read. Do not wire a new Claude feature to
+    /// the log signal; under 2.1.28x it is dead.
+    ///
+    /// Never produced by the recency fallback — a false "waiting" is the worst failure. The
     /// waiting-band feature (T4) renders the input-waiting affordance for this; earlier
     /// features treat it as an attention state (see `sidebar_model::resolve_status`).
     Waiting,

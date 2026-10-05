@@ -1,0 +1,20 @@
+     │ 25. Changelog: Where release notes are kept.                                    │
+     │ 26. Contributing: How to propose changes.                                       │
+     │ 27. Code of conduct: Expected behavior for contributors.                        │
+     │ 28. Security: How to report vulnerabilities.                                    │
+     │ 29. License: The license this project uses.                                     │
+     │ 30. Acknowledgements: Credits and thanks.                                       │
+     │                                                                                 │
+     │ Verification                                                                    │
+     │                                                                                 │
+     │ - wc -l README.md shows 31 lines (title plus 30 sections).                      │
+     │ - grep -cE '^[0-9]+\. ' README.md returns 30.                                   │
+     │ - Open the file and check that the numbers run from 1 to 30 with no gaps.       │
+     ╰─────────────────────────────────────────────────────────────────────────────────╯
+
+✻ Cogitated for 12s · done 3:57 PM
+
+────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ plan mode on (shift+tab to cycle) · ← for agents

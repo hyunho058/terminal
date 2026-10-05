@@ -1,0 +1,20 @@
+
+
+❯ Use the AskUserQuestion tool to ask me ONE question: "Which fruit should the example
+  use?" with exactly three options: Apple, Banana, Cherry. Do nothing else.
+────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Fruit
+
+Which fruit should the example use?
+
+❯ 1. Apple
+     Use Apple in the example.
+  2. Banana
+     Use Banana in the example.
+  3. Cherry
+     Use Cherry in the example.
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
