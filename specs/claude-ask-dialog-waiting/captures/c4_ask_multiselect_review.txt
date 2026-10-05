@@ -1,0 +1,20 @@
+
+⏺ You picked Apple, Red and Small. As you asked, I'm stopping here.
+
+✻ Sautéed for 3s · done 3:54 PM
+
+❯ Use the AskUserQuestion tool with multiSelect true to ask ONE question: which
+  toppings do I want? Options: Cheese, Olives, Basil, Mushrooms. Do nothing else.
+
+────────────────────────────────────────────────────────────────────────────────────────
+←  ☒ Toppings  ✔ Submit  →
+
+Review your answers
+
+ ● Which toppings do you want?
+   → Cheese
+
+Ready to submit your answers?
+
+❯ 1. Submit answers
+  2. Cancel

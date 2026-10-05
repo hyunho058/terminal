@@ -1,0 +1,20 @@
+  toppings do I want? Options: Cheese, Olives, Basil, Mushrooms. Do nothing else.
+────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Toppings  ✔ Submit  →
+
+Which toppings do you want?
+
+❯ 1. [ ] Cheese
+         Add Cheese.
+  2. [ ] Olives
+         Add Olives.
+  3. [ ] Basil
+         Add Basil.
+  4. [ ] Mushrooms
+         Add Mushrooms.
+  5. [ ] Type something
+     Submit
+────────────────────────────────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

@@ -964,6 +964,127 @@ mod tests {
     }
 
     #[test]
+    fn a_claude_question_dialog_reads_waiting_on_its_card() {
+        // claude-ask-dialog-waiting R0.1 / R0.2 / R0.3 — the captured multi-question dialog,
+        // bytes → level → row → card, over the Busy log Claude Code 2.1.28x leaves while it is
+        // up (the pending AskUserQuestion is not on disk). The band is fed the same Waiting
+        // the card resolves from; the screen Claude drew after an answer takes both back.
+        let Some(mut tabs) = tabs_with(1) else {
+            return;
+        };
+        let id = ids(&tabs)[0];
+        // The captures' own grid: an 80-column tab would hard-wrap their 88-column rows.
+        tabs.resize_all(88, 36);
+        let active = tabs.active().id;
+        let base = || vec![(id, crate::tabmeta::AgentState::Busy, true)];
+        let snap = crate::tabmeta::TabMetaSnapshot::default();
+        let busy = crate::tabmeta::Agent {
+            kind: crate::tabmeta::AgentKind::Claude,
+            state: crate::tabmeta::AgentState::Busy,
+        };
+        let card = |tabs: &Tabs| {
+            let row = tabs.titles(&snap).into_iter().next().expect("row");
+            crate::sidebar_model::resolve_status(
+                Some(&busy),
+                row.blocking_dialog,
+                row.running,
+                row.last_exit,
+            )
+        };
+        let advance = |tabs: &mut Tabs, screen: &str| {
+            tabs.by_id_mut(id)
+                .expect("tab")
+                .terminal
+                .advance(screen.replace('\n', "\r\n").as_bytes());
+        };
+
+        advance(&mut tabs, crate::prompt::REAL_ASK_MULTI);
+        let scan = tabs.rescan_dialogs(base(), active);
+        assert_eq!(scan.flipped, vec![(id, true)]);
+        assert_eq!(scan.states, vec![(id, crate::tabmeta::AgentState::Waiting)]);
+        assert_eq!(
+            card(&tabs),
+            renderer::sidebar_card::CardStatus::WaitingForInput
+        );
+
+        advance(&mut tabs, crate::prompt::REAL_ASK_ANSWERED);
+        let answered = tabs.rescan_dialogs(base(), active);
+        assert_eq!(answered.flipped, vec![(id, false)]);
+        assert_eq!(
+            answered.states,
+            vec![(id, crate::tabmeta::AgentState::Busy)]
+        );
+        assert_eq!(card(&tabs), renderer::sidebar_card::CardStatus::Working);
+    }
+
+    #[test]
+    fn a_claude_plan_dialog_reads_waiting_on_its_card() {
+        // claude-ask-dialog-waiting R0.4 — the captured plan-approval dialog, the same chain.
+        let Some(mut tabs) = tabs_with(1) else {
+            return;
+        };
+        let id = ids(&tabs)[0];
+        // The captures' own grid: an 80-column tab would hard-wrap their 88-column rows.
+        tabs.resize_all(88, 36);
+        let dialog = crate::prompt::REAL_PLAN_WIDE.replace('\n', "\r\n");
+        tabs.by_id_mut(id)
+            .expect("tab")
+            .terminal
+            .advance(dialog.as_bytes());
+        let active = tabs.active().id;
+        let scan = tabs.rescan_dialogs(vec![(id, crate::tabmeta::AgentState::Busy, true)], active);
+        assert_eq!(scan.flipped, vec![(id, true)]);
+        let snap = crate::tabmeta::TabMetaSnapshot::default();
+        let row = tabs.titles(&snap).into_iter().next().expect("row");
+        let busy = crate::tabmeta::Agent {
+            kind: crate::tabmeta::AgentKind::Claude,
+            state: crate::tabmeta::AgentState::Busy,
+        };
+        assert_eq!(
+            crate::sidebar_model::resolve_status(
+                Some(&busy),
+                row.blocking_dialog,
+                row.running,
+                row.last_exit
+            ),
+            renderer::sidebar_card::CardStatus::WaitingForInput
+        );
+    }
+
+    #[test]
+    fn a_question_dialog_on_a_tab_without_an_agent_is_not_waiting() {
+        // claude-ask-dialog-waiting R5.1 — the same screen, but no agent on the tab: no level.
+        let Some(mut tabs) = tabs_with(1) else {
+            return;
+        };
+        let id = ids(&tabs)[0];
+        // The captures' own grid: an 80-column tab would hard-wrap their 88-column rows.
+        tabs.resize_all(88, 36);
+        let dialog = crate::prompt::REAL_ASK_MULTI.replace('\n', "\r\n");
+        tabs.by_id_mut(id)
+            .expect("tab")
+            .terminal
+            .advance(dialog.as_bytes());
+        // Positive control: the screen IS a dialog, so only the missing agent can explain no level.
+        let tail = tabs
+            .by_id_mut(id)
+            .expect("tab")
+            .terminal
+            .viewport_tail_text(crate::prompt::TAIL_ROWS);
+        assert!(crate::prompt::shows_blocking_prompt(&tail));
+        let active = tabs.active().id;
+        let scan = tabs.rescan_dialogs(
+            vec![(id, crate::tabmeta::AgentState::Unknown, false)],
+            active,
+        );
+        assert_eq!(scan.flipped, vec![]);
+        assert_eq!(scan.states, vec![(id, crate::tabmeta::AgentState::Unknown)]);
+        let snap = crate::tabmeta::TabMetaSnapshot::default();
+        let row = tabs.titles(&snap).into_iter().next().expect("row");
+        assert!(!row.blocking_dialog);
+    }
+
+    #[test]
     fn a_background_tabs_dialog_level_reaches_its_row() {
         // agent-card-status R7.7 / R8.3 — the level the scan stored on a tab that is NOT
         // active lands on that tab's row, which is what its card resolves from; the active

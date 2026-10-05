@@ -1,0 +1,20 @@
+     rates, latency and business metrics, then widen the rollout step by step if things
+     look healthy. This catches problems early with limited blast radius, but it needs
+     good monitoring and traffic-splitting tooling.
+  3. Rolling
+     Replace instances of the old version with the new one gradually, a few at a time,
+     until the whole fleet runs the new release. No extra environment is needed, and
+     capacity stays mostly intact throughout. It is the default in many orchestrators
+     like Kubernetes. The downside is that both versions serve traffic at once during
+     rollout, and rollback means rolling back again.
+  4. Recreate
+     Stop every instance of the old version, then start the new version in its place. It
+     is the simplest strategy to set up and reason about, and it avoids running two
+     versions side by side, which helps when versions are incompatible. The cost is
+     downtime between shutdown and startup, so it suits development environments, batch
+     jobs or systems that tolerate brief outages.
+  5. Type something.
+────────────────────────────────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
