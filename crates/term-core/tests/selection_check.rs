@@ -261,6 +261,24 @@ fn a_split_frame_that_changes_the_text_clears_at_its_end() {
 }
 
 #[test]
+fn a_stray_sync_end_with_no_block_open_does_not_check() {
+    // scroll-anchor D5 (verification gate, B1): only a `?2026l` that closes an open
+    // block is a frame end. A stray one, here halfway through a repaint that blanks
+    // `bravo` and then restores it, must not check there, or it would clear a
+    // selection whose text the drain ends up holding unchanged.
+    let mut t = bravo_selected();
+    t.advance(b"\x1b[2;1H\x1b[2K\x1b[?2026l");
+    assert!(
+        t.selection().is_some(),
+        "a `?2026l` with no open block ran a check mid-repaint"
+    );
+    t.advance(b"bravo");
+    settle(&mut t);
+    assert!(t.selection().is_some(), "the drain's text is unchanged");
+    assert_eq!(t.selection_text().as_deref(), Some("bravo"));
+}
+
+#[test]
 fn without_sync_the_check_waits_for_the_drain_not_the_chunk() {
     // scroll-anchor R5.5 — `advance` never checks; the drain's settle does.
     let mut t = bravo_selected();

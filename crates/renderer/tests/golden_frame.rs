@@ -916,6 +916,11 @@ fn assert_tint_on(found: &[(u16, u16)], row: u16, moved_from: Option<u16>, momen
 /// whose every row is full, with `alpha` on viewport row 2 selected through the
 /// content API exactly as the app's drag does (`point_at` at the moment the cell is
 /// learned, then `set_selection`). `None` only when GPU tests are opted out of.
+///
+/// The spec's R8 names a 10×4 terminal. This uses the renderer's own grid instead
+/// (107×47 at this file's frame size), as every other test here does, because the
+/// terminal must match what the renderer draws. D8 asks only for `rows ≥ 4`, asserted
+/// below, and the assertions scan every row, so the larger grid covers more.
 fn selected_on_row_2() -> Option<(Renderer, Terminal)> {
     let cfg = Config::default();
     let mut r = headless(&cfg)?;

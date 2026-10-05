@@ -63,6 +63,11 @@ pub(crate) struct SelectionDrag {
     /// set yet" from "set, then cleared", which `selection().is_none()` alone cannot —
     /// it reads `None` in both (R3.4).
     started: bool,
+    /// The drag had a move while another tab was in front. Such a move writes nothing
+    /// (R3.5), but the pointer went somewhere, so the gesture is no longer a click on
+    /// any tab, even if it ends back on its own tab with no further motion (D3
+    /// amendment, B5).
+    left_tab: bool,
 }
 
 impl SelectionDrag {
@@ -75,6 +80,7 @@ impl SelectionDrag {
             anchor: terminal.point_at(cell.0, cell.1),
             moved: false,
             started: false,
+            left_tab: false,
         }
     }
 
@@ -84,8 +90,9 @@ impl SelectionDrag {
     ///
     /// The order is the specification, and each step guards the next:
     ///
-    /// 0. Another tab in front → [`DragMove::Ignore`], before anything is read or
-    ///    recorded, so neither tab is written (R3.5).
+    /// 0. Another tab in front → [`DragMove::Ignore`], so neither tab is written
+    ///    (R3.5). Only `left_tab` is recorded, which keeps the release from reading as
+    ///    a click.
     /// 1. Started, and the selection is gone → [`DragMove::Spent`] (R3.3). Gated on
     ///    `started`, because a fresh drag also has no selection yet (R3.4).
     /// 2. Off the press cell → `drag_moved`, keyed on the **viewport** cell (R3.2).
@@ -98,6 +105,7 @@ impl SelectionDrag {
         has_selection: bool,
     ) -> DragMove {
         if active != self.tab {
+            self.left_tab = true;
             return DragMove::Ignore;
         }
         if self.started && !has_selection {
@@ -141,23 +149,34 @@ impl SelectionDrag {
     }
 }
 
-/// `drag_moved` for the drag a release ends — did the pointer ever leave the press
-/// cell? What hyperlinks' `url_to_open` reads to tell a click from a drag (hyperlinks
-/// D19), and what [`release`] decides on.
+/// Whether the release that ends `drag` is a **click** on `active`, the tab in front
+/// at release. Three things must hold: the pointer never left the press cell (the
+/// `drag_moved` of `selection-input` D8), the gesture never moved while another tab
+/// was in front, and the release lands on the tab the press did. The negation is what
+/// hyperlinks' `url_to_open` reads as `drag_moved` to tell a click from a drag
+/// (hyperlinks D19), and it is what [`release`] decides on.
+///
+/// The tab half (selection-scroll-anchor D3, as amended at the verification gate): a
+/// move on another tab does nothing (R3.5), so it no longer sets `drag_moved`. A
+/// gesture pressed on tab A and released on tab B would then read as a click on B. It
+/// would clear B's selection, and with ⌘ held it would open whatever link B has lit.
+/// Neither tab saw a click, so the release is inert. The same holds for a round trip:
+/// press on A, move on B, switch back to A with no further motion, release. The
+/// pointer moved, so `left_tab` keeps it from reading as a click on A (B5).
 ///
 /// `None` — a release with no drag recorded — reads as a click. The event loop cannot
 /// reach that (`dragging` is armed only together with a drag), and it is what the
 /// `drag_moved: false` the app started with meant before this type existed.
-pub(crate) fn moved(drag: Option<SelectionDrag>) -> bool {
-    drag.is_some_and(|d| d.moved)
+pub(crate) fn is_click(drag: Option<SelectionDrag>, active: TabId) -> bool {
+    drag.is_none_or(|d| !d.moved && !d.left_tab && d.tab == active)
 }
 
-/// End `drag` on release, against `terminal` — the **active** tab's, exactly as before
-/// this type existed (selection-input R3.4, unchanged; D3: "Release behaves as it does
-/// today"). A plain click clears the selection; a real drag leaves it standing for
-/// Cmd+C. Returns whether it cleared — the caller's cue to redraw.
-pub(crate) fn release(drag: Option<SelectionDrag>, terminal: &mut Terminal) -> bool {
-    if moved(drag) {
+/// End `drag` on release, against `terminal`, the **active** tab's. A click (see
+/// [`is_click`]) clears the selection (selection-input R3.4, unchanged). A real drag
+/// leaves it standing for Cmd+C, and a release on a tab other than the press's
+/// touches nothing. Returns whether it cleared — the caller's cue to redraw.
+pub(crate) fn release(drag: Option<SelectionDrag>, active: TabId, terminal: &mut Terminal) -> bool {
+    if !is_click(drag, active) {
         return false;
     }
     terminal.clear_selection();
@@ -226,13 +245,13 @@ mod tests {
         // A jitter move reported in the same cell.
         assert!(!drag.drive(A, (2, 2), &mut t));
         assert!(
-            !moved(Some(drag)),
+            is_click(Some(drag), A),
             "drag_moved is keyed on the viewport cell"
         );
         let sel = t.selection().expect("the earlier selection is untouched");
         assert_eq!((sel.anchor, sel.focus), earlier, "no selection was set");
 
-        assert!(release(Some(drag), &mut t), "a click clears on release");
+        assert!(release(Some(drag), A, &mut t), "a click clears on release");
         assert_eq!(t.selection(), None);
     }
 
@@ -255,13 +274,38 @@ mod tests {
         assert_eq!(t.selection(), None, "a spent drag never re-creates");
 
         assert!(
-            !release(Some(drag), &mut t),
+            !release(Some(drag), A, &mut t),
             "a real drag does not clear on release"
         );
         assert_eq!(
             t.selection(),
             None,
             "and nothing comes back through release"
+        );
+    }
+
+    // selection-scroll-anchor R3.3, through the real D4 check rather than a simulated
+    // clear: an app repaints a selected cell mid-drag, the drain settles, and the drag
+    // is spent. A further move does not re-anchor on the repainted line.
+    #[test]
+    fn a_repaint_under_a_started_drag_spends_it() {
+        let mut t = fixture();
+        let mut drag = SelectionDrag::press(A, (0, 1), &t);
+        assert!(drag.drive(A, (4, 1), &mut t));
+        assert_eq!(t.selection_text().as_deref(), Some("bravo"));
+
+        t.advance(b"\x1b[2;1Hx"); // `bravo` -> `xravo`
+        t.settle_selection(std::time::Instant::now()); // what `Session::drain` does
+        assert_eq!(t.selection(), None, "the D4 check cleared the changed text");
+
+        assert!(
+            !drag.drive(A, (2, 2), &mut t),
+            "a spent drag writes nothing"
+        );
+        assert_eq!(t.selection(), None);
+        assert!(
+            !release(Some(drag), A, &mut t),
+            "and its release is no click"
         );
     }
 
@@ -274,7 +318,7 @@ mod tests {
 
         assert!(drag.drive(A, (4, 1), &mut t));
         assert!(drag.started);
-        assert!(moved(Some(drag)));
+        assert!(!is_click(Some(drag), A));
         assert_eq!(t.selection_text().as_deref(), Some("bravo"));
     }
 
@@ -292,7 +336,7 @@ mod tests {
 
         assert!(drag.drive(A, (0, 1), &mut t), "back on the press cell");
         assert_eq!(t.selection_text().as_deref(), Some("b"));
-        assert!(!release(Some(drag), &mut t));
+        assert!(!release(Some(drag), A, &mut t));
         assert_eq!(t.selection_text().as_deref(), Some("b"));
     }
 
@@ -326,11 +370,65 @@ mod tests {
         assert!(!drag.drive(B, (4, 1), &mut tab_b));
         assert_eq!(tab_b.selection(), None, "the anchor never reaches tab B");
         assert_eq!(tab_a.selection(), None, "and tab A is not written either");
-        assert!(!moved(Some(drag)), "an ignored move records nothing");
+        assert!(!drag.moved, "an ignored move records no `drag_moved`");
+        assert!(
+            !is_click(Some(drag), A),
+            "but the drag left its tab, so it is no click on A either (B5)"
+        );
 
         // Back on tab A, the same drag acts again: the check is per move.
         assert!(drag.drive(A, (4, 1), &mut tab_a));
         assert_eq!(tab_a.selection_text().as_deref(), Some("bravo"));
+        assert_eq!(tab_b.selection(), None);
+    }
+
+    // selection-scroll-anchor D3 as amended at the verification gate (B3): a gesture
+    // pressed on tab A and released on tab B is a click on neither. Its moves on B were
+    // ignored (R3.5), so `drag_moved` alone would call it a click and clear B's selection
+    // and, with ⌘ held, open B's lit link.
+    #[test]
+    fn a_release_on_another_tab_is_inert() {
+        let mut tab_b = fixture();
+        tab_b.set_selection(tab_b.point_at(0, 1), tab_b.point_at(4, 1));
+        let tab_a = fixture();
+        // Pressed on A; B is brought to the front with the button held, and the release
+        // comes there with no move at all, so only the tab half can tell.
+        let drag = SelectionDrag::press(A, (0, 1), &tab_a);
+
+        assert!(
+            !is_click(Some(drag), B),
+            "released on B, so not a click: `url_to_open` reads `drag_moved` true"
+        );
+        assert!(
+            !release(Some(drag), B, &mut tab_b),
+            "the release clears nothing"
+        );
+        assert_eq!(tab_b.selection_text().as_deref(), Some("bravo"));
+
+        // The same untouched drag released on its own tab is still a click.
+        assert!(is_click(Some(drag), A));
+    }
+
+    // selection-scroll-anchor D3 amendment, round trip (B5): pressed on A, moved while
+    // B was in front, released back on A with no further motion. Every check at release
+    // sees an unmoved pointer on its own tab, but the gesture did go somewhere. Without
+    // `left_tab` it would clear A's selection and, with ⌘ held, open the link lit where
+    // the pointer ended.
+    #[test]
+    fn a_drag_that_left_its_tab_is_no_click_when_it_comes_back() {
+        let mut tab_a = fixture();
+        tab_a.set_selection(tab_a.point_at(0, 0), tab_a.point_at(4, 0));
+        let mut tab_b = fixture();
+        let mut drag = SelectionDrag::press(A, (0, 1), &tab_a);
+
+        assert!(!drag.drive(B, (4, 2), &mut tab_b), "R3.5: B is not written");
+        // Back on A, no `CursorMoved` arrives before the release.
+        assert!(!is_click(Some(drag), A), "the gesture left its tab");
+        assert!(
+            !release(Some(drag), A, &mut tab_a),
+            "the release clears nothing"
+        );
+        assert_eq!(tab_a.selection_text().as_deref(), Some("alpha"));
         assert_eq!(tab_b.selection(), None);
     }
 
@@ -340,8 +438,8 @@ mod tests {
     fn a_release_with_no_drag_recorded_is_a_click() {
         let mut t = fixture();
         t.set_selection(t.point_at(0, 1), t.point_at(4, 1));
-        assert!(!moved(None));
-        assert!(release(None, &mut t));
+        assert!(is_click(None, A));
+        assert!(release(None, A, &mut t));
         assert_eq!(t.selection(), None);
     }
 
@@ -383,8 +481,8 @@ mod tests {
     // stops calling it — or calls `point_at` itself again, which is how the T1 stop-gap
     // converted the press cell at move time and anchored on the wrong line. So: the app's
     // event loop converts no cell and writes no selection of its own, each arm hands its
-    // gesture to this module, and the release reads `drag_moved` for the link decision
-    // BEFORE `release` consumes the drag — after it, `moved` reads `None`, every drag
+    // gesture to this module, and the release reads `is_click` for the link decision
+    // BEFORE `release` consumes the drag. After it, the drag reads `None`, every drag
     // reads as a click, and a ⌘-drag ending on a link would open it (hyperlinks D19).
     #[test]
     fn the_event_loop_arms_only_delegate_to_the_drag() {
@@ -423,7 +521,7 @@ mod tests {
 
         let release = arm(&code, "ReleaseTarget::Selection =>");
         let moved_at = release
-            .find("drag::moved(")
+            .find("drag::is_click(")
             .expect("the release reads `drag_moved` from the drag");
         let release_at = release
             .find("drag::release(")

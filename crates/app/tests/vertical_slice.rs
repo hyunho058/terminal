@@ -281,7 +281,10 @@ fn shell_output_reaches_actual_pixels() {
 /// from a variable so the echo cannot contain it.
 ///
 /// Falsified: with the `settle_selection` call removed from `drain`, the final
-/// assertion fails.
+/// assertion fails. That holds only while the shell emits no `?2026l` around this
+/// output: a prompt theme that wraps its redraws in synchronized updates would clear
+/// the selection at the `?2026l` itself (D5), and this test would pass without the
+/// drain's settle. The zsh this runs against wraps nothing.
 #[test]
 fn draining_output_that_repaints_a_selected_row_clears_the_selection() {
     let Some(mut session) = live_session() else {

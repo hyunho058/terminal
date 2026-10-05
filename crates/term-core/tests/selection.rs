@@ -409,6 +409,39 @@ fn a_narrower_history_row_is_padded_and_does_not_soft_wrap() {
     assert_eq!(t.selection_text().as_deref(), Some("hello\nab"));
 }
 
+#[test]
+fn a_column_past_the_right_margin_highlights_exactly_what_copy_returns() {
+    // scroll-anchor D2 (verification gate, B2). A drag pressed before a resize sets
+    // its first selection after it, so its anchor column was measured at the old
+    // width. The projection clamps the column the way the extractor does. Unclamped,
+    // the highlight would tint one cell while copy returned four.
+    let mut t = term(10, 3);
+    t.advance(b"abcdefghij\r\nklmnop\r\nqrs");
+    let press = t.point_at(8, 0); // taken at press time, at width 10
+    t.resize(6, 3);
+    let focus = t.point_at(2, 1);
+    t.set_selection(press, focus);
+
+    let snap = t.snapshot();
+    let sel = snap.selection.expect("on screen");
+    assert_eq!(
+        sel.normalized(),
+        ((5, 0), (2, 1)),
+        "anchor column clamped to the new right margin"
+    );
+    let tinted: String = (0..3)
+        .flat_map(|row| (0..6).map(move |col| (col, row)))
+        .filter(|&(col, row)| sel.contains(col, row, 6))
+        .filter_map(|(col, row)| snap.cell(col, row).map(|c| c.ch))
+        .collect();
+    assert_eq!(tinted, "fklm", "the cells the highlight covers");
+    assert_eq!(
+        t.selection_text().as_deref(),
+        Some("fklm"),
+        "the text copy returns: the same cells (`f` fills the last column, so it joins)"
+    );
+}
+
 // ---- selection-model R4: bracketed-paste mode (DECSET/DECRST 2004) ----
 
 #[test]

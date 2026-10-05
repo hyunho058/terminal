@@ -2623,20 +2623,28 @@ impl ApplicationHandler<UserEvent> for App {
                 // Nothing is re-resolved here — that is what makes "what is underlined
                 // is exactly what opens" true at the moment of the open, not merely by
                 // construction (D20).
+                // A release on a tab other than the press's is no click at all
+                // (`drag::is_click`): it neither opens the link lit there nor clears
+                // that tab's selection.
+                let active = inner.tabs.active().id;
                 let url = url_to_open(ClickInput {
                     cmd_at_press: inner.link_cmd_at_press,
                     cmd_at_release: inner.mods.super_key(),
-                    drag_moved: drag::moved(inner.drag),
+                    drag_moved: !drag::is_click(inner.drag, active),
                     lit: inner.link_handle.span(),
                 });
                 // End the drag (selection-input). A plain click — the pointer never
                 // left the press cell — clears any selection; a real drag leaves the
                 // selection standing for Cmd+C. Unchanged by the open above: an
                 // opening click still clears the selection, exactly as it does today.
-                // `drag::release` decides, against the active tab as it always has,
-                // and the drag is consumed: the next press builds a fresh one.
+                // `drag::release` decides, against the active tab, and the drag is
+                // consumed: the next press builds a fresh one.
                 inner.dragging = false;
-                if drag::release(inner.drag.take(), &mut inner.tabs.active_mut().terminal) {
+                if drag::release(
+                    inner.drag.take(),
+                    active,
+                    &mut inner.tabs.active_mut().terminal,
+                ) {
                     inner.redraw();
                 }
                 // Replay whatever the drag swallowed (terminal-scroll D6). Without this

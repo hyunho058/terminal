@@ -1165,19 +1165,28 @@ impl Grid {
     /// DECSET/DECRST `?2026` — open or close a synchronized update
     /// (selection-scroll-anchor D5).
     ///
-    /// `?2026l` is the exact end of the app's frame, so closing runs the D4 check
-    /// (trigger `sync-end`) right here, mid-chunk, with no settle needed: whatever
-    /// was painted inside the block is complete.
+    /// `?2026l` that closes an **open** block is the exact end of the app's frame, so
+    /// it runs the D4 check (trigger `sync-end`) right here, mid-chunk, with no settle
+    /// needed: whatever was painted inside the block is complete.
+    ///
+    /// A `?2026l` with no block open ends no frame. It changes nothing and checks
+    /// nothing. Checking there would be a check in the middle of whatever the app is
+    /// painting (D4/D5: never mid-frame), so a stray close from an app that never
+    /// opened a block could clear a selection whose text the rest of its repaint
+    /// restores. The drain settle still checks that output.
     ///
     /// A `?2026h` while a block is **already** open changes nothing — in particular
     /// it keeps the block's stamp. Re-opening would reset the stamp, and an app that
     /// repeated `?2026h` without ever closing could then defer the check forever,
     /// which is the unbounded case [`SYNC_STALE`] exists to rule out.
     pub(crate) fn set_synchronized_update(&mut self, on: bool) {
+        let was_open = self.sync != SyncUpdate::Closed;
         if !on {
             self.sync = SyncUpdate::Closed;
-            self.check_selection("sync-end");
-        } else if self.sync == SyncUpdate::Closed {
+            if was_open {
+                self.check_selection("sync-end");
+            }
+        } else if !was_open {
             self.sync = SyncUpdate::Open { seen_at: None };
         }
     }

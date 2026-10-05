@@ -173,6 +173,11 @@ pub(crate) fn soft_wraps(row: &[Cell], cols: u16) -> bool {
 /// linear-span rule: the clipped span is exactly the visible part of the stream.
 /// `None` iff the span ends above the viewport or starts below it; otherwise at
 /// least one cell is visible.
+///
+/// Columns are clamped to `cols - 1`, the same rule the extractor applies, so the
+/// highlight covers exactly the cells copy returns. A stored column is normally
+/// already `< cols`, but not always: a drag pressed before a resize sets its first
+/// selection after it, from a press cell measured at the old width.
 pub(crate) fn project_selection(
     start: Point,
     end: Point,
@@ -181,6 +186,7 @@ pub(crate) fn project_selection(
     rows: u16,
 ) -> Option<Selection> {
     let last_row = i128::from(rows) - 1;
+    let last_col = cols - 1;
     let start_row = i128::from(start.line) - i128::from(top);
     let end_row = i128::from(end.line) - i128::from(top);
     if end_row < 0 || start_row > last_row {
@@ -191,12 +197,12 @@ pub(crate) fn project_selection(
     let anchor = if start_row < 0 {
         (0, 0) // starts above the viewport
     } else {
-        (start.col, start_row as u16)
+        (start.col.min(last_col), start_row as u16)
     };
     let focus = if end_row > last_row {
-        (cols - 1, rows - 1) // ends below the viewport
+        (last_col, rows - 1) // ends below the viewport
     } else {
-        (end.col, end_row as u16)
+        (end.col.min(last_col), end_row as u16)
     };
     Some(Selection { anchor, focus })
 }

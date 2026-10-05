@@ -3,7 +3,11 @@
 ## Meta
 - **Created**: 2026-10-03
 - **Type**: dev
-- **Status**: approved (not yet executed)
+- **Status**: implemented on `feat/selection-scroll-anchor`; verification gate passed
+  (3 iterations, 2026-10-04, contract in `loop.md`)
+- **Amended 2026-10-04**: two user-approved D3 release amendments (verification gate
+  B3, B5), and a Research correction. In a mac-terminal tab Claude Code sends no
+  `?2026`; D5's rationale and two Known Gaps were updated, and no decision changed.
 - **Approved by**: user (spec only — implementation is a separate decision)
 - **Approved at**: 2026-10-03
 - **L2-reviewer**: two rounds, both NEEDS_FIX, all findings verified and applied except one rejected with reasoning (D5 steelman: idle debounce starves under continuous repaint)
@@ -111,6 +115,9 @@ scanned for mode sequences and mapped against the read boundaries.
 - **Every frame is wrapped in synchronized output**: 4 × `?2026h`, 4 × `?2026l`, each
   pair bracketing exactly one repaint (`?2026h` at 233 … `?2026l` at 2207, then three
   ~110-byte frames).
+  **Corrected 2026-10-04: this does not hold in a mac-terminal tab.** Claude Code
+  brackets frames only when `TERM_PROGRAM` names a terminal it recognises. This
+  capture evidently inherited one from the session that ran it. See the next section.
 - **macOS PTY reads cap at 1024 bytes.** Read sizes were `[13, 30, 16, 12, 33, 40, 20,
   1024, 1024, 239, 111, 111, 105]` against a 65 536-byte buffer. The first frame
   (~2 KB) arrived **split across two reads**. The app reads with an 8 KiB buffer
@@ -119,12 +126,62 @@ scanned for mode sequences and mapped against the read boundaries.
 - The four captured frames contain no `SU`/`SD`/`RI` and no `CSI 2K`/`CSI A`. These were
   **startup frames only**: no wheel scroll was driven, because that needs a long
   transcript, which means resuming a live session. The sequence of a *scroll* frame is
-  therefore **unmeasured**. The design does not depend on it. Claude Code runs on the
+  therefore **unmeasured** (now measured: see the 2026-10-04 section below). The design
+  does not depend on it. Claude Code runs on the
   alt screen, which never retains history (`grid.rs:672`), so whether it scrolls by
   repaint or by `SU` inside the alt screen, the moved rows keep their positional line
   numbers and D4 clears the selection either way.
 - This repo parses **no** `?2026` today: `grep` finds no `2026` handling in `parser.rs`.
   Unknown DECSET modes fall through the `?`-mode loop (`parser.rs:410-420`).
+
+### Measured again, as a mac-terminal tab sees it (2026-10-04, after implementation)
+The section above was captured in an environment this terminal never gives a tab. This
+capture reproduces a tab's environment instead:
+- `TERM=xterm-256color`, `COLORTERM=truecolor`, `LANG=C.UTF-8`, `LC_CTYPE=UTF-8`, and
+  no `TERM_PROGRAM`;
+- every `CLAUDE*` variable stripped;
+- no answer to any query, because term-core has no reply path.
+
+It was a Python `pty.fork()` harness at 100×30, run from the main repo cwd (the trusted
+folder the eyeball session also used). The transcript was built with ten `!seq` bash-mode
+commands, which make no model call. The harness then sent 8 wheel-up and 4 wheel-down
+notches as this terminal encodes them (`encode_wheel_report`, SGR `ESC [ < 64|65 ; col ;
+row M`), with every read recorded. A second run added the `TMUX` / `TERM_PROGRAM=tmux`
+that a window launched from a tmux shell leaks into its tabs.
+
+- **Claude Code sends no `?2026` here: 0 × `?2026h`, 0 × `?2026l`**, at startup, while
+  the transcript grew, and on all 12 notches, in both runs.
+- **What decides it is `TERM_PROGRAM`, not the version.** Startup probes:
+
+  | binary | environment | `?2026h` / `?2026l` |
+  |---|---|---|
+  | 2.1.289 | no `TERM_PROGRAM` (a mac-terminal tab) | 0 / 0 |
+  | 2.1.287 | same | 0 / 0 |
+  | 2.1.289 | `TERM_PROGRAM=tmux` | 0 / 0 |
+  | 2.1.289 | `TERM_PROGRAM=iTerm.app` | 1 / 1 |
+  | 2.1.289 | `TERM_PROGRAM=ghostty` | 1 / 1, and no `?1049h` at startup |
+
+- **A wheel notch is an in-place repaint**, which closes the "unmeasured" gap of the
+  section above. Each notch sends ~0.9–1.3 KB: 2 `CUP` (4 on the first notch), 4–7 `EL`,
+  and text. It sends no `SU`/`SD`/`RI`, no `DECSTBM`, no `IL`/`DL` and no `CSI 2J`. The
+  transcript labels in each frame show the content shifting under fixed rows. The first
+  wheel-down after the top produced no output. D4's change check therefore decides every
+  Claude Code scroll, as designed.
+- **Those repaints are split across reads, unbracketed.**
+  - No-`TERM_PROGRAM` run: 8 of the 11 notches that produced output arrived in two or
+    three reads (`[1024, 28, 113]`, `[1024, 230]`, `[1024, 12]`, …).
+  - tmux run: 1 of 11 (`[966, 100]`).
+
+  A split is set by timing, not only by the 1024-byte cap.
+- **Queries Claude Code sends, which this terminal leaves unanswered:** DA1 (`CSI c`),
+  the kitty keyboard query (`CSI ? u`) and XTVERSION (`CSI > q`), each twice. Whether an
+  XTVERSION or DECRQM answer would make it bracket frames is **unmeasured**.
+- **The eyeball session agrees:** 4 selection clears during a Claude Code session in
+  the test window (16:48:38–16:48:46Z), all with trigger `drain`, none `sync-end`.
+
+**What this changes:** none of D1–D8. In a mac-terminal tab, every Claude Code clear is
+D5's drain check (b). The `?2026l` check (a) serves apps that do bracket frames. Claude
+Code also joins the "apps that do not bracket frames" Known Gap below.
 
 ### The paths a content-anchored selection touches
 - **Drag** (`terminal_app.rs:2574-2589` press, `:2435-2451` move): the press stores
@@ -273,6 +330,15 @@ checkpoints below were resolved by recommendation and are marked `assumed`.
   clear), and the next press starts fresh. `term-core` needs no new event.
   **Rejected**: re-creating on the next move. A selection made over repainting
   content would flicker off and back on, re-anchored to text the user never pressed on.
+- **Amended at the verification gate (2026-10-04, user-approved):** a release on a tab
+  other than `drag_tab` is **inert**: no clear, and no link open. The moves on the
+  other tab are ignored, so `drag_moved` alone would have read the gesture as a click
+  on that tab. It would then clear that tab's selection and, with ⌘ held, open its lit
+  link. `drag::is_click` requires both an unmoved pointer and `drag_tab == active`.
+  A second amendment, approved the same day, covers the round trip. A drag that had
+  any move while another tab was in front is no click at all, even when it is
+  released back on `drag_tab` with no further motion. Those moves still write nothing
+  (R3.5), but the pointer went somewhere (`SelectionDrag::left_tab`).
 
 ### D4: A selection whose selected characters change is cleared
 - **Status**: assumed
@@ -300,6 +366,10 @@ checkpoints below were resolved by recommendation and are marked `assumed`.
   guarantee, and it adds a state for a case that, on the measured traffic, is almost
   always a real change. Claude Code's split frames are its large repaints; its spinner
   frames fit in one 1024-byte read.
+  (2026-10-04: Claude Code opens no synchronized update in a mac-terminal tab, per the
+  second Research capture. So this adoption case does not arise for it here. Its split
+  wheel repaints meet the drain check instead, covered in the Known Gap on apps that do
+  not bracket frames.)
 
   A check (timed by D5) clears the selection when either:
   - **(a)** the selection's **start** line (the earlier of the two points, ordered by
@@ -369,6 +439,13 @@ checkpoints below were resolved by recommendation and are marked `assumed`.
   every later check skipped. That is today's bug, in a corner, and it contradicts the
   Confirmed Goal. The caller-supplied instant gives the bound without giving
   `term-core` a clock.
+  **Corrected 2026-10-04:** the "Claude Code wraps every frame" premise holds only under
+  a `TERM_PROGRAM` it recognises. In a mac-terminal tab it sends no `?2026` (second
+  Research capture), so (b), the drain check, carries every Claude Code clear here. The
+  decision stands for both halves:
+  - the 1024-byte split is re-measured on wheel repaints (8 of 11 notches split), so a
+    per-chunk check would still see half-painted frames;
+  - (a) still serves apps that do bracket frames.
   **Rejected (steelman)**: an app-side idle debounce, checking only after N ms with no
   output, to cut false clears for TUIs that do not use `?2026`. A TUI that repaints
   continuously (htop, a tmux status clock, a spinner) never goes idle, so the check
@@ -465,22 +542,34 @@ checkpoints below were resolved by recommendation and are marked `assumed`.
   block opened (D5). An app that dies mid-frame with nothing printed afterwards
   leaves a changed selection highlighted until the next output, typically the echo of
   the user's next keystroke. In that window it is drawn but cannot be copied.
-- **Apps that do not bracket frames with `?2026`** (vim, tmux, others): a repaint split
-  across two drain batches can clear a selection whose text ends up unchanged. That is
-  a false *clear*, never a stale highlight, and erring in that direction is the choice D5
-  makes on purpose (an idle debounce was weighed and rejected there). **How often this
-  happens is unmeasured.** To measure it, clears are logged at `debug` with their
-  trigger (`sync-end`, `drain`, `sync-timeout`), so a session in vim or tmux shows
-  whether `drain` clears outnumber real changes. Whether tmux emits `?2026` toward
-  this terminal is also unmeasured.
+- **Apps that do not bracket frames with `?2026`** (vim, tmux, others, and **Claude
+  Code itself in a mac-terminal tab**, measured 2026-10-04 in Research): a repaint
+  split across two drain batches can clear a selection whose text ends up unchanged.
+  That is a false *clear*, never a stale highlight, and erring in that direction is the
+  choice D5 makes on purpose (an idle debounce was weighed and rejected there).
+  - For a Claude Code **scroll** the outcome is the same either way, because the text
+    under the selection really does change. Its wheel repaints split across reads (8 of
+    11 notches in one run) but carry no `?2026`.
+  - The exposure is any other repaint that only *passes through* a selected cell's text
+    and restores it, split across drains.
+  - **How often this happens is unmeasured.** The first eyeball reading is 4 clears in
+    a Claude Code session, all `drain`. Whether any of them was false is not known.
+  - To measure it, clears are logged at `debug` with their trigger (`sync-end`,
+    `drain`, `sync-timeout`), so a session in vim, tmux or Claude Code shows whether
+    `drain` clears outnumber real changes.
+  - Whether tmux emits `?2026` toward this terminal is also unmeasured. A possible
+    follow-up is to answer XTVERSION or DECRQM `?2026`, which might lead apps to bracket
+    frames. That is unmeasured, and it would be a separate feature.
 - **A drag move between the halves of a split frame adopts the half-painted state**
   as its baseline (D4, "What a re-baseline can adopt"). The user is pointing at what
   is drawn at that instant, so this is accepted rather than guarded.
 - **An app's own scroll is not followed.** A repaint carries no "scrolled by N"
   signal, and region scrolls are deliberately not followed (D1, steelman). In Claude
   Code a selection is cleared as soon as the view shifts, including the app's
-  auto-follow while a response streams. Claude Code's actual scroll-frame sequence is
-  unmeasured (Research), but D4's outcome does not depend on it.
+  auto-follow while a response streams. Claude Code's scroll-frame sequence was
+  measured on 2026-10-04 (Research): an in-place repaint of `CUP` + text + `EL`, with
+  no `SU`/`SD`/`RI`/`DECSTBM`. So no future "follow region scrolls" extension (D1)
+  would apply to it either.
 - **Rendering still ignores `?2026`**, so there is no tear-free frame presentation. That
   is a separate feature: D5 uses the flag only to time the check.
 - **A drag held while output streams at the live bottom** carries its anchor up into
