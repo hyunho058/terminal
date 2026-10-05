@@ -67,6 +67,8 @@ pub(crate) mod waiting;
 
 // The crate's entire public surface. Each line names its one consumer, because
 // that consumer is the only thing keeping the item out of the dead-code lint.
+/// `crates/app/tests/vertical_slice.rs` drags a selection over a real shell's output.
+pub use drag::{is_click as release_is_click, release as release_drag, SelectionDrag};
 /// `crates/app/tests/vertical_slice.rs` types through the real encoder.
 pub use input::encode_key;
 /// The SD4 seam: named in the signatures below and asserted by

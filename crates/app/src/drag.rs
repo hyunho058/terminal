@@ -47,7 +47,7 @@ pub(crate) enum DragMove {
 /// `CursorMoved`, and ended by the module's [`release`], which consumes it. The next
 /// press builds a fresh one, so nothing here outlives its gesture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SelectionDrag {
+pub struct SelectionDrag {
     /// The tab the press landed in. Only that tab's grid is ever written (R3.5): a
     /// tab switch with the button held must not carry this anchor — a line number in
     /// *this* tab's content — into another tab's grid, where it names unrelated text.
@@ -73,7 +73,7 @@ pub(crate) struct SelectionDrag {
 impl SelectionDrag {
     /// Arm a drag for a press on viewport `cell` of tab `tab`, whose terminal is
     /// `terminal`. The cell becomes a content point **now**, at press time (R3.1).
-    pub(crate) fn press(tab: TabId, cell: (u16, u16), terminal: &Terminal) -> Self {
+    pub fn press(tab: TabId, cell: (u16, u16), terminal: &Terminal) -> Self {
         SelectionDrag {
             tab,
             press_cell: cell,
@@ -132,12 +132,7 @@ impl SelectionDrag {
     /// selection is written to. Passing the active tab's terminal rather than looking
     /// the drag tab up is safe because step 0 refuses every move in which they differ,
     /// and in every other move they are the same terminal.
-    pub(crate) fn drive(
-        &mut self,
-        active: TabId,
-        cell: (u16, u16),
-        terminal: &mut Terminal,
-    ) -> bool {
+    pub fn drive(&mut self, active: TabId, cell: (u16, u16), terminal: &mut Terminal) -> bool {
         let focus = terminal.point_at(cell.0, cell.1);
         match self.step(active, cell, focus, terminal.selection().is_some()) {
             DragMove::Set { anchor, focus } => {
@@ -167,7 +162,7 @@ impl SelectionDrag {
 /// `None` — a release with no drag recorded — reads as a click. The event loop cannot
 /// reach that (`dragging` is armed only together with a drag), and it is what the
 /// `drag_moved: false` the app started with meant before this type existed.
-pub(crate) fn is_click(drag: Option<SelectionDrag>, active: TabId) -> bool {
+pub fn is_click(drag: Option<SelectionDrag>, active: TabId) -> bool {
     drag.is_none_or(|d| !d.moved && !d.left_tab && d.tab == active)
 }
 
@@ -175,7 +170,7 @@ pub(crate) fn is_click(drag: Option<SelectionDrag>, active: TabId) -> bool {
 /// [`is_click`]) clears the selection (selection-input R3.4, unchanged). A real drag
 /// leaves it standing for Cmd+C, and a release on a tab other than the press's
 /// touches nothing. Returns whether it cleared — the caller's cue to redraw.
-pub(crate) fn release(drag: Option<SelectionDrag>, active: TabId, terminal: &mut Terminal) -> bool {
+pub fn release(drag: Option<SelectionDrag>, active: TabId, terminal: &mut Terminal) -> bool {
     if !is_click(drag, active) {
         return false;
     }
