@@ -4,11 +4,64 @@
 //! cell control" surface the project exists to own — deliberately GPU-free so it
 //! can be unit-tested headlessly.
 
+use std::time::{Duration, Instant};
+
 use unicode_width::UnicodeWidthChar;
 
 use crate::image::{Decoded, ImageLayer};
 use crate::scrollback::{History, DEFAULT_HISTORY_LIMIT};
-use crate::selection::Selection;
+use crate::selection::{ContentSelection, Point};
+use crate::snapshot::soft_wraps;
+
+/// How long an open synchronized update (`?2026h` with no `?2026l` yet) may defer
+/// the selection check, measured at drains (selection-scroll-anchor D5).
+///
+/// An app that dies mid-frame never sends its `?2026l`; without a bound every later
+/// check would be skipped and a changed selection would stay highlighted for good.
+/// [`Terminal::settle_selection`](crate::Terminal::settle_selection) drops a block
+/// at the first settle at least this long after it first saw it open. The time is
+/// always the caller's — `term-core` owns the rule, not a clock.
+pub const SYNC_STALE: Duration = Duration::from_secs(1);
+
+/// The stored drag selection plus the reference its change check compares against
+/// (selection-scroll-anchor D2/D4). One value, so every path that drops the
+/// selection — a clear, a resize, a failed check — drops its reference with it.
+#[derive(Clone, Debug)]
+struct StoredSelection {
+    span: ContentSelection,
+    /// D4's reference: the selected characters of every selected line that was on
+    /// the **live screen** when the selection was set, re-taken on every set. Lines
+    /// already in history are left out — history rows are never rewritten, so they
+    /// cannot change — which bounds this by one screen (`rows × cols` cells) however
+    /// far into history the selection reaches. Empty for a selection lying wholly in
+    /// history.
+    reference: Vec<ReferenceLine>,
+}
+
+/// The characters (`Cell::ch`, continuation spacers included) of one line's
+/// selected cells, starting at `first_col`, as they were when the selection was set.
+#[derive(Clone, Debug)]
+struct ReferenceLine {
+    line: u64,
+    first_col: u16,
+    chars: Vec<char>,
+}
+
+/// DECSET `?2026` — synchronized update — as far as the selection check needs it
+/// (selection-scroll-anchor D5). Rendering ignores it.
+///
+/// One enum rather than a flag plus a stamp, so "closed" can never carry a stale
+/// stamp: every close (`?2026l`, RIS, leaving the alt screen, the stale timeout)
+/// drops the stamp by construction.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SyncUpdate {
+    Closed,
+    /// `seen_at` is the `now` of the first settle that found the block open, or
+    /// `None` before any settle has.
+    Open {
+        seen_at: Option<Instant>,
+    },
+}
 
 /// A packed `0xRRGGBB` color. UI-agnostic: the renderer converts to whatever the
 /// GPU needs.
@@ -192,11 +245,19 @@ pub struct Grid {
     mouse_button_event: bool,
     mouse_any_event: bool,
     mouse_encoding: MouseEncoding,
-    /// The live drag selection (anchor/focus viewport cells), or `None`. Carried to
-    /// the renderer on `GridSnapshot.selection` and extracted to text via
-    /// `GridSnapshot::selection_text`. Cleared on `resize` (coords are dimension-
-    /// bound); when to clear it on new output/scroll is the app's policy.
-    selection: Option<Selection>,
+    /// The drag selection as two content [`Point`]s (selection-scroll-anchor D2), or
+    /// `None`. Content-anchored, so it follows its text through terminal-owned
+    /// scrolling. The renderer sees it projected into viewport cells on
+    /// `GridSnapshot.selection` (at every `view_offset`); its text comes from
+    /// [`selection_text`](Grid::selection_text), which reads history + live by line.
+    /// Cleared on `resize` (D7: no rewrap, so line content is dimension-bound), and
+    /// by the D4 change check when its selected text changes.
+    selection: Option<StoredSelection>,
+    /// DECSET `?2026` synchronized update, which times the D4 change check
+    /// (selection-scroll-anchor D5): the check runs at `?2026l` and at each drain's
+    /// settle, never inside an open block. Absent from `GridSnapshot` — rendering
+    /// does not honour it.
+    sync: SyncUpdate,
     /// Inline-image placements anchored to cells (image-paste D2, SD5).
     images: ImageLayer,
     /// DECSTBM top/bottom margins — the inclusive row range scrolling is confined
@@ -339,6 +400,7 @@ impl Grid {
             mouse_any_event: false,
             mouse_encoding: MouseEncoding::Legacy,
             selection: None,
+            sync: SyncUpdate::Closed,
             images: ImageLayer::new(),
             scroll_top: 0,
             scroll_bottom: rows - 1,
@@ -355,6 +417,23 @@ impl Grid {
             command_running: false,
             osc_title: None,
         }
+    }
+
+    /// A grid whose scrollback keeps at most `limit` rows — **test-only**, so a
+    /// test can drive eviction in a few lines instead of 100 000
+    /// (selection-scroll-anchor R1.4/R4.5). Production grids always use
+    /// [`DEFAULT_HISTORY_LIMIT`].
+    #[cfg(test)]
+    pub(crate) fn with_history_limit(
+        cols: u16,
+        rows: u16,
+        fg: Color,
+        bg: Color,
+        limit: usize,
+    ) -> Self {
+        let mut grid = Grid::new(cols, rows, fg, bg);
+        grid.history = History::new(limit);
+        grid
     }
 
     pub fn cols(&self) -> u16 {
@@ -911,9 +990,17 @@ impl Grid {
     /// buffer — so there is no per-buffer margin state to preserve, and without
     /// this the shell would come back scrolling inside the dead app's region. The
     /// cursor is deliberately **not** homed (R4.1/R4.5).
+    ///
+    /// Leaving also closes an open synchronized update, for the same reason: an app
+    /// that dies mid-frame leaves its `?2026h` open, and its shell's prompt must not
+    /// inherit the deferral (selection-scroll-anchor D5). That close runs no check
+    /// of its own (D7) — the next settle does.
     pub fn set_alt_screen(&mut self, on: bool) {
         self.alt_screen = on;
         self.reset_scroll_region();
+        if !on {
+            self.reset_synchronized_update();
+        }
     }
     pub fn alt_screen(&self) -> bool {
         self.alt_screen
@@ -984,17 +1071,273 @@ impl Grid {
         self.mouse_encoding
     }
 
-    /// Set the live drag selection (anchor/focus viewport cells).
-    pub fn set_selection(&mut self, selection: Selection) {
-        self.selection = Some(selection);
+    /// Set the drag selection from two content points (selection-scroll-anchor D3).
+    /// `anchor` is where the drag began, `focus` its current end; either order is
+    /// accepted. Build them with [`point_at`](Grid::point_at) at the moment the cell
+    /// is learned.
+    ///
+    /// Every set re-takes the D4 reference from the cells as they are **now**, so
+    /// each drag move re-baselines it. There is no deferred capture.
+    pub fn set_selection(&mut self, anchor: Point, focus: Point) {
+        let span = ContentSelection { anchor, focus };
+        let reference = self.live_reference(span);
+        self.selection = Some(StoredSelection { span, reference });
     }
-    /// Clear any selection.
+    /// Clear any selection (and with it, its reference).
     pub fn clear_selection(&mut self) {
         self.selection = None;
     }
-    /// The current selection, if any.
-    pub fn selection(&self) -> Option<Selection> {
-        self.selection
+    /// The stored selection (content points, as set), if any.
+    pub fn selection(&self) -> Option<ContentSelection> {
+        self.selection.as_ref().map(|s| s.span)
+    }
+
+    /// D4's reference for `span`: the selected characters of each selected line on
+    /// the live screen at this moment — lines `evicted + history_len` and below,
+    /// whatever the `view_offset`. At most one screen of cells; empty when the span
+    /// lies wholly in history.
+    fn live_reference(&self, span: ContentSelection) -> Vec<ReferenceLine> {
+        let (start, end) = span.normalized();
+        let last_col = self.cols - 1;
+        let first_line = start.line.max(self.live_top_line());
+        let last_line = end.line.min(self.live_bottom_line());
+        (first_line..=last_line)
+            .filter_map(|line| {
+                let (first, last) = selected_cols(start, end, line, last_col);
+                let cells = self
+                    .line(line)?
+                    .get(usize::from(first)..=usize::from(last))?;
+                Some(ReferenceLine {
+                    line,
+                    first_col: first,
+                    chars: cells.iter().map(|c| c.ch).collect(),
+                })
+            })
+            .collect()
+    }
+
+    /// The D4 test, read-only — the **one** predicate both the change check and
+    /// copy's re-verify (D6) use: whether `sel` no longer names the text it was set
+    /// on. True when
+    ///
+    /// - **(a)** its start — the earlier point in reading order, not necessarily the
+    ///   anchor — is older than the oldest retained line. Eviction takes the oldest
+    ///   lines first, so any evicted selected line implies an evicted start; or
+    /// - **(b)** any referenced cell, re-read at its line (now in history or still
+    ///   live), holds a different character.
+    ///
+    /// Characters only: a colour or attribute change is not a change (copy would
+    /// return the same text). A line that moved into history compares equal by
+    /// construction, since history rows are never rewritten — which is exactly why
+    /// terminal-owned scrolling keeps a selection and an app's repaint does not.
+    fn selection_changed(&self, sel: &StoredSelection) -> bool {
+        let (start, _) = sel.span.normalized();
+        start.line < self.history.evicted()
+            || sel.reference.iter().any(|r| !self.reference_line_holds(r))
+    }
+
+    /// Whether `r`'s line still holds `r`'s characters at `r`'s columns.
+    fn reference_line_holds(&self, r: &ReferenceLine) -> bool {
+        let first = usize::from(r.first_col);
+        self.line(r.line)
+            .and_then(|cells| cells.get(first..first + r.chars.len()))
+            .is_some_and(|cells| cells.iter().map(|c| c.ch).eq(r.chars.iter().copied()))
+    }
+
+    /// Run the D4 check now: clear the selection if its text changed, logging the
+    /// `trigger` that caught it (selection-scroll-anchor R5.9 — `sync-end`, `drain`
+    /// or `sync-timeout`). No work at all without a selection (C5); otherwise at most
+    /// one screen of cell compares.
+    fn check_selection(&mut self, trigger: &'static str) {
+        if self
+            .selection
+            .as_ref()
+            .is_some_and(|sel| self.selection_changed(sel))
+        {
+            tracing::debug!(
+                trigger,
+                "selection cleared: its text changed or its start left scrollback"
+            );
+            self.selection = None;
+        }
+    }
+
+    /// DECSET/DECRST `?2026` — open or close a synchronized update
+    /// (selection-scroll-anchor D5).
+    ///
+    /// `?2026l` that closes an **open** block is the exact end of the app's frame, so
+    /// it runs the D4 check (trigger `sync-end`) right here, mid-chunk, with no settle
+    /// needed: whatever was painted inside the block is complete.
+    ///
+    /// A `?2026l` with no block open ends no frame. It changes nothing and checks
+    /// nothing. Checking there would be a check in the middle of whatever the app is
+    /// painting (D4/D5: never mid-frame), so a stray close from an app that never
+    /// opened a block could clear a selection whose text the rest of its repaint
+    /// restores. The drain settle still checks that output.
+    ///
+    /// A `?2026h` while a block is **already** open changes nothing — in particular
+    /// it keeps the block's stamp. Re-opening would reset the stamp, and an app that
+    /// repeated `?2026h` without ever closing could then defer the check forever,
+    /// which is the unbounded case [`SYNC_STALE`] exists to rule out.
+    pub(crate) fn set_synchronized_update(&mut self, on: bool) {
+        let was_open = self.sync != SyncUpdate::Closed;
+        if !on {
+            self.sync = SyncUpdate::Closed;
+            if was_open {
+                self.check_selection("sync-end");
+            }
+        } else if !was_open {
+            self.sync = SyncUpdate::Open { seen_at: None };
+        }
+    }
+
+    /// Close an open synchronized update **without** a check of its own — RIS and
+    /// leaving the alt screen (selection-scroll-anchor D5). Neither is a frame end,
+    /// and D7 gives neither a dedicated clear: the next settle checks, now that
+    /// nothing defers it.
+    pub(crate) fn reset_synchronized_update(&mut self) {
+        self.sync = SyncUpdate::Closed;
+    }
+
+    /// Whether a synchronized update is open — test-only; nothing outside the
+    /// selection check reads it.
+    #[cfg(test)]
+    pub(crate) fn synchronized_update(&self) -> bool {
+        matches!(self.sync, SyncUpdate::Open { .. })
+    }
+
+    /// The end-of-drain half of the D4 timing (selection-scroll-anchor D5); see
+    /// [`Terminal::settle_selection`](crate::Terminal::settle_selection).
+    ///
+    /// - no block open → check now (trigger `drain`);
+    /// - a block open that no settle has seen yet → stamp it `now`, skip;
+    /// - a block open for less than [`SYNC_STALE`] since its stamp → skip;
+    /// - one open for at least [`SYNC_STALE`] → drop it, then check (trigger
+    ///   `sync-timeout`).
+    ///
+    /// A `now` earlier than the stamp counts as no time elapsed.
+    pub(crate) fn settle_selection(&mut self, now: Instant) {
+        match self.sync {
+            SyncUpdate::Closed => self.check_selection("drain"),
+            SyncUpdate::Open { seen_at: None } => {
+                self.sync = SyncUpdate::Open { seen_at: Some(now) };
+            }
+            SyncUpdate::Open {
+                seen_at: Some(seen),
+            } => {
+                if now.saturating_duration_since(seen) >= SYNC_STALE {
+                    self.sync = SyncUpdate::Closed;
+                    self.check_selection("sync-timeout");
+                }
+            }
+        }
+    }
+
+    /// Rows that have aged out of the scrollback cap since this grid was created
+    /// (selection-scroll-anchor D1). History row `i` is content line
+    /// `evicted() + i`.
+    pub fn evicted(&self) -> u64 {
+        self.history.evicted()
+    }
+
+    /// The content line of live row 0: `evicted + history_len` (D1).
+    fn live_top_line(&self) -> u64 {
+        self.history.evicted() + self.history.len() as u64
+    }
+
+    /// The content line of the last live row — the newest line that exists.
+    fn live_bottom_line(&self) -> u64 {
+        self.live_top_line() + u64::from(self.rows) - 1
+    }
+
+    /// The content line shown on viewport row 0 at the current `view_offset`
+    /// (selection-scroll-anchor D2's `top`). `view_offset` never exceeds
+    /// `history_len` (every writer clamps it), so this cannot underflow.
+    pub(crate) fn top_line(&self) -> u64 {
+        self.live_top_line() - self.view_offset as u64
+    }
+
+    /// The content [`Point`] under viewport cell `(col, row)` at the current
+    /// `view_offset` (selection-scroll-anchor D3): line `top + row`, same column.
+    ///
+    /// Pure arithmetic, deliberately unclamped: a cell outside the viewport maps to
+    /// a line outside it, which the snapshot projection then clips or drops.
+    pub fn point_at(&self, col: u16, row: u16) -> Point {
+        Point {
+            line: self.top_line() + u64::from(row),
+            col,
+        }
+    }
+
+    /// The cells of content line `line` — a retained history row at the width it
+    /// was **captured** at, or a live row at the current width — or `None` when the
+    /// line has been evicted or lies below the live bottom.
+    pub(crate) fn line(&self, line: u64) -> Option<&[Cell]> {
+        let idx = line.checked_sub(self.history.evicted())?;
+        let hist = self.history.len() as u64;
+        if idx < hist {
+            return self.history_row(usize::try_from(idx).ok()?);
+        }
+        let cols = self.cols as usize;
+        let start = usize::try_from(idx - hist).ok()?.checked_mul(cols)?;
+        self.cells.get(start..start.checked_add(cols)?)
+    }
+
+    /// The stored selection's text, read from history + live **by line number**
+    /// (selection-scroll-anchor D6), or `None` when there is no selection **or its
+    /// text has changed**.
+    ///
+    /// This is the one extractor: it returns the whole selection even when part of
+    /// it has scrolled off-screen, which the visible snapshot cannot. It walks the
+    /// linear span (the start line from `start.col`, interior lines full-width, the
+    /// end line up to `end.col`), skipping double-width continuation cells and
+    /// `trim_end`-ing each line segment — the same shape as
+    /// [`GridSnapshot::to_text`](crate::GridSnapshot::to_text). Lines are joined with
+    /// `\n`, **except** that a soft-wrapped line joins the next with no separator,
+    /// by the D8 rule shared with hyperlinks ([`soft_wraps`]).
+    ///
+    /// **Copy re-verifies** (D6). Before reading, it runs the D4 test itself —
+    /// read-only, and whatever the check's timing (D5) — and returns `None` when the
+    /// selection's start has been evicted or a referenced cell now holds a different
+    /// character. So it can never return text other than what was selected, even in
+    /// the window before the next check clears the highlight. (This supersedes the
+    /// earlier rule that a line no longer retained reads as blank: an evicted start
+    /// now refuses the copy, and every later selected line is still retained.)
+    ///
+    /// Every line is read through the **current** `cols`: a history row captured
+    /// wider is cut at the right margin and one captured narrower is padded blank,
+    /// matching what the snapshot shows. A span reaching past the live bottom stops
+    /// there. Never panics on out-of-range points.
+    pub fn selection_text(&self) -> Option<String> {
+        let sel = self.selection.as_ref()?;
+        if self.selection_changed(sel) {
+            return None;
+        }
+        let (start, end) = sel.span.normalized();
+        let last_col = self.cols - 1;
+        let end_line = end.line.min(self.live_bottom_line());
+
+        let mut out = String::new();
+        for line in start.line..=end_line {
+            let cells = self.line(line);
+            let (first, last) = selected_cols(start, end, line, last_col);
+            let mut segment = String::new();
+            for col in first..=last {
+                match cells.and_then(|r| r.get(col as usize)) {
+                    // The wide leader already carries the glyph — drop its spacer.
+                    Some(c) if c.is_continuation() => {}
+                    Some(c) => segment.push(c.ch),
+                    None => segment.push(' '),
+                }
+            }
+            out.push_str(segment.trim_end());
+            // Join to the next selected line: newline unless this line soft-wraps.
+            let wraps = cells.is_some_and(|r| soft_wraps(r, self.cols));
+            if line < end_line && !wraps {
+                out.push('\n');
+            }
+        }
+        Some(out)
     }
 
     /// The last `rows` non-blank-terminated rows of the visible viewport as text.
@@ -1317,7 +1660,9 @@ impl Grid {
         self.cells = next;
         self.cursor.col = self.cursor.col.min(cols - 1);
         self.cursor.row = self.cursor.row.min(rows - 1);
-        // A selection's coords are dimension-bound; a resize invalidates it (D9).
+        // A selection is dimension-bound: with no rewrap (architecture G4), a line's
+        // columns mean something else at the new width, so a resize clears it
+        // (selection-model D9, kept by selection-scroll-anchor D7/R7.1).
         self.selection = None;
         // A deferred wrap is dimension-bound too: the last column just moved, so a
         // retained flag would fire a stray wrap on a cursor no longer at the margin
@@ -1334,6 +1679,20 @@ impl Grid {
     pub fn cells(&self) -> &[Cell] {
         &self.cells
     }
+}
+
+/// The inclusive `(first, last)` columns of `line` that the linear span
+/// `start..=end` (in reading order) selects: from `start.col` on the start line, up
+/// to `end.col` on the end line, the full width on every line between — each
+/// clamped to `last_col`.
+///
+/// One rule for "which cells are selected" (selection-scroll-anchor D4/D6): the
+/// extractor reads exactly these cells, and the change reference records exactly
+/// these, so a change the copy would show is a change the check sees.
+fn selected_cols(start: Point, end: Point, line: u64, last_col: u16) -> (u16, u16) {
+    let first = if line == start.line { start.col } else { 0 };
+    let last = if line == end.line { end.col } else { last_col };
+    (first.min(last_col), last.min(last_col))
 }
 
 #[cfg(test)]
@@ -1406,6 +1765,75 @@ mod tests {
         assert_eq!(g.cell(2, 0).unwrap().ch, '>');
         assert_eq!(g.cell(3, 0).unwrap().ch, ' ');
         assert_eq!(row_text(&g, 0), "PP>", "prompt intact, typed text cleared");
+    }
+
+    #[test]
+    fn the_reference_never_exceeds_one_screen() {
+        // selection-scroll-anchor R4.9 — a selection from 50 lines back in history
+        // to the bottom live row references only the three live lines, full width:
+        // 10 × 3 cells, however far into history it reaches.
+        let mut g = grid(10, 3);
+        let mut p = Processor::new();
+        for i in 0..60 {
+            p.advance(&mut g, format!("line{i}\r\n").as_bytes());
+        }
+        let live_top = g.point_at(0, 0).line;
+        assert!(live_top >= 50, "precondition: 50 lines of history");
+        g.set_selection(
+            Point {
+                line: live_top - 50,
+                col: 0,
+            },
+            g.point_at(9, 2),
+        );
+        let reference = &g.selection.as_ref().expect("set").reference;
+        let cells: usize = reference.iter().map(|r| r.chars.len()).sum();
+        assert!(cells <= 10 * 3, "bounded by one screen: {cells}");
+        let lines: Vec<u64> = reference.iter().map(|r| r.line).collect();
+        assert_eq!(
+            lines,
+            vec![live_top, live_top + 1, live_top + 2],
+            "the live lines, and only those"
+        );
+        assert_eq!(cells, 10 * 3, "each at full width");
+    }
+
+    #[test]
+    fn the_reference_records_exactly_the_selected_cells() {
+        // selection-scroll-anchor D4 — the columns the copy would read: from the
+        // start column on the start line, up to the end column on the end line,
+        // continuation spacers included. Taken while scrolled back too: "on the live
+        // screen" does not depend on the viewport.
+        fn reference_of(g: &Grid) -> Vec<(u64, u16, String)> {
+            let sel = g.selection.as_ref().expect("set");
+            sel.reference
+                .iter()
+                .map(|r| (r.line, r.first_col, r.chars.iter().collect()))
+                .collect()
+        }
+        let cont = Cell::CONTINUATION;
+        let mut g = grid(6, 3);
+        let mut p = Processor::new();
+        // `h0` scrolls into history as line 0; live lines 1–3 read `x`, `ab한cd`,
+        // `efgh`.
+        p.advance(&mut g, "h0\r\nx\r\nab한cd\r\nefgh".as_bytes());
+        assert_eq!(g.history_len(), 1, "precondition");
+
+        // At the live bottom: line 2 from col 1, line 3 up to col 2.
+        g.set_selection(g.point_at(1, 1), g.point_at(2, 2));
+        assert_eq!(
+            reference_of(&g),
+            vec![(2, 1, format!("b한{cont}cd")), (3, 0, "efg".to_string())]
+        );
+
+        // Scrolled back by one, viewport row 0 is history line 0: the reference
+        // still starts at the first LIVE line, not at the viewport's first row.
+        g.scroll_up(1);
+        g.set_selection(g.point_at(0, 0), g.point_at(3, 2));
+        assert_eq!(
+            reference_of(&g),
+            vec![(1, 0, "x     ".to_string()), (2, 0, format!("ab한{cont}"))]
+        );
     }
 
     #[test]

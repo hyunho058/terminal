@@ -105,6 +105,7 @@ extraction, and (3) DECSET/DECRST 2004 bracketed-paste mode on the `Grid` expose
 ## Known Gaps
 - Precise per-row soft-wrap flag (threaded through `print`/scrollback) is deferred; D8's filled-to-last-column heuristic is the baseline and errs both ways: it can (a) mis-join a hard-newline line that exactly fills the width, and (b) mis-**split** a genuinely soft-wrapped row whose `cols-1` was left blank because `Grid::print` margin-wrapped a double-width (CJK/한글) char instead of splitting it (`grid.rs:289`, test `wide_char_wraps_rather_than_splitting_the_margin`). The stored `wrapped` flag is the single fix for both.
 - Selection anchored into scrollback history (drag while scrolled, or a selection that survives scrolling) is out of scope; selection is live-viewport-only (D9), matching the image baseline.
+  - **Superseded by `specs/selection-scroll-anchor`**, which reverses D9 and this gap. The selection is now stored as content lines, projected into the snapshot at every `view_offset`, extracted by `Terminal::selection_text`, and cleared when its text changes.
 - The policy for clearing a stale selection on new shell output / viewport scroll lives in `selection-input`, not here.
 
 ## Requirements

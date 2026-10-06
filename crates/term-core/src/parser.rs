@@ -9,7 +9,8 @@
 //! reverse); the DECSTBM scroll region (`r`) with region-aware scrolling (SU `S`,
 //! SD `T`, IL `L`, DL `M`, plus `ESC D`/`ESC M`); in-line edits (ICH `@`,
 //! DCH `P`); and the modes DECCKM `?1`, DECAWM `?7`, alt-screen `?1049`,
-//! bracketed paste `?2004`.
+//! bracketed paste `?2004`, and synchronized update `?2026` (which times only the
+//! selection change check — rendering does not honour it).
 //!
 //! Still unimplemented on purpose (see `specs/vt-tui-completeness` Known Gaps):
 //! DECTCEM `?25` cursor visibility, DECSC/DECRC (`ESC 7`/`ESC 8`, `CSI s`/`u`),
@@ -278,8 +279,9 @@ impl Perform for Performer<'_> {
     /// Bare ESC sequences (no CSI/OSC introducer). Three are implemented: IND
     /// (`ESC D`), RI (`ESC M`), and RIS (`ESC c`).
     ///
-    /// RIS is handled only far enough to undo DECCKM (arrow-key-input D9) and to
-    /// drop the scroll region (vt-tui-completeness D5) — that is the recovery path
+    /// RIS is handled only far enough to undo DECCKM (arrow-key-input D9), to drop
+    /// the scroll region (vt-tui-completeness D5), and to close an open synchronized
+    /// update (selection-scroll-anchor D5) — that is the recovery path
     /// D3 relies on, since nothing else clears those once a TUI dies without
     /// sending `?1l` and `reset`/`tput reset` sends RIS.
     ///
@@ -340,6 +342,10 @@ impl Perform for Performer<'_> {
             // documented escape hatch work. Uses `reset_scroll_region`, not
             // `set_scroll_region`: RIS must not move the cursor (R4.3/R4.5).
             self.grid.reset_scroll_region();
+            // And close any synchronized update the dead app left open
+            // (selection-scroll-anchor D5), so the selection check stops deferring.
+            // No check here (D7): the next settle runs one.
+            self.grid.reset_synchronized_update();
         }
     }
 
@@ -431,6 +437,12 @@ impl Perform for Performer<'_> {
                     // the grid is unchanged and the flag is absent from
                     // `GridSnapshot`.
                     Some(2004) => self.grid.set_bracketed_paste(on),
+                    // DECSET/DECRST ?2026 — synchronized update. Used ONLY to time
+                    // the selection change check (selection-scroll-anchor D5): an app
+                    // brackets each frame with it, and a frame can arrive split
+                    // across PTY reads, so the check waits for `?2026l` — and that
+                    // close runs it, at the exact frame end. Rendering ignores it.
+                    Some(2026) => self.grid.set_synchronized_update(on),
                     // Mouse tracking. Each mode is an INDEPENDENT flag, as in xterm:
                     // an app enables several at once and may disable them one at a
                     // time, and collapsing that to "off" would silently kill the
@@ -1138,6 +1150,22 @@ mod tests {
         );
         assert!(!g.app_cursor_keys(), "RIS still clears DECCKM");
         assert!(!g.bracketed_paste(), "RIS still clears bracketed paste");
+    }
+
+    #[test]
+    fn synchronized_update_is_tracked_inside_a_multi_parameter_decset() {
+        // selection-scroll-anchor R5.1 — `?2026` sets and resets the flag, and is
+        // honoured as the second parameter of a batched DECSET, not only alone.
+        let mut g = grid();
+        let mut p = Processor::new();
+        assert!(!g.synchronized_update(), "fresh: closed");
+        p.advance(&mut g, b"\x1b[?2026h");
+        assert!(g.synchronized_update());
+        p.advance(&mut g, b"\x1b[?2026l");
+        assert!(!g.synchronized_update());
+        p.advance(&mut g, b"\x1b[?1049;2026h");
+        assert!(g.synchronized_update(), "the second parameter counts");
+        assert!(g.alt_screen(), "and so does the first");
     }
 
     #[test]

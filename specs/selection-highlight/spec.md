@@ -87,6 +87,7 @@ factored as a pure function unit-tested without a GPU.
 ### D9: Empty/absent selection records nothing
 - **Status**: resolved
 - **Rationale**: When `snapshot.selection` is `None` (no selection, or scrolled into history per `selection-model` D9) or yields zero member cells, `record` early-returns without a render pass — no cost, no stray tint. This also means scrolling away from a selection hides its highlight for free. Rejected: always recording an (empty) pass (wasteful and needless).
+- **Note**: `specs/selection-scroll-anchor` reversed the "hidden while scrolled into history" policy this relies on. `snapshot.selection` is now projected at every `view_offset`, so it is `None` only when no part of the selection is on screen. The early return is unchanged.
 
 ## Constraints
 - No GUI/widget crate; wgpu/`bytemuck`/`wgpu::util` only. `renderer` must not import `winit` (window-agnostic, C1/SD2).

@@ -19,6 +19,14 @@ pub const DEFAULT_HISTORY_LIMIT: usize = 100_000;
 pub struct History {
     rows: VecDeque<Row>,
     limit: usize,
+    /// How many rows have ever been evicted off the front (selection-scroll-anchor
+    /// D1). Monotonic: +1 per `pop_front`, never reset.
+    ///
+    /// This is what makes a content line number stable. Index 0 is the oldest
+    /// *retained* row, so its meaning shifts on every eviction; `evicted + index`
+    /// does not, because an eviction raises `evicted` by exactly as much as it
+    /// lowers every index.
+    evicted: u64,
 }
 
 impl History {
@@ -26,6 +34,7 @@ impl History {
         History {
             rows: VecDeque::new(),
             limit: limit.max(1),
+            evicted: 0,
         }
     }
 
@@ -34,7 +43,14 @@ impl History {
         self.rows.push_back(row);
         while self.rows.len() > self.limit {
             self.rows.pop_front();
+            self.evicted += 1;
         }
+    }
+
+    /// Total rows evicted off the front since this history was created (D1). Row
+    /// `i` of [`get`](History::get) is content line `evicted() + i`.
+    pub fn evicted(&self) -> u64 {
+        self.evicted
     }
 
     pub fn len(&self) -> usize {
@@ -78,6 +94,28 @@ mod tests {
         assert_eq!(h.get(0).unwrap()[0].ch, '2', "oldest survivor is row 2");
         assert_eq!(h.get(2).unwrap()[0].ch, '4', "newest is row 4");
         assert!(h.get(3).is_none(), "nothing beyond the cap");
+    }
+
+    #[test]
+    fn evicted_counts_every_row_popped_off_the_front() {
+        // selection-scroll-anchor R1.1 — cap 3, push 5 → 2 evictions; a fresh
+        // history has evicted nothing, and pushes under the cap evict nothing.
+        let fresh = History::new(3);
+        assert_eq!(fresh.evicted(), 0, "fresh history has evicted nothing");
+
+        let mut h = History::new(3);
+        for n in 0..3 {
+            h.push(row(n));
+        }
+        assert_eq!(h.evicted(), 0, "pushes up to the cap evict nothing");
+        for n in 3..5 {
+            h.push(row(n));
+        }
+        assert_eq!(h.len(), 3);
+        assert_eq!(h.evicted(), 2, "one per pop_front");
+        // The D1 identity: retained index i is line evicted + i, so the row that
+        // was pushed n-th (0-based) sits at index n - evicted.
+        assert_eq!(h.get(0).unwrap()[0].ch, '2', "line 2 == evicted + 0");
     }
 
     #[test]

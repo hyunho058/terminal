@@ -49,6 +49,7 @@ use winit::keyboard::ModifiersState;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CursorIcon, Window, WindowId};
 
+use crate::drag::{self, SelectionDrag};
 use crate::hyperlink::{
     frame_rescans, url_to_open, ClickInput, HoverInput, HoverState, LinkTrigger, Opener, Update,
 };
@@ -66,7 +67,6 @@ use crate::session::{Session, TabId, WakeSource};
 use crate::tabmeta::{AgentState, TabMetaSnapshot};
 use crate::tabs::Tabs;
 use crate::waiting::{WaitingKind, WaitingState};
-use term_core::Selection;
 
 /// Custom event: something happened off the UI thread that needs a wake.
 #[derive(Debug, Clone, Copy)]
@@ -220,13 +220,16 @@ struct Running {
     /// Hands a URL to macOS on an opening click (hyperlinks D14).
     opener: Opener,
     /// Left-drag selection state (selection-input, the sanctioned event-loop
-    /// exception). While `dragging`, `CursorMoved` updates the active grid's
-    /// selection focus. `drag_anchor` is the press cell; `drag_moved` records
-    /// whether the focus ever left the anchor cell — a plain click (never moved)
-    /// clears the selection on release, jitter-safely (cell-granular, not raw px).
+    /// exception). `dragging` is the gesture's armed flag — what the release routing
+    /// and the terminal-scroll D6 freeze read. While it is set, `CursorMoved` hands
+    /// the pointer's cell to `drag`.
     dragging: bool,
-    drag_anchor: (u16, u16),
-    drag_moved: bool,
+    /// The drag itself (selection-scroll-anchor D3): its tab, its press cell, its
+    /// content anchor taken at press time, and `drag_moved` — whether the pointer
+    /// ever left the press cell, so a plain click clears the selection on release,
+    /// jitter-safely (cell-granular, not raw px). `Some` from a grid press to its
+    /// release. See [`SelectionDrag`].
+    drag: Option<SelectionDrag>,
     /// What the in-flight drag swallowed, replayed on release (terminal-scroll D6).
     /// Meaningless while `dragging` is false; reset at each press.
     drag_latch: DragLatch,
@@ -473,8 +476,7 @@ impl App {
             epoch: Instant::now(),
             open_menu: None,
             dragging: false,
-            drag_anchor: (0, 0),
-            drag_moved: false,
+            drag: None,
             drag_latch: DragLatch::default(),
             cursor_icon: CursorIcon::Default,
             resize_drag: None,
@@ -2007,14 +2009,13 @@ impl Running {
         let menu_was_open = self.open_menu.is_some();
         // Seam data for handlers, read from the active tab BEFORE the mutable
         // `writer` borrow (D9): bracketed-paste mode (text-paste) + the selection
-        // text (copy-clipboard). The full-grid `snapshot()` clone is paid ONLY when
-        // a selection actually exists, so the common keystroke stays cheap.
+        // text (copy-clipboard). The text comes from the grid, not a snapshot
+        // (selection-scroll-anchor D6): it reads scrollback + live by line, so it
+        // returns a selection that has partly scrolled off-screen, and it clones no
+        // grid. With no selection it returns `None` at once, so the common keystroke
+        // stays cheap.
         let bracketed = self.tabs.active().terminal.bracketed_paste();
-        let selection_text = if self.tabs.active().terminal.selection().is_some() {
-            self.tabs.active().terminal.snapshot().selection_text()
-        } else {
-            None
-        };
+        let selection_text = self.tabs.active().terminal.selection_text();
         // The seam's writer is wrapped in a `WriteProbe` at both dispatch points
         // (terminal-scroll D4): a handler that sends the user's bytes to the shell —
         // Cmd+V paste is the shipped example — must snap a scrolled-back viewport, and
@@ -2432,20 +2433,15 @@ impl ApplicationHandler<UserEvent> for App {
                 inner.refresh_hover(); // one hit_test feeds both hover fields (D8)
                 inner.refresh_link_hover(LinkTrigger::Pointer); // trigger 3 (D24)
 
-                // Left-drag selection (selection-input): once the focus leaves the
-                // anchor cell, set the active grid's selection live. Keying `moved`
-                // on the *cell* (not raw px) makes an ordinary click jitter-safe.
+                // Left-drag selection (selection-input): once the pointer leaves the
+                // press cell, set the drag tab's selection live. Every rule — which tab,
+                // when `drag_moved` flips, when a cleared selection spends the drag —
+                // is `SelectionDrag::drive`'s (selection-scroll-anchor D3); this arm
+                // only resolves the cell and hands over the active tab.
                 if inner.dragging {
-                    if let Some(focus) = inner.cursor_cell() {
-                        if focus != inner.drag_anchor {
-                            inner.drag_moved = true;
-                        }
-                        if inner.drag_moved {
-                            let sel = Selection {
-                                anchor: inner.drag_anchor,
-                                focus,
-                            };
-                            inner.tabs.active_mut().terminal.set_selection(sel);
+                    if let (Some(cell), Some(drag)) = (inner.cursor_cell(), inner.drag.as_mut()) {
+                        let active = inner.tabs.active_mut();
+                        if drag.drive(active.id, cell, &mut active.terminal) {
                             inner.redraw();
                         }
                     }
@@ -2572,12 +2568,14 @@ impl ApplicationHandler<UserEvent> for App {
                     PressRoute::Grid => {
                         if let Some(cell) = inner.cursor_cell() {
                             // Over a real grid cell → anchor a selection and arm the drag
-                            // (selection-input). Nothing is shown until the focus leaves
+                            // (selection-input). Nothing is shown until the pointer leaves
                             // this cell; a press in the dead band (cursor_cell → None)
-                            // arms nothing.
-                            inner.drag_anchor = cell;
+                            // arms nothing. The anchor becomes a content point HERE, at
+                            // press time, inside `SelectionDrag::press` (D3/R3.1).
+                            let active = inner.tabs.active();
+                            inner.drag =
+                                Some(SelectionDrag::press(active.id, cell, &active.terminal));
                             inner.dragging = true;
-                            inner.drag_moved = false;
                             // Sample ⌘ at press (hyperlinks D22). The drag is armed exactly
                             // as before either way — ⌘ adds a gesture here, it removes none.
                             inner.link_cmd_at_press = inner.mods.super_key();
@@ -2625,19 +2623,28 @@ impl ApplicationHandler<UserEvent> for App {
                 // Nothing is re-resolved here — that is what makes "what is underlined
                 // is exactly what opens" true at the moment of the open, not merely by
                 // construction (D20).
+                // A release on a tab other than the press's is no click at all
+                // (`drag::is_click`): it neither opens the link lit there nor clears
+                // that tab's selection.
+                let active = inner.tabs.active().id;
                 let url = url_to_open(ClickInput {
                     cmd_at_press: inner.link_cmd_at_press,
                     cmd_at_release: inner.mods.super_key(),
-                    drag_moved: inner.drag_moved,
+                    drag_moved: !drag::is_click(inner.drag, active),
                     lit: inner.link_handle.span(),
                 });
-                // End the drag (selection-input). A plain click — the focus never
-                // left the anchor cell — clears any selection; a real drag leaves the
+                // End the drag (selection-input). A plain click — the pointer never
+                // left the press cell — clears any selection; a real drag leaves the
                 // selection standing for Cmd+C. Unchanged by the open above: an
                 // opening click still clears the selection, exactly as it does today.
+                // `drag::release` decides, against the active tab, and the drag is
+                // consumed: the next press builds a fresh one.
                 inner.dragging = false;
-                if !inner.drag_moved {
-                    inner.tabs.active_mut().terminal.clear_selection();
+                if drag::release(
+                    inner.drag.take(),
+                    active,
+                    &mut inner.tabs.active_mut().terminal,
+                ) {
                     inner.redraw();
                 }
                 // Replay whatever the drag swallowed (terminal-scroll D6). Without this
@@ -2893,10 +2900,13 @@ fn near_bottom(offset: usize) -> bool {
 
 /// What a left-drag swallowed while it held the pointer (terminal-scroll D6).
 ///
-/// A drag freezes the viewport, because `CursorMoved` resolves the drag focus with
-/// `cursor_cell()` (viewport coords) while `Terminal::set_selection` stores live-grid
-/// coords — so *any* offset change mid-drag decouples "the row under my finger" from
-/// "the row I'm selecting". But suppressing without recording is a trap: `scrollback`
+/// A drag freezes the viewport. The freeze was introduced because `CursorMoved` resolved
+/// the drag focus in viewport coords while `Terminal::set_selection` stored live-grid
+/// coords, so any offset change mid-drag decoupled "the row under my finger" from "the
+/// row I'm selecting". That reason no longer holds — since selection-scroll-anchor D3
+/// both ends are content points, the anchor taken at press time (`drag::SelectionDrag`)
+/// — but the freeze and this latch are kept unchanged (that spec's D7): lifting the
+/// freeze is a separate feature. And suppressing without recording is a trap: `scrollback`
 /// D2's auto-increment keeps running in the frozen window, walking `view_offset` past
 /// `SNAP_FLOOR`, so a plain suppress would leave both snaps permanently disarmed. These
 /// two fields are what the release replays them against.

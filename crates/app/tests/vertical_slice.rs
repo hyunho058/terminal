@@ -15,13 +15,16 @@
 //! deadline and a diagnostic instead of by opting out. `SKIP_SHELL_TESTS=1` opts
 //! out explicitly for an environment with no usable `/bin/zsh`.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use app::encode_key;
+use app::{release_drag, release_is_click, SelectionDrag};
 use app::{Session, TabId, Wake};
 use common::config::Config;
-use renderer::testing::{holds_text, CellGeometry};
-use renderer::Renderer;
+use renderer::selection_layer::SelectionLayer;
+use renderer::testing::{holds_text, is_ink, CellGeometry};
+use renderer::{CapturedFrame, Renderer};
 use term_core::Color;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
@@ -46,6 +49,11 @@ fn fg_bg() -> (Color, Color) {
 /// a spawned one, so a session that demanded a proxy would be permanently
 /// unreachable from here.
 fn live_session() -> Option<Session> {
+    live_session_as(TabId(0))
+}
+
+/// [`live_session`] for tab `id`, for a test that needs two tabs.
+fn live_session_as(id: TabId) -> Option<Session> {
     // `term_core::testing`, not a copy of the check: this file wrote the
     // `SKIP_SHELL_TESTS` contract down first and then three more copies of it
     // appeared, because the version extracted into `app::session` was
@@ -55,7 +63,7 @@ fn live_session() -> Option<Session> {
     }
     let (fg, bg) = fg_bg();
     let wake: Wake = Box::new(|_| {});
-    match Session::spawn(TabId(0), COLS, ROWS, fg, bg, wake) {
+    match Session::spawn(id, COLS, ROWS, fg, bg, wake) {
         Ok(s) => Some(s),
         Err(e) => panic!(
             "could not spawn a session ({e}). This is the only test that covers \
@@ -268,4 +276,304 @@ fn shell_output_reaches_actual_pixels() {
         "every one of the {total} cells reads as ink, so \"has ink\" is measuring \
          something other than drawn content"
     );
+}
+
+/// selection-scroll-anchor R5.8: `Session::drain` settles the selection once after its
+/// chunk loop, so shell output that repaints a selected row clears the selection without
+/// the caller settling anything itself.
+///
+/// The selection is made on a blank row well below the prompt, *after* the command line
+/// has been echoed, and a drain with nothing new must keep it. The command then moves
+/// the cursor onto that row and prints there. So the clear can only have come from the
+/// command's output, through `drain`. As in the test above, the marker is assembled
+/// from a variable so the echo cannot contain it.
+///
+/// Falsified: with the `settle_selection` call removed from `drain`, the final
+/// assertion fails. That holds only while the shell emits no `?2026l` around this
+/// output: a prompt theme that wraps its redraws in synchronized updates would clear
+/// the selection at the `?2026l` itself (D5), and this test would pass without the
+/// drain's settle. The zsh this runs against wraps nothing.
+#[test]
+fn draining_output_that_repaints_a_selected_row_clears_the_selection() {
+    let Some(mut session) = live_session() else {
+        return;
+    };
+    // 0-based row 12 is the `13` in the CUP below, far from the prompt on row 0 or 1.
+    const ROW: u16 = 12;
+    const MARKER: &str = "OVERWRITE";
+
+    type_text(&mut session, "m=OVER; printf '\\033[13;1H%sWRITE' \"$m\"");
+    let text = grid_until(&mut session, "%sWRITE");
+    assert!(
+        text.contains("%sWRITE"),
+        "the command line was never echoed within {SHELL_TIMEOUT:?}. Grid was:\n{text}"
+    );
+
+    let t = &mut session.terminal;
+    let row: String = t
+        .snapshot()
+        .to_text()
+        .lines()
+        .nth(usize::from(ROW))
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        row.trim().is_empty(),
+        "precondition: row {ROW} is blank before the command runs, read {row:?}"
+    );
+    let (anchor, focus) = (t.point_at(0, ROW), t.point_at(8, ROW));
+    t.set_selection(anchor, focus);
+
+    // A drain that brings nothing new settles too, and must keep a selection whose
+    // text has not changed.
+    session.drain();
+    assert!(
+        session.terminal.selection().is_some(),
+        "a settle over unchanged text cleared the selection"
+    );
+
+    press_enter(&mut session);
+    let text = grid_until(&mut session, MARKER);
+    assert!(
+        text.contains(MARKER),
+        "the command's output never reached the grid within {SHELL_TIMEOUT:?}. \
+         Grid was:\n{text}"
+    );
+    assert_eq!(
+        session.terminal.selection(),
+        None,
+        "output repainted the selected row and `drain` returned, but the selection \
+         is still set: `Session::drain` did not settle it. Grid was:\n{text}"
+    );
+    assert_eq!(session.terminal.selection_text(), None);
+}
+
+// ---- selection-scroll-anchor: a drag selection over a real shell's output ----
+
+/// The visible rows as text, one char per cell, so an index into a row is a column.
+fn screen_rows(session: &Session) -> Vec<String> {
+    let snap = session.terminal.snapshot();
+    (0..ROWS)
+        .map(|r| {
+            (0..COLS)
+                .map(|c| snap.cell(c, r).map_or(' ', |x| x.ch))
+                .collect()
+        })
+        .collect()
+}
+
+/// The lowest viewport row that reads exactly `line`. Exact, so the echo of the
+/// command that printed it (`printf '...bravo...'`) can never be the match.
+fn row_of(session: &Session, line: &str) -> Option<u16> {
+    screen_rows(session)
+        .iter()
+        .rposition(|l| l.trim_end() == line)
+        .map(|r| r as u16)
+}
+
+/// Drain until `line` is a whole row on screen, or fail with the grid.
+fn drain_until_row(session: &mut Session, line: &str) -> u16 {
+    let deadline = Instant::now() + SHELL_TIMEOUT;
+    loop {
+        session.drain();
+        if let Some(row) = row_of(session, line) {
+            return row;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the shell never printed the line {line:?} within {SHELL_TIMEOUT:?}. Grid was:\n{}",
+            screen_rows(session).join("\n")
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A cell's dominant colour: its background, whatever the glyph (`golden_frame.rs`'s
+/// argument for the mode over a fixed sample pixel applies unchanged).
+fn cell_mode(frame: &CapturedFrame, geo: &CellGeometry, col: u16, row: u16) -> [u8; 4] {
+    let (x0, y0, x1, y1) = geo.cell_rect(col, row, frame);
+    let mut counts: HashMap<[u8; 4], u32> = HashMap::new();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            *counts.entry(frame.pixel(x, y)).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|&(_, n)| n)
+        .map(|(px, _)| px)
+        .expect("a cell inside the frame has pixels")
+}
+
+/// The cells the selection tint lights in the real frame. The same snapshot is
+/// drawn with and without its `selection`, and a cell counts when its dominant
+/// colour differs between the two. A shell prompt or an app may paint backgrounds
+/// of its own, and comparing against the frame's background would count those;
+/// comparing a frame against itself cancels them.
+fn tinted(r: &mut Renderer, session: &Session) -> Vec<(u16, u16)> {
+    let snap = session.terminal.snapshot();
+    let mut bare = snap.clone();
+    bare.selection = None;
+    let with = r.capture(&snap).expect("read the frame with the selection");
+    let without = r.capture(&bare).expect("read the frame without it");
+    let geo = CellGeometry::of(r);
+    let mut lit = Vec::new();
+    for row in 0..ROWS.min(geo.rows()) {
+        for col in 0..COLS.min(geo.cols()) {
+            if is_ink(
+                cell_mode(&with, &geo, col, row),
+                cell_mode(&without, &geo, col, row),
+            ) {
+                lit.push((col, row));
+            }
+        }
+    }
+    lit
+}
+
+fn row_cells(row: u16, cols: std::ops::RangeInclusive<u16>) -> Vec<(u16, u16)> {
+    cols.map(|c| (c, row)).collect()
+}
+
+/// selection-scroll-anchor, end to end: the user's own check, with a real zsh,
+/// the app's drag type, its copy source and real pixels.
+///
+/// Every other selection test drives one layer: `term-core`'s with fed bytes,
+/// `drag.rs`'s with a fixture terminal, `golden_frame.rs`'s with a constructed
+/// grid. This one crosses all of them at once:
+/// keystroke → zsh → PTY reader → `drain` → grid → `SelectionDrag` →
+/// `Terminal::selection_text` (what Cmd+C copies) → `Renderer::capture`.
+///
+/// 1. Drag over `bravo`, then run a command whose output scrolls the screen. The
+///    highlight rides up with the text, and copy still returns it.
+/// 2. Push `bravo` into scrollback. Copy still returns it. Scroll back and the
+///    highlight is drawn there, and a new drag over a history line works.
+/// 3. A press on tab A released with tab B in front, and a round trip back to A:
+///    neither is a click, so no selection is cleared and no link would open.
+///
+/// Only winit's delivery of the mouse event is left out. `drag.rs`'s source-scan
+/// test pins that the event loop hands every press, move and release to this type.
+///
+/// Falsified three ways, each red at the step named:
+/// - projecting only at the live bottom (the pre-feature `selection-model` D9)
+///   fails step 2's tint;
+/// - projecting stored lines as viewport rows fails step 1's tint;
+/// - a release that ignores tabs fails step 3.
+#[test]
+fn a_drag_selection_follows_shell_output_into_scrollback() {
+    let Some(mut s) = live_session() else {
+        return;
+    };
+    let cfg = Config::default();
+    let Some(mut r) = headless_renderer(&cfg) else {
+        return;
+    };
+    r.add_layer(Box::new(SelectionLayer::new()));
+    let a = TabId(0);
+
+    // Fill the screen first, so the next output scrolls it.
+    type_text(&mut s, "seq 100; printf 'alpha\\nbravo\\ncharlie\\n'");
+    press_enter(&mut s);
+    drain_until_row(&mut s, "charlie");
+    let row = drain_until_row(&mut s, "bravo");
+
+    // 1. Drag over `bravo`, release, and let output scroll it.
+    let mut drag = SelectionDrag::press(a, (0, row), &s.terminal);
+    assert!(
+        drag.drive(a, (4, row), &mut s.terminal),
+        "a move off the press cell selects"
+    );
+    assert!(
+        !release_drag(Some(drag), a, &mut s.terminal),
+        "a drag is no click"
+    );
+    assert_eq!(s.terminal.selection_text().as_deref(), Some("bravo"));
+    assert_eq!(
+        tinted(&mut r, &s),
+        row_cells(row, 0..=4),
+        "the tint is on bravo"
+    );
+
+    type_text(&mut s, "seq 5 | sed 's/^/n/'");
+    press_enter(&mut s);
+    drain_until_row(&mut s, "n5");
+    let moved = drain_until_row(&mut s, "bravo");
+    assert!(
+        moved < row,
+        "precondition: the output scrolled bravo up ({row} -> {moved})"
+    );
+    assert_eq!(
+        s.terminal.selection_text().as_deref(),
+        Some("bravo"),
+        "after the screen scrolled, Cmd+C still copies the text that was selected"
+    );
+    assert_eq!(
+        tinted(&mut r, &s),
+        row_cells(moved, 0..=4),
+        "the tint rode up with bravo from row {row} to row {moved}"
+    );
+
+    // 2. Into scrollback, then scrolled back to.
+    type_text(&mut s, "seq 80 | sed 's/^/m/'");
+    press_enter(&mut s);
+    drain_until_row(&mut s, "m80");
+    assert_eq!(
+        row_of(&s, "bravo"),
+        None,
+        "precondition: bravo left the live screen"
+    );
+    assert_eq!(
+        s.terminal.selection_text().as_deref(),
+        Some("bravo"),
+        "copy reads a selection that has scrolled into history"
+    );
+    let mut back = 0;
+    while row_of(&s, "bravo").is_none() {
+        s.terminal.scroll_up(1);
+        back += 1;
+        assert!(back <= 200, "bravo never came back into view");
+    }
+    let shown = row_of(&s, "bravo").expect("in view");
+    assert_eq!(
+        tinted(&mut r, &s),
+        row_cells(shown, 0..=4),
+        "scrolled back {back} lines, the tint is drawn on bravo"
+    );
+    let history = row_of(&s, "charlie").expect("charlie is in view too");
+    let mut drag = SelectionDrag::press(a, (0, history), &s.terminal);
+    assert!(drag.drive(a, (6, history), &mut s.terminal));
+    assert_eq!(s.terminal.selection_text().as_deref(), Some("charlie"));
+    assert_eq!(
+        tinted(&mut r, &s),
+        row_cells(history, 0..=6),
+        "a drag made while scrolled back is drawn"
+    );
+
+    // 3. Releases with another tab in front.
+    let b = TabId(1);
+    let mut sb = live_session_as(b).expect("shell tests are enabled: a second tab spawns");
+    type_text(&mut sb, "echo tab-b-text");
+    press_enter(&mut sb);
+    let brow = drain_until_row(&mut sb, "tab-b-text");
+    let mut drag = SelectionDrag::press(b, (0, brow), &sb.terminal);
+    assert!(drag.drive(b, (9, brow), &mut sb.terminal));
+    assert!(!release_drag(Some(drag), b, &mut sb.terminal));
+
+    let click_on_a = SelectionDrag::press(a, (0, 0), &s.terminal);
+    assert!(
+        !release_is_click(Some(click_on_a), b),
+        "pressed on A, released on B: not a click, so no link on B opens"
+    );
+    assert!(!release_drag(Some(click_on_a), b, &mut sb.terminal));
+    let mut round_trip = SelectionDrag::press(a, (0, 0), &s.terminal);
+    assert!(
+        !round_trip.drive(b, (5, 3), &mut sb.terminal),
+        "B is not written"
+    );
+    assert!(
+        !release_drag(Some(round_trip), a, &mut s.terminal),
+        "moved while B was in front, released back on A: not a click"
+    );
+    assert_eq!(s.terminal.selection_text().as_deref(), Some("charlie"));
+    assert_eq!(sb.terminal.selection_text().as_deref(), Some("tab-b-text"));
 }

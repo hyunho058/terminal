@@ -26,12 +26,14 @@ pub mod snapshot;
 pub mod testing;
 
 pub use error::{Error, Result};
-pub use grid::{Cell, CellAttrs, Color, CommandEnd, Cursor, Grid, MouseEncoding, MouseProtocol};
+pub use grid::{
+    Cell, CellAttrs, Color, CommandEnd, Cursor, Grid, MouseEncoding, MouseProtocol, SYNC_STALE,
+};
 pub use image::{Decoded, ImageLayer, Placement};
 pub use links::{link_at, LinkSpan};
 pub use pty::Pty;
 pub use scrollback::History;
-pub use selection::Selection;
+pub use selection::{ContentSelection, Point, Selection};
 pub use snapshot::GridSnapshot;
 
 use parser::Processor;
@@ -50,6 +52,24 @@ impl Terminal {
     pub fn new(cols: u16, rows: u16, fg: Color, bg: Color) -> Self {
         Terminal {
             grid: Grid::new(cols, rows, fg, bg),
+            processor: Processor::new(),
+        }
+    }
+
+    /// A terminal whose scrollback keeps at most `limit` rows — **test-only**, so a
+    /// test can evict history in a few lines (selection-scroll-anchor R1.4/R4.5).
+    /// `#[cfg(test)]`, so it is reachable from this crate's unit tests only, not
+    /// from `tests/`.
+    #[cfg(test)]
+    pub(crate) fn with_history_limit(
+        cols: u16,
+        rows: u16,
+        fg: Color,
+        bg: Color,
+        limit: usize,
+    ) -> Self {
+        Terminal {
+            grid: Grid::with_history_limit(cols, rows, fg, bg, limit),
             processor: Processor::new(),
         }
     }
@@ -116,6 +136,15 @@ impl Terminal {
         self.grid.history_len()
     }
 
+    /// Rows that have aged out of the scrollback cap since this terminal was
+    /// created (selection-scroll-anchor D1). Monotonic. Together with
+    /// [`history_len`](Terminal::history_len) it fixes the content line numbering:
+    /// history row `i` is line `evicted() + i`, live row `r` is line
+    /// `evicted() + history_len() + r`.
+    pub fn evicted(&self) -> u64 {
+        self.grid.evicted()
+    }
+
     /// Whether the alternate screen is active (`?1049h`).
     pub fn alt_screen(&self) -> bool {
         self.grid.alt_screen()
@@ -172,12 +201,29 @@ impl Terminal {
         self.grid.pending_wrap()
     }
 
-    /// Set the live drag selection (the app drives this from the mouse — see the
-    /// `selection-input` feature). Carried to the renderer via
-    /// [`snapshot`](Terminal::snapshot); its text is read via
-    /// [`GridSnapshot::selection_text`](crate::GridSnapshot::selection_text).
-    pub fn set_selection(&mut self, selection: Selection) {
-        self.grid.set_selection(selection);
+    /// The content [`Point`] under viewport cell `(col, row)` at the current
+    /// scrollback offset (selection-scroll-anchor D3): line `top + row`, where `top`
+    /// is the line on viewport row 0, and the same column.
+    ///
+    /// Convert a cell **when the app learns it** — the press anchor at press time,
+    /// the focus at move time — because the content under a cell moves with output
+    /// and with the wheel. Unclamped: a cell outside the viewport maps to a line
+    /// outside it.
+    pub fn point_at(&self, col: u16, row: u16) -> Point {
+        self.grid.point_at(col, row)
+    }
+
+    /// Set the drag selection from two content points (the app drives this from
+    /// the mouse — see the `selection-input` feature). `anchor` is where the drag
+    /// began, `focus` its current end, in either order. Build both with
+    /// [`point_at`](Terminal::point_at).
+    ///
+    /// Anchored to content, so it moves with its text through terminal-owned
+    /// scrolling. The renderer sees it projected into viewport cells on
+    /// [`snapshot`](Terminal::snapshot)'s `selection`; its text is read with
+    /// [`selection_text`](Terminal::selection_text).
+    pub fn set_selection(&mut self, anchor: Point, focus: Point) {
+        self.grid.set_selection(anchor, focus);
     }
 
     /// Clear any drag selection.
@@ -185,9 +231,47 @@ impl Terminal {
         self.grid.clear_selection();
     }
 
-    /// The current drag selection, if any.
-    pub fn selection(&self) -> Option<Selection> {
+    /// The stored drag selection — the two content points as last set — if any.
+    pub fn selection(&self) -> Option<ContentSelection> {
         self.grid.selection()
+    }
+
+    /// The selection's text, read from scrollback + live by line number, or `None`
+    /// when there is no selection **or its text has changed** (selection-scroll-anchor
+    /// D6).
+    ///
+    /// This is what Cmd+C copies. It returns the **whole** selection, including any
+    /// part that has scrolled off-screen, which a [`GridSnapshot`] — the visible
+    /// rows only — cannot. Lines join with `\n` except across a soft wrap, by the
+    /// same rule hyperlinks use.
+    ///
+    /// It re-verifies before reading: if the selection's start has aged out of
+    /// scrollback, or a selected cell that was on the live screen when the selection
+    /// was set now holds a different character, it returns `None` — read-only, and
+    /// without waiting for [`settle_selection`](Terminal::settle_selection). So a copy
+    /// never returns text the user did not select, even while a stale highlight is
+    /// still drawn.
+    pub fn selection_text(&self) -> Option<String> {
+        self.grid.selection_text()
+    }
+
+    /// Run the selection change check at the end of a drain
+    /// (selection-scroll-anchor D4/D5): clear the selection if the text under it
+    /// has changed since it was set. Call it **once after** feeding a batch of PTY
+    /// chunks through [`advance`](Terminal::advance) — never per chunk, because a
+    /// frame can arrive split across reads and a per-chunk check would see it
+    /// half-painted. `now` is the caller's clock (the app passes `Instant::now()`,
+    /// tests pass fixed instants); `term-core` keeps none.
+    ///
+    /// While an app holds a synchronized update open (`?2026h`), the check is left
+    /// to that block's `?2026l`, which runs it at the exact frame end. A block still
+    /// open [`SYNC_STALE`] after the first settle that saw it is dropped and checked
+    /// here, so an app that dies mid-frame cannot defer the check forever.
+    ///
+    /// Moves that keep the text — output scrolling it into history, the wheel —
+    /// never clear; an app repainting different characters over it does.
+    pub fn settle_selection(&mut self, now: std::time::Instant) {
+        self.grid.settle_selection(now);
     }
 
     /// Take the most-recent OSC 133 command-end event parsed from the shell's
@@ -352,6 +436,242 @@ mod tests {
             t.take_command_end().is_none(),
             "garbage → no event, no panic"
         );
+    }
+
+    // --- Content lines through eviction (selection-scroll-anchor D1) ---
+    //
+    // These need `with_history_limit`, which is `#[cfg(test)]`, so they live here
+    // rather than in `tests/selection.rs`.
+
+    /// The text of content line `line`, or `None` once it is evicted or below the
+    /// live bottom — read straight from the grid's line lookup.
+    fn line_of(t: &Terminal, line: u64) -> Option<String> {
+        let cells = t.grid.line(line)?;
+        let text: String = cells
+            .iter()
+            .filter(|c| !c.is_continuation())
+            .map(|c| c.ch)
+            .collect();
+        Some(text.trim_end().to_string())
+    }
+
+    #[test]
+    fn eviction_keeps_line_numbers_on_their_text() {
+        // selection-scroll-anchor R1.4 — history limit 2. Line numbers are
+        // recorded while retained; each eviction grows `evicted` by exactly one and
+        // leaves every retained line reading the same text.
+        let mut t = Terminal::with_history_limit(10, 2, Color(0xE0E0E0), Color(0x101010), 2);
+        t.advance(b"l0\r\nl1\r\nl2\r\nl3"); // history [l0, l1] (full), live [l2, l3]
+        assert_eq!((t.evicted(), t.history_len()), (0, 2));
+        assert_eq!(line_of(&t, 1).as_deref(), Some("l1"));
+
+        t.advance(b"\r\nl4"); // l2 enters history, l0 is evicted
+        assert_eq!(t.evicted(), 1, "one row evicted");
+        assert_eq!(
+            line_of(&t, 0),
+            None,
+            "the evicted line is gone, not re-pointed"
+        );
+        assert_eq!(
+            line_of(&t, 1).as_deref(),
+            Some("l1"),
+            "L still reads its text"
+        );
+        assert_eq!(
+            line_of(&t, 2).as_deref(),
+            Some("l2"),
+            "entered history unchanged"
+        );
+        assert_eq!(line_of(&t, 4).as_deref(), Some("l4"), "a live line");
+        assert_eq!(line_of(&t, 5), None, "below the live bottom");
+
+        t.advance(b"\r\nl5\r\nl6"); // two more evictions: l1, l2
+        assert_eq!(t.evicted(), 3, "grew by exactly the rows evicted");
+        assert_eq!(line_of(&t, 2), None);
+        assert_eq!(line_of(&t, 3).as_deref(), Some("l3"));
+        assert_eq!(line_of(&t, 6).as_deref(), Some("l6"));
+    }
+
+    #[test]
+    fn point_at_counts_evicted_rows() {
+        // selection-scroll-anchor R1.2 with eviction under way: live row r is line
+        // `evicted + history_len + r`, and scrolled back the same line stays on the
+        // same text.
+        let mut t = Terminal::with_history_limit(10, 3, Color(0xE0E0E0), Color(0x101010), 2);
+        t.advance(b"l0\r\nl1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6");
+        let (e, h) = (t.evicted(), t.history_len() as u64);
+        assert_eq!((e, h), (2, 2), "precondition: eviction under way");
+        assert_eq!(
+            t.point_at(4, 1),
+            Point {
+                line: e + h + 1,
+                col: 4
+            }
+        );
+        assert_eq!(line_of(&t, e + h + 1).as_deref(), Some("l5"));
+        t.scroll_up(2);
+        assert_eq!(
+            t.point_at(0, 0),
+            Point { line: e, col: 0 },
+            "oldest retained"
+        );
+        assert_eq!(line_of(&t, e).as_deref(), Some("l2"));
+    }
+
+    // --- The selection change check (selection-scroll-anchor D4/D5/D6) ---
+    //
+    // Here rather than in `tests/selection_check.rs` because each needs the
+    // test-only history limit or reads the sync flag, both crate-internal.
+
+    use std::time::{Duration, Instant};
+
+    /// `alpha` / `bravo` / `charlie` on a 10×3 terminal, `bravo` selected.
+    fn bravo_selected() -> Terminal {
+        let mut t = Terminal::new(10, 3, Color(0xE0E0E0), Color(0x101010));
+        t.advance(b"alpha\r\nbravo\r\ncharlie");
+        let (a, f) = (t.point_at(0, 1), t.point_at(4, 1));
+        t.set_selection(a, f);
+        assert_eq!(t.selection_text().as_deref(), Some("bravo"), "precondition");
+        t
+    }
+
+    /// History limit 2, `l0`/`l1` in history (line 0 is the oldest retained) and
+    /// `l2`/`l3` live.
+    fn full_history() -> Terminal {
+        let mut t = Terminal::with_history_limit(10, 2, Color(0xE0E0E0), Color(0x101010), 2);
+        t.advance(b"l0\r\nl1\r\nl2\r\nl3");
+        assert_eq!((t.evicted(), t.history_len()), (0, 2), "precondition");
+        t
+    }
+
+    #[test]
+    fn evicting_the_start_of_a_backward_selection_clears_it() {
+        // selection-scroll-anchor R4.5 — anchor on the later line, focus on the
+        // earlier one, both in history (so the reference is empty and only the
+        // eviction test can fire). The start — the earlier point, not the anchor —
+        // is what eviction is measured against.
+        let mut t = full_history();
+        t.set_selection(Point { line: 1, col: 1 }, Point { line: 0, col: 0 });
+        t.settle_selection(Instant::now());
+        assert!(
+            t.selection().is_some(),
+            "the start is the oldest retained line, not yet evicted"
+        );
+        assert_eq!(t.selection_text().as_deref(), Some("l0\nl1"));
+
+        t.advance(b"\r\nl4"); // l2 enters history, l0 is evicted
+        assert_eq!(t.evicted(), 1, "precondition: the start line is gone");
+        t.settle_selection(Instant::now());
+        assert_eq!(t.selection(), None);
+    }
+
+    #[test]
+    fn copy_refuses_an_evicted_selection_before_any_settle() {
+        // selection-scroll-anchor R6.5 — no settle since the eviction, so the
+        // selection is still stored; the copy re-verifies on its own.
+        let mut t = full_history();
+        t.set_selection(Point { line: 0, col: 0 }, Point { line: 1, col: 1 });
+        assert_eq!(
+            t.selection_text().as_deref(),
+            Some("l0\nl1"),
+            "precondition"
+        );
+        t.advance(b"\r\nl4");
+        assert!(t.selection().is_some(), "no check has run");
+        assert_eq!(t.selection_text(), None);
+    }
+
+    #[test]
+    fn an_unclosed_block_stops_deferring_one_second_after_it_was_first_seen() {
+        // selection-scroll-anchor R5.6 — the first settle stamps the block, and the
+        // bound is inclusive: 999 ms keeps deferring, 1000 ms checks.
+        let mut t = bravo_selected();
+        t.advance(b"\x1b[?2026h\x1b[2;1Hx");
+        let t0 = Instant::now();
+        t.settle_selection(t0);
+        assert!(t.selection().is_some(), "first settle only stamps");
+        t.settle_selection(t0 + Duration::from_millis(999));
+        assert!(t.selection().is_some(), "999 ms: still deferring");
+        t.settle_selection(t0 + Duration::from_millis(1000));
+        assert_eq!(t.selection(), None, "1000 ms: stale, checked");
+        assert!(!t.grid.synchronized_update(), "and the block is dropped");
+        assert_eq!(SYNC_STALE, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_first_drain_well_past_the_bound_checks_too() {
+        // selection-scroll-anchor D5 — "the first drain at least one second after":
+        // output that pauses for 5 s after the stamp still gets its check.
+        let mut t = bravo_selected();
+        t.advance(b"\x1b[?2026h\x1b[2;1Hx");
+        let t0 = Instant::now();
+        t.settle_selection(t0);
+        t.settle_selection(t0 + Duration::from_secs(5));
+        assert_eq!(t.selection(), None);
+    }
+
+    #[test]
+    fn a_repeated_open_does_not_move_the_stamp_forward() {
+        // selection-scroll-anchor D5 — a second `?2026h` inside an open block must
+        // not restart the clock, or an app repeating it could defer forever.
+        let mut t = bravo_selected();
+        t.advance(b"\x1b[?2026h\x1b[2;1Hx");
+        let t0 = Instant::now();
+        t.settle_selection(t0);
+        t.advance(b"\x1b[?2026h");
+        t.settle_selection(t0 + Duration::from_millis(1000));
+        assert_eq!(t.selection(), None, "timed from the first stamp");
+    }
+
+    #[test]
+    fn a_stale_block_whose_text_held_keeps_the_selection_and_stops_deferring() {
+        // selection-scroll-anchor D5 — the timeout drops the block and checks; a
+        // selection whose text did not change survives it, and the very next
+        // settle checks again instead of re-stamping.
+        let mut t = bravo_selected();
+        t.advance(b"\x1b[?2026h");
+        let t0 = Instant::now();
+        t.settle_selection(t0);
+        t.settle_selection(t0 + SYNC_STALE);
+        assert!(
+            t.selection().is_some(),
+            "unchanged text survives the timeout"
+        );
+        assert!(!t.grid.synchronized_update());
+        t.advance(b"\x1b[2;1Hx");
+        t.settle_selection(t0 + SYNC_STALE);
+        assert_eq!(t.selection(), None, "no block left to defer this drain");
+    }
+
+    #[test]
+    fn ris_and_leaving_the_alt_screen_close_an_open_block() {
+        // selection-scroll-anchor R5.7 — in two terminals, each with a changed
+        // selection inside an open block. Neither close checks on its own (D7);
+        // the next settle does, without waiting for the stale bound.
+        let mut ris = bravo_selected();
+        ris.advance(b"\x1b[?2026h\x1b[2;1Hx");
+        assert!(ris.grid.synchronized_update(), "precondition: open");
+        ris.advance(b"\x1bc");
+        assert!(!ris.grid.synchronized_update(), "RIS closes it");
+        assert!(ris.selection().is_some(), "RIS runs no check of its own");
+        ris.settle_selection(Instant::now());
+        assert_eq!(ris.selection(), None, "the first settle checks");
+
+        let mut alt = bravo_selected();
+        alt.advance(b"\x1b[?2026h\x1b[2;1Hx");
+        alt.advance(b"\x1b[?1049h");
+        assert!(
+            alt.grid.synchronized_update(),
+            "entering the alt screen leaves it open"
+        );
+        alt.advance(b"\x1b[?1049l");
+        assert!(!alt.grid.synchronized_update(), "leaving closes it");
+        assert!(
+            alt.selection().is_some(),
+            "leaving runs no check of its own"
+        );
+        alt.settle_selection(Instant::now());
+        assert_eq!(alt.selection(), None, "the first settle checks");
     }
 
     #[test]
