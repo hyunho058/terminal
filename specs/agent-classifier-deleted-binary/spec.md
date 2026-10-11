@@ -449,6 +449,14 @@ D1 has to argue against reusing that floor rather than merely noting it.
   undetected by the sidebar skin, because stage 1b needs a path the fallback cannot supply
   (D1/D2). The panel is unaffected — `tabsession::find_claude`'s argv floor covers it. Named
   as a Non-goal, recorded here so the asymmetry is not rediscovered as a new bug.
+  **Closed 2026-10-10, after it was observed.** A `claude` 2.1.290 session that outlived an
+  update to 2.1.296 showed a `Running` card under a panel reading `[Claude]`; the updater had
+  deleted `versions/2.1.290`, and the recovered name was `2.1.290`, not `claude` (the kernel
+  names the file the `~/.local/bin/claude` symlink resolved to). The fix keeps D2's rejection
+  of a synthesised path: a pathless process whose name is version-shaped (`is_version`) reads
+  argv and classifies **argv[0]** through stages 1 and 1b. That is the KERN_ARGMAX `sysctl` D1
+  rejected as the general fallback, opened only for that one shape, so a deleted `rustc` still
+  costs none. Pinned live by `a_live_versioned_install_survives_its_binary_being_deleted`.
 - `Probed::NoAgent` remains unreachable in production, so `ai-monitor`'s `history.jsonl` tier
   stays dead code. Out of scope by the user's decision at L0; worth its own spec.
 - This fix does not make detection robust against the *next* thing `agy`'s updater changes.
