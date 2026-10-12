@@ -3004,6 +3004,15 @@ mod tests {
         }
     }
 
+    // korean-input-chords R2.2 — measured: 2-Set Korean Cmd+Shift+M arrives as `ㅡ`.
+    #[test]
+    fn korean_cmd_shift_m_toggles_after_substitution() {
+        let (raw, fixed) =
+            crate::input::korean_chord("ㅡ", "m", ModifiersState::SUPER | ModifiersState::SHIFT);
+        assert!(!AiMonitorOverlay::is_toggle(&raw));
+        assert!(AiMonitorOverlay::is_toggle(&fixed));
+    }
+
     /// Cmd+Shift+M.
     fn toggle_chord() -> KeyInput {
         chord(

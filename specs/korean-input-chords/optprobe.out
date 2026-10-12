@@ -1,0 +1,27 @@
+== select ABC
+== ABC: Cmd+Opt+S
+keyDown kc=1 chars=ß ignoring=s cmd=true shift=false layout=com.apple.keylayout.ABC key_without_modifiers=s marked-before=''
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== ABC: Cmd+Opt+Shift+M
+keyDown kc=46 chars=Â ignoring=M cmd=true shift=true layout=com.apple.keylayout.ABC key_without_modifiers=m marked-before=''
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== ABC: Cmd+Opt+C
+keyDown kc=8 chars=ç ignoring=c cmd=true shift=false layout=com.apple.keylayout.ABC key_without_modifiers=c marked-before=''
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== ABC: Cmd+Opt+1
+keyDown kc=18 chars=¡ ignoring=1 cmd=true shift=false layout=com.apple.keylayout.ABC key_without_modifiers=1 marked-before=''
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== select Korean
+== KO: Cmd+Opt+S
+keyDown kc=1 chars=s ignoring=ㄴ cmd=true shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㄴ marked-before=''
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO: Cmd+Opt+Shift+M
+keyDown kc=46 chars=m ignoring=ㅡ cmd=true shift=true layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㅡ marked-before=''
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO: Cmd+Opt+C
+keyDown kc=8 chars=c ignoring=ㅊ cmd=true shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㅊ marked-before=''
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO: Cmd+Opt+1
+keyDown kc=18 chars=1 ignoring=1 cmd=true shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=1 marked-before=''
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== restore

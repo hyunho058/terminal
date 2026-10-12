@@ -305,3 +305,49 @@ idle behaviour. See G1 for what the caches do and do not buy against it.
     stays frozen while a dialog is up (measured: 10+ minutes on a live `AskUserQuestion`). A
     record's `timestamp` is when it was created, not when it was written, so reading the
     file afterwards cannot show this. Check it live.
+- **G9** Cmd chords under the 2-Set Korean input source rest on four facts about AppKit and
+  winit that this repo cannot pin (`specs/korean-input-chords`). Recorded beside G5–G8 because
+  they are the same *kind* of fact: someone else's behaviour, read as data, with nobody to tell
+  us when it changes.
+
+  1. **The Korean IM answers a Cmd keyDown mid-composition by committing first.** With a
+     syllable marked, it calls `insertText:` with the syllable and then `doCommandBySelector:`.
+     If it stopped committing, there would be no `Ime::Commit` to recover the chord from, and
+     a mid-composition chord would go quiet again, with `하` still underlined. Two of three
+     synthetic probe runs showed exactly that mode, which is believed to be an artifact.
+  2. **winit drops the key after a commit.** `do_command_by_selector` returns early in the
+     `Committed` state (winit-0.30.13 `view.rs:426-428`), so no `KeyboardInput` is emitted.
+     If a later winit forwards the key, the chord arrives twice: once replayed, once as a
+     `KeyboardInput`. The one-shot `replayed_ts` guard drops the second one.
+  3. **`NSApp.currentEvent` is that keyDown while the commit is handled.** `replay_lost_chord`
+     rebuilds the chord from it. Measured only inside the probe's `insertText`, not inside
+     winit's handler; the spec's manual checklist (step 4) is the in-app confirmation. If
+     AppKit changed this, the replay could rebuild the wrong key, or nothing.
+  4. **winit dispatches the commit synchronously and drains its queue first-in, first-out.**
+     The handler is idle inside `keyDown` (`app_state.rs:306-320`). If the commit were queued
+     (a nested run loop, or re-entry), `currentEvent` could be a later event, and winit
+     prints `had to queue event`, visible under `RUST_LOG=winit=debug`. If the queue were
+     not first-in, first-out, a forwarded duplicate could arrive *before* the replay, and
+     the one-shot `replayed_ts` guard would no longer catch it.
+
+  Idle chords rest on a fifth, simpler fact: winit builds a Cmd chord's logical key from
+  `charactersIgnoringModifiers` (the jamo), while `characters` (the Command-layer string,
+  `text_with_all_modifiers`) is Roman. `input::chord_key` swaps the latter in.
+  `key_without_modifiers` is no substitute, because under Korean the current *layout* source
+  is `2SetHangul`.
+
+  **The oracles:** the `chord-substitute` and `chord-replay` lines
+  (`RUST_LOG=app=debug,winit=debug`, on stdout — the `winit` target carries fact 4's line),
+  and `specs/korean-input-chords/composeprobe.swift`, which drives the real IM through
+  `NSTextInputContext.handleEvent` in a real `NSApplication`. A bare `CGEvent` bypasses the
+  input method and has cleared this bug falsely once. **"A Cmd chord does nothing while I'm
+  typing Korean"** should be read as "check for a `chord-replay` line first". No line with `하`
+  still underlined means fact 1 moved (the IM did not commit); no line with `하` committed
+  means fact 3 or 4 moved (look for `had to queue event`); a line whose `keyCode` is not the
+  key just pressed means fact 3 or 4 moved; a `chord-replay duplicate dropped` line means fact
+  2 moved.
+
+  **Still lost mid-composition, deliberately:** Cmd+Enter, Cmd+Backspace, Cmd+Escape,
+  Cmd+F-keys, Cmd+PageUp/PageDown and Cmd+ForwardDelete. If the IM commits on them too
+  (unmeasured for named keys), each logs only a `chord-replay skipped` line, because no Cmd
+  matcher reads them. Cmd+Tab is not listed: macOS takes it before the app sees it.
