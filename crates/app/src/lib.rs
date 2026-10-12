@@ -50,6 +50,7 @@ pub(crate) mod copy;
 pub(crate) mod dashboard;
 pub(crate) mod drag;
 pub(crate) mod hyperlink;
+pub(crate) mod ime_chord;
 pub(crate) mod input;
 pub(crate) mod overlay;
 pub(crate) mod presence_fd;

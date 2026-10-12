@@ -123,6 +123,14 @@ mod tests {
         assert!(!is_copy(&keyinput("v", true)));
     }
 
+    // korean-input-chords R2.2 — 2-Set Korean Cmd+C arrives as `ㅊ`.
+    #[test]
+    fn korean_cmd_c_is_copy_after_substitution() {
+        let (raw, fixed) = crate::input::korean_chord("ㅊ", "c", ModifiersState::SUPER);
+        assert!(!is_copy(&raw));
+        assert!(is_copy(&fixed));
+    }
+
     type Recorded = Rc<RefCell<Vec<String>>>;
     type Sink = Box<dyn Fn(&str)>;
 

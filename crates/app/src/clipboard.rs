@@ -186,6 +186,15 @@ impl Overlay for ImagePresenter {
 mod tests {
     use super::*;
 
+    // korean-input-chords R2.2 — 2-Set Korean Cmd+V arrives as `ㅍ`.
+    #[test]
+    fn korean_cmd_v_is_paste_after_substitution() {
+        let (raw, fixed) =
+            crate::input::korean_chord("ㅍ", "v", winit::keyboard::ModifiersState::SUPER);
+        assert!(!is_paste(&raw));
+        assert!(is_paste(&fixed));
+    }
+
     #[test]
     fn wrap_paste_brackets_when_mode_on() {
         // R2.1.

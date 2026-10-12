@@ -855,6 +855,23 @@ mod tests {
         assert_eq!(t.text, "abcd");
     }
 
+    // korean-input-chords R2.2 — 2-Set Korean Cmd+Shift+R arrives as `ㄱ`, Cmd+A as `ㅁ`.
+    #[test]
+    fn korean_rename_chords_fire_after_substitution() {
+        let (raw, fixed) =
+            crate::input::korean_chord("ㄱ", "r", ModifiersState::SUPER | ModifiersState::SHIFT);
+        assert!(!RenameOverlay::is_toggle(&raw));
+        assert!(RenameOverlay::is_toggle(&fixed));
+
+        let (raw, fixed) = crate::input::korean_chord("ㅁ", "a", ModifiersState::SUPER);
+        let mut t = field("abcd");
+        RenameOverlay::edit(&mut t, &raw);
+        assert!(!t.selected, "the raw jamo must not select");
+        RenameOverlay::edit(&mut t, &fixed);
+        assert!(t.selected);
+        assert_eq!(t.text, "abcd");
+    }
+
     #[test]
     fn cmd_a_reselects_the_whole_name() {
         // The way back to "replace everything" once the opening selection is consumed.

@@ -622,6 +622,16 @@ impl Overlay for CaptureOverlay {
 mod tests {
     use super::*;
 
+    // korean-input-chords R2.2 — measured: 2-Set Korean Cmd+Shift+G arrives as `ㅎ`.
+    #[test]
+    fn korean_cmd_shift_g_is_the_capture_chord_after_substitution() {
+        use winit::keyboard::ModifiersState;
+        let (raw, fixed) =
+            crate::input::korean_chord("ㅎ", "g", ModifiersState::SUPER | ModifiersState::SHIFT);
+        assert!(!is_capture_chord(&raw));
+        assert!(is_capture_chord(&fixed));
+    }
+
     /// How long a helper waits for the watcher thread before giving up.
     ///
     /// Bounds a *failure*, never a success: the stub child exits within a poll or two

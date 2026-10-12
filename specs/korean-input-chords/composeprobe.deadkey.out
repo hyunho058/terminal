@@ -1,0 +1,112 @@
+== select ABC
+== ABC: Cmd+T
+keyDown kc=17 chars=t ignoring=t cmd=true shift=false layout=com.apple.keylayout.ABC key_without_modifiers=t marked-before=''
+  doCommandBySelector noop:
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== ABC: Cmd+Shift+M
+keyDown kc=46 chars=m ignoring=M cmd=true shift=true layout=com.apple.keylayout.ABC key_without_modifiers=m marked-before=''
+  doCommandBySelector noop:
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== ABC: Cmd+Shift+]
+keyDown kc=30 chars=] ignoring=} cmd=true shift=true layout=com.apple.keylayout.ABC key_without_modifiers=] marked-before=''
+  doCommandBySelector noop:
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== ABC: Cmd+1
+keyDown kc=18 chars=1 ignoring=1 cmd=true shift=false layout=com.apple.keylayout.ABC key_without_modifiers=1 marked-before=''
+  doCommandBySelector noop:
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== select Korean
+== KO idle: Cmd+T
+keyDown kc=17 chars=t ignoring=ㅅ cmd=true shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㅅ marked-before=''
+  doCommandBySelector noop:
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO idle: Cmd+Shift+M
+keyDown kc=46 chars=m ignoring=ㅡ cmd=true shift=true layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㅡ marked-before=''
+  doCommandBySelector noop:
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO idle: Cmd+Shift+]
+keyDown kc=30 chars=] ignoring=} cmd=true shift=true layout=com.apple.keylayout.2SetHangul key_without_modifiers=] marked-before=''
+  doCommandBySelector noop:
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO idle: Cmd+1
+keyDown kc=18 chars=1 ignoring=1 cmd=true shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=1 marked-before=''
+  doCommandBySelector noop:
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO idle: Cmd+A
+keyDown kc=0 chars=a ignoring=ㅁ cmd=true shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㅁ marked-before=''
+  doCommandBySelector noop:
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO idle: Cmd+Shift+G
+keyDown kc=5 chars=g ignoring=ㅎ cmd=true shift=true layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㅎ marked-before=''
+  doCommandBySelector noop:
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO: type g (ㅎ)
+keyDown kc=5 chars=ㅎ ignoring=ㅎ cmd=false shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㅎ marked-before=''
+  insertText 'ㅎ' hadMarked=false currentEvent=[keyDown kc=5 chars=ㅎ cmd=false]
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO composing ㅎ: Cmd+T
+keyDown kc=17 chars=t ignoring=ㅅ cmd=true shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㅅ marked-before=''
+  doCommandBySelector noop:
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO: Escape to clear
+keyDown kc=53 chars= ignoring= cmd=false shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers= marked-before=''
+  doCommandBySelector cancelOperation:
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO: type g k (하)
+keyDown kc=5 chars=ㅎ ignoring=ㅎ cmd=false shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㅎ marked-before=''
+  insertText 'ㅎ' hadMarked=false currentEvent=[keyDown kc=5 chars=ㅎ cmd=false]
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+keyDown kc=40 chars=ㅏ ignoring=ㅏ cmd=false shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㅏ marked-before=''
+  insertText 'ㅏ' hadMarked=false currentEvent=[keyDown kc=40 chars=ㅏ cmd=false]
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO composing 하: Cmd+Shift+M
+keyDown kc=46 chars=m ignoring=ㅡ cmd=true shift=true layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㅡ marked-before=''
+  doCommandBySelector noop:
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO: type r (ㄱ)
+keyDown kc=15 chars=ㄱ ignoring=ㄱ cmd=false shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㄱ marked-before=''
+  insertText 'ㄱ' hadMarked=false currentEvent=[keyDown kc=15 chars=ㄱ cmd=false]
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO composing ㄱ: Cmd+C
+keyDown kc=8 chars=c ignoring=ㅊ cmd=true shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㅊ marked-before=''
+  doCommandBySelector noop:
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO: type g (ㅎ)
+keyDown kc=5 chars=ㅎ ignoring=ㅎ cmd=false shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㅎ marked-before=''
+  insertText 'ㅎ' hadMarked=false currentEvent=[keyDown kc=5 chars=ㅎ cmd=false]
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO composing ㅎ: Cmd+V
+keyDown kc=9 chars=v ignoring=ㅍ cmd=true shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㅍ marked-before=''
+  doCommandBySelector noop:
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO: type g (ㅎ)
+keyDown kc=5 chars=ㅎ ignoring=ㅎ cmd=false shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㅎ marked-before=''
+  insertText 'ㅎ' hadMarked=false currentEvent=[keyDown kc=5 chars=ㅎ cmd=false]
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO composing ㅎ: Cmd+1
+keyDown kc=18 chars=1 ignoring=1 cmd=true shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=1 marked-before=''
+  doCommandBySelector noop:
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO: Escape to clear
+keyDown kc=53 chars= ignoring= cmd=false shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers= marked-before=''
+  doCommandBySelector cancelOperation:
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO: type g k (하) again
+keyDown kc=5 chars=ㅎ ignoring=ㅎ cmd=false shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㅎ marked-before=''
+  insertText 'ㅎ' hadMarked=false currentEvent=[keyDown kc=5 chars=ㅎ cmd=false]
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+keyDown kc=40 chars=ㅏ ignoring=ㅏ cmd=false shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=ㅏ marked-before=''
+  insertText 'ㅏ' hadMarked=false currentEvent=[keyDown kc=40 chars=ㅏ cmd=false]
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== KO composing 하: Cmd+1
+keyDown kc=18 chars=1 ignoring=1 cmd=true shift=false layout=com.apple.keylayout.2SetHangul key_without_modifiers=1 marked-before=''
+  doCommandBySelector noop:
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== select ABC for dead key
+== ABC: Option+e (dead acute)
+keyDown kc=14 chars= ignoring=e cmd=false shift=false layout=com.apple.keylayout.ABC key_without_modifiers=e marked-before=''
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== ABC dead key pending: Cmd+T
+keyDown kc=17 chars=´t ignoring=t cmd=true shift=false layout=com.apple.keylayout.ABC key_without_modifiers=t marked-before=''
+  -> winit KeyboardInput emitted: true  (state now ground, marked-after='')
+== restore

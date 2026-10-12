@@ -318,6 +318,8 @@ Preedit→커서 위치 인라인 렌더, 조합중 `KeyboardInput.text` 중복 
   원안이 막으려던 사고 자체는 실재한다: 탭 전환은 내부 액션이라 `resignFirstResponder`가
   일어나지 않아 macOS가 marked text를 들고 있고, 뒤이은 `Ime::Commit`이 **새 탭의 셸에**
   써진다. Cmd+T는 Named 키 + modifier라 D8 게이트를 그냥 통과하므로 키보드만으로 도달 가능하다.
+  *(정정, 2026-10-10: Cmd+T는 Named 키가 아니라 `Key::Character`이고, 조합 중에는 Korean IM이
+  음절을 커밋한 뒤 winit이 그 키를 아예 내보내지 않는다 — `specs/korean-input-chords` 참조.)*
   거부한 대안: (a) 가드만 — 후보창이 남고 다음 타건이 이전 음절을 이어갈 수 있다,
   (b) 조합중 탭 전환 차단 — 단축키가 가끔 안 듣는 것처럼 느껴진다.
 

@@ -53,6 +53,80 @@ pub fn tab_action(key: &Key, mods: &ModifiersState) -> Option<TabAction> {
     }
 }
 
+/// The key and text a Cmd chord should be matched as, given what winit reported for it
+/// (korean-input-chords D1–D5).
+///
+/// Under the 2-Set Korean input source winit builds a Cmd chord's `logical_key` from
+/// `NSEvent.charactersIgnoringModifiers`, which is the jamo — `ㅅ` for Cmd+T, `ㅡ` for
+/// Cmd+Shift+M — so every letter chord in the crate misses. The same event's
+/// `characters` (winit's `text_with_all_modifiers`) is the Command-layer string, which is
+/// Roman under 2-Set Korean (measured; other sources are unmeasured), and is what is substituted
+/// here. `key_without_modifiers` is no substitute: under Korean the current layout source is
+/// `2SetHangul`, so it reports the jamo too (`specs/korean-input-chords`).
+///
+/// Substitutes only when Cmd is held, the logical key is a non-ASCII character, and the
+/// Command-layer string is exactly one ASCII-graphic char. Everything else — ABC, digits,
+/// brackets, plain Hangul typing, named keys, a Cmd+Ctrl chord whose Command-layer string is
+/// a control char — comes back as `logical`/`text` untouched, which is what keeps ABC
+/// byte-for-byte identical by construction rather than by test luck.
+///
+/// Shift upper-cases the substitute: `characters` ignores Shift under Cmd (`m` for
+/// Cmd+Shift+M, even on ABC) while ABC's logical key heeds it (`M`), and the unclaimed
+/// Cmd+letter that falls through to `encode_key`'s text fallback must send what ABC sends.
+pub fn chord_key(
+    logical: &Key,
+    text: Option<&str>,
+    text_with_all_modifiers: Option<&str>,
+    mods: ModifiersState,
+) -> (Key, Option<String>) {
+    let unchanged = || (logical.clone(), text.map(str::to_owned));
+    if !mods.super_key() {
+        return unchanged();
+    }
+    let Key::Character(reported) = logical else {
+        return unchanged();
+    };
+    if reported.is_ascii() {
+        return unchanged();
+    }
+    let mut command_layer = text_with_all_modifiers.unwrap_or_default().chars();
+    let (Some(c), None) = (command_layer.next(), command_layer.next()) else {
+        return unchanged();
+    };
+    if !c.is_ascii_graphic() {
+        return unchanged();
+    }
+    let c = if mods.shift_key() {
+        c.to_ascii_uppercase()
+    } else {
+        c
+    };
+    let roman = c.to_string();
+    tracing::debug!(from = %reported, to = %roman, "chord-substitute");
+    (Key::Character(roman.as_str().into()), Some(roman))
+}
+
+/// Test-only: a 2-Set Korean Cmd chord as winit delivers it (logical key and text = the
+/// jamo) and as the `KeyboardInput` arm hands it on after [`chord_key`] — the pair every
+/// letter matcher's korean-input-chords R2.2 test checks. The raw half is what proves a
+/// test exercises the fix: each matcher must miss it.
+#[cfg(test)]
+pub(crate) fn korean_chord(jamo: &str, roman: &str, mods: ModifiersState) -> (KeyInput, KeyInput) {
+    let raw = KeyInput {
+        key: Key::Character(jamo.into()),
+        text: Some(jamo.to_owned()),
+        mods,
+        physical: crate::seam::NO_PHYSICAL,
+    };
+    let (key, text) = chord_key(&raw.key, raw.text.as_deref(), Some(roman), mods);
+    let fixed = KeyInput {
+        key,
+        text,
+        ..raw.clone()
+    };
+    (raw, fixed)
+}
+
 /// What the app does about a pointer press (D1). Distinct from the renderer's *region*
 /// enum: several regions map to one action, and two map to "consumed" (`Inert`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1036,6 +1110,130 @@ mod tests {
         );
         // A non-chord char with Cmd held is also not a tab action.
         assert_eq!(tab_action(&ch("z"), &ModifiersState::SUPER), None);
+    }
+
+    // ---- korean-input-chords R1: `chord_key` ----
+
+    const CMD: ModifiersState = ModifiersState::SUPER;
+
+    fn chord_of(
+        logical: Key,
+        text: &str,
+        command_layer: Option<&str>,
+        mods: ModifiersState,
+    ) -> (Key, Option<String>) {
+        chord_key(&logical, Some(text), command_layer, mods)
+    }
+
+    // R1.1 — measured: 2-Set Korean Cmd+T reports `ㅅ` / `t`.
+    #[test]
+    fn korean_cmd_letter_becomes_the_roman_letter() {
+        assert_eq!(
+            chord_of(ch("ㅅ"), "ㅅ", Some("t"), CMD),
+            (ch("t"), Some("t".into()))
+        );
+    }
+
+    // R1.2 — measured: Cmd+Shift+M reports `ㅡ` / `m`; ABC's logical key is `M`.
+    #[test]
+    fn shift_upper_cases_the_substitute() {
+        assert_eq!(
+            chord_of(ch("ㅡ"), "ㅡ", Some("m"), CMD | ModifiersState::SHIFT),
+            (ch("M"), Some("M".into()))
+        );
+    }
+
+    // R1.3 — measured: Cmd+Shift+] reports `}` / `]` on ABC and Korean alike. Substituting
+    // would turn `}` into `]`, so this also pins the ASCII guard.
+    #[test]
+    fn an_ascii_logical_key_passes_through() {
+        assert_eq!(
+            chord_of(ch("}"), "}", Some("]"), CMD | ModifiersState::SHIFT),
+            (ch("}"), Some("}".into()))
+        );
+        assert_eq!(
+            chord_of(ch("t"), "t", Some("t"), CMD),
+            (ch("t"), Some("t".into()))
+        );
+    }
+
+    // R1.4 — plain Hangul typing and Ctrl chords are not Cmd chords.
+    #[test]
+    fn no_cmd_means_no_substitution() {
+        for mods in [ModifiersState::empty(), ModifiersState::CONTROL] {
+            assert_eq!(
+                chord_of(ch("ㅅ"), "ㅅ", Some("t"), mods),
+                (ch("ㅅ"), Some("ㅅ".into())),
+                "{mods:?}"
+            );
+        }
+    }
+
+    // R1.5 — the Command-layer string must be exactly one ASCII-graphic char.
+    #[test]
+    fn a_command_layer_that_is_not_one_ascii_graphic_char_blocks_substitution() {
+        let mods = CMD | ModifiersState::CONTROL;
+        for layer in [
+            None,
+            Some(""),
+            Some("\u{3}"),
+            Some(" "),
+            Some("tt"),
+            Some("ㅊ"),
+        ] {
+            assert_eq!(
+                chord_of(ch("ㅊ"), "ㅊ", layer, mods),
+                (ch("ㅊ"), Some("ㅊ".into())),
+                "{layer:?}"
+            );
+        }
+    }
+
+    // R1.6 — named keys are never substituted, whatever the Command-layer string says.
+    #[test]
+    fn named_keys_pass_through() {
+        let left = Key::Named(NamedKey::ArrowLeft);
+        assert_eq!(
+            chord_key(&left, None, Some("\u{F702}"), CMD),
+            (left.clone(), None)
+        );
+        assert_eq!(chord_key(&left, None, Some("a"), CMD), (left, None));
+    }
+
+    // R2.2 — the tab and sidebar chords, measured jamo (Cmd+T `ㅅ`, Cmd+W `ㅈ`, Cmd+S `ㄴ`).
+    #[test]
+    fn korean_tab_and_sidebar_chords_fire_after_substitution() {
+        for (jamo, roman, action) in [
+            ("ㅅ", "t", TabAction::New),
+            ("ㅈ", "w", TabAction::CloseActive),
+        ] {
+            let (raw, fixed) = korean_chord(jamo, roman, CMD);
+            assert_eq!(
+                tab_action(&raw.key, &raw.mods),
+                None,
+                "{jamo}: raw must miss"
+            );
+            assert_eq!(tab_action(&fixed.key, &fixed.mods), Some(action), "{jamo}");
+        }
+        let (raw, fixed) = korean_chord("ㄴ", "s", CMD | ModifiersState::SHIFT);
+        assert!(!is_sidebar_toggle_chord(&raw.key, &raw.mods));
+        assert!(is_sidebar_toggle_chord(&fixed.key, &fixed.mods));
+    }
+
+    // R2.3 — an unclaimed Cmd+letter reaches the shell as it does on ABC, never as a jamo.
+    #[test]
+    fn an_unclaimed_korean_cmd_letter_sends_what_abc_sends() {
+        let mods = CMD | ModifiersState::SHIFT;
+        let (key, text) = chord_of(ch("ㅌ"), "ㅌ", Some("x"), mods);
+        assert_eq!(
+            encode_key(&key, text.as_deref(), mods, false),
+            Some(b"X".to_vec())
+        );
+        assert_eq!(
+            encode_key(&ch("X"), Some("X"), mods, false),
+            Some(b"X".to_vec()),
+            "the ABC bytes this must match"
+        );
     }
 
     /// Every cursor/nav test below goes through this: no modifiers, DECCKM off.

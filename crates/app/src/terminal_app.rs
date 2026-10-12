@@ -27,7 +27,8 @@ use std::time::Instant;
 
 use common::config::{Config, SidebarConfig};
 use common::watch::ConfigWatcher;
-use objc2_app_kit::NSView;
+use objc2::MainThreadMarker;
+use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSEventType, NSView};
 use renderer::cursor_layer::CursorLayer;
 use renderer::link_layer::{LinkHandle, LinkLayer};
 use renderer::preedit_layer::{PreeditHandle, PreeditLayer};
@@ -44,6 +45,7 @@ use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 // winit 0.30 re-exports raw-window-handle 0.6 (`rwh_06`, a default feature), so
 // reaching the `NSView` needs no new dependency on `app` (D11).
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -53,6 +55,7 @@ use crate::drag::{self, SelectionDrag};
 use crate::hyperlink::{
     frame_rescans, url_to_open, ClickInput, HoverInput, HoverState, LinkTrigger, Opener, Update,
 };
+use crate::ime_chord::{self, CmdEventFacts, Replay};
 use crate::input::{
     self, encode_key, hover_card, hover_cursor, is_double_click, is_sidebar_toggle_chord,
     pixel_to_cell, press_dismisses_modals, sidebar_press, sidebar_region, suppress_key, tab_action,
@@ -79,6 +82,42 @@ pub enum UserEvent {
     /// A registered overlay has pending background work (e.g. ai-monitor's log
     /// tail); the loop should `poll` the overlays and redraw.
     OverlayPending,
+}
+
+/// AppKit's current event as plain data (korean-input-chords D7) — read-only, never
+/// consumed or re-posted. `None` off the main thread or when there is no current event.
+///
+/// Unfiltered: every event becomes facts, and `ime_chord` decides what counts. Only the
+/// key fields are guarded, because `characters` and `keyCode` raise an Objective-C
+/// exception on a non-key event (a mouse click can be current when a commit arrives).
+fn current_event_facts() -> Option<CmdEventFacts> {
+    let mtm = MainThreadMarker::new()?;
+    let event = NSApplication::sharedApplication(mtm).currentEvent()?;
+    let kind = event.r#type();
+    let flags = event.modifierFlags();
+    let is_key = kind == NSEventType::KeyDown || kind == NSEventType::KeyUp;
+    let string = |s: Option<objc2::rc::Retained<objc2_foundation::NSString>>| {
+        s.map(|s| s.to_string()).unwrap_or_default()
+    };
+    Some(CmdEventFacts {
+        is_key_down: kind == NSEventType::KeyDown,
+        command: flags.contains(NSEventModifierFlags::Command),
+        shift: flags.contains(NSEventModifierFlags::Shift),
+        control: flags.contains(NSEventModifierFlags::Control),
+        option: flags.contains(NSEventModifierFlags::Option),
+        key_code: if is_key { event.keyCode() } else { 0 },
+        characters: if is_key {
+            string(event.characters())
+        } else {
+            String::new()
+        },
+        characters_ignoring_modifiers: if is_key {
+            string(event.charactersIgnoringModifiers())
+        } else {
+            String::new()
+        },
+        timestamp: event.timestamp(),
+    })
 }
 
 /// One waiting-band row's folder name: the tab's **live** published cwd, falling back to the
@@ -315,6 +354,11 @@ struct Running {
     /// new tab's shell — silent cross-tab data corruption (R8.3). `None` means the
     /// text never went through a composition, and goes to the active tab (R8.5).
     composing_tab: Option<TabId>,
+    /// `NSEvent.timestamp` of the chord the last commit replayed, or `None`
+    /// (korean-input-chords D8). The next `KeyboardInput` consumes it: if that event is
+    /// the one already replayed, it is dropped, so a winit that one day forwards the key
+    /// after a commit cannot run Cmd+T twice.
+    replayed_ts: Option<f64>,
     /// Write end of the [`PreeditLayer`]'s shared model (D9/R7.1) — the only way
     /// the composition reaches the screen. It deliberately never touches
     /// `term-core`: these characters have not been written to the PTY, so putting
@@ -494,6 +538,7 @@ impl App {
             composing: false,
             preedit: String::new(),
             composing_tab: None,
+            replayed_ts: None,
             preedit_handle,
             waiting: WaitingState::new(),
             tabmeta_snapshot: TabMetaSnapshot::default(),
@@ -527,98 +572,21 @@ impl Running {
     /// Handle one `WindowEvent::Ime` (R6.2/R6.6/R6.7, D12). All four variants are
     /// handled explicitly — falling into `_ => {}` for `Disabled` is exactly the
     /// deadlock R6.7 guards against.
-    fn on_ime(&mut self, ime: Ime) {
+    ///
+    /// Returns `false` when a chord replayed from a commit asked the app to exit (Cmd+W on
+    /// the last tab while composing) — the same contract as `on_key`.
+    fn on_ime(&mut self, ime: Ime) -> bool {
         match ime {
             // The IME finished a syllable: those bytes are the user's text (R6.2).
             // winit queues an empty `Preedit` immediately before every `Commit`
             // (view.rs:411-414), so `composing` is already false here for the plain
             // ASCII path; clear it anyway so the state can never outlive a commit.
             Ime::Commit(text) => {
-                // Route by tab identity, not by "whoever is active now" (R8/D11):
-                // the composition belongs to the tab it started in. Deliberately
-                // *not* a one-shot "discard the next commit" guard — a guard that
-                // misfires eats a character that has no other path to the PTY
-                // (`had_ime_input` suppresses the duplicate `KeyboardInput`,
-                // view.rs:478-489).
-                //
-                // This read is only meaningful because ownership deliberately
-                // OUTLIVES the empty `Preedit` that winit queues immediately before
-                // every `Commit` (view.rs:412-413). Clearing the owner there — as
-                // the first cut did — made this whole routing inert: `composing_tab`
-                // was always `None` by the time we got here, so every commit fell to
-                // the active tab and `Tab`/`Drop` were dead code. Ownership is
-                // released *here*, after the bytes have been placed, and by
-                // `Ime::Disabled` / the start of a new composition.
-                // A visible text field claims the composition first (sticky-tab-title
-                // R2.6). This branch is the whole reason the rename field can accept
-                // Hangul: `Ime::Commit` bypasses `on_key` entirely — the composing gate
-                // withholds the duplicate `KeyboardInput` — so without this the syllable
-                // would go to the shell and the field would receive nothing at all.
-                if !text.is_empty()
-                    && self
-                        .overlays
-                        .command(&OverlayCommand::ImeCommit(text.clone()))
-                        == Handled::Consumed
-                {
-                    self.set_preedit(String::new());
-                    self.composing_tab = None;
-                    self.redraw();
-                    return;
-                }
-                if !text.is_empty() {
-                    let composing_tab = self.composing_tab;
-                    let target =
-                        commit_target(composing_tab, |id| self.tabs.by_id_mut(id).is_some());
-                    match target {
-                        // The composing tab is still open — write there (R8.3).
-                        CommitTarget::Tab(id) => {
-                            let ok = match self.tabs.by_id_mut(id) {
-                                Some(session) => match session.write(text.as_bytes()) {
-                                    Ok(()) => true,
-                                    Err(e) => {
-                                        tracing::warn!("pty write failed: {e}");
-                                        false
-                                    }
-                                },
-                                // Unreachable: `commit_target` only yields `Tab` when
-                                // the probe said it exists. Never panic on it.
-                                None => {
-                                    tracing::warn!(tab = id.0, "commit target vanished");
-                                    false
-                                }
-                            };
-                            // Snap the tab the bytes went to, not the active one
-                            // (terminal-scroll D4) — a composition that began in a tab
-                            // the user has since left still owns its own viewport.
-                            if ok {
-                                self.snap_after_input(id);
-                            }
-                        }
-                        // Plain, non-composed text — the active tab, as always.
-                        // This branch is what guarantees no character is ever
-                        // lost (R8.5).
-                        CommitTarget::Active => {
-                            // The path `on_key` never sees: winit's composing gate plus
-                            // `had_ime_input` mean a committed 한글 syllable arrives
-                            // *only* here. Without this snap, typing Korean into a
-                            // scrolled-back view would leave the screen frozen and the
-                            // terminal looking dead (terminal-scroll D4).
-                            match self.tabs.active_mut().write(text.as_bytes()) {
-                                Ok(()) => self.snap_active_after_input(),
-                                Err(e) => tracing::warn!("pty write failed: {e}"),
-                            }
-                        }
-                        // The tab that owned the composition was closed: those
-                        // bytes have no owner, so drop them silently (R8.4).
-                        CommitTarget::Drop => {
-                            tracing::debug!("ime commit dropped: composing tab closed");
-                        }
-                    }
-                }
-                // The bytes are placed: release ownership so the next composition
-                // starts clean (R8/D11).
-                self.set_preedit(String::new());
-                self.composing_tab = None;
+                self.place_commit(text.clone());
+                // After BOTH of `place_commit`'s exits — the rename field's early return
+                // included — so a mid-composition Cmd+A in the field replays too
+                // (korean-input-chords D7).
+                return self.replay_lost_chord(&text);
             }
             // Composition in flight. Empty text is winit's synthetic clear signal
             // (view.rs:345), so `!is_empty()` is exactly the composing predicate (R6.6).
@@ -646,6 +614,132 @@ impl Running {
                 // The IME is gone, so no `Commit` is coming for this composition —
                 // release ownership too, or it would leak into the next one (D11).
                 self.composing_tab = None;
+            }
+        }
+        true
+    }
+
+    /// Place a committed syllable (R6.2, R8): the rename field first, else the tab the
+    /// composition started in. Split out of `on_ime` so the chord replay runs after both of
+    /// its exits.
+    fn place_commit(&mut self, text: String) {
+        // Route by tab identity, not by "whoever is active now" (R8/D11):
+        // the composition belongs to the tab it started in. Deliberately
+        // *not* a one-shot "discard the next commit" guard — a guard that
+        // misfires eats a character that has no other path to the PTY
+        // (`had_ime_input` suppresses the duplicate `KeyboardInput`,
+        // view.rs:478-489).
+        //
+        // This read is only meaningful because ownership deliberately
+        // OUTLIVES the empty `Preedit` that winit queues immediately before
+        // every `Commit` (view.rs:412-413). Clearing the owner there — as
+        // the first cut did — made this whole routing inert: `composing_tab`
+        // was always `None` by the time we got here, so every commit fell to
+        // the active tab and `Tab`/`Drop` were dead code. Ownership is
+        // released *here*, after the bytes have been placed, and by
+        // `Ime::Disabled` / the start of a new composition.
+        // A visible text field claims the composition first (sticky-tab-title
+        // R2.6). This branch is the whole reason the rename field can accept
+        // Hangul: `Ime::Commit` bypasses `on_key` entirely — the composing gate
+        // withholds the duplicate `KeyboardInput` — so without this the syllable
+        // would go to the shell and the field would receive nothing at all.
+        if !text.is_empty()
+            && self
+                .overlays
+                .command(&OverlayCommand::ImeCommit(text.clone()))
+                == Handled::Consumed
+        {
+            self.set_preedit(String::new());
+            self.composing_tab = None;
+            self.redraw();
+            return;
+        }
+        if !text.is_empty() {
+            let composing_tab = self.composing_tab;
+            let target = commit_target(composing_tab, |id| self.tabs.by_id_mut(id).is_some());
+            match target {
+                // The composing tab is still open — write there (R8.3).
+                CommitTarget::Tab(id) => {
+                    let ok = match self.tabs.by_id_mut(id) {
+                        Some(session) => match session.write(text.as_bytes()) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::warn!("pty write failed: {e}");
+                                false
+                            }
+                        },
+                        // Unreachable: `commit_target` only yields `Tab` when
+                        // the probe said it exists. Never panic on it.
+                        None => {
+                            tracing::warn!(tab = id.0, "commit target vanished");
+                            false
+                        }
+                    };
+                    // Snap the tab the bytes went to, not the active one
+                    // (terminal-scroll D4) — a composition that began in a tab
+                    // the user has since left still owns its own viewport.
+                    if ok {
+                        self.snap_after_input(id);
+                    }
+                }
+                // Plain, non-composed text — the active tab, as always.
+                // This branch is what guarantees no character is ever
+                // lost (R8.5).
+                CommitTarget::Active => {
+                    // The path `on_key` never sees: winit's composing gate plus
+                    // `had_ime_input` mean a committed 한글 syllable arrives
+                    // *only* here. Without this snap, typing Korean into a
+                    // scrolled-back view would leave the screen frozen and the
+                    // terminal looking dead (terminal-scroll D4).
+                    match self.tabs.active_mut().write(text.as_bytes()) {
+                        Ok(()) => self.snap_active_after_input(),
+                        Err(e) => tracing::warn!("pty write failed: {e}"),
+                    }
+                }
+                // The tab that owned the composition was closed: those
+                // bytes have no owner, so drop them silently (R8.4).
+                CommitTarget::Drop => {
+                    tracing::debug!("ime commit dropped: composing tab closed");
+                }
+            }
+        }
+        // The bytes are placed: release ownership so the next composition
+        // starts clean (R8/D11).
+        self.set_preedit(String::new());
+        self.composing_tab = None;
+    }
+
+    /// Replay a Cmd chord the input method consumed while committing (korean-input-chords
+    /// D7/D8). Mid-composition, the 2-Set Korean IM answers a Cmd keyDown by committing the
+    /// syllable, and winit then emits no `KeyboardInput` for it at all; but this commit is
+    /// dispatched synchronously inside that keyDown, so AppKit's current event is the lost
+    /// chord (measured in the probe's `insertText`, not inside winit — G9 facts 3 and 4; the
+    /// `chord-replay` line's `keyCode` is the in-app check). Runs after the syllable is
+    /// placed, so Cmd+T opens the new tab only once `하` is in the old one, and Cmd+V pastes
+    /// after it.
+    fn replay_lost_chord(&mut self, commit_text: &str) -> bool {
+        if commit_text.is_empty() {
+            return true;
+        }
+        let facts = current_event_facts();
+        let replay = ime_chord::replay_decision(facts.as_ref(), commit_text);
+        self.replayed_ts = ime_chord::guard_after_commit(&replay);
+        let key_code = facts.as_ref().map(|f| f.key_code);
+        match replay {
+            Replay::None => true,
+            Replay::Skip(why) => {
+                tracing::debug!(?key_code, why, "chord-replay skipped");
+                true
+            }
+            Replay::Key(input, timestamp) => {
+                tracing::debug!(
+                    ?key_code,
+                    timestamp,
+                    characters = ?facts.as_ref().map(|f| f.characters.as_str()),
+                    key = ?input.key,
+                    "chord-replay"
+                );
+                self.on_key(input)
             }
         }
     }
@@ -2726,7 +2820,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
-            WindowEvent::Ime(ime) => inner.on_ime(ime),
+            WindowEvent::Ime(ime) => {
+                // A replayed chord can be Cmd+W on the last tab (korean-input-chords D7).
+                let keep_running = inner.on_ime(ime);
+                if !keep_running {
+                    event_loop.exit();
+                }
+            }
 
             WindowEvent::Focused(false) => {
                 // A resize in flight COMMITS and ends here (tab-resize D17/R7.6). Cmd-Tab
@@ -2756,6 +2856,17 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput {
                 event: key_event, ..
             } if key_event.state == ElementState::Pressed => {
+                // The event a commit already replayed, delivered again (D8). One-shot, and
+                // ahead of the composing gate; releases never reach this arm.
+                if inner.replayed_ts.is_some()
+                    && ime_chord::take_duplicate(
+                        &mut inner.replayed_ts,
+                        current_event_facts().map(|f| f.timestamp),
+                    )
+                {
+                    tracing::debug!("chord-replay duplicate dropped");
+                    return;
+                }
                 // Composing gate, ahead of the whole dispatch chain (R6.3/D8):
                 // a character key mid-composition belongs to the IME and must never
                 // reach `encode_key`. Named keys still pass (R6.4) — winit forwards
@@ -2763,9 +2874,20 @@ impl ApplicationHandler<UserEvent> for App {
                 if suppress_key(inner.composing, &key_event.logical_key) {
                     return;
                 }
+                // Under 2-Set Korean winit reports a Cmd chord's logical key as the jamo
+                // (`ㅅ` for Cmd+T); `chord_key` swaps in the Roman Command-layer string so
+                // every letter chord below matches as it does on ABC, and leaves every
+                // other key exactly as winit built it (korean-input-chords D1–D5). The
+                // composing gate above deliberately still reads winit's raw key.
+                let (key, text) = input::chord_key(
+                    &key_event.logical_key,
+                    key_event.text.as_deref(),
+                    key_event.text_with_all_modifiers(),
+                    inner.mods,
+                );
                 let input = KeyInput {
-                    key: key_event.logical_key.clone(),
-                    text: key_event.text.as_ref().map(|t| t.to_string()),
+                    key,
+                    text,
                     mods: inner.mods,
                     physical: key_event.physical_key,
                 };
