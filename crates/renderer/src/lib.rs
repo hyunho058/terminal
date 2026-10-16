@@ -36,7 +36,10 @@ pub mod testing;
 
 use atlas::{Atlas, GlyphKey};
 use bytemuck::{Pod, Zeroable};
-use common::config::{AiMonitorConfig, Config, SidebarConfig};
+use common::config::{
+    AiMonitorConfig, Config, SidebarConfig, FONT_SIZE_DEFAULT, FONT_SIZE_MAX, FONT_SIZE_MIN,
+    MONITOR_WIDTH_MAX, MONITOR_WIDTH_MIN, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN,
+};
 use font_set::FONT_CANDIDATES;
 use swash::shape::ShapeContext;
 use swash::FontRef;
@@ -245,6 +248,11 @@ pub struct Renderer {
     /// `None` defers to `[ai_monitor].width_px`, exactly as `SidebarOverride::width_px`
     /// defers to `[sidebar].width_px`.
     monitor_width_override: Option<f32>,
+    /// Baseline terminal font size in logical points from `Config` (terminal-font-size D9).
+    font_size_pt: f32,
+    /// Runtime font size override in logical points (terminal-font-size D9). `None` defers
+    /// to `font_size_pt`.
+    font_size_override: Option<f32>,
     ppem: f32,
     ligatures: bool,
     bg_default: u32,
@@ -518,6 +526,8 @@ impl Renderer {
             ai_monitor: cfg.ai_monitor.clone(),
             monitor_open: false,
             monitor_width_override: None,
+            font_size_pt: cfg.font.size_pt,
+            font_size_override: None,
             ppem,
             ligatures: cfg.font.ligatures,
             bg_default: cfg.theme.background,
@@ -642,8 +652,8 @@ impl Renderer {
     /// `Config::load_from`'s clamp.
     pub fn set_sidebar_width(&mut self, logical_px: f32) {
         self.sidebar_override.width_px = Some(logical_px.clamp(
-            common::config::SIDEBAR_WIDTH_MIN,
-            common::config::SIDEBAR_WIDTH_MAX,
+            SIDEBAR_WIDTH_MIN,
+            SIDEBAR_WIDTH_MAX,
         ));
         self.sync_left_inset();
     }
@@ -728,7 +738,7 @@ impl Renderer {
             self.config.width as f32,
             self.cell_size.0,
             self.left_inset,
-            common::config::MONITOR_WIDTH_MIN * scale,
+            MONITOR_WIDTH_MIN * scale,
         );
         if px == self.right_inset {
             // A drag calls this on every `CursorMoved`, so an unchanged width must not
@@ -801,6 +811,72 @@ impl Renderer {
         self.sync_right_inset();
     }
 
+    /// Effective terminal font size in logical points — runtime override if set, else the
+    /// baseline `font_size_pt` from `Config` (terminal-font-size D9).
+    fn effective_font_size(&self) -> f32 {
+        self.font_size_override.unwrap_or(self.font_size_pt)
+    }
+
+    /// The terminal's effective font size in **logical** points — config baseline with the
+    /// runtime override applied (terminal-font-size D9, R2.1).
+    pub fn font_size_logical(&self) -> f32 {
+        self.effective_font_size()
+    }
+
+    /// Drop the runtime font-size override so the config baseline is authoritative again
+    /// (terminal-font-size D9, R2.4).
+    pub fn clear_font_override(&mut self) {
+        self.font_size_override = None;
+    }
+
+    /// Set the terminal font size in logical points at runtime (terminal-font-size D1, D4,
+    /// D6, D9, D10; R2.1, R2.2, R2.5).
+    ///
+    /// Clamps `size_pt` to `[FONT_SIZE_MIN, FONT_SIZE_MAX]` (falling back to
+    /// `FONT_SIZE_DEFAULT` if non-finite). Returns `false` without rebuilding `Atlas` or
+    /// clearing `last_snapshot` when the clamped size equals `effective_font_size()` (D10 /
+    /// R2.2). Otherwise updates `font_size_override`, `cell_size`, and `ppem`, rebuilds the
+    /// glyph `Atlas` and `glyph_bind_group`, invalidates `last_snapshot`, re-syncs both side
+    /// insets (`sync_left_inset` → `sync_right_inset`), and returns `true`.
+    pub fn set_font_size(&mut self, size_pt: f32) -> bool {
+        let clamped = clamp_font_size(size_pt);
+        if (clamped - self.effective_font_size()).abs() == 0.0 {
+            return false;
+        }
+        self.font_size_override = Some(clamped);
+        self.cell_size = cell_size_for_pt(clamped, self.scale_factor);
+        self.ppem = clamped * self.scale_factor as f32;
+        if let Some(atlas) = Atlas::new(&self.device, &self.fonts, self.ppem) {
+            self.atlas = atlas;
+            self.glyph_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("glyph-bg"),
+                layout: &self.glyph_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.glyph_uniform_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(self.atlas.view()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(self.atlas.sampler()),
+                    },
+                ],
+            });
+        } else {
+            tracing::warn!(
+                ppem = self.ppem,
+                "failed to rebuild glyph atlas on set_font_size"
+            );
+        }
+        self.last_snapshot = None;
+        self.sync_left_inset();
+        true
+    }
+
     /// The window backing scale factor. A sidebar `DrawLayer` multiplies logical-px
     /// [`SidebarConfig::width_px`] / `SidebarMetrics` by this to get physical px
     /// (D1/D10); `FrameCtx.scale_factor` carries the same value to layers.
@@ -817,8 +893,10 @@ impl Renderer {
     ///
     /// [`grid_size`]: Renderer::grid_size
     pub fn apply_config(&mut self, cfg: &Config) {
-        self.cell_size = cell_size_px(cfg, self.scale_factor);
-        self.ppem = cfg.font.size_pt * self.scale_factor as f32;
+        self.font_size_pt = cfg.font.size_pt;
+        let eff_pt = self.effective_font_size();
+        self.cell_size = cell_size_for_pt(eff_pt, self.scale_factor);
+        self.ppem = eff_pt * self.scale_factor as f32;
         self.ligatures = cfg.font.ligatures;
         self.bg_default = cfg.theme.background;
         self.clear = to_wgpu_color(cfg.theme.background);
@@ -1910,9 +1988,20 @@ fn build_pipeline(
     })
 }
 
-fn cell_size_px(cfg: &Config, scale_factor: f64) -> (f32, f32) {
-    let px = cfg.font.size_pt * scale_factor as f32;
+fn clamp_font_size(size_pt: f32) -> f32 {
+    if !size_pt.is_finite() {
+        return FONT_SIZE_DEFAULT;
+    }
+    size_pt.clamp(FONT_SIZE_MIN, FONT_SIZE_MAX)
+}
+
+fn cell_size_for_pt(size_pt: f32, scale_factor: f64) -> (f32, f32) {
+    let px = size_pt * scale_factor as f32;
     ((px * 0.6).round().max(1.0), (px * 1.2).round().max(1.0))
+}
+
+pub fn cell_size_px(cfg: &Config, scale_factor: f64) -> (f32, f32) {
+    cell_size_for_pt(cfg.font.size_pt, scale_factor)
 }
 
 /// Cols × rows that fit a framebuffer, reserving `top_inset` px above the grid
@@ -1956,12 +2045,9 @@ pub const MIN_TERMINAL_COLS: u16 = 20;
 /// where every later comparison would silently answer `false`.
 fn clamp_monitor_width(raw: f32) -> f32 {
     if !raw.is_finite() {
-        return common::config::MONITOR_WIDTH_MIN;
+        return MONITOR_WIDTH_MIN;
     }
-    raw.clamp(
-        common::config::MONITOR_WIDTH_MIN,
-        common::config::MONITOR_WIDTH_MAX,
-    )
+    raw.clamp(MONITOR_WIDTH_MIN, MONITOR_WIDTH_MAX)
 }
 
 /// The band the ai-monitor panel may actually occupy, in **physical** px — D4's clamp,
@@ -4140,5 +4226,276 @@ mod tests {
             clamp_monitor_width(f32::NAN),
             common::config::MONITOR_WIDTH_MIN
         );
+    }
+
+    #[test]
+    fn font_size_clamps_to_bounds_and_falls_back_on_non_finite() {
+        assert_eq!(clamp_font_size(14.0), 14.0);
+        assert_eq!(clamp_font_size(8.0), FONT_SIZE_MIN);
+        assert_eq!(clamp_font_size(32.0), FONT_SIZE_MAX);
+        assert_eq!(clamp_font_size(4.0), FONT_SIZE_MIN);
+        assert_eq!(clamp_font_size(60.0), FONT_SIZE_MAX);
+        assert_eq!(clamp_font_size(f32::NAN), FONT_SIZE_DEFAULT);
+        assert_eq!(clamp_font_size(f32::INFINITY), FONT_SIZE_DEFAULT);
+        assert_eq!(clamp_font_size(f32::NEG_INFINITY), FONT_SIZE_DEFAULT);
+
+        let mut cfg = Config::default();
+        for pt in [8.0_f32, 13.0, 14.0, 15.0, 20.0, 32.0] {
+            for sf in [1.0_f64, 2.0] {
+                cfg.font.size_pt = pt;
+                assert_eq!(cell_size_px(&cfg, sf), cell_size_for_pt(pt, sf));
+            }
+        }
+    }
+
+    #[test]
+    fn set_font_size_updates_metrics_and_atlas_epoch_and_skips_boundary_no_op() {
+        // R2.1 & R2.2: set_font_size updates runtime override, cell_size, ppem, and rebuilds
+        // Atlas when clamped size changes; returns false without rebuilding Atlas or clearing
+        // last_snapshot when clamped size equals effective_font_size.
+        let cfg = Config::default();
+        let Ok(mut r) = Renderer::new_headless(1200, 800, 2.0, &cfg) else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        let target = r.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen"),
+            size: wgpu::Extent3d {
+                width: 1200,
+                height: 800,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: r.surface_format(),
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut t = term_core::Terminal::new(10, 2, term_core::Color(0xFFFFFF), term_core::Color(0));
+        t.advance(b"hello");
+        let snap = t.snapshot();
+
+        assert_eq!(r.font_size_logical(), 14.0);
+        assert_eq!(r.font_size_override, None);
+        assert_eq!(r.cell_size(), cell_size_for_pt(14.0, 2.0));
+        assert_eq!(r.ppem, 28.0);
+
+        r.draw_to(&view, &snap);
+        let epoch_14 = r.atlas.epoch();
+        let reshape_14 = r.reshape_count();
+        assert!(r.last_snapshot.is_some());
+
+        // R2.2: setting 14.0 (or NaN, which falls back to 14.0) is a boundary no-op.
+        assert!(!r.set_font_size(14.0));
+        assert!(!r.set_font_size(f32::NAN));
+        assert_eq!(r.atlas.epoch(), epoch_14, "no-op must not rebuild Atlas");
+        assert!(
+            r.last_snapshot.is_some(),
+            "no-op must not clear last_snapshot"
+        );
+        r.draw_to(&view, &snap);
+        assert_eq!(
+            r.reshape_count(),
+            reshape_14,
+            "idle frame after no-op must not re-shape"
+        );
+
+        // R2.1: changing to 15.0 updates override, cell_size, ppem, rebuilds Atlas, and clears cache.
+        assert!(r.set_font_size(15.0));
+        assert_eq!(r.font_size_logical(), 15.0);
+        assert_eq!(r.font_size_override, Some(15.0));
+        assert_eq!(r.cell_size(), cell_size_for_pt(15.0, 2.0));
+        assert_eq!(r.ppem, 30.0);
+        let epoch_15 = r.atlas.epoch();
+        assert!(
+            epoch_15 > epoch_14,
+            "set_font_size must rebuild Atlas with incremented epoch"
+        );
+        assert!(
+            r.last_snapshot.is_none(),
+            "set_font_size must invalidate last_snapshot"
+        );
+
+        // Next frame re-shapes once and then settles (D6).
+        r.draw_to(&view, &snap);
+        assert_eq!(r.reshape_count(), reshape_14 + 1);
+        r.draw_to(&view, &snap);
+        assert_eq!(r.reshape_count(), reshape_14 + 1);
+
+        // R2.2 at FONT_SIZE_MIN (8.0): clamping 7.0 -> 8.0 when already at 8.0 is a no-op.
+        assert!(r.set_font_size(8.0));
+        assert_eq!(r.font_size_logical(), 8.0);
+        r.draw_to(&view, &snap);
+        let epoch_min = r.atlas.epoch();
+        assert!(!r.set_font_size(7.0));
+        assert!(!r.set_font_size(8.0));
+        assert_eq!(r.atlas.epoch(), epoch_min);
+        assert!(r.last_snapshot.is_some());
+
+        // R2.2 at FONT_SIZE_MAX (32.0): clamping 33.0 -> 32.0 when already at 32.0 is a no-op.
+        assert!(r.set_font_size(32.0));
+        assert_eq!(r.font_size_logical(), 32.0);
+        r.draw_to(&view, &snap);
+        let epoch_max = r.atlas.epoch();
+        assert!(!r.set_font_size(33.0));
+        assert!(!r.set_font_size(32.0));
+        assert_eq!(r.atlas.epoch(), epoch_max);
+        assert!(r.last_snapshot.is_some());
+    }
+
+    #[test]
+    fn apply_config_preserves_font_override_until_clear_font_override() {
+        // R2.3 & R2.4: apply_config updates baseline font_size_pt while preserving an
+        // active font_size_override; clear_font_override restores effective size to baseline.
+        let cfg = Config::default();
+        let Ok(mut r) = Renderer::new_headless(1200, 800, 2.0, &cfg) else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        assert!(r.set_font_size(18.0));
+        assert_eq!(r.font_size_logical(), 18.0);
+
+        // R2.3: reload with cfg.font.size_pt == 14.0 keeps override 18.0 authoritative.
+        r.apply_config(&cfg);
+        assert_eq!(r.font_size_pt, 14.0);
+        assert_eq!(r.font_size_logical(), 18.0);
+        assert_eq!(r.cell_size(), cell_size_for_pt(18.0, 2.0));
+        assert_eq!(r.ppem, 36.0);
+
+        // R2.4: clear_font_override followed by apply_config restores baseline (16.0).
+        let mut cfg16 = Config::default();
+        cfg16.font.size_pt = 16.0;
+        r.apply_config(&cfg16);
+        assert_eq!(r.font_size_pt, 16.0);
+        assert_eq!(
+            r.font_size_logical(),
+            18.0,
+            "override still wins before clear"
+        );
+
+        r.clear_font_override();
+        r.apply_config(&cfg16);
+        assert_eq!(r.font_size_override, None);
+        assert_eq!(r.font_size_logical(), 16.0);
+        assert_eq!(r.cell_size(), cell_size_for_pt(16.0, 2.0));
+        assert_eq!(r.ppem, 32.0);
+    }
+
+    #[test]
+    fn font_size_increase_re_evaluates_right_inset_against_min_terminal_cols() {
+        // R2.5: increasing font_size_pt widens cell_size.0 and re-runs sync_right_inset(),
+        // squeezing or force-closing monitor_band_px to preserve MIN_TERMINAL_COLS (20)
+        // without mutating monitor_open().
+        let cfg = Config::default();
+        let Ok(mut r) = Renderer::new_headless(950, 800, 1.0, &cfg) else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        r.set_monitor_open(true);
+        // At 14pt @1x: cell_w = 8.0, left_inset = 340.0 -> cap = 950 - 340 - 160 = 450 >= 430.
+        assert_eq!(r.right_inset(), 430.0);
+        assert!(r.grid_size().0 >= MIN_TERMINAL_COLS);
+
+        // At 20pt @1x: cell_w = 12.0 -> cap = 950 - 340 - 240 = 370 (squeezed, >= 300 min).
+        assert!(r.set_font_size(20.0));
+        assert_eq!(r.right_inset(), 370.0);
+        assert!(r.grid_size().0 >= MIN_TERMINAL_COLS);
+        assert!(r.monitor_open());
+        assert_eq!(r.monitor_width_logical(), 430.0);
+
+        // At 32pt @1x: cell_w = 19.0 -> cap = 950 - 340 - 380 = 230 < 300 -> collapses to 0.0.
+        assert!(r.set_font_size(32.0));
+        assert_eq!(r.right_inset(), 0.0);
+        assert!(r.grid_size().0 >= MIN_TERMINAL_COLS);
+        assert!(
+            r.monitor_open(),
+            "R2.5: monitor_open intent remains true when squeezed closed by font size"
+        );
+        assert_eq!(r.monitor_width_logical(), 430.0);
+
+        // Resetting font size back to 14pt restores the 430px band automatically.
+        assert!(r.set_font_size(14.0));
+        assert_eq!(r.right_inset(), 430.0);
+    }
+
+    #[test]
+    fn card_atlases_stay_fixed_while_preedit_and_monitor_panel_follow_font_size_epoch() {
+        // R2.6: Sidebar CardAtlases (17px title / 12.5px meta) do not rebuild when
+        // terminal font size changes, while PreeditLayer and MonitorPanel detect the new
+        // ctx.atlas.epoch() and ctx.cell on the next frame and rebuild once.
+        let cfg = Config::default();
+        let Ok(mut r) = Renderer::new_headless(1200, 800, 1.0, &cfg) else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        let mut cards = sidebar_text::CardAtlases::new();
+        assert!(cards.ensure(r.device(), &r.fonts, r.scale_factor()));
+        assert_eq!(cards.builds(), 1);
+        let title_epoch = cards.epoch(sidebar_text::CardFace::Title);
+        let meta_epoch = cards.epoch(sidebar_text::CardFace::Meta);
+
+        let target = r.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen"),
+            size: wgpu::Extent3d {
+                width: 1200,
+                height: 800,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: r.surface_format(),
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut t = term_core::Terminal::new(40, 10, term_core::Color(0xFFFFFF), term_core::Color(0));
+        t.advance(b"prompt % ");
+        let snap = t.snapshot();
+
+        r.set_monitor_open(true);
+        let (preedit_layer, preedit_handle) = preedit_layer::PreeditLayer::new();
+        preedit_handle.set_text("한".into());
+        let (monitor_layer, monitor_handle) = monitor_panel::MonitorPanel::new();
+        monitor_handle.set(monitor_model::MonitorModel {
+            visible: true,
+            ..monitor_model::MonitorModel::default()
+        });
+
+        type SeenCtx = std::rc::Rc<std::cell::Cell<(u64, [f32; 2])>>;
+        struct EpochCellProbe(SeenCtx);
+        impl DrawLayer for EpochCellProbe {
+            fn z_order(&self) -> i32 {
+                120
+            }
+            fn record(&mut self, ctx: &mut FrameCtx<'_>) {
+                self.0.set((ctx.atlas.epoch(), ctx.cell));
+            }
+        }
+        let seen: SeenCtx = Default::default();
+        r.add_layer(Box::new(preedit_layer));
+        r.add_layer(Box::new(monitor_layer));
+        r.add_layer(Box::new(EpochCellProbe(seen.clone())));
+
+        r.draw_to(&view, &snap);
+        let (epoch_before, cell_before) = seen.get();
+        assert_eq!(cell_before, [8.0, 17.0]);
+
+        // Increase terminal font size to 18.0 pt.
+        assert!(r.set_font_size(18.0));
+
+        // Sidebar CardAtlases depend only on (FontSet, scale_factor) and do not rebuild.
+        assert!(!cards.ensure(r.device(), &r.fonts, r.scale_factor()));
+        assert_eq!(cards.builds(), 1);
+        assert_eq!(cards.epoch(sidebar_text::CardFace::Title), title_epoch);
+        assert_eq!(cards.epoch(sidebar_text::CardFace::Meta), meta_epoch);
+
+        // Next frame hands the new atlas epoch and 18pt cell metrics to PreeditLayer and MonitorPanel.
+        r.draw_to(&view, &snap);
+        let (epoch_after, cell_after) = seen.get();
+        assert!(epoch_after > epoch_before);
+        assert_eq!(cell_after, [11.0, 22.0]);
     }
 }

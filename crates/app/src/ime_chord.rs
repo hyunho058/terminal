@@ -162,7 +162,7 @@ pub fn take_duplicate(replayed_ts: &mut Option<f64>, current_ts: Option<f64>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::{monitor_jump, tab_action, TabAction};
+    use crate::input::{font_action, monitor_jump, tab_action, FontAction, TabAction};
 
     fn facts(key_code: u16, characters: &str, ignoring: &str) -> CmdEventFacts {
         CmdEventFacts {
@@ -350,6 +350,48 @@ mod tests {
         assert_eq!(next.text.as_deref(), Some("}"));
         assert_eq!(tab_action(&next.key, &next.mods), Some(TabAction::Next));
     }
+
+    // terminal-font-size R3.4 — mid-composition replay preserves `=`, `+`, `-`, `0` so
+    // `font_action` matches `Increase`, `Decrease`, and `Reset` when composing Hangul.
+    #[test]
+    fn r3_4_mid_composition_replay_preserves_font_zoom_chords() {
+        let (equal, _) = replayed(&facts(24, "=", "="));
+        assert_eq!(equal.key, ch("="));
+        assert_eq!(equal.text.as_deref(), Some("="));
+        assert_eq!(
+            font_action(&equal.key, &equal.mods),
+            Some(FontAction::Increase)
+        );
+
+        let plus_facts = CmdEventFacts {
+            shift: true,
+            ..facts(24, "=", "+")
+        };
+        let (plus, _) = replayed(&plus_facts);
+        assert_eq!(plus.key, ch("+"));
+        assert_eq!(plus.text.as_deref(), Some("+"));
+        assert_eq!(
+            font_action(&plus.key, &plus.mods),
+            Some(FontAction::Increase)
+        );
+
+        let (minus, _) = replayed(&facts(27, "-", "-"));
+        assert_eq!(minus.key, ch("-"));
+        assert_eq!(minus.text.as_deref(), Some("-"));
+        assert_eq!(
+            font_action(&minus.key, &minus.mods),
+            Some(FontAction::Decrease)
+        );
+
+        let (zero, _) = replayed(&facts(29, "0", "0"));
+        assert_eq!(zero.key, ch("0"));
+        assert_eq!(zero.text.as_deref(), Some("0"));
+        assert_eq!(
+            font_action(&zero.key, &zero.mods),
+            Some(FontAction::Reset)
+        );
+    }
+
 
     // R5.3 — every non-empty commit resets the guard to what it replayed.
     #[test]
