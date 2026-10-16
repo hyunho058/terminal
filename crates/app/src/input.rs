@@ -53,6 +53,36 @@ pub fn tab_action(key: &Key, mods: &ModifiersState) -> Option<TabAction> {
     }
 }
 
+/// Window-global font size action triggered by `Cmd+=` / `Cmd++`, `Cmd+-`, or `Cmd+0`
+/// (terminal-font-size D7/D11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FontAction {
+    Increase,
+    Decrease,
+    Reset,
+}
+
+/// Map a keypress to a window-global font size action, or `None` if it isn't a font chord
+/// (terminal-font-size D7/D11, R3.1–R3.3).
+///
+/// Requires `Cmd` (`super_key`) without `Alt` or `Ctrl`. `=` and `+` match with or without
+/// `Shift` (since `+` requires `Shift` on US/ANSI keyboards), whereas `-` and `0` require
+/// `!mods.shift_key()` so `Cmd+Shift+-` (`_`) and `Cmd+Shift+0` (`)`) are rejected.
+pub fn font_action(key: &Key, mods: &ModifiersState) -> Option<FontAction> {
+    if !mods.super_key() || mods.alt_key() || mods.control_key() {
+        return None;
+    }
+    let Key::Character(s) = key else {
+        return None;
+    };
+    match s.as_str() {
+        "=" | "+" => Some(FontAction::Increase),
+        "-" if !mods.shift_key() => Some(FontAction::Decrease),
+        "0" if !mods.shift_key() => Some(FontAction::Reset),
+        _ => None,
+    }
+}
+
 /// The key and text a Cmd chord should be matched as, given what winit reported for it
 /// (korean-input-chords D1–D5).
 ///
@@ -363,7 +393,7 @@ pub const RECENT_WRITES: usize = 4;
 ///
 /// The float comparison is on the **re-parsed** value, which is exact only because the
 /// writer emits a round-trip representation (`config::save_sidebar`, R8.7).
-pub fn classify_delivery(delivered: (f32, bool), recent: &[(f32, bool)]) -> ConfigDelivery {
+pub fn classify_delivery<T: Copy + PartialEq>(delivered: T, recent: &[T]) -> ConfigDelivery {
     if recent.contains(&delivered) {
         ConfigDelivery::Echo
     } else {
@@ -372,9 +402,9 @@ pub fn classify_delivery(delivered: (f32, bool), recent: &[(f32, bool)]) -> Conf
 }
 
 /// Push a successful write onto the recent-writes ring, capped at [`RECENT_WRITES`].
-pub fn remember_write(recent: &mut Vec<(f32, bool)>, pair: (f32, bool)) {
-    recent.retain(|p| *p != pair);
-    recent.push(pair);
+pub fn remember_write<T: Copy + PartialEq>(recent: &mut Vec<T>, entry: T) {
+    recent.retain(|p| *p != entry);
+    recent.push(entry);
     while recent.len() > RECENT_WRITES {
         recent.remove(0);
     }
@@ -397,11 +427,7 @@ pub fn remember_write(recent: &mut Vec<(f32, bool)>, pair: (f32, bool)) {
 ///
 /// Compared against the applied config rather than the write history so the guard also
 /// covers the FIRST gesture of a session, when nothing has been written yet.
-pub fn needs_persist(
-    current: (f32, bool),
-    on_disk: (f32, bool),
-    override_authoritative: bool,
-) -> bool {
+pub fn needs_persist<T: PartialEq>(current: T, on_disk: T, override_authoritative: bool) -> bool {
     current != on_disk || override_authoritative
 }
 
@@ -2565,6 +2591,139 @@ mod tests {
             &Key::Character("r".into()),
             &cmd_shift
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // terminal-font-size: `font_action` (R3.1–R3.4) + scalar f32 echo suppression (D9)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn r3_1_font_action_maps_cmd_equal_and_cmd_plus_with_or_without_shift_to_increase() {
+        let cmd = ModifiersState::SUPER;
+        let cmd_shift = ModifiersState::SUPER | ModifiersState::SHIFT;
+        for mods in [cmd, cmd_shift] {
+            assert_eq!(
+                font_action(&ch("="), &mods),
+                Some(FontAction::Increase),
+                "= with {mods:?}"
+            );
+            assert_eq!(
+                font_action(&ch("+"), &mods),
+                Some(FontAction::Increase),
+                "+ with {mods:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn r3_2_font_action_maps_unshifted_cmd_minus_to_decrease_and_cmd_zero_to_reset() {
+        let cmd = ModifiersState::SUPER;
+        assert_eq!(font_action(&ch("-"), &cmd), Some(FontAction::Decrease));
+        assert_eq!(font_action(&ch("0"), &cmd), Some(FontAction::Reset));
+    }
+
+    #[test]
+    fn r3_3_font_action_rejects_ctrl_alt_missing_super_or_shifted_minus_and_zero() {
+        let cmd = ModifiersState::SUPER;
+        let cmd_shift = ModifiersState::SUPER | ModifiersState::SHIFT;
+
+        // Shifted `-` / `_` and `0` / `)` must not trigger Decrease or Reset.
+        for s in ["-", "_", "0", ")"] {
+            assert_eq!(font_action(&ch(s), &cmd_shift), None, "shifted {s:?}");
+        }
+        // `_` and `)` are rejected even without Shift.
+        for s in ["_", ")", "1", "t", "s"] {
+            assert_eq!(font_action(&ch(s), &cmd), None, "unclaimed {s:?}");
+        }
+        // Any combination with CONTROL, ALT, or missing SUPER is rejected across all font keys.
+        for mods in [
+            ModifiersState::empty(),
+            ModifiersState::SHIFT,
+            ModifiersState::CONTROL,
+            ModifiersState::ALT,
+            ModifiersState::SUPER | ModifiersState::CONTROL,
+            ModifiersState::SUPER | ModifiersState::ALT,
+            ModifiersState::SUPER | ModifiersState::CONTROL | ModifiersState::SHIFT,
+            ModifiersState::SUPER | ModifiersState::ALT | ModifiersState::SHIFT,
+        ] {
+            for s in ["=", "+", "-", "0"] {
+                assert_eq!(
+                    font_action(&ch(s), &mods),
+                    None,
+                    "key {s:?} with {mods:?} must not match"
+                );
+            }
+        }
+        // Named keys never match.
+        assert_eq!(font_action(&Key::Named(NamedKey::Enter), &cmd), None);
+    }
+
+    #[test]
+    fn r3_4_korean_2set_chord_key_preserves_font_zoom_keys() {
+        // Under 2-Set Korean, `=`, `+`, `-`, `0` are ASCII graphics, so `chord_key` passes
+        // them through unchanged and `font_action` matches all three actions.
+        let cmd = ModifiersState::SUPER;
+        let cmd_shift = ModifiersState::SUPER | ModifiersState::SHIFT;
+        for (reported, command_layer, mods, want) in [
+            ("=", "=", cmd, FontAction::Increase),
+            ("+", "=", cmd_shift, FontAction::Increase),
+            ("+", "+", cmd_shift, FontAction::Increase),
+            ("-", "-", cmd, FontAction::Decrease),
+            ("0", "0", cmd, FontAction::Reset),
+        ] {
+            let (key, text) = chord_key(&ch(reported), Some(reported), Some(command_layer), mods);
+            assert_eq!(key, ch(reported), "reported {reported:?} preserved");
+            assert_eq!(text.as_deref(), Some(reported));
+            assert_eq!(font_action(&key, &mods), Some(want));
+        }
+        // Even if a non-ASCII logical key were reported alongside a font symbol on the
+        // Command layer, `chord_key` substitutes the ASCII graphic so `font_action` fires.
+        for (jamo, roman, mods, want) in [
+            ("ㅎ", "=", cmd, FontAction::Increase),
+            ("ㅎ", "+", cmd_shift, FontAction::Increase),
+            ("ㅎ", "-", cmd, FontAction::Decrease),
+            ("ㅎ", "0", cmd, FontAction::Reset),
+        ] {
+            let (_raw, fixed) = korean_chord(jamo, roman, mods);
+            assert_eq!(font_action(&fixed.key, &fixed.mods), Some(want));
+        }
+    }
+
+    #[test]
+    fn scalar_f32_echo_suppression_helpers_track_font_size_writes() {
+        // D9 / R5.1–R5.3: the generic ring and persistence predicates also work over a
+        // scalar `f32`. The font path itself keeps only its latest write, not a ring (see
+        // `terminal_app::should_clear_font_override`); it reuses `classify_delivery` and
+        // `needs_persist`.
+        let mut written_font: Vec<f32> = Vec::new();
+        assert_eq!(
+            classify_delivery(15.0_f32, &written_font),
+            ConfigDelivery::HumanEdit
+        );
+
+        for pt in [15.0_f32, 16.0, 17.0, 18.0, 19.0] {
+            remember_write(&mut written_font, pt);
+        }
+        assert_eq!(written_font.len(), RECENT_WRITES);
+        assert_eq!(
+            classify_delivery(15.0_f32, &written_font),
+            ConfigDelivery::HumanEdit,
+            "oldest write evicted past RECENT_WRITES"
+        );
+        assert_eq!(
+            classify_delivery(19.0_f32, &written_font),
+            ConfigDelivery::Echo
+        );
+
+        // Deduplication moves an existing scalar to the newest slot.
+        remember_write(&mut written_font, 16.0_f32);
+        assert_eq!(written_font.len(), RECENT_WRITES);
+        assert_eq!(written_font.last().copied(), Some(16.0_f32));
+
+        // `needs_persist` on scalar `f32`.
+        assert!(!needs_persist(14.0_f32, 14.0_f32, false));
+        assert!(needs_persist(15.0_f32, 14.0_f32, false));
+        assert!(needs_persist(14.0_f32, 14.0_f32, true));
     }
 
     #[test]

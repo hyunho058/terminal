@@ -128,11 +128,22 @@ pub const SIDEBAR_WIDTH_MIN: f32 = 260.0;
 /// starves the terminal grid of columns on a laptop display (D2).
 pub const SIDEBAR_WIDTH_MAX: f32 = 440.0;
 
+/// Minimum terminal `font.size_pt` (terminal-font-size D7). Below `8.0 pt` (`cell_w = 5px`
+/// at 1×), glyphs become illegible.
+pub const FONT_SIZE_MIN: f32 = 8.0;
+/// Maximum terminal `font.size_pt` (terminal-font-size D7). Above `32.0 pt` (`cell_w = 19px`
+/// at 1×), a standard laptop window with sidebar open fits barely 25 columns.
+pub const FONT_SIZE_MAX: f32 = 32.0;
+/// Default terminal `font.size_pt` (terminal-font-size D7) — also the target of `Cmd+0` reset.
+pub const FONT_SIZE_DEFAULT: f32 = 14.0;
+/// Per-chord step (`±1.0 pt`) for `Cmd+=` / `Cmd++` and `Cmd+-` (terminal-font-size D7).
+pub const FONT_SIZE_STEP: f32 = 1.0;
+
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
             family: "Menlo".to_string(),
-            size_pt: 14.0,
+            size_pt: FONT_SIZE_DEFAULT,
             // Off by default: Menlo's typographic f-ligatures (fi, fl, …) collapse
             // into one glyph the renderer draws only at the lead cell, leaving a
             // "ghost space" on the monospace grid (`first` → `fi rst`). Programming
@@ -217,6 +228,13 @@ impl Config {
     /// never keep the terminal from starting. A non-finite width falls back to the
     /// default. Emitted here (load/reload only), never per frame.
     fn normalize(&mut self) {
+        self.font.size_pt = clamp_width(
+            "font.size_pt",
+            self.font.size_pt,
+            FONT_SIZE_MIN,
+            FONT_SIZE_MAX,
+            FONT_SIZE_DEFAULT,
+        );
         self.sidebar.width_px = clamp_width(
             "sidebar.width_px",
             self.sidebar.width_px,
@@ -259,8 +277,9 @@ fn clamp_width(field: &str, requested: f32, min: f32, max: f32, fallback: f32) -
 
 // ---------------------------------------------------------------------------
 // Chrome write-back (tab-resize D8) — the FIRST thing in this workspace that
-// writes `config.toml` rather than only reading it. Two callers now: the sidebar's
-// drag/collapse, and the ai-monitor panel's drag/toggle (right-panel D6).
+// writes `config.toml` rather than only reading it. Three callers now: the sidebar's
+// drag/collapse, the ai-monitor panel's drag/toggle (right-panel D6), and terminal
+// font size chords (terminal-font-size D9).
 // ---------------------------------------------------------------------------
 
 /// The temp file a [`save_sidebar`] writes before renaming it over the target (D8).
@@ -315,6 +334,13 @@ pub fn save_ai_monitor(path: &Path, width_px: f32, open: bool) -> Result<()> {
         "ai_monitor",
         &[("width_px", fmt_f32(width_px)), ("open", open.to_string())],
     )
+}
+
+/// Persist ONLY `[font].size_pt` to `path` (terminal-font-size D9/R1.4), preserving comments,
+/// key order, `[font].family`, `[font].ligatures`, and all other tables byte-for-byte via
+/// atomic rename.
+pub fn save_font_size(path: &Path, size_pt: f32) -> Result<()> {
+    save_table(path, "font", &[("size_pt", fmt_f32(size_pt))])
 }
 
 /// Write `entries` into `[table]` of the TOML file at `path`, leaving every other byte
@@ -1222,5 +1248,116 @@ columns = 120
         let path = blocker.join("config.toml");
         assert!(save_sidebar(&path, 400.0, false).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // terminal-font-size: R1.1 – R1.4
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn font_size_constants_and_default_match_spec() {
+        // R1.1 — exported constants and FontConfig::default().size_pt.
+        assert_eq!(FONT_SIZE_MIN, 8.0);
+        assert_eq!(FONT_SIZE_MAX, 32.0);
+        assert_eq!(FONT_SIZE_DEFAULT, 14.0);
+        assert_eq!(FONT_SIZE_STEP, 1.0);
+        assert_eq!(FontConfig::default().size_pt, FONT_SIZE_DEFAULT);
+    }
+
+    #[test]
+    fn font_size_is_clamped_and_normalized_at_load() {
+        // R1.2 — out-of-range font.size_pt clamps to [8.0, 32.0] via Config::load_from.
+        let p_low = write_tmp_config("font-clamp-up", "[font]\nsize_pt = 4.0\n");
+        assert_eq!(
+            Config::load_from(&p_low).expect("loads").font.size_pt,
+            FONT_SIZE_MIN
+        );
+        let _ = std::fs::remove_dir_all(p_low.parent().unwrap());
+
+        let p_high = write_tmp_config("font-clamp-down", "[font]\nsize_pt = 60.0\n");
+        assert_eq!(
+            Config::load_from(&p_high).expect("loads").font.size_pt,
+            FONT_SIZE_MAX
+        );
+        let _ = std::fs::remove_dir_all(p_high.parent().unwrap());
+
+        let p_in = write_tmp_config("font-in-band", "[font]\nsize_pt = 18.0\n");
+        assert_eq!(Config::load_from(&p_in).expect("loads").font.size_pt, 18.0);
+        let _ = std::fs::remove_dir_all(p_in.parent().unwrap());
+
+        // R1.3 — non-finite font.size_pt falls back to FONT_SIZE_DEFAULT (14.0).
+        let p_nan = write_tmp_config("font-nan", "[font]\nsize_pt = nan\n");
+        assert_eq!(
+            Config::load_from(&p_nan).expect("loads").font.size_pt,
+            FONT_SIZE_DEFAULT
+        );
+        let _ = std::fs::remove_dir_all(p_nan.parent().unwrap());
+
+        let p_inf = write_tmp_config("font-inf", "[font]\nsize_pt = inf\n");
+        assert_eq!(
+            Config::load_from(&p_inf).expect("loads").font.size_pt,
+            FONT_SIZE_DEFAULT
+        );
+        let _ = std::fs::remove_dir_all(p_inf.parent().unwrap());
+    }
+
+    #[test]
+    fn save_font_size_surgically_updates_only_size_pt() {
+        // R1.4 — surgical [font].size_pt write preserves comments, family, ligatures, and
+        // unrelated tables byte-for-byte.
+        let original = "\
+# header comment
+[font]
+family = \"JetBrains Mono\"
+size_pt = 14.0  # baseline
+ligatures = true
+
+[sidebar]
+width_px = 340.0
+collapsed = false
+
+[ai_monitor]
+width_px = 430.0
+open = true
+";
+        let path = write_tmp_config("font-save", original);
+        save_font_size(&path, 16.0).expect("save_font_size succeeds");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let expected = "\
+# header comment
+[font]
+family = \"JetBrains Mono\"
+size_pt = 16.0  # baseline
+ligatures = true
+
+[sidebar]
+width_px = 340.0
+collapsed = false
+
+[ai_monitor]
+width_px = 430.0
+open = true
+";
+        assert_eq!(text, expected);
+        let reloaded = Config::load_from(&path).expect("reloads");
+        assert_eq!(reloaded.font.family, "JetBrains Mono");
+        assert_eq!(reloaded.font.size_pt, 16.0);
+        assert!(reloaded.font.ligatures);
+        assert_eq!(reloaded.sidebar.width_px, 340.0);
+        assert_eq!(reloaded.ai_monitor.width_px, 430.0);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+        // Fresh install without [font] table synthesizes [font] without touching [grid].
+        let path_missing = write_tmp_config("font-save-insert", "[grid]\ncolumns = 110\n");
+        save_font_size(&path_missing, 18.0).expect("save_font_size inserts [font]");
+        let reloaded = Config::load_from(&path_missing).expect("reloads");
+        assert_eq!(reloaded.font.size_pt, 18.0);
+        assert_eq!(reloaded.grid.columns, 110);
+        let _ = std::fs::remove_dir_all(path_missing.parent().unwrap());
+
+        // Refuses inline table `font = { ... }` rather than corrupting the file.
+        let path_inline = write_tmp_config("font-inline", "font = { size_pt = 14.0 }\n");
+        assert!(save_font_size(&path_inline, 16.0).is_err());
+        let _ = std::fs::remove_dir_all(path_inline.parent().unwrap());
     }
 }
