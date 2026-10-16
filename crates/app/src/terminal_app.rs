@@ -305,8 +305,12 @@ struct Running {
     /// drag's echo as a *panel* human edit — clearing the panel's override on a gesture that
     /// never touched it.
     written_monitor: Vec<(f32, bool)>,
-    /// Recent `[font].size_pt` writes for echo suppression (terminal-font-size D9/R5.1).
-    written_font: Vec<f32>,
+    /// The most recent `[font].size_pt` this session wrote, for echo suppression
+    /// (terminal-font-size D9/R5.1). One value, not a ring like `written_sidebar`: font
+    /// sizes are whole-point steps that recur constantly (14→15→14), so a ring would hold
+    /// most plausible hand edits and swallow them as echoes. See
+    /// [`should_clear_font_override`].
+    last_written_font: Option<f32>,
     /// The last `Config` actually applied to the running app (tab-resize D15, as amended).
     ///
     /// Echo suppression compares the **whole** delivered config against this, not just the
@@ -534,7 +538,7 @@ impl App {
             config_path,
             written_sidebar: Vec::new(),
             written_monitor: Vec::new(),
-            written_font: Vec::new(),
+            last_written_font: None,
             last_applied_cfg: self.cfg.clone(),
             sidebar_override_authoritative: false,
             monitor_override_authoritative: false,
@@ -1552,13 +1556,13 @@ impl Running {
         }
         match common::config::save_font_size(&path, size_pt) {
             Ok(()) => {
-                input::remember_write(&mut self.written_font, size_pt);
+                self.last_written_font = Some(size_pt);
                 self.font_override_authoritative = false;
                 self.last_applied_cfg.font.size_pt = size_pt;
             }
             Err(e) => {
                 tracing::warn!("font size not saved: {e}");
-                self.written_font.clear();
+                self.last_written_font = None;
                 self.font_override_authoritative = true;
             }
         }
@@ -1573,14 +1577,8 @@ impl Running {
     /// redraw, or disk write occurs.
     fn do_font_action(&mut self, action: FontAction) {
         self.close_card_menu();
-        let target = target_font_size(self.renderer.font_size_logical(), action);
-        let before = self.renderer.grid_size();
-        if !self.renderer.set_font_size(target) {
+        if !apply_font_action(&mut self.renderer, &mut self.tabs, action) {
             return;
-        }
-        let after = self.renderer.grid_size();
-        if input::needs_refit(before, after) {
-            crate::settings::refit(&self.renderer, &mut self.tabs);
         }
         let inp = self.sidebar_input();
         self.scroll = sidebar_layout::clamp_scroll(self.scroll, &inp);
@@ -2282,7 +2280,7 @@ impl Running {
             self.do_font_action(action);
             return true;
         }
-        // 3) Tab chords, intercepted before the shell (D5/R3.2).
+        // 3c) Tab chords, intercepted before the shell (D5/R3.2).
         if let Some(action) = tab_action(&input.key, &input.mods) {
             return self.do_tab_action(action);
         }
@@ -2475,7 +2473,7 @@ impl ApplicationHandler<UserEvent> for App {
                     ) {
                         inner.renderer.clear_monitor_override();
                     }
-                    // Reconcile `[font].size_pt` against `written_font` (terminal-font-size
+                    // Reconcile `[font].size_pt` against `last_written_font` (terminal-font-size
                     // D9/R5.1–R5.3). If a previous save failed (`font_override_authoritative`)
                     // and `cfg.font.size_pt` still equals `last_applied_cfg.font.size_pt`, this
                     // reload is for an unrelated field and must keep the runtime font override;
@@ -2483,7 +2481,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if should_clear_font_override(
                         cfg.font.size_pt,
                         inner.last_applied_cfg.font.size_pt,
-                        &inner.written_font,
+                        inner.last_written_font,
                         inner.font_override_authoritative,
                     ) {
                         inner.renderer.clear_font_override();
@@ -3243,21 +3241,55 @@ fn target_font_size(current_pt: f32, action: FontAction) -> f32 {
     }
 }
 
+/// The renderer-and-tabs half of a font chord (terminal-font-size R0.1, R4.1–R4.4): step
+/// the size, and refit every tab when the grid actually changed. Returns `false` on a
+/// boundary no-op, before anything is touched. That early return is what keeps `Cmd+0`
+/// at the default, or `Cmd+=` at the maximum, from clearing every tab's selection
+/// through `refit`.
+///
+/// Split out of [`Running::do_font_action`] so a test can drive this exact code with a
+/// headless renderer, which `Running` (it owns a window) cannot be built around.
+fn apply_font_action(
+    renderer: &mut Renderer,
+    tabs: &mut impl crate::settings::RefitTarget,
+    action: FontAction,
+) -> bool {
+    let target = target_font_size(renderer.font_size_logical(), action);
+    let before = renderer.grid_size();
+    if !renderer.set_font_size(target) {
+        return false;
+    }
+    if input::needs_refit(before, renderer.grid_size()) {
+        crate::settings::refit(renderer, tabs);
+    }
+    true
+}
+
 /// Whether a `ConfigReloaded` delivery should clear the renderer's runtime font override
 /// (terminal-font-size D9, R5.1–R5.3).
 ///
-/// When `font_override_authoritative` is `false`, any delivery not in `written_font` is a
-/// human edit and clears the runtime override. When `font_override_authoritative` is `true`
-/// (a previous `save_font_size` failed), an unrelated reload still delivers the old on-disk
-/// `last_applied_pt` and must preserve the runtime override; only an explicit human edit that
-/// changes `delivered_pt` away from `last_applied_pt` clears the override.
+/// When `font_override_authoritative` is `false`, a delivery is an echo only if it equals
+/// the **most recent** write; anything else is a human edit and clears the runtime override.
+/// Matching against older writes, as the sidebar's ring does, would be wrong here: zooming
+/// 14→15→16→15→14 and then hand-editing the file to 16 would read as an echo of the second
+/// write, leaving the window at 14 while the file says 16 until restart.
+///
+/// The cost of keeping only one value: if the watcher read the file between two rapid
+/// zoom writes, that stale size reads as a human edit and the font snaps to it for one
+/// delivery. The next delivery carries the latest write and settles it, because by then the
+/// override is gone and the file is the baseline.
+///
+/// When `font_override_authoritative` is `true` (a previous `save_font_size` failed), an
+/// unrelated reload still delivers the old on-disk `last_applied_pt` and must preserve the
+/// runtime override; only an explicit human edit that changes `delivered_pt` away from
+/// `last_applied_pt` clears the override.
 fn should_clear_font_override(
     delivered_pt: f32,
     last_applied_pt: f32,
-    written_font: &[f32],
+    last_written_font: Option<f32>,
     font_override_authoritative: bool,
 ) -> bool {
-    let delivery = input::classify_delivery(delivered_pt, written_font);
+    let delivery = input::classify_delivery(delivered_pt, last_written_font.as_slice());
     let authoritative_unchanged = font_override_authoritative && delivered_pt == last_applied_pt;
     input::should_clear_override(delivery, authoritative_unchanged)
 }
@@ -4333,13 +4365,23 @@ mod tests {
         );
     }
 
-    /// **R0.1 / R4.1–R4.4 — window-global multi-tab resize and selection preservation on boundary no-op.**
+    /// **R0.1 / R4.1–R4.4 — a font chord refits every tab, and a boundary no-op refits none.**
+    ///
+    /// Drives [`apply_font_action`], the code `do_font_action` runs, not a copy of it. The
+    /// spy records every `resize_all`, because the no-op half is about a call that must
+    /// **not** happen: `refit` is what clears a selection, so one stray call at a bound is
+    /// the regression. Comparing the tabs' sizes alone could not see it, since a refit to
+    /// the unchanged size leaves them exactly as they were.
     #[test]
     fn window_global_font_refit_updates_all_open_tabs_and_boundary_noop_preserves_selection() {
-        struct MultiTabTerminals(Vec<term_core::Terminal>);
+        struct MultiTabTerminals {
+            terms: Vec<term_core::Terminal>,
+            refits: Vec<(u16, u16)>,
+        }
         impl crate::settings::RefitTarget for MultiTabTerminals {
             fn resize_all(&mut self, cols: u16, rows: u16) {
-                for t in &mut self.0 {
+                self.refits.push((cols, rows));
+                for t in &mut self.terms {
                     t.resize(cols, rows);
                 }
             }
@@ -4351,49 +4393,57 @@ mod tests {
             return;
         };
         let (init_cols, init_rows) = renderer.grid_size();
-        let mut tabs = MultiTabTerminals(vec![
-            scroll_term(init_cols, init_rows),
-            scroll_term(init_cols, init_rows),
-        ]);
-
-        // Select text in active tab 1.
-        tabs.0[1].set_selection(
+        let mut tabs = MultiTabTerminals {
+            terms: vec![
+                scroll_term(init_cols, init_rows),
+                scroll_term(init_cols, init_rows),
+            ],
+            refits: Vec::new(),
+        };
+        tabs.terms[1].set_selection(
             term_core::Point { line: 0, col: 0 },
             term_core::Point { line: 0, col: 5 },
         );
-        assert!(tabs.0[1].selection().is_some());
 
-        // R4.4: At FONT_SIZE_DEFAULT (14.0), Reset produces target == 14.0, so
-        // `Renderer::set_font_size(14.0)` returns `false` and `settings::refit` is skipped:
-        // active selection is preserved and grid dimensions remain unchanged.
-        let target_reset = target_font_size(renderer.font_size_logical(), FontAction::Reset);
-        assert!(!renderer.set_font_size(target_reset));
-        assert!(tabs.0[1].selection().is_some());
-        assert_eq!(
-            (tabs.0[0].snapshot().cols, tabs.0[0].snapshot().rows),
-            (init_cols, init_rows)
-        );
-        assert_eq!(
-            (tabs.0[1].snapshot().cols, tabs.0[1].snapshot().rows),
-            (init_cols, init_rows)
-        );
+        // R4.4: Cmd+0 at the default is a no-op: no refit, so the selection survives.
+        assert!(!apply_font_action(
+            &mut renderer,
+            &mut tabs,
+            FontAction::Reset
+        ));
+        assert_eq!(tabs.refits, Vec::<(u16, u16)>::new());
+        assert!(tabs.terms[1].selection().is_some());
 
-        // R0.1 / R4.1: Increasing font size (14.0 -> 15.0) returns `true`, changes cell/grid
-        // dimensions, and `settings::refit` resizes ALL open tabs to the new `(cols, rows)`.
-        let target_up = target_font_size(renderer.font_size_logical(), FontAction::Increase);
-        assert!(renderer.set_font_size(target_up));
+        // R0.1 / R4.1: Cmd+= changes the grid and refits ALL tabs to it, once.
+        assert!(apply_font_action(
+            &mut renderer,
+            &mut tabs,
+            FontAction::Increase
+        ));
         let after = renderer.grid_size();
-        if input::needs_refit((init_cols, init_rows), after) {
-            crate::settings::refit(&renderer, &mut tabs);
+        assert_ne!(after, (init_cols, init_rows), "15pt must change the grid");
+        assert_eq!(tabs.refits, vec![after]);
+        for t in &tabs.terms {
+            assert_eq!((t.snapshot().cols, t.snapshot().rows), after);
         }
-        assert_eq!(
-            (tabs.0[0].snapshot().cols, tabs.0[0].snapshot().rows),
-            after
-        );
-        assert_eq!(
-            (tabs.0[1].snapshot().cols, tabs.0[1].snapshot().rows),
-            after
-        );
+
+        // R4.4 at the top bound: once at FONT_SIZE_MAX, Cmd+= refits nothing.
+        assert!(renderer.set_font_size(FONT_SIZE_MAX));
+        tabs.refits.clear();
+        assert!(!apply_font_action(
+            &mut renderer,
+            &mut tabs,
+            FontAction::Increase
+        ));
+        assert_eq!(tabs.refits, Vec::<(u16, u16)>::new());
+
+        // Cmd+- steps back down by one point.
+        assert!(apply_font_action(
+            &mut renderer,
+            &mut tabs,
+            FontAction::Decrease
+        ));
+        assert_eq!(renderer.font_size_logical(), FONT_SIZE_MAX - FONT_SIZE_STEP);
     }
 
     /// **R4.1–R4.3 / D11 — modal `RenameOverlay` consumes `Cmd+=`, `Cmd+-`, `Cmd+0` before `font_action`.**
@@ -4436,35 +4486,46 @@ mod tests {
     /// **R5.1 / R5.2 / R5.3 — echo suppression, external human edits, and failed-save authority.**
     #[test]
     fn config_reloaded_reconciles_font_override_across_echo_human_edit_and_failed_save() {
-        let mut written_font: Vec<f32> = Vec::new();
         let last_applied_pt = 14.0f32;
 
-        // R5.1: Successful save records 15.0 in `written_font` with `authoritative = false`.
-        // When watcher delivers 15.0, it is classified as SelfWrite and does NOT clear override.
+        // R5.1: Successful save records 15.0 as the last write with `authoritative = false`.
+        // When watcher delivers 15.0, it is classified as an echo and does NOT clear override.
         let current_pt = 15.0f32;
         assert!(input::needs_persist(current_pt, last_applied_pt, false));
-        input::remember_write(&mut written_font, current_pt);
+        let last_written = Some(current_pt);
         assert!(!should_clear_font_override(
             15.0,
             last_applied_pt,
-            &written_font,
+            last_written,
             false
         ));
 
-        // R5.2: External human edit to `size_pt = 18.0` (not in `written_font`) clears override.
-        assert!(should_clear_font_override(
-            18.0,
-            15.0,
-            &written_font,
-            false
-        ));
+        // R5.2: External human edit to `size_pt = 18.0` (not the last write) clears override.
+        assert!(should_clear_font_override(18.0, 15.0, last_written, false));
+        // ...and so does any edit when nothing has been written yet this session.
+        assert!(should_clear_font_override(18.0, 14.0, None, false));
 
         // R5.3: Failed save sets `font_override_authoritative = true` while on-disk config is
         // still 14.0 (`last_applied_pt = 14.0`).
         // 1) An unrelated reload that still delivers `size_pt = 14.0` preserves the override:
-        assert!(!should_clear_font_override(14.0, 14.0, &written_font, true));
+        assert!(!should_clear_font_override(14.0, 14.0, None, true));
         // 2) A human edit to `[font].size_pt = 20.0` (delivered != last_applied_pt) clears it:
-        assert!(should_clear_font_override(20.0, 14.0, &written_font, true));
+        assert!(should_clear_font_override(20.0, 14.0, None, true));
+    }
+
+    /// **R5.2 — a hand edit to a size this session already wrote still wins.**
+    ///
+    /// Font sizes are whole-point steps, so they recur: zoom 14→15→16→15→14 and the
+    /// session has written 16 before. A hand edit to `size_pt = 16` must still read as a
+    /// human edit. With a ring of recent writes (the sidebar's scheme) it read as an echo:
+    /// the window stayed at 14 while the file said 16, until restart.
+    #[test]
+    fn a_hand_edit_to_a_previously_written_font_size_still_clears_the_override() {
+        // After writing 15, 16, 15, 14 in turn, only the last write is remembered.
+        let last_written = Some(14.0_f32);
+        assert!(should_clear_font_override(16.0, 14.0, last_written, false));
+        assert!(should_clear_font_override(15.0, 14.0, last_written, false));
+        // The latest write coming back is still an echo.
+        assert!(!should_clear_font_override(14.0, 14.0, last_written, false));
     }
 }
-

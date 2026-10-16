@@ -2691,8 +2691,10 @@ mod tests {
 
     #[test]
     fn scalar_f32_echo_suppression_helpers_track_font_size_writes() {
-        // D9 / R5.1–R5.3: `written_font` uses the same generic ring and persistence
-        // predicates with scalar `f32` (`[font].size_pt`) rather than `(f32, bool)`.
+        // D9 / R5.1–R5.3: the generic ring and persistence predicates also work over a
+        // scalar `f32`. The font path itself keeps only its latest write, not a ring (see
+        // `terminal_app::should_clear_font_override`); it reuses `classify_delivery` and
+        // `needs_persist`.
         let mut written_font: Vec<f32> = Vec::new();
         assert_eq!(
             classify_delivery(15.0_f32, &written_font),

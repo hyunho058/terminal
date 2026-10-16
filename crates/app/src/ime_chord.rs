@@ -386,12 +386,8 @@ mod tests {
         let (zero, _) = replayed(&facts(29, "0", "0"));
         assert_eq!(zero.key, ch("0"));
         assert_eq!(zero.text.as_deref(), Some("0"));
-        assert_eq!(
-            font_action(&zero.key, &zero.mods),
-            Some(FontAction::Reset)
-        );
+        assert_eq!(font_action(&zero.key, &zero.mods), Some(FontAction::Reset));
     }
-
 
     // R5.3 — every non-empty commit resets the guard to what it replayed.
     #[test]

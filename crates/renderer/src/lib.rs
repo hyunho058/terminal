@@ -651,10 +651,8 @@ impl Renderer {
     /// band (R5.7) — the public backing for a drag-resize, which does not go through
     /// `Config::load_from`'s clamp.
     pub fn set_sidebar_width(&mut self, logical_px: f32) {
-        self.sidebar_override.width_px = Some(logical_px.clamp(
-            SIDEBAR_WIDTH_MIN,
-            SIDEBAR_WIDTH_MAX,
-        ));
+        self.sidebar_override.width_px =
+            Some(logical_px.clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX));
         self.sync_left_inset();
     }
 
@@ -846,35 +844,63 @@ impl Renderer {
         self.font_size_override = Some(clamped);
         self.cell_size = cell_size_for_pt(clamped, self.scale_factor);
         self.ppem = clamped * self.scale_factor as f32;
-        if let Some(atlas) = Atlas::new(&self.device, &self.fonts, self.ppem) {
-            self.atlas = atlas;
-            self.glyph_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("glyph-bg"),
-                layout: &self.glyph_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.glyph_uniform_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(self.atlas.view()),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(self.atlas.sampler()),
-                    },
-                ],
-            });
-        } else {
-            tracing::warn!(
-                ppem = self.ppem,
-                "failed to rebuild glyph atlas on set_font_size"
-            );
-        }
+        self.swap_atlas();
         self.last_snapshot = None;
         self.sync_left_inset();
         true
+    }
+
+    /// Rebuild the glyph atlas at `self.ppem` and re-point the grid's `glyph_bind_group`
+    /// at it — the **only** atlas-swap site. `apply_config` and `set_font_size` both
+    /// come through here.
+    ///
+    /// Rebuilding shares the same mapped bytes (D7/R3.2): a live ppem change must not
+    /// re-read (or re-copy) the 55 MB fallback face on every tick of the config watcher.
+    ///
+    /// The `None` arm — allocation failed, the old atlas is retained — is a *defined*
+    /// outcome for bind groups, not an unhandled hole: `epoch` does not change, so the
+    /// three text layers correctly keep their cached bind groups. That is right rather
+    /// than lucky, because the old texture is still alive and its view still valid
+    /// (D8/R4.3). What that arm leaves unaddressed: both callers update `cell_size` and
+    /// `ppem` *before* this fallible call, so a failure leaves the atlas rasterized at the
+    /// OLD ppem while the caller's `last_snapshot = None` forces a re-shape at the NEW
+    /// cell geometry — glyphs drawn at the wrong size. A pre-existing defect, recorded as
+    /// Known Gap G-d in specs/atlas-swap-bind-invalidation/spec.md.
+    fn swap_atlas(&mut self) {
+        let Some(atlas) = Atlas::new(&self.device, &self.fonts, self.ppem) else {
+            tracing::warn!(ppem = self.ppem, "failed to rebuild the glyph atlas");
+            return;
+        };
+        self.atlas = atlas;
+        // The three text layers (sidebar/overlay/preedit) self-guard against this swap:
+        // each caches its atlas bind group keyed on `(format, atlas.epoch())` and rebuilds
+        // when the texture identity changes. The grid does **not** — it is correct only
+        // because this is the single swap site and rebuilds `glyph_bind_group` by hand
+        // right here (D7; Known Gap G-a in specs/atlas-swap-bind-invalidation/spec.md).
+        // A new caller must therefore route through this function, not copy it, or give
+        // the grid the same epoch-keyed guard the layers have. Otherwise the grid samples
+        // the replaced texture with UVs computed against the new one: no crash, no
+        // validation error, just wrong glyphs for the rest of the session.
+        // `golden_frame.rs`'s `a_zoomed_frame_matches_one_rendered_at_that_size_from_the_start`
+        // is the pixel check that fails if this line goes missing.
+        self.glyph_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("glyph-bg"),
+            layout: &self.glyph_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.glyph_uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(self.atlas.view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(self.atlas.sampler()),
+                },
+            ],
+        });
     }
 
     /// The window backing scale factor. A sidebar `DrawLayer` multiplies logical-px
@@ -907,55 +933,8 @@ impl Renderer {
         self.ai_monitor = cfg.ai_monitor.clone();
 
         // Rebuild the atlas at the new ppem so glyphs re-rasterize (size + ligature
-        // changes need fresh coverage), then re-point the glyph bind group at it.
-        // Rebuilding shares the same mapped bytes (D7/R3.2): a live ppem change
-        // must not re-read (or re-copy) the 55 MB fallback face on every tick of
-        // the config watcher.
-        //
-        // The `None` arm — allocation failed, the old atlas is retained — is a
-        // *defined* outcome for bind groups, not an unhandled hole: `epoch` does not
-        // change, so the three text layers correctly keep their cached bind groups.
-        // That is right rather than lucky, because the old texture is still alive and
-        // its view still valid (D8/R4.3).
-        // What that arm leaves unaddressed, and this spec deliberately does not fix:
-        // `self.cell_size` and `self.ppem` were already updated above, *before* this
-        // fallible call, so a failure leaves the atlas rasterized at the OLD ppem while
-        // `last_snapshot = None` below forces a re-shape at the NEW cell geometry —
-        // glyphs drawn at the wrong size. A separate pre-existing defect, recorded as
-        // Known Gap G-d in specs/atlas-swap-bind-invalidation/spec.md.
-        if let Some(atlas) = Atlas::new(&self.device, &self.fonts, self.ppem) {
-            self.atlas = atlas;
-            // The three text layers (sidebar/overlay/preedit) self-guard against this
-            // swap: each caches its atlas bind group keyed on `(format, atlas.epoch())`
-            // and rebuilds when the texture identity changes. The grid does **not** —
-            // it is correct only because `apply_config` is the single atlas-swap site
-            // and rebuilds `glyph_bind_group` by hand right here. Correct by accident,
-            // not by invariant (D7; Known Gap G-a in
-            // specs/atlas-swap-bind-invalidation/spec.md).
-            // Whoever adds a second swap site must therefore either route it through
-            // here or give the grid the same epoch-keyed guard the layers have.
-            // Otherwise the grid samples the replaced texture with UVs computed against
-            // the new one: no crash, no validation error, just wrong glyphs for the rest
-            // of the session — exactly the bug that spec was written to close.
-            self.glyph_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("glyph-bg"),
-                layout: &self.glyph_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.glyph_uniform_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(self.atlas.view()),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(self.atlas.sampler()),
-                    },
-                ],
-            });
-        }
+        // changes need fresh coverage) and re-point the glyph bind group at it.
+        self.swap_atlas();
         // Theme/font/atlas/cell-metrics changed → force the next frame to re-shape,
         // else a content-equal snapshot would re-present stale-theme buffers (R1.4).
         self.last_snapshot = None;
@@ -4273,7 +4252,8 @@ mod tests {
             view_formats: &[],
         });
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut t = term_core::Terminal::new(10, 2, term_core::Color(0xFFFFFF), term_core::Color(0));
+        let mut t =
+            term_core::Terminal::new(10, 2, term_core::Color(0xFFFFFF), term_core::Color(0));
         t.advance(b"hello");
         let snap = t.snapshot();
 
@@ -4451,7 +4431,8 @@ mod tests {
             view_formats: &[],
         });
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut t = term_core::Terminal::new(40, 10, term_core::Color(0xFFFFFF), term_core::Color(0));
+        let mut t =
+            term_core::Terminal::new(40, 10, term_core::Color(0xFFFFFF), term_core::Color(0));
         t.advance(b"prompt % ");
         let snap = t.snapshot();
 

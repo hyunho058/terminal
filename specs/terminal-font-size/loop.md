@@ -11,7 +11,7 @@ Verify that runtime terminal font size zoom (`Cmd+=` / `Cmd++`, `Cmd+-`, `Cmd+0`
   - `crates/common/src/config.rs` (`T1`, `TT1` — `FONT_SIZE_MIN/MAX/DEFAULT/STEP`, `Config::normalize()` clamping, `save_font_size`)
   - `crates/renderer/src/lib.rs` (`T2`, `TT2` — `font_size_pt`, `font_size_override`, `set_font_size`, `clear_font_override`, `font_size_logical`, `apply_config` override preservation)
   - `crates/app/src/input.rs`, `crates/app/src/ime_chord.rs` (`T3`, `TT3` — `FontAction`, `font_action`, Korean 2-Set `chord_key`, generic `classify_delivery` / `remember_write` / `needs_persist`)
-  - `crates/app/src/terminal_app.rs` (`T4`, `TT0`, `TT4`, `TT5` — `do_font_action`, `persist_font_size`, `written_font`, `font_override_authoritative`, `should_clear_font_override`)
+  - `crates/app/src/terminal_app.rs` (`T4`, `TT0`, `TT4`, `TT5` — `do_font_action`, `persist_font_size`, `last_written_font`, `apply_font_action`, `font_override_authoritative`, `should_clear_font_override`)
 - Out:
   - Modifying `crates/term-core` (`C1`) or `crates/renderer/src/card_atlas.rs` (`D2` / Non-goals)
   - Per-tab font sizes, pinch-to-zoom, Cmd+scroll zoom, or toast/HUD overlay (Non-goals)

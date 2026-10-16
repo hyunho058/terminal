@@ -73,7 +73,7 @@ Allow users to dynamically adjust the terminal's font size (increase, decrease, 
 - **Rationale**: Mirrors the exact persistence architecture of `[sidebar]` and `[ai_monitor]` (`crates/common/src/config.rs:294-318`, `crates/app/src/terminal_app.rs:1439-1528, 2374-2408`):
   1. `common::config::save_font_size(path, size_pt)` calls the existing surgical `save_table(path, "font", &[("size_pt", fmt_f32(size_pt))])`, preserving comments, formatting, `family`, and `ligatures` byte-for-byte via atomic `config.toml.tmp` rename.
   2. `Renderer` stores `font_size_pt: f32` (from `Config`) alongside `font_size_override: Option<f32>`, exposing `effective_font_size(&self) -> f32` (`self.font_size_override.unwrap_or(self.font_size_pt)`), `font_size_logical(&self) -> f32`, `set_font_size(&mut self, size_pt: f32) -> bool`, and `clear_font_override(&mut self)`. Crucially, `Renderer::apply_config` updates `self.font_size_pt = cfg.font.size_pt` and derives `cell_size` and `ppem` from `self.effective_font_size()` (via `cell_size_for_pt(self.effective_font_size(), self.scale_factor)`), so an unrelated config reload while `font_override_authoritative` is true (e.g., if `save_font_size` failed on a read-only disk) never wipes the user's runtime font override.
-  3. `Running` holds `written_font: Vec<f32>` (capped at `RECENT_WRITES = 4`) and `font_override_authoritative: bool`. On a successful save, `last_applied_cfg.font.size_pt` is updated so the watcher's own echo is suppressed by `suppress_delivery` (`delivered == applied`), while an external human edit to `[font].size_pt` in `config.toml` classifies as `ConfigDelivery::HumanEdit`, clears `font_size_override`, and applies live.
+  3. `Running` holds `last_written_font: Option<f32>` (the most recent write only) and `font_override_authoritative: bool`. Unlike the sidebar's `RECENT_WRITES` ring, one value is kept because font sizes are whole-point steps that recur (14→15→14): a ring would hold most plausible hand edits and swallow them as echoes (zoom 14→15→16→15→14, hand-edit to 16, and the window stays at 14). The accepted cost: a delivery read between two rapid zoom writes reads as a human edit for one delivery, and the next delivery settles it. On a successful save, `last_applied_cfg.font.size_pt` is updated so the watcher's own echo is suppressed by `suppress_delivery` (`delivered == applied`), while an external human edit to `[font].size_pt` in `config.toml` classifies as `ConfigDelivery::HumanEdit`, clears `font_size_override`, and applies live.
   4. **Steelman counterargument against persisting runtime zoom (`Cmd++`/`Cmd+-`) to `config.toml`**: In browsers or some terminals (e.g., iTerm2 temporary zoom), users might temporarily zoom in during a screen share and expect a new window or restart to return to `14.0 pt`. Why persistence wins here: (a) this terminal is a single-window app where `[sidebar]` and `[ai_monitor]` layout changes already persist immediately via `save_table`, creating a consistent "your workspace stays how you left it" mental model; and (b) `Cmd+0` is explicitly defined in D7 to reset to `FONT_SIZE_DEFAULT = 14.0` (rather than session-initial config) and persist `14.0`, giving users a single-chord recovery after a screen share even across restarts.
   Rejected alternative: session-only in-memory zoom (loses user's preferred font size on restart and diverges from how sidebar and monitor sizing behave in this app).
 
@@ -215,12 +215,12 @@ Allow users to dynamically adjust the terminal's font size (increase, decrease, 
 ### R5: File-watcher echo suppression and external human-edit reconciliation for `[font].size_pt` (`crates/app`) — D9
 
 #### R5.1: Self-written `[font].size_pt` reload is classified as `Echo` and suppressed
-- **Given**: `persist_font_size()` succeeded in writing `size_pt = 15.0`, recording `15.0` in `written_font` (capped at `RECENT_WRITES = 4`) and setting `last_applied_cfg.font.size_pt = 15.0`
+- **Given**: `persist_font_size()` succeeded in writing `size_pt = 15.0`, recording `last_written_font = Some(15.0)` and setting `last_applied_cfg.font.size_pt = 15.0`
 - **When**: The config file watcher delivers a `Config` with `font.size_pt = 15.0` (and unchanged other fields)
-- **Then**: `classify_delivery` matches `15.0` in `written_font` as `ConfigDelivery::Echo`, `suppress_delivery` returns `true` (`delivered == last_applied_cfg`), and `settings::apply` is skipped
+- **Then**: `classify_delivery` matches `15.0` against `last_written_font` as `ConfigDelivery::Echo`, `suppress_delivery` returns `true` (`delivered == last_applied_cfg`), and `settings::apply` is skipped
 
 #### R5.2: External human edit to `[font].size_pt` clears `font_size_override` and applies live across all tabs
-- **Given**: `Running` state with `font_size_override = Some(15.0)` and `written_font` not containing `20.0`
+- **Given**: `Running` state with `font_size_override = Some(15.0)` and `last_written_font != Some(20.0)` (including when `20.0` was written earlier in the session but is not the latest write)
 - **When**: A user edits `config.toml` externally to `size_pt = 20.0` and the file watcher delivers the reloaded `Config`
 - **Then**: `classify_delivery` returns `ConfigDelivery::HumanEdit`, `renderer.clear_font_override()` and `font_override_authoritative = false` are executed, and `settings::apply` rebuilds the atlas at `20.0 pt` and refits all tabs
 
@@ -248,7 +248,7 @@ Allow users to dynamically adjust the terminal's font size (increase, decrease, 
 - **Scope**:
   - Store `font_size_pt: f32` (initialized from `cfg.font.size_pt`) and `font_size_override: Option<f32>` (`None`) on `Renderer`.
   - Extract pure `clamp_font_size(size_pt: f32) -> f32` and `cell_size_for_pt(size_pt: f32, scale_factor: f64) -> (f32, f32)` helpers (`cell_size_px` delegates to `cell_size_for_pt`).
-  - Implement `effective_font_size(&self) -> f32`, `pub fn font_size_logical(&self) -> f32`, `pub fn clear_font_override(&mut self)`, and `pub fn set_font_size(&mut self, size_pt: f32) -> bool` (clamps `size_pt`; returns `false` on boundary no-op without rebuilding `Atlas` or clearing `last_snapshot`; on change updates `font_size_override`, `cell_size`, `ppem`, rebuilds `Atlas` and `glyph_bind_group`, clears `last_snapshot = None`, and calls `sync_left_inset()` which chains `sync_right_inset()`).
+  - Implement `effective_font_size(&self) -> f32`, `pub fn font_size_logical(&self) -> f32`, `pub fn clear_font_override(&mut self)`, and `pub fn set_font_size(&mut self, size_pt: f32) -> bool` (clamps `size_pt`; returns `false` on boundary no-op without rebuilding `Atlas` or clearing `last_snapshot`; on change updates `font_size_override`, `cell_size`, `ppem`, rebuilds `Atlas` and `glyph_bind_group` through the single swap site `swap_atlas` shared with `apply_config`, clears `last_snapshot = None`, and calls `sync_left_inset()` which chains `sync_right_inset()`).
   - Update `Renderer::apply_config` to set `self.font_size_pt = cfg.font.size_pt` and derive `cell_size` and `ppem` from `self.effective_font_size()`.
   - Add tests in `crates/renderer/src/lib.rs` verifying R2.1–R2.6.
 
@@ -266,11 +266,11 @@ Allow users to dynamically adjust the terminal's font size (increase, decrease, 
 - **Depends on**: T2, T3
 - **Files**: `crates/app/src/terminal_app.rs`
 - **Scope**:
-  - Add `written_font: Vec<f32>` and `font_override_authoritative: bool` to `Running`.
+  - Add `last_written_font: Option<f32>` and `font_override_authoritative: bool` to `Running`.
   - Dispatch `input::font_action(&input.key, &input.mods)` in `Running::on_key` after `overlays.dispatch`, `router.dispatch`, and `is_sidebar_toggle_chord` (closing any open card menu via `self.close_card_menu()`, calling `self.do_font_action(action)`, and returning early, matching `do_tab_action`).
   - Implement `Running::do_font_action` (computing target from `self.renderer.font_size_logical()`, returning early if `!self.renderer.set_font_size(target)`, calling `settings::refit` when `input::needs_refit(before, after)` holds, re-clamping sidebar scroll and hover, updating IME cursor area, requesting `inner.redraw()`, and calling `self.persist_font_size()`).
-  - Implement `Running::persist_font_size` using `common::config::save_font_size` + `written_font` ring + `font_override_authoritative`.
-  - Reconcile `written_font` in `UserEvent::ConfigReloaded` (draining `inner.config_rx`) alongside `written_sidebar` and `written_monitor`.
+  - Implement `Running::persist_font_size` using `common::config::save_font_size` + `last_written_font` + `font_override_authoritative`.
+  - Reconcile `last_written_font` in `UserEvent::ConfigReloaded` (draining `inner.config_rx`) alongside `written_sidebar` and `written_monitor`.
   - Add tests in `crates/app/src/terminal_app.rs` verifying R0.1, R4.1–R4.4, and R5.1–R5.3.
 
 ## External Dependencies

@@ -1026,3 +1026,71 @@ fn scrolling_back_moves_the_selection_tint_back() {
         "scrolled back one line",
     );
 }
+
+/// A runtime zoom (`Renderer::set_font_size`, terminal-font-size R2.1) has to put the
+/// same pixels on screen as a renderer that was **built** at that size.
+///
+/// This is the pixel half of the zoom path. Its unit tests in `lib.rs` assert the
+/// decisions — the override, `cell_size`, `ppem`, a bumped atlas epoch, one re-shape —
+/// and all of them stay green if the grid's `glyph_bind_group` is left pointing at the
+/// replaced atlas texture, which samples the old texture with the new atlas's UVs and
+/// draws the wrong glyphs for the rest of the session (Known Gap G-a in
+/// `specs/atlas-swap-bind-invalidation/spec.md`). Measured: deleting that rebuild left
+/// the `renderer` and `app` suites at 1430 passed / 0 failed.
+///
+/// The oracle is a second renderer constructed at the target size, so the assertion
+/// needs no font-specific fixture: the two frames must be byte-identical. The first
+/// frame is drawn at the default size before zooming so the old atlas really holds
+/// glyphs. Otherwise a stale bind group would sample an empty texture, and the
+/// failure would come out blank rather than wrong.
+#[test]
+fn a_zoomed_frame_matches_one_rendered_at_that_size_from_the_start() {
+    const ZOOMED_PT: f32 = 20.0;
+    let feed = b"hello world\r\nsecond line";
+
+    let cfg = Config::default();
+    let Some(mut zoomed) = headless(&cfg) else {
+        return;
+    };
+    let _ = render(&mut zoomed, feed);
+    assert!(
+        zoomed.set_font_size(ZOOMED_PT),
+        "20pt differs from the default"
+    );
+    let (_, after_zoom) = render(&mut zoomed, feed);
+
+    let mut cfg_at_size = Config::default();
+    cfg_at_size.font.size_pt = ZOOMED_PT;
+    let Some(mut fresh) = headless(&cfg_at_size) else {
+        return;
+    };
+    assert_eq!(zoomed.grid_size(), fresh.grid_size());
+    let (_, reference) = render(&mut fresh, feed);
+
+    let bg = reference.modal_pixel();
+    let inked = reference
+        .pixels()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|&&px| is_ink(px, bg))
+        .count();
+    assert!(
+        inked > 0,
+        "the reference frame is blank; the comparison would be vacuous"
+    );
+
+    let differing = after_zoom
+        .pixels()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(reference.pixels().as_chunks::<4>().0)
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        differing, 0,
+        "{differing} pixels differ between the zoomed frame and one rendered at \
+         {ZOOMED_PT}pt from the start; the grid is drawing from the wrong atlas"
+    );
+}
