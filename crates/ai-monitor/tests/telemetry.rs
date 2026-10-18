@@ -541,6 +541,165 @@ fn an_in_flight_agent_is_visible_before_it_completes() {
     assert!(s.subagents[0].ended_ok);
 }
 
+// ---- api-request-blob: a transcript copy is not an event ---------------------
+//
+// Claude Code 2.1.302 writes `api-request-blob` records: a timestampless copy of the
+// outgoing API request, whose `message.content` repeats earlier turns block for block,
+// assistant and user alike. Folded, every repeated `Agent` call opened a second card with
+// no start and no agent id that nothing could complete, so a finished agent read as a
+// live one forever (11 real agents became 19 cards). The shapes below are trimmed from
+// that session.
+
+/// The blob Claude Code writes for `line`: its `message`, and nothing else of it.
+fn as_blob(line: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(line).unwrap();
+    serde_json::json!({
+        "type": "api-request-blob",
+        "hash": "0f3a",
+        "message": v["message"],
+    })
+    .to_string()
+}
+
+/// A conversation record of `kind` whose array content is the single `block`.
+fn conversation(kind: &str, ts: &str, block: &str) -> String {
+    format!(
+        r#"{{"type":"{kind}","timestamp":"{ts}","message":{{"role":"{kind}","content":[{block}]}}}}"#
+    )
+}
+
+const AGENT_USE: &str = r#"{"type":"tool_use","id":"a1","name":"Agent","input":{"subagent_type":"general-purpose","description":"spec review"}}"#;
+
+#[test]
+fn blob_copies_of_every_conversation_record_change_nothing() {
+    // The whole contract in one comparison: Claude Code follows conversation records with
+    // blobs repeating them, and the panel must read exactly what it reads without them.
+    // Every field is compared, so a blob reaching any ring, counter or turn tally fails
+    // here, not only the agents ring this was found through.
+    let plain = include_str!("fixtures/session.jsonl");
+    let mut with_blobs = String::new();
+    let mut copied = 0;
+    for line in plain.lines() {
+        with_blobs.push_str(line);
+        with_blobs.push('\n');
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        if v["message"]["content"].is_array() || v["message"]["content"].is_string() {
+            with_blobs.push_str(&as_blob(line));
+            with_blobs.push('\n');
+            copied += 1;
+        }
+    }
+    // Guards the guard: a fixture with no content to copy would compare two identical
+    // inputs and pass vacuously.
+    assert_eq!(copied, 13, "every assistant and user record has a copy");
+    assert_eq!(fold(&with_blobs), fixture());
+}
+
+#[test]
+fn an_api_request_blob_repeating_an_agent_call_opens_no_second_card() {
+    let result = r#"{"type":"user","timestamp":"2026-08-19T00:00:57.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"a1","content":"looks good"}]},"toolUseResult":{"status":"completed","agentId":"agent-11"}}"#;
+    let launch = conversation("assistant", "2026-08-19T00:00:00.000Z", AGENT_USE);
+    let s = fold(
+        &[
+            launch.clone(),
+            result.to_string(),
+            as_blob(&launch),
+            as_blob(result),
+        ]
+        .join("\n"),
+    );
+    assert_eq!(
+        s.subagents.len(),
+        1,
+        "one call, one card: {:?}",
+        s.subagents
+    );
+    let a = &s.subagents[0];
+    assert!(a.completed);
+    assert_eq!(a.agent_id.as_deref(), Some("agent-11"));
+    assert_eq!(a.start_ms, Some(T0));
+    assert_eq!(a.end_ms, Some(T0 + 57_000));
+    // The repeated result is not a second call, and not an orphan either: it is not read.
+    assert_eq!(s.total_tool_calls, 1);
+    assert_eq!(s.orphan_tool_results, 0);
+    assert_eq!(s.duplicate_tool_ids, 0);
+}
+
+#[test]
+fn a_blob_repeating_a_running_agent_leaves_one_live_card_with_its_start() {
+    // The case the screenshot showed: while a background agent runs, the next request's
+    // blob repeats its launch. The real card must stay the only one, still live, still
+    // timed from its launch, and still joinable by the notification that will end it.
+    let launch = conversation("assistant", "2026-08-19T00:00:00.000Z", AGENT_USE);
+    let receipt = r#"{"type":"user","timestamp":"2026-08-19T00:00:00.083Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"a1","content":"Async agent launched successfully."}]},"toolUseResult":{"isAsync":true,"agentId":"agent-11"}}"#;
+    let s = fold(
+        &[
+            launch.clone(),
+            receipt.to_string(),
+            as_blob(&launch),
+            as_blob(receipt),
+        ]
+        .join("\n"),
+    );
+    assert_eq!(s.subagents.len(), 1, "{:?}", s.subagents);
+    let a = &s.subagents[0];
+    assert!(!a.completed, "running, not done");
+    assert_eq!(a.start_ms, Some(T0));
+    assert_eq!(a.agent_id.as_deref(), Some("agent-11"));
+}
+
+#[test]
+fn a_blob_repeating_a_file_call_adds_no_file_row() {
+    let read_use =
+        r#"{"type":"tool_use","id":"r1","name":"Read","input":{"file_path":"/src/lib.rs"}}"#;
+    let read_result = r#"{"type":"tool_result","tool_use_id":"r1","content":"fn main() {}"}"#;
+    let launch = conversation("assistant", "2026-08-19T00:00:00.000Z", read_use);
+    let result = conversation("user", "2026-08-19T00:00:00.040Z", read_result);
+    let s = fold(
+        &[
+            launch.clone(),
+            result.clone(),
+            as_blob(&launch),
+            as_blob(&result),
+        ]
+        .join("\n"),
+    );
+    assert_eq!(s.files.len(), 1, "{:?}", s.files);
+    assert_eq!(s.files[0].duration_ms, Some(40));
+}
+
+#[test]
+fn a_command_name_quoted_in_a_blob_registers_no_skill() {
+    // Both content forms reach `scan_command_name` from a conversation record; a blob
+    // repeating either must reach it from neither.
+    let s = fold(
+        &[
+            as_blob(r#"{"message":{"role":"user","content":"<command-name>/foo</command-name>"}}"#),
+            as_blob(&conversation(
+                "user",
+                "2026-08-19T00:00:00.000Z",
+                r#"{"type":"text","text":"<command-name>/bar</command-name>"}"#,
+            )),
+        ]
+        .join("\n"),
+    );
+    assert!(s.skills.is_empty(), "{:?}", s.skills);
+}
+
+#[test]
+fn an_unknown_record_type_carrying_content_is_ignored() {
+    // Allowed by name, not refused by name: the next record type that carries a copy of
+    // the transcript is ignored without anyone having to learn its name first.
+    let launch = conversation("assistant", "2026-08-19T00:00:00.000Z", AGENT_USE).replacen(
+        r#""type":"assistant""#,
+        r#""type":"some-future-copy""#,
+        1,
+    );
+    let s = fold(&launch);
+    assert!(s.subagents.is_empty(), "{:?}", s.subagents);
+    assert_eq!(s.turns_assistant, 0);
+}
+
 // ---- agent-elapsed-sidechain R1/R2/R3: launch vs completion -------------------
 
 /// An `Agent` tool_use, then a result of the caller's choosing.
