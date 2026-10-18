@@ -703,6 +703,22 @@ impl SessionTelemetry {
             Some("attachment") => self.on_attachment(v, ts),
             _ => {}
         }
+        // Only a conversation record's content is an event. Claude Code 2.1.302 began
+        // writing `api-request-blob` records: a copy of the outgoing API request, with no
+        // timestamp, whose `message.content` repeats earlier assistant turns block for
+        // block. Scanned, every `Agent` call it repeats opened a second ring entry with no
+        // start and no agent id, which nothing could ever complete, so a finished agent
+        // stayed on the panel as a permanent live ghost (measured: 11 real agents folded
+        // to 19 cards). Allowed by name rather than refusing the blob by name, so the next
+        // record type that carries a transcript copy is ignored by default rather than
+        // folded. On 2026-10-18 the whole local corpus held `message.content` on exactly
+        // three types: `assistant`, `user` and `api-request-blob`.
+        if !matches!(
+            v.get("type").and_then(Value::as_str),
+            Some("assistant" | "user")
+        ) {
+            return;
+        }
         match v.pointer("/message/content") {
             Some(Value::Array(items)) => {
                 for it in items {
