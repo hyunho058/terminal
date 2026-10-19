@@ -7,6 +7,7 @@
 use crate::grid::{Cell, Color, Cursor, Grid};
 use crate::image::Placement;
 use crate::selection::{Point, Selection};
+use unicode_width::UnicodeWidthChar;
 
 /// An immutable, cheaply-clonable view of the visible grid at one instant.
 #[derive(Clone, Debug, PartialEq)]
@@ -115,7 +116,16 @@ impl GridSnapshot {
                 match self.cell(col, row) {
                     // Skip the trailing spacer of a double-width char (the leader
                     // already carries the glyph) so copied text is `한글`, not `한 글`.
-                    Some(c) if c.is_continuation() => {}
+                    // Leader-validated continuation (D6): orphan continuations are emitted as ' '.
+                    Some(c) if c.is_continuation() => {
+                        let is_valid_continuation = col > 0
+                            && self.cell(col - 1, row).is_some_and(|prev| {
+                                prev.ch.width() == Some(2) && !prev.is_continuation()
+                            });
+                        if !is_valid_continuation {
+                            line.push(' ');
+                        }
+                    }
                     Some(c) => line.push(c.ch),
                     None => line.push(' '),
                 }

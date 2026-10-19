@@ -45,6 +45,7 @@ use swash::shape::ShapeContext;
 use swash::FontRef;
 use term_core::{Cell, CellAttrs, GridSnapshot};
 use thiserror::Error;
+use unicode_width::UnicodeWidthChar;
 use wgpu::util::DeviceExt;
 
 pub use font_set::{FontData, FontFace, FontFamily, FontSet, StyleResolution, StyleSlot};
@@ -1579,13 +1580,14 @@ fn split_runs(styles: &[Option<RunStyle>]) -> Vec<Run> {
 }
 
 /// One row flattened for shaping (D16/R4.3).
-struct RowChars {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowChars {
     /// The row's characters in column order, with the trailing spacer of every
     /// double-width char dropped: its leader's glyph already spans both cells.
-    chars: Vec<char>,
+    pub chars: Vec<char>,
     /// `char_col[i]` is the absolute column of `chars[i]` — the anchor its cluster
     /// is placed at (R4.5). Wide chars leave a gap: `한a` → `[0, 2]`.
-    char_col: Vec<u16>,
+    pub char_col: Vec<u16>,
 }
 
 /// The `(bold, italic)` a cell asks for — what the *cell* wants, before any
@@ -1604,35 +1606,53 @@ fn cell_style(snapshot: &GridSnapshot, col: u16, row: u16) -> (bool, bool) {
 
 /// Whether `(col, row)` holds the trailing spacer of a double-width char.
 ///
-/// The single predicate both the row walk (R4.3) and the span measurement (D6)
-/// read, so the two can never disagree about what a wide cell is.
+/// A spacer is only valid if preceded by a double-width leader (D1).
 fn is_continuation(snapshot: &GridSnapshot, col: u16, row: u16) -> bool {
-    snapshot
+    if col == 0 {
+        return false;
+    }
+    let cell_is_continuation = snapshot
         .cell(col, row)
         .map(Cell::is_continuation)
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !cell_is_continuation {
+        return false;
+    }
+    snapshot
+        .cell(col - 1, row)
+        .is_some_and(|c| c.ch.width() == Some(2) && !c.is_continuation())
 }
 
 /// Walk a row into its shaping input: chars with spacers skipped, plus the
 /// absolute column of each (D16/R4.3). Split out of [`build_glyph_instances`] so
 /// the indexing basis — the thing wide chars desync — is testable on its own.
-fn row_chars(snapshot: &GridSnapshot, row: u16) -> RowChars {
+pub fn row_chars(snapshot: &GridSnapshot, row: u16) -> RowChars {
     let mut chars = Vec::new();
     let mut char_col = Vec::new();
     for col in 0..snapshot.cols {
         if is_continuation(snapshot, col, row) {
             continue;
         }
-        chars.push(snapshot.cell(col, row).map(|c| c.ch).unwrap_or(' '));
+        let ch = snapshot.cell(col, row).map(|c| {
+            if c.is_continuation() {
+                ' ' // Orphan continuation cell without leader is treated as blank space (D1)
+            } else {
+                c.ch
+            }
+        }).unwrap_or(' ');
+        chars.push(ch);
         char_col.push(col);
     }
     RowChars { chars, char_col }
 }
 
 /// Cell span of the char led by `col`: 2 when the next column holds its
-/// continuation spacer, else 1 (D6).
-fn cell_span(snapshot: &GridSnapshot, col: u16, row: u16) -> u16 {
-    if is_continuation(snapshot, col.saturating_add(1), row) {
+/// continuation spacer, else 1 (D6, D5).
+pub fn cell_span(snapshot: &GridSnapshot, col: u16, row: u16) -> u16 {
+    let is_wide_leader = snapshot
+        .cell(col, row)
+        .is_some_and(|c| c.ch.width() == Some(2) && !c.is_continuation());
+    if is_wide_leader && is_continuation(snapshot, col.saturating_add(1), row) {
         2
     } else {
         1
