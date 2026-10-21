@@ -1010,9 +1010,10 @@ fn r2_2_a_subagent_since_the_user_input_is_no_robust_signal() {
 }
 
 /// The fixture's first reply (step 12) is the measured shape D13 exists for: a turn that
-/// defined and invoked a subagent, then narrated.
+/// defined and invoked a subagent, then narrated. Its subagent has not reported back by then,
+/// so it reads Busy (`agy-background-working` D1, R4.2, which amends D13's `None`).
 #[test]
-fn r2_2_the_real_fixtures_reply_after_a_subagent_is_no_robust_signal() {
+fn r2_2_the_real_fixtures_reply_after_an_unreported_subagent_is_busy() {
     let fixture = include_str!("fixtures/antigravity_transcript.jsonl");
     let through_step_12: String = fixture.lines().take(13).map(|l| format!("{l}\n")).collect();
     assert!(through_step_12
@@ -1020,7 +1021,7 @@ fn r2_2_the_real_fixtures_reply_after_a_subagent_is_no_robust_signal() {
         .last()
         .is_some_and(|l| l.contains("\"step_index\": 12")));
     let path = write_bytes("r2-2-fixture", through_step_12.as_bytes());
-    assert_eq!(read(&path).last, None);
+    assert_eq!(read(&path).last, Some(LastMessage::AssistantBusy));
 }
 
 #[test]

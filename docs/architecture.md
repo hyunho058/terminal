@@ -265,6 +265,25 @@ idle behaviour. See G1 for what the caches do and do not buy against it.
     toward a false `Waiting for input`. A renamed `ask_question` would lose its `Waiting`
     the same way. **"Antigravity never reads Waiting any more" should be read as "check
     the step names first".**
+  - **Antigravity's background-work pairing** (`specs/agy-background-working`, which amends
+    `agent-card-status` D13). After a tool-less reply the card reads `Working` while a
+    background task or subagent the turn started has not reported back. That rests on four
+    strings, matched exactly:
+    - the task-start header: content beginning `Created At: …\n` and then `Tool is running as
+      a background task with task id: <uuid>/task-<n>`, on a `RUNNING` step;
+    - the subagent header: content beginning `Created At: …\n` (optionally `Completed At:
+      …\n`) and then `Created the following subagents:`, followed by `"conversationId"` values;
+    - the notice header: a `SYSTEM_MESSAGE` line `[Message] timestamp=… sender=<id>`;
+    - the task text `Task id "<id>" ` (any status word after it).
+
+    A renamed **start** string reads as nothing pending, which is the pre-feature behaviour. A
+    task is finished by either completion form, so only renaming **both** leaves it pending.
+    A subagent, and a `schedule` timer, have only the `sender=` header: rename it alone and
+    every turn that started one reads `Working` until the agent's next step. **"agy reads
+    Working after it has finished" should be read as "grep the newest `SYSTEM_MESSAGE` for
+    `sender=`".** One cost is accepted, not a defect: a hand-off after `agy` launches a
+    long-lived process for the user (`cargo run`, a dev server) reads `Working` until that
+    process exits or the user types.
   - **Claude Code's background-work records** (`specs/claude-background-working`). A Claude
     card whose last turn ended (`end_turn`) reads `Working`, not `Waiting for input`, while
     background work started since the last human prompt has not reported back.

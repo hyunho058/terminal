@@ -14,7 +14,9 @@
 //! - the final [`TAIL_CAP`] bytes decide the classification, exactly as Claude's does;
 //! - **only** when the deciding step is a tool-less reply, a scan back of up to
 //!   [`PROMPT_SCAN_CAP`] bytes looks for the last `USER_INPUT` to rule out background work
-//!   (D13). Every other outcome costs the 8 KiB tail and nothing more (R2.7).
+//!   (D13), and for background work the turn started that has not reported back
+//!   (`agy-background-working` D1, which amends D13). Every other outcome costs the 8 KiB
+//!   tail and nothing more (R2.7).
 //!
 //! Both reads go through one byte source ([`state_from_reads`]), which is what lets a test
 //! count the bytes a classification cost without a file, a clock or any global state.
@@ -23,6 +25,7 @@
 //! No FD or `libc` code (AG11, `agent-card-status` R9.3) — which conversation a tab holds is
 //! `app`'s question; this is handed a path.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -71,6 +74,9 @@ const BLOCKING_TOOLS: &[&str] = &["ask_question"];
 /// measured corpus the two agree, and they differ exactly on a tool nobody has measured. A
 /// deny-list reads a reply after a new or renamed background tool as Waiting — the worst
 /// failure this project names — while this reads it as no robust signal.
+///
+/// Amended by `agy-background-working` D1: background work that has not yet *reported back*
+/// outranks this list, and reads `AssistantBusy` (see [`turn_verdict`]).
 const FOREGROUND_TOOLS: &[&str] = &[
     "run_command",
     "view_file",
@@ -200,38 +206,182 @@ fn classify(
     }
 }
 
-/// `AssistantEndTurn` iff the turn ending in this reply did only foreground work since the
-/// last `USER_INPUT`, found within the back-scan window (`agent-card-status` D13, D14).
-/// Otherwise no robust signal: `None`, which the app's fallback never reads as Waiting.
+/// The classification of a tool-less reply, from the back-scan window (`agent-card-status`
+/// D13, D14, as amended by `agy-background-working` D1): `AssistantBusy` while background work
+/// the turn started has not reported back, `AssistantEndTurn` when the turn did only
+/// foreground work, otherwise no robust signal — `None`, which the app's fallback never reads
+/// as Waiting.
 fn finished_turn(back_scan: impl FnOnce() -> Option<Vec<u8>>) -> Option<LastMessage> {
     let window = back_scan()?;
-    turn_was_foreground(&String::from_utf8_lossy(&window)).then_some(LastMessage::AssistantEndTurn)
+    match turn_verdict(&String::from_utf8_lossy(&window)) {
+        Turn::Pending => Some(LastMessage::AssistantBusy),
+        Turn::Foreground => Some(LastMessage::AssistantEndTurn),
+        Turn::Undecided => None,
+    }
 }
 
-/// Whether every step after the last `USER_INPUT` in `window` is foreground work (D13).
+/// What the steps since the last `USER_INPUT` say about the reply that ends them.
+#[derive(Debug, PartialEq)]
+enum Turn {
+    /// A background task or subagent started in the turn has not reported back
+    /// (`agy-background-working` D1).
+    Pending,
+    /// Every step is foreground work (D13).
+    Foreground,
+    /// Background work cannot be ruled out, and none is known to be pending.
+    Undecided,
+}
+
+/// Walk `window` newest first to the last `USER_INPUT` (`agy-background-working` D4).
 ///
-/// Walks back from the end — so the reply itself, and any bookkeeping written after it,
-/// are checked too. Three ways to fail, all of them "background work cannot be ruled out":
-/// a step that is not foreground, a line that cannot be read (so cannot be checked), and
-/// running out of window before a `USER_INPUT` (D14: an 8 KiB tail reaches the last user
-/// input for only 23 of 111 measured replies, 1 MiB for all of them).
-fn turn_was_foreground(window: &str) -> bool {
+/// Newest first, every completion notice is seen before the start it answers, so a start
+/// whose id is not yet in the completed set is pending — and nothing older can undo that,
+/// which is why the walk returns at once. Pending outranks the foreground verdict (D1): an
+/// unlisted tool or kind in the same turn does not hide work still running.
+///
+/// The walk also ends at a line it cannot read, or at the window's start. Neither is a
+/// `USER_INPUT`, so with nothing pending found the answer is [`Turn::Undecided`] (D13's
+/// three ways to fail, D14: an 8 KiB tail reaches the last user input for only 23 of 111
+/// measured replies, 1 MiB for all of them). Steps written after the reply — a notice
+/// landing — are in the window and walked like any other, so a completion clears the hold
+/// as soon as it is written.
+fn turn_verdict(window: &str) -> Turn {
+    let mut completed: HashSet<String> = HashSet::new();
+    let mut foreground = true;
     for line in window.lines().rev() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         let Ok(step) = serde_json::from_str::<Value>(line) else {
-            return false;
+            break;
         };
         if step_kind(&step) == Some("USER_INPUT") {
-            return true;
+            return if foreground {
+                Turn::Foreground
+            } else {
+                Turn::Undecided
+            };
         }
-        if !is_foreground(&step) {
-            return false;
+        if step_kind(&step) == Some("SYSTEM_MESSAGE") {
+            let ids = content(&step).map(completed_ids).unwrap_or_default();
+            completed.extend(ids.into_iter().map(String::from));
         }
+        if started_ids(&step).iter().any(|id| !completed.contains(*id)) {
+            return Turn::Pending;
+        }
+        foreground &= is_foreground(&step);
     }
-    false
+    Turn::Undecided
+}
+
+/// The `Tool is running as a background task` marker (`agy-background-working` D2 form 1).
+const TASK_START: &str = "Tool is running as a background task with task id: ";
+/// The header of an `invoke_subagent` result (D2 form 2).
+const SUBAGENT_HEADER: &str = "Created the following subagents:";
+/// A completion notice's header line, up to its timestamp (D3).
+const NOTICE_HEADER: &str = "[Message] timestamp=";
+/// A task's completion text, up to its quoted id (D3).
+const TASK_ID_TEXT: &str = "Task id \"";
+
+/// The background ids `step` starts (`agy-background-working` D2): a task id from a
+/// `RUNNING` step's own header, and every subagent id under an `invoke_subagent` result's
+/// header. Both are read only at the content's start, so output that *quotes* either — a
+/// command that printed another transcript — starts nothing (measured: an unanchored match
+/// gave a false pending on one corpus reply; the anchored one gave none).
+fn started_ids(step: &Value) -> Vec<&str> {
+    let mut ids: Vec<&str> = task_start(step).into_iter().collect();
+    ids.extend(subagent_starts(step));
+    ids
+}
+
+/// D2 form 1: `status: "RUNNING"`, and content that *begins* `Created At: <line>\n` followed
+/// directly by [`TASK_START`] and a task id. Measured 2026-10-19: 58 of 58 real starts have
+/// exactly this shape (41 `GENERIC`, 17 `RUN_COMMAND`), and the 2 other occurrences of the
+/// marker were quoted inside `DONE` steps.
+fn task_start(step: &Value) -> Option<&str> {
+    if step.get("status").and_then(Value::as_str) != Some("RUNNING") {
+        return None;
+    }
+    let body = after_line(content(step)?, "Created At: ")?;
+    task_id_at(body.strip_prefix(TASK_START)?)
+}
+
+/// D2 form 2: content that *begins* `Created At: <line>\n`, optionally `Completed At:
+/// <line>\n`, then [`SUBAGENT_HEADER`]; every `"conversationId": "<uuid>"` after it. Keyed on
+/// the header, not the step's `type`: current `agy` writes `GENERIC` here, the fixture
+/// `INVOKE_SUBAGENT`.
+fn subagent_starts(step: &Value) -> Vec<&str> {
+    let Some(body) = content(step).and_then(|c| after_line(c, "Created At: ")) else {
+        return Vec::new();
+    };
+    let body = after_line(body, "Completed At: ").unwrap_or(body);
+    let Some(list) = body.strip_prefix(SUBAGENT_HEADER) else {
+        return Vec::new();
+    };
+    list.split("\"conversationId\"")
+        .skip(1)
+        .filter_map(|after| {
+            let quoted = after.trim_start().strip_prefix(':')?.trim_start();
+            let id = uuid_at(quoted.strip_prefix('"')?)?;
+            quoted[1 + id.len()..].starts_with('"').then_some(id)
+        })
+        .collect()
+}
+
+/// The ids a `SYSTEM_MESSAGE`'s `content` completes (`agy-background-working` D3), by two
+/// independent recognisers: a line beginning `[Message] timestamp=<ts> sender=<id>`, and the
+/// text `Task id "<id>" ` with any status word after it. Any message from an id counts as its
+/// end — measured, 57 of 57 messages from a task were terminal (45 `finished`, 10 `was
+/// canceled`, 2 timer firings with no `Task id` text at all). A subagent's report has only
+/// the first: its body is free text.
+fn completed_ids(content: &str) -> Vec<&str> {
+    let senders = content.lines().filter_map(|line| {
+        let rest = line.strip_prefix(NOTICE_HEADER)?;
+        let rest = &rest[rest.find(' ')?..];
+        sender_id_at(rest.strip_prefix(" sender=")?)
+    });
+    let texts = content.match_indices(TASK_ID_TEXT).filter_map(|(at, _)| {
+        let rest = &content[at + TASK_ID_TEXT.len()..];
+        let id = task_id_at(rest)?;
+        rest[id.len()..].starts_with("\" ").then_some(id)
+    });
+    senders.chain(texts).collect()
+}
+
+/// The text after `s`'s first line, if that line begins with `label`.
+fn after_line<'a>(s: &'a str, label: &str) -> Option<&'a str> {
+    let rest = s.strip_prefix(label)?;
+    Some(&rest[rest.find('\n')? + 1..])
+}
+
+/// A conversation id at the start of `s`: 36 characters of lowercase hex and `-` (D2).
+fn uuid_at(s: &str) -> Option<&str> {
+    let id = s.get(..36)?;
+    id.bytes()
+        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'-'))
+        .then_some(id)
+}
+
+/// A task id at the start of `s`: `<uuid>/task-<digits>`, ending at the last digit, so the
+/// newline, `.`, `,` or `"` after it is never part of it (D2). A start and its completion are
+/// cut by this one rule, or they would never match.
+fn task_id_at(s: &str) -> Option<&str> {
+    let uuid = uuid_at(s)?;
+    let rest = s[uuid.len()..].strip_prefix("/task-")?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    (digits > 0).then(|| &s[..s.len() - rest.len() + digits])
+}
+
+/// A notice's sender: a task id when one is there, else the bare conversation id of a
+/// subagent (D3).
+fn sender_id_at(s: &str) -> Option<&str> {
+    task_id_at(s).or_else(|| uuid_at(s))
+}
+
+/// A step's `content`, when it is a string.
+fn content(step: &Value) -> Option<&str> {
+    step.get("content").and_then(Value::as_str)
 }
 
 /// D13 for one step: "known foreground work" — a kind this reader knows, not `status:
@@ -389,6 +539,28 @@ mod tests {
         assert!(
             read as u64 > TAIL_CAP,
             "read {read} bytes: no back-scan ran"
+        );
+    }
+
+    #[test]
+    fn r3_5_a_pending_reply_costs_the_same_back_scan_and_no_more() {
+        // `agy-background-working` R3.5: walking for pending work re-uses D14's window. A
+        // pending reply reads the tail plus that window, and nothing else.
+        let mut start = step("GENERIC");
+        start["status"] = json!("RUNNING");
+        start["content"] = json!(
+            "Created At: x\nTool is running as a background task with task id: \
+             2091e717-a2d0-4967-9d63-96b8a5a868b3/task-451\n"
+        );
+        let mut steps = vec![step("USER_INPUT")];
+        steps.extend(foreground_filler(40 * 1024));
+        steps.extend([dispatch("run_command"), start, reply()]);
+        let bytes = transcript(&steps);
+        let (last, read) = classify_counting(&bytes);
+        assert_eq!(last, Some(LastMessage::AssistantBusy));
+        assert!(
+            read as u64 <= TAIL_CAP + PROMPT_SCAN_CAP,
+            "read {read} bytes"
         );
     }
 
