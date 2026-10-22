@@ -576,11 +576,20 @@ fn r0_1_interactive_prompt_cjk_typing_consecutive_characters() {
     // Check individual cell columns: characters occupy consecutive columns 9..=13 without gaps
     assert_eq!(snap.cell(0, 0).map(|c| c.ch), Some('['));
     assert_eq!(snap.cell(1, 0).map(|c| c.ch), Some('한'));
-    assert_eq!(snap.cell(2, 0).map(|c| c.ch), Some(term_core::Cell::CONTINUATION));
+    assert_eq!(
+        snap.cell(2, 0).map(|c| c.ch),
+        Some(term_core::Cell::CONTINUATION)
+    );
     assert_eq!(snap.cell(3, 0).map(|c| c.ch), Some('국'));
-    assert_eq!(snap.cell(4, 0).map(|c| c.ch), Some(term_core::Cell::CONTINUATION));
+    assert_eq!(
+        snap.cell(4, 0).map(|c| c.ch),
+        Some(term_core::Cell::CONTINUATION)
+    );
     assert_eq!(snap.cell(5, 0).map(|c| c.ch), Some('어'));
-    assert_eq!(snap.cell(6, 0).map(|c| c.ch), Some(term_core::Cell::CONTINUATION));
+    assert_eq!(
+        snap.cell(6, 0).map(|c| c.ch),
+        Some(term_core::Cell::CONTINUATION)
+    );
     assert_eq!(snap.cell(7, 0).map(|c| c.ch), Some(']'));
     assert_eq!(snap.cell(8, 0).map(|c| c.ch), Some(' '));
     assert_eq!(snap.cell(9, 0).map(|c| c.ch), Some('f'));

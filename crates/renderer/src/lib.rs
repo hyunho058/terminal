@@ -1633,13 +1633,16 @@ pub fn row_chars(snapshot: &GridSnapshot, row: u16) -> RowChars {
         if is_continuation(snapshot, col, row) {
             continue;
         }
-        let ch = snapshot.cell(col, row).map(|c| {
-            if c.is_continuation() {
-                ' ' // Orphan continuation cell without leader is treated as blank space (D1)
-            } else {
-                c.ch
-            }
-        }).unwrap_or(' ');
+        let ch = snapshot
+            .cell(col, row)
+            .map(|c| {
+                if c.is_continuation() {
+                    ' ' // Orphan continuation cell without leader is treated as blank space (D1)
+                } else {
+                    c.ch
+                }
+            })
+            .unwrap_or(' ');
         chars.push(ch);
         char_col.push(col);
     }

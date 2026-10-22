@@ -1327,12 +1327,11 @@ impl Grid {
                     // The wide leader already carries the glyph — drop its spacer.
                     // Leader-validated continuation (D6): orphan continuations are emitted as ' '.
                     Some(c) if c.is_continuation() => {
-                        let is_valid_continuation = col > 0
-                            && cells
-                                .and_then(|r| r.get(col as usize - 1))
-                                .is_some_and(|prev| {
-                                    prev.ch.width() == Some(2) && !prev.is_continuation()
-                                });
+                        let is_valid_continuation =
+                            col > 0
+                                && cells.and_then(|r| r.get(col as usize - 1)).is_some_and(
+                                    |prev| prev.ch.width() == Some(2) && !prev.is_continuation(),
+                                );
                         if !is_valid_continuation {
                             segment.push(' ');
                         }

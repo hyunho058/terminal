@@ -79,7 +79,9 @@ fn tui_cursor_moves_and_backspace_preserve_column_alignment() {
     // 'b' at 12
     // 'x' at 13
     // 'y' at 14
-    let expected_chars = vec!['>', ' ', '[', '한', '국', '어', ']', ' ', 'a', 'b', 'x', 'y'];
+    let expected_chars = vec![
+        '>', ' ', '[', '한', '국', '어', ']', ' ', 'a', 'b', 'x', 'y',
+    ];
     let expected_cols = vec![0, 1, 2, 3, 5, 7, 9, 10, 11, 12, 13, 14];
 
     assert_eq!(&row.chars[..12], &expected_chars[..]);
