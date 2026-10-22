@@ -559,3 +559,83 @@ fn a_batched_private_mode_applies_every_parameter() {
     assert!(!t.autowrap());
     assert!(t.alt_screen(), "untouched modes stay put");
 }
+
+// --- R0: TUI input box interactive prompt regression suite ----------------------
+
+#[test]
+fn r0_1_interactive_prompt_cjk_typing_consecutive_characters() {
+    let mut t = term(80, 24);
+    // When: Terminal consumes \r[한국어] field\x1b[K
+    t.advance("\r[한국어] field\x1b[K".as_bytes());
+
+    let snap = t.snapshot();
+    let text = snap.to_text();
+    let first_line = text.lines().next().unwrap_or("");
+    assert_eq!(first_line, "[한국어] field");
+
+    // Check individual cell columns: characters occupy consecutive columns 9..=13 without gaps
+    assert_eq!(snap.cell(0, 0).map(|c| c.ch), Some('['));
+    assert_eq!(snap.cell(1, 0).map(|c| c.ch), Some('한'));
+    assert_eq!(
+        snap.cell(2, 0).map(|c| c.ch),
+        Some(term_core::Cell::CONTINUATION)
+    );
+    assert_eq!(snap.cell(3, 0).map(|c| c.ch), Some('국'));
+    assert_eq!(
+        snap.cell(4, 0).map(|c| c.ch),
+        Some(term_core::Cell::CONTINUATION)
+    );
+    assert_eq!(snap.cell(5, 0).map(|c| c.ch), Some('어'));
+    assert_eq!(
+        snap.cell(6, 0).map(|c| c.ch),
+        Some(term_core::Cell::CONTINUATION)
+    );
+    assert_eq!(snap.cell(7, 0).map(|c| c.ch), Some(']'));
+    assert_eq!(snap.cell(8, 0).map(|c| c.ch), Some(' '));
+    assert_eq!(snap.cell(9, 0).map(|c| c.ch), Some('f'));
+    assert_eq!(snap.cell(10, 0).map(|c| c.ch), Some('i'));
+    assert_eq!(snap.cell(11, 0).map(|c| c.ch), Some('e'));
+    assert_eq!(snap.cell(12, 0).map(|c| c.ch), Some('l'));
+    assert_eq!(snap.cell(13, 0).map(|c| c.ch), Some('d'));
+
+    // Cursor should be at column 14
+    assert_eq!(snap.cursor.col, 14);
+    assert_eq!(snap.cursor.row, 0);
+
+    // Columns 14..80 must be blank
+    for col in 14..80 {
+        assert_eq!(
+            snap.cell(col, 0).map(|c| c.ch),
+            Some(' '),
+            "column {} should be blank",
+            col
+        );
+    }
+}
+
+#[test]
+fn r0_2_prompt_line_redraw_with_clear_leaves_no_stray_trailing_characters() {
+    let mut t = term(80, 24);
+    // Given: A grid row previously holding [한국어] longer_previous_input
+    t.advance("\r[한국어] longer_previous_input\x1b[K".as_bytes());
+    assert_eq!(
+        t.snapshot().to_text().lines().next().unwrap_or(""),
+        "[한국어] longer_previous_input"
+    );
+
+    // When: Terminal consumes \r[한국어] short\x1b[K
+    t.advance("\r[한국어] short\x1b[K".as_bytes());
+
+    let snap = t.snapshot();
+    let text = snap.to_text();
+    let first_line = text.lines().next().unwrap_or("");
+    assert_eq!(first_line, "[한국어] short");
+
+    // Past column 14 up to 79: all cells hold blank spaces with default attributes
+    for col in 14..80 {
+        let cell = snap.cell(col, 0).expect("cell exists");
+        assert_eq!(cell.ch, ' ', "col {} should be blank space", col);
+        assert_eq!(cell.fg, FG, "col {} should have default fg", col);
+        assert_eq!(cell.bg, BG, "col {} should have default bg", col);
+    }
+}

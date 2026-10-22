@@ -1325,7 +1325,17 @@ impl Grid {
             for col in first..=last {
                 match cells.and_then(|r| r.get(col as usize)) {
                     // The wide leader already carries the glyph — drop its spacer.
-                    Some(c) if c.is_continuation() => {}
+                    // Leader-validated continuation (D6): orphan continuations are emitted as ' '.
+                    Some(c) if c.is_continuation() => {
+                        let is_valid_continuation =
+                            col > 0
+                                && cells.and_then(|r| r.get(col as usize - 1)).is_some_and(
+                                    |prev| prev.ch.width() == Some(2) && !prev.is_continuation(),
+                                );
+                        if !is_valid_continuation {
+                            segment.push(' ');
+                        }
+                    }
                     Some(c) => segment.push(c.ch),
                     None => segment.push(' '),
                 }
@@ -1479,20 +1489,31 @@ impl Grid {
 
     /// Erase from the cursor to end of the current line (`CSI 0 K`).
     pub fn clear_line_from_cursor(&mut self) {
-        let start = self.index(self.cursor.col, self.cursor.row);
+        if self.cursor.row >= self.rows || self.cols == 0 {
+            return;
+        }
+        let col = self.cursor.col.min(self.cols.saturating_sub(1));
+        let start = self.index(col, self.cursor.row);
         let end = self.index(0, self.cursor.row) + self.cols as usize;
         self.blank_span(start, end);
     }
 
     /// Erase from the start of the line to the cursor **inclusive** (`CSI 1 K`).
     pub fn clear_line_to_cursor(&mut self) {
+        if self.cursor.row >= self.rows || self.cols == 0 {
+            return;
+        }
+        let col = self.cursor.col.min(self.cols.saturating_sub(1));
         let start = self.index(0, self.cursor.row);
-        let end = self.index(self.cursor.col, self.cursor.row) + 1;
+        let end = self.index(col, self.cursor.row) + 1;
         self.blank_span(start, end);
     }
 
     /// Erase the entire cursor line (`CSI 2 K`).
     pub fn clear_line(&mut self) {
+        if self.cursor.row >= self.rows || self.cols == 0 {
+            return;
+        }
         let start = self.index(0, self.cursor.row);
         let end = start + self.cols as usize;
         self.blank_span(start, end);
@@ -1573,7 +1594,7 @@ impl Grid {
     /// cell is half of one. The constant-time counterpart to
     /// [`repair_wide_pairs`](Grid::repair_wide_pairs), used by `print` before it
     /// overwrites a cell so a pair is never left with one half orphaned.
-    fn break_wide_pair_at(&mut self, col: u16, row: u16) {
+    pub fn break_wide_pair_at(&mut self, col: u16, row: u16) {
         if col >= self.cols || row >= self.rows {
             return;
         }
@@ -1581,10 +1602,14 @@ impl Grid {
         let fill = self.pen_blank();
         if self.cells[idx].is_continuation() {
             // Spacer here → its leader is the cell to the left.
-            if col > 0 && self.cells[idx - 1].ch.width().unwrap_or(0) == 2 {
+            if col > 0
+                && self.cells[idx - 1].ch.width().unwrap_or(0) == 2
+                && !self.cells[idx - 1].is_continuation()
+            {
                 self.cells[idx - 1] = fill;
             }
         } else if self.cells[idx].ch.width().unwrap_or(0) == 2
+            && !self.cells[idx].is_continuation()
             && col + 1 < self.cols
             && self.cells[idx + 1].is_continuation()
         {
@@ -1601,7 +1626,7 @@ impl Grid {
     /// cell — the wide-char corruption class the `wide-chars` work already paid to
     /// fix. One pass over the mutated row restores the invariant: every spacer has a
     /// wide leader to its left, and every wide leader has its spacer to its right.
-    fn repair_wide_pairs(&mut self, row: u16, fill: Cell) {
+    pub fn repair_wide_pairs(&mut self, row: u16, fill: Cell) {
         if row >= self.rows {
             return;
         }
@@ -1611,11 +1636,15 @@ impl Grid {
             let idx = base + i;
             if self.cells[idx].is_continuation() {
                 // A spacer is only legal directly after a wide leader.
-                let orphan = i == 0 || self.cells[idx - 1].ch.width().unwrap_or(0) != 2;
+                let orphan = i == 0
+                    || self.cells[idx - 1].ch.width().unwrap_or(0) != 2
+                    || self.cells[idx - 1].is_continuation();
                 if orphan {
                     self.cells[idx] = fill;
                 }
-            } else if self.cells[idx].ch.width().unwrap_or(0) == 2 {
+            } else if self.cells[idx].ch.width().unwrap_or(0) == 2
+                && !self.cells[idx].is_continuation()
+            {
                 // A wide leader is only legal when its spacer survived.
                 let orphan = i + 1 >= cols || !self.cells[base + i + 1].is_continuation();
                 if orphan {
@@ -1629,18 +1658,32 @@ impl Grid {
     /// Does NOT move the cursor or touch rows above it — this is the erase a shell
     /// sends (`\r ESC[J`) when redrawing its prompt, so it must preserve scrollback.
     pub fn clear_from_cursor(&mut self) {
-        let start = self.index(self.cursor.col, self.cursor.row);
-        for cell in &mut self.cells[start..] {
-            *cell = Cell::blank(self.default_fg, self.default_bg);
+        if self.cursor.row >= self.rows || self.cols == 0 {
+            return;
         }
+        let col = self.cursor.col.min(self.cols.saturating_sub(1));
+        let row = self.cursor.row;
+        let start = self.index(col, row);
+        let blank = Cell::blank(self.default_fg, self.default_bg);
+        for cell in &mut self.cells[start..] {
+            *cell = blank;
+        }
+        self.repair_wide_pairs(row, blank);
     }
 
     /// Erase from the start of the display to the cursor (inclusive) (CSI 1J).
     pub fn clear_to_cursor(&mut self) {
-        let end = (self.index(self.cursor.col, self.cursor.row) + 1).min(self.cells.len());
-        for cell in &mut self.cells[..end] {
-            *cell = Cell::blank(self.default_fg, self.default_bg);
+        if self.cursor.row >= self.rows || self.cols == 0 {
+            return;
         }
+        let col = self.cursor.col.min(self.cols.saturating_sub(1));
+        let row = self.cursor.row;
+        let end = (self.index(col, row) + 1).min(self.cells.len());
+        let blank = Cell::blank(self.default_fg, self.default_bg);
+        for cell in &mut self.cells[..end] {
+            *cell = blank;
+        }
+        self.repair_wide_pairs(row, blank);
     }
 
     /// Resize the grid, preserving overlapping content, and clamp the cursor.
