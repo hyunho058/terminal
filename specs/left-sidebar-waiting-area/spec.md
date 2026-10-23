@@ -124,6 +124,11 @@ pinned로 둔다. 세 신호 소스(에이전트 멈춤 = `~/.claude/projects/**
 ### D16: "입력 대기(Waiting)" 판정 규칙 (feasibility spike 기반)
 - **Status**: resolved (reviewer #1)
 - **Rationale**: 비활성 세션의 최신 jsonl(8KiB tail)에서 마지막 assistant/user 이벤트 판정: **마지막 assistant 이벤트의 `stop_reason=="end_turn"` → Waiting**(에이전트가 턴을 사람에게 넘김). 마지막이 `stop_reason=="tool_use"`(도구 실행중) 또는 `user`+`toolUseResult`(tool_result) → **Busy**. 마지막이 human_prompt(`user`, `toolUseResult` 없음) → **Busy**(사람이 방금 입력, 에이전트가 응답 예정). 로그 없음/미해결 → **Unknown**. 기존 `state_from`(`activity.rs:37-46`)·`tail_state`(`ai-monitor/src/activity.rs:30-51`)를 role-only에서 (role + stop_reason + toolUseResult) 판독으로 확장.
+  > **Amended by `specs/claude-background-working` D1 — Claude 한정 축소.**
+  > `end_turn` → Waiting은 이제 그 턴이 시작한 백그라운드 작업(`run_in_background` Bash, 비동기
+  > 서브에이전트 등, 마지막 사람 프롬프트 이후 시작분)이 **모두 보고를 마친 경우에만** 성립한다.
+  > 아직 보고하지 않은 작업이 남아 있으면 `AssistantBusy` → Busy(카드 `Working`)로 읽는다.
+  > 그 외 판정(tool_use, toolUseResult, human_prompt, Unknown)은 변경 없음.
 
 ### D17: 세션당 waiting 항목 1개, 전 신호 우선순위 = 에러 > 입력대기 > 완료
 - **Status**: resolved (reviewer #2)

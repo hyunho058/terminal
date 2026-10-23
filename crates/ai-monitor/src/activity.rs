@@ -7,6 +7,8 @@
 //! this reads at most the final [`TAIL_CAP`] bytes and returns only the role of the last
 //! parseable line, plus the file's `(mtime, len)` so the caller can memoise on them.
 
+use std::collections::HashSet;
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::SystemTime;
@@ -65,27 +67,59 @@ pub struct TailState {
 /// 8 KiB window (a single assistant turn + tool output easily exceeds it) — that is
 /// [`recent_prompts`], a separate, wider read.
 pub fn tail_state(log: &Path) -> Option<TailState> {
-    let mut file = std::fs::File::open(log).ok()?;
+    let mut file = File::open(log).ok()?;
     let meta = file.metadata().ok()?;
     let len = meta.len();
     if len == 0 {
         return None;
     }
     let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    state_from_reads(len, mtime, |cap| read_last(&mut file, len, cap))
+}
 
-    // Seek to the last TAIL_CAP bytes and read forward — a genuine cap, so a 200 KiB log
-    // costs 8 KiB of I/O (R6.1).
-    let start = len.saturating_sub(TAIL_CAP);
-    file.seek(SeekFrom::Start(start)).ok()?;
+/// The last `cap` bytes of the first `len` bytes of `file` — a genuine cap, so a 200 KiB log
+/// costs 8 KiB of I/O for the tail (R6.1).
+///
+/// Bounded by the `len` the caller `stat`ed, not by end of file, as in
+/// `antigravity/tail.rs`: the log is live, and the back-scan
+/// (`specs/claude-background-working` D7) runs after the tail read, so reading to EOF would
+/// let the two windows describe different files.
+fn read_last(file: &mut File, len: u64, cap: u64) -> Option<Vec<u8>> {
+    let window = cap.min(len);
+    file.seek(SeekFrom::Start(len - window)).ok()?;
     let mut buf = Vec::new();
-    file.take(TAIL_CAP).read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
+    file.take(window).read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// [`tail_state`] over a byte source: `read_last(cap)` yields the log's final `cap` bytes.
+/// Every byte the classification costs passes through it, which is how a test observes the
+/// byte budget (`specs/claude-background-working` R4.7).
+///
+/// The final [`TAIL_CAP`] bytes decide the classification. **Only** when that says
+/// `AssistantEndTurn` is a further [`PROMPT_SCAN_CAP`] read, walked by [`background_pending`]:
+/// a turn that ended with background work still out reads `AssistantBusy` instead
+/// (`claude-background-working` D1, D7). A back-scan that cannot be read leaves today's
+/// result, so this path can only ever turn a Waiting into a Busy, never the reverse.
+fn state_from_reads(
+    len: u64,
+    mtime: SystemTime,
+    mut read_last: impl FnMut(u64) -> Option<Vec<u8>>,
+) -> Option<TailState> {
+    let tail = read_last(TAIL_CAP)?;
+    let text = String::from_utf8_lossy(&tail);
 
     // The last parseable line. Scanning from the end skips a half-written final line and
     // the partial first line left by seeking into the middle of a record.
     let role = text.lines().rev().find_map(parse_line)?.role;
     // The D16 input-waiting signal from the last *meaningful* message (see below).
-    let last = last_meaningful(&text);
+    let mut last = last_meaningful(&text);
+    if last == Some(LastMessage::AssistantEndTurn)
+        && read_last(PROMPT_SCAN_CAP)
+            .is_some_and(|window| background_pending(&String::from_utf8_lossy(&window)))
+    {
+        last = Some(LastMessage::AssistantBusy);
+    }
     Some(TailState {
         role,
         mtime,
@@ -328,6 +362,169 @@ fn classify_user(v: &Value) -> LastMessage {
     } else {
         LastMessage::UserPrompt
     }
+}
+
+/// Whether background work started since the last human prompt in `window` has not yet
+/// reported back (`specs/claude-background-working` D1, D4).
+///
+/// Walks `window` newest first, collecting completions ([`completed_id`]) and returning
+/// `true` at the first start ([`started_ids`]) none of them names. Newest first is what
+/// makes a completion clear only starts *older* than it: a resumed agent reuses its earlier
+/// `agentId`, and the first run's notification, written before the resume, must not clear
+/// the resumed run (D3). Records written after the `end_turn` are in the window too, so a
+/// completion that lands clears the hold as soon as it is on disk.
+///
+/// Keyed on the record's `type`, not `message.role`: an `api-request-blob` carries
+/// `message.role: "user"` and would otherwise read as a human prompt and end the walk (D4).
+///
+/// The walk stops, with nothing pending, at the last human prompt ([`is_human_prompt`]) —
+/// only work started in this turn counts (L0) — and at the first line that does not parse.
+/// That is normally the window's first line, cut mid-record. The newest line cannot be it:
+/// the walk runs only after [`last_meaningful`] found an `end_turn` with no unreadable line
+/// after it. No time limit (D6): work that never reports holds Busy until the user types.
+fn background_pending(window: &str) -> bool {
+    let mut completed: HashSet<&str> = HashSet::new();
+    let records: Vec<Value> = window
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map_while(|l| serde_json::from_str(l).ok())
+        .collect();
+    for v in &records {
+        if is_human_prompt(v) {
+            return false;
+        }
+        if let Some(id) = completed_id(v) {
+            completed.insert(id);
+        }
+        if started_ids(v).any(|id| !completed.contains(id)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The ids a record starts: a `type: "user"` record whose `toolUseResult` has one of four
+/// shapes, a **closed** list (`claude-background-working` D2). Measured over 96 logs
+/// (2026-10-22): 92 background `Bash` (`backgroundTaskId`, including a command moved to the
+/// background at its timeout), 203 background `Agent` (`isAsync` + `async_launched`), 6
+/// forked skills (`background` + `forked`), 34 `SendMessage` resumes (`resumedAgentId`, 14
+/// also `revivedAgentId`).
+///
+/// Typed fields, not result text, so output that quotes them starts nothing. A `Monitor`
+/// (`taskId`), a foreground `Agent` (no `agentId`), `ScheduleWakeup` and cron tools start
+/// nothing; neither does an unmeasured tool, which keeps today's Waiting rather than holding
+/// Working forever. A renamed field degrades the same way (`docs/architecture.md` G8).
+fn started_ids(v: &Value) -> impl Iterator<Item = &str> {
+    let result = Some(v)
+        .filter(|v| record_type(v) == Some("user"))
+        .and_then(|v| v.get("toolUseResult"));
+    let field = |k: &str| result.and_then(|r| r.get(k)).and_then(Value::as_str);
+    let flag = |k: &str| result.and_then(|r| r.get(k)) == Some(&Value::Bool(true));
+    let status = field("status");
+    let async_agent = flag("isAsync") && status == Some("async_launched");
+    let forked = flag("background") && status == Some("forked");
+    let agent = field("agentId").filter(|_| async_agent || forked);
+    [
+        field("backgroundTaskId"),
+        agent,
+        field("resumedAgentId"),
+        field("revivedAgentId"),
+    ]
+    .into_iter()
+    .flatten()
+}
+
+/// The id a record completes, by one of four forms (`claude-background-working` D3):
+///
+/// 1. a `queue-operation` `enqueue` whose `content` is a `<task-notification>` — written when
+///    the result arrives, whatever Claude is doing (292 of 295 measured starts);
+/// 2. a `user` record with `origin.kind: "task-notification"`: the notification woke an idle
+///    Claude (144 of 295);
+/// 3. an `attachment` `queued_command` with `commandMode: "task-notification"`: it landed
+///    mid-turn (153 of 295);
+/// 4. a `TaskStop` result (`toolUseResult.task_id`). Stopping writes no notification.
+///
+/// Three independent notification recognisers, so a rename must break all three before a
+/// finished task reads pending. Any `<status>` completes (completed, failed, killed). A
+/// `peer` message completes nothing: it names no task, and its sender may still be working.
+fn completed_id(v: &Value) -> Option<&str> {
+    let str_at = |p: &str| v.pointer(p).and_then(Value::as_str);
+    match record_type(v)? {
+        "queue-operation" if str_at("/operation") == Some("enqueue") => {
+            notified_id(str_at("/content")?)
+        }
+        "attachment"
+            if str_at("/attachment/type") == Some("queued_command")
+                && str_at("/attachment/commandMode") == Some("task-notification") =>
+        {
+            notified_id(str_at("/attachment/prompt")?)
+        }
+        "user" if str_at("/origin/kind") == Some("task-notification") => {
+            notified_id(message_str(v)?)
+        }
+        "user" => str_at("/toolUseResult/task_id"),
+        _ => None,
+    }
+}
+
+/// The text of the first `<task-id>…</task-id>` in `text`, iff `text` begins (after leading
+/// whitespace) with `<task-notification>`. Quoted mid-text, the tag names nothing.
+fn notified_id(text: &str) -> Option<&str> {
+    let rest = text.trim_start().strip_prefix("<task-notification>")?;
+    let (_, after) = rest.split_once("<task-id>")?;
+    after.split_once("</task-id>").map(|(id, _)| id)
+}
+
+/// Whether `v` is a human prompt, the boundary of the turn's span
+/// (`claude-background-working` D4): a `type: "user"` record that is not a tool result
+/// (no `toolUseResult`, no `tool_result` block), not `isMeta`, not a `task-notification` or
+/// `peer` by `origin.kind`, and whose text is not a `<task-notification>`.
+///
+/// Errs toward "this is a prompt", which forgets pending work and keeps today's Waiting.
+/// So slash commands, `!` commands, accepted suggestions and continuation summaries all count
+/// (pending work does not survive a compaction), and so does a record with no text at all (an
+/// image-only paste). `origin` is not required: 263 measured records predate the field.
+fn is_human_prompt(v: &Value) -> bool {
+    let origin = v.pointer("/origin/kind").and_then(Value::as_str);
+    record_type(v) == Some("user")
+        && v.get("toolUseResult").is_none()
+        && v.get("isMeta") != Some(&Value::Bool(true))
+        && !matches!(origin, Some("task-notification" | "peer"))
+        && message_str(v).is_none_or(|t| notified_id(t).is_none())
+        && !has_tool_result_block(v)
+}
+
+/// D3's message text: `message.content` when it is a string, else the `text` of the first
+/// `text` block of the array, else nothing.
+fn message_str(v: &Value) -> Option<&str> {
+    let content = v.pointer("/message/content")?;
+    if let Some(s) = content.as_str() {
+        return Some(s);
+    }
+    content
+        .as_array()?
+        .iter()
+        .find(|b| b.get("type").and_then(Value::as_str) == Some("text"))?
+        .get("text")?
+        .as_str()
+}
+
+/// Whether `message.content` holds a `tool_result` block. Measured, every such record also
+/// carries `toolUseResult` (5,936 of 5,936), so this is a guard, not a measured case.
+fn has_tool_result_block(v: &Value) -> bool {
+    v.pointer("/message/content")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+        })
+}
+
+fn record_type(v: &Value) -> Option<&str> {
+    v.get("type").and_then(Value::as_str)
 }
 
 #[cfg(test)]
@@ -628,6 +825,18 @@ mod tests {
     }
 
     #[test]
+    fn prompts_read_the_string_content_form_and_skip_a_blank_one() {
+        let body = concat!(
+            r#"{"type":"user","message":{"role":"user","content":"fix the flaky test"}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"   "}}"#,
+            "\n",
+        );
+        let log = tmpfile("prompts-string", body.as_bytes());
+        assert_eq!(recent_prompts(&log), vec!["fix the flaky test"]);
+    }
+
+    #[test]
     fn prompts_empty_when_no_human_turn() {
         let body =
             br#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn"}}"#;
@@ -660,6 +869,94 @@ mod tests {
         );
         // …but the wider prompt scan finds it.
         assert_eq!(recent_prompts(&log), vec!["실제 사람 프롬프트"]);
+    }
+
+    // ---- the background back-scan's byte budget (claude-background-working R4.7) ----
+
+    /// Classify `bytes` through a counting byte source; returns the result and bytes read.
+    fn classify_counting(bytes: &[u8]) -> (Option<LastMessage>, u64) {
+        let mut read = 0u64;
+        let len = bytes.len() as u64;
+        let state = state_from_reads(len, SystemTime::UNIX_EPOCH, |cap| {
+            let window = cap.min(len);
+            read += window;
+            Some(bytes[(len - window) as usize..].to_vec())
+        });
+        (state.and_then(|s| s.last), read)
+    }
+
+    /// A log of foreground tool calls, larger than `PROMPT_SCAN_CAP`, ending in `last`.
+    fn big_log_ending_in(last: &str) -> Vec<u8> {
+        let call =
+            r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use"}}"#;
+        let res = format!(
+            r#"{{"type":"user","message":{{"role":"user"}},"toolUseResult":{{"stdout":"{}"}}}}"#,
+            "x".repeat(2000)
+        );
+        let mut bytes = Vec::new();
+        while (bytes.len() as u64) < PROMPT_SCAN_CAP + TAIL_CAP {
+            bytes.extend_from_slice(format!("{call}\n{res}\n").as_bytes());
+        }
+        bytes.extend_from_slice(last.as_bytes());
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[test]
+    fn r4_7_only_an_end_turn_reads_past_the_tail() {
+        let end = r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn"}}"#;
+        let (last, read) = classify_counting(&big_log_ending_in(end));
+        assert_eq!(last, Some(LastMessage::AssistantEndTurn));
+        assert_eq!(
+            read,
+            TAIL_CAP + PROMPT_SCAN_CAP,
+            "end_turn: tail + back-scan"
+        );
+
+        for (what, line) in [
+            (
+                "tool_use",
+                r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use"}}"#,
+            ),
+            (
+                "tool result",
+                r#"{"type":"user","message":{"role":"user"},"toolUseResult":{"stdout":"ok"}}"#,
+            ),
+            (
+                "human prompt",
+                r#"{"type":"user","message":{"role":"user","content":"go"}}"#,
+            ),
+        ] {
+            let (_, read) = classify_counting(&big_log_ending_in(line));
+            assert_eq!(read, TAIL_CAP, "{what}: the tail only");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_back_scan_keeps_todays_result() {
+        // The tail reads, the back-scan does not: today's AssistantEndTurn, not a guess.
+        let body = concat!(
+            r#"{"type":"user","toolUseResult":{"backgroundTaskId":"b1"},"message":{"role":"user"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn"}}"#,
+            "\n"
+        );
+        let state = state_from_reads(body.len() as u64, SystemTime::UNIX_EPOCH, |cap| {
+            (cap == TAIL_CAP).then(|| body.as_bytes().to_vec())
+        });
+        assert_eq!(
+            state.and_then(|s| s.last),
+            Some(LastMessage::AssistantEndTurn)
+        );
+    }
+
+    #[test]
+    fn read_last_is_bounded_by_the_stated_len() {
+        // Bytes appended after the stat are not read: both windows describe one file.
+        let p = tmpfile("read-last", b"0123456789");
+        let mut f = File::open(&p).expect("open");
+        assert_eq!(read_last(&mut f, 6, 4).as_deref(), Some(&b"2345"[..]));
+        assert_eq!(read_last(&mut f, 6, 100).as_deref(), Some(&b"012345"[..]));
     }
 
     #[test]

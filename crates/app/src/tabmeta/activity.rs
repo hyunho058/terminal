@@ -463,10 +463,13 @@ fn tail_role(
     {
         super::probe::LOG_READ.bump(1);
         // Honest wrapper accounting (R6.1): the activity tail is bounded to TAIL_CAP; the
-        // label scan adds up to PROMPT_SCAN_CAP more, both only on a changed log.
+        // label scan adds up to PROMPT_SCAN_CAP more, both only on a changed log. The tail
+        // read may add one more PROMPT_SCAN_CAP back-scan, when the tail ends in an
+        // `end_turn` (`claude-background-working` D7). `TailState` does not say whether it
+        // ran, so this is an upper bound that counts it every time.
         super::probe::LOG_READ_BYTES.bump(
             len.min(ai_monitor::activity::TAIL_CAP)
-                + len.min(ai_monitor::activity::PROMPT_SCAN_CAP),
+                + 2 * len.min(ai_monitor::activity::PROMPT_SCAN_CAP),
         );
     }
     memo.role.insert(
@@ -777,6 +780,35 @@ mod tests {
         );
         assert_eq!(super::super::probe::LOG_READ.get(), 0, "no re-read");
         assert_eq!(super::super::probe::LOG_RESOLVE.get(), 0, "no re-resolve");
+    }
+
+    #[test]
+    fn a_changed_log_accounts_the_conditional_back_scan() {
+        // claude-background-working R5.3 — the app cannot see whether the tail read ran its
+        // back-scan, so a changed log is accounted at the upper bound.
+        let _g = super::super::probe::serial();
+        let root = projects_root("backscan-bytes");
+        let cwd = Path::new("/proj/backscan-bytes");
+        let line =
+            br#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn"}}"#;
+        let mut body = Vec::new();
+        while (body.len() as u64) <= ai_monitor::activity::PROMPT_SCAN_CAP {
+            body.extend_from_slice(line);
+            body.push(b'\n');
+        }
+        write_log(&root, cwd, "s1", &body);
+        let mut memo = ActivityMemo::new();
+        super::super::probe::reset_all();
+        let _ = ranked(&mut memo, &root, cwd, 0, SystemTime::now());
+        assert_eq!(
+            super::super::probe::LOG_READ.get(),
+            1,
+            "one changed-log read"
+        );
+        assert_eq!(
+            super::super::probe::LOG_READ_BYTES.get(),
+            ai_monitor::activity::TAIL_CAP + 2 * ai_monitor::activity::PROMPT_SCAN_CAP
+        );
     }
 
     #[test]
