@@ -113,6 +113,15 @@ impl Tabs {
         }
     }
 
+    /// The strip index of tab `id`, or `None` if no open tab carries it
+    /// (session-flow-viewer D7/R8.3) — what `AppRequest::ActivateTab` resolves through
+    /// before `TabAction::Jump`. The lookup itself is [`tab_position`], pure so it is
+    /// testable without spawning a shell.
+    pub fn position(&self, id: TabId) -> Option<usize> {
+        let ids: Vec<TabId> = self.sessions.iter().map(|s| s.id).collect();
+        tab_position(&ids, id)
+    }
+
     /// Whether `id` is the active tab (so background output skips redraw, R1.2).
     /// Bounds-safe: after the last tab closes (the app is exiting) a still-queued
     /// PTY wake must not index an empty set (C3 — clean exit).
@@ -388,6 +397,13 @@ impl Tabs {
     }
 }
 
+/// Where tab `id` sits in the strip `ids` (session-flow-viewer R8.3), or `None` when it is
+/// not there — a tab closed between a graph card press and its apply. `None` is a no-op for
+/// the caller, never a fallback to some other index: an id names one tab or none.
+pub fn tab_position(ids: &[TabId], id: TabId) -> Option<usize> {
+    ids.iter().position(|&t| t == id)
+}
+
 /// The active index after closing a **different** tab (sticky-tab-title R3.7): the active
 /// session keeps its identity, so its index shifts down by one only when the closed tab
 /// sat before it. Pure, so the off-by-one that would silently switch tabs is unit-tested.
@@ -574,6 +590,33 @@ mod tests {
         assert_eq!(tabs.active_index(), 0);
         tabs.prev();
         assert_eq!(tabs.active_index(), 2, "prev wraps off the front");
+    }
+
+    #[test]
+    fn tab_position_finds_an_id_in_strip_order_or_nothing() {
+        // session-flow-viewer R8.3.
+        let ids = [TabId(1), TabId(7), TabId(9)];
+        assert_eq!(tab_position(&ids, TabId(7)), Some(1));
+        assert_eq!(tab_position(&ids, TabId(1)), Some(0));
+        assert_eq!(tab_position(&ids, TabId(9)), Some(2));
+        assert_eq!(tab_position(&ids, TabId(4)), None);
+        assert_eq!(tab_position(&[], TabId(1)), None);
+    }
+
+    #[test]
+    fn position_reads_the_live_strip() {
+        let Some(mut tabs) = tabs_with(3) else {
+            return;
+        };
+        let ids: Vec<TabId> = tabs.sessions.iter().map(|s| s.id).collect();
+        assert_eq!(tabs.position(ids[2]), Some(2));
+        assert!(tabs.close(ids[0]));
+        assert_eq!(tabs.position(ids[2]), Some(1), "a close shifts the index");
+        assert_eq!(
+            tabs.position(ids[0]),
+            None,
+            "a closed tab resolves to nothing"
+        );
     }
 
     #[test]

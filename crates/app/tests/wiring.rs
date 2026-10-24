@@ -19,7 +19,7 @@
 //! registered the `tabmeta` pump, the tests here asserted a set of four, and
 //! deleting that one line stopped the sidebar's git branch and agent status from
 //! ever refreshing with the entire suite green. The pump now travels in the value
-//! (`feature_registrations` takes the worker's handle), and the six-overlay shape
+//! (`feature_registrations` takes the worker's handle), and the seven-overlay shape
 //! is asserted below.
 //!
 //! These tests run the set all the way into the **live registries**, not just to
@@ -49,9 +49,9 @@ fn priorities(overlays: &[Box<dyn Overlay>]) -> Vec<i32> {
 fn every_feature_extension_is_registered() {
     assert_eq!(
         feature_overlays(None, no_deadline()).len(),
-        5,
-        "the overlay set changed — rename, ai-monitor, image presenter, selection \
-         presenter, region capture. If a feature was added, assert its priority below \
+        6,
+        "the overlay set changed — session graph, rename, ai-monitor, image presenter, \
+         selection presenter, region capture. If a feature was added, assert its priority below \
          too; if one was removed, say so here."
     );
     assert_eq!(feature_handlers().len(), 2, "Cmd+V paste and Cmd+C copy");
@@ -73,14 +73,14 @@ fn the_registered_set_reaches_the_live_registries() {
     let mut set = feature_registrations(None, None);
     assert_eq!(
         set.counts(),
-        (2, 5),
-        "the assembled set changed — 2 handlers (Cmd+V, Cmd+C), 5 overlays"
+        (2, 6),
+        "the assembled set changed — 2 handlers (Cmd+V, Cmd+C), 6 overlays"
     );
 
     let (router, host, layers) = set.install();
     assert_eq!(
         host.priorities(),
-        vec![200, 100, 0, 0, 0],
+        vec![300, 200, 100, 0, 0, 0],
         "the overlays that reached the host, in the order it offers keys to them"
     );
     assert_eq!(
@@ -90,7 +90,7 @@ fn the_registered_set_reaches_the_live_registries() {
     );
     assert_eq!(
         layers.len(),
-        5,
+        6,
         "every overlay contributes a DrawLayer; one that reaches the host without \
          its layer eats keys and draws nothing"
     );
@@ -121,18 +121,18 @@ fn the_metadata_pump_joins_the_set_the_app_runs() {
     let mut set = feature_registrations(None, Some(handle));
     assert_eq!(
         set.counts(),
-        (2, 6),
+        (2, 7),
         "the pump did not join the assembled set"
     );
 
     let (_, host, layers) = set.install();
     assert_eq!(
         host.priorities(),
-        vec![200, 100, 0, 0, 0, i32::MIN],
+        vec![300, 200, 100, 0, 0, 0, i32::MIN],
         "the pump must reach the host, and must sit behind every real overlay so \
          it can never take a key from one"
     );
-    assert_eq!(layers.len(), 6, "the pump's no-op layer went missing");
+    assert_eq!(layers.len(), 7, "the pump's no-op layer went missing");
 }
 
 /// D8a.1: an open rename field owns the keyboard, so it must sit ahead of the
@@ -144,11 +144,41 @@ fn the_rename_field_outranks_the_ai_monitor_panel() {
     let prios = priorities(&overlays);
     assert_eq!(
         prios,
-        vec![200, 100, 0, 0, 0],
+        vec![300, 200, 100, 0, 0, 0],
         "registration priorities changed; keyboard ownership between features \
          depends on this order (D8a.1). region-capture sits at 0, BELOW the rename \
          field — its D1 'an open rename field swallows the chord' is only true \
          while it does."
+    );
+}
+
+/// session-flow-graph D5/R1.4: the open graph covers the whole window — the rename field
+/// and the ai-monitor included — so it must see every key before either of them. It is
+/// the one overlay that covers the window, and it outranks every other registered overlay.
+/// A relative fact between independently written features, like the rename field's lead
+/// over the monitor above.
+#[test]
+fn the_session_graph_outranks_every_other_overlay() {
+    let overlays = feature_overlays(None, no_deadline());
+    let graphs: Vec<i32> = overlays
+        .iter()
+        .filter(|o| o.covers_window())
+        .map(|o| o.priority())
+        .collect();
+    assert_eq!(
+        graphs,
+        vec![300],
+        "exactly one window-covering overlay, at 300"
+    );
+    let highest_other = overlays
+        .iter()
+        .filter(|o| !o.covers_window())
+        .map(|o| o.priority())
+        .max()
+        .expect("other overlays are registered");
+    assert!(
+        300 > highest_other,
+        "the session graph must outrank every other overlay (highest other: {highest_other})"
     );
 }
 

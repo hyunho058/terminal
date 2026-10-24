@@ -21,6 +21,15 @@
 //! Every impure edge is a thin wrapper around a pure core ([`parse_clients`], [`select_pane`])
 //! or takes its syscall as an injected closure ([`resolve_rdevs`]), so every branch is tested
 //! with no tmux installed and no live tty.
+//!
+//! **Pane enumeration** (session-flow-viewer D9) is the second, opt-in half: while the session
+//! graph is open the worker also needs the *other* panes of the window a tab's client shows.
+//! `list-clients` gains a `#{session_name}:#{window_index}` column naming that window, and one
+//! memoised `list-panes -a` per tick ([`PaneMemo`], the same one-entry shape as [`Memo`]) lists
+//! every pane on the server; [`panes_of`] joins the two. The active pane is the one whose pid
+//! is the client's `pane_pid` — the pid [`select_pane`] re-rooted the card at — never
+//! `#{pane_active}`, because two process calls can disagree within a tick and the card and the
+//! graph must not describe different panes as "active".
 
 // This module was the mechanism half of the `tmux-pane-resolution` set, and carried a
 // blanket `#![allow(dead_code)]` while its consumers (`worker.rs`, `tabsession.rs`) were
@@ -97,18 +106,117 @@ fn tmux_client_of(root: u32) -> Option<TmuxClient> {
     tmux_client_of_with(root, super::proc::exe_path, super::proc::children_of)
 }
 
-/// Pure: parse `tmux list-clients -F '#{client_tty} #{pane_pid}'` output into its rows.
+/// The `list-clients` format. The third column (session-flow-viewer D9) names the window the
+/// client is showing, in the same `session:index` spelling [`PANES_FORMAT`] prints, so the two
+/// outputs join on plain string equality.
+const CLIENTS_FORMAT: &str = "#{client_tty} #{pane_pid} #{session_name}:#{window_index}";
+
+/// The `list-panes -a` format (session-flow-viewer D9): window first, so a session name
+/// containing spaces is recovered by parsing the two numeric columns off the **right**.
+const PANES_FORMAT: &str = "#{session_name}:#{window_index} #{pane_active} #{pane_pid}";
+
+/// At most this many panes of one window are published per tab (session-flow-viewer D9). The
+/// active pane is always among them — it is the one the card describes — so a cap that could
+/// drop it would make the split tree disagree with the card.
+pub const MAX_PANES: usize = 8;
+
+/// One attached tmux client: the tty it runs on, the pane it is showing, and that pane's window
+/// (`session_name:window_index`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientRow {
+    pub tty: PathBuf,
+    pub pane_pid: u32,
+    pub window: String,
+}
+
+/// One pane on the tmux server, as `list-panes -a` reports it.
+///
+/// `active` is `#{pane_active}` in a row from [`parse_panes`]. In a row returned by
+/// [`panes_of`] it means "this is the client's pane" instead — the only meaning anything
+/// downstream reads (session-flow-viewer D9).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaneRow {
+    pub window: String,
+    pub active: bool,
+    pub pid: u32,
+}
+
+/// Pure: parse `tmux list-clients -F` [`CLIENTS_FORMAT`] output into its rows.
 ///
 /// Tolerant **per row** — a short, malformed or non-numeric line is dropped individually rather
 /// than failing the whole map, because one unparseable client must not blind the tab to a
-/// second, valid one.
-pub(crate) fn parse_clients(out: &str) -> Vec<(PathBuf, u32)> {
+/// second, valid one. A row with no window column is dropped too: tmux always prints one for
+/// this format, so its absence means the line is not what was asked for. The window is the
+/// rest of the line, so a session name containing spaces survives.
+pub fn parse_clients(out: &str) -> Vec<ClientRow> {
     out.lines()
         .filter_map(|line| {
-            let mut fields = line.split_whitespace();
+            let mut fields = line.splitn(3, ' ');
             let tty = fields.next()?;
             let pane = fields.next()?.parse::<u32>().ok()?;
-            (pane > 0).then(|| (PathBuf::from(tty), pane))
+            let window = fields.next()?.trim_end();
+            (pane > 0 && !tty.is_empty() && !window.is_empty()).then(|| ClientRow {
+                tty: PathBuf::from(tty),
+                pane_pid: pane,
+                window: window.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Pure: parse `tmux list-panes -a -F` [`PANES_FORMAT`] output into its rows.
+///
+/// Tolerant per row, on [`parse_clients`]' terms: a line whose last two columns are not a
+/// `0`/`1` flag and a positive pid, or whose window is empty, is skipped on its own.
+pub fn parse_panes(out: &str) -> Vec<PaneRow> {
+    out.lines()
+        .filter_map(|line| {
+            let mut fields = line.trim_end().rsplitn(3, ' ');
+            let pid = fields.next()?.parse::<u32>().ok()?;
+            let active = match fields.next()? {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            let window = fields.next()?;
+            (pid > 0 && !window.is_empty()).then(|| PaneRow {
+                window: window.to_string(),
+                active,
+                pid,
+            })
+        })
+        .collect()
+}
+
+/// Pure: the panes of the window `client` shows, in tmux's order, with `active` true for
+/// exactly the client's own pane (session-flow-viewer D9; R6.3, R6.4, R6.7).
+///
+/// Empty — the tab renders unsplit — when there is no client, when the window has fewer than
+/// two panes, or when no listed pane is the client's. The last is the within-tick disagreement
+/// between `list-clients` and `list-panes`, and publishing nothing beats guessing which pane the
+/// card is describing. At most [`MAX_PANES`] rows: the client's pane is always kept, and the
+/// others are taken in order until the cap.
+pub fn panes_of(client: Option<&ClientRow>, panes: &[PaneRow]) -> Vec<PaneRow> {
+    let Some(client) = client else {
+        return Vec::new();
+    };
+    let in_window = || panes.iter().filter(|p| p.window == client.window);
+    if in_window().count() < 2 || !in_window().any(|p| p.pid == client.pane_pid) {
+        return Vec::new();
+    }
+    let mut others = 0usize;
+    in_window()
+        .filter(|p| {
+            if p.pid == client.pane_pid {
+                return true;
+            }
+            others += 1;
+            others < MAX_PANES
+        })
+        .map(|p| PaneRow {
+            window: p.window.clone(),
+            active: p.pid == client.pane_pid,
+            pid: p.pid,
         })
         .collect()
 }
@@ -120,18 +228,18 @@ pub(crate) fn parse_clients(out: &str) -> Vec<(PathBuf, u32)> {
 /// Resolving here — once, at fetch — rather than at selection is what keeps the cost at N stats
 /// per tick instead of N per tab per tick.
 pub(crate) fn resolve_rdevs(
-    rows: &[(PathBuf, u32)],
+    rows: &[ClientRow],
     rdev_of: impl Fn(&Path) -> Option<u32>,
 ) -> Vec<(u32, u32)> {
     rows.iter()
-        .filter_map(|(tty, pane)| rdev_of(tty).map(|dev| (dev, *pane)))
+        .filter_map(|row| rdev_of(&row.tty).map(|dev| (dev, row.pane_pid)))
         .collect()
 }
 
 /// Pure: the pane whose client holds `tty_dev`. First match wins, which makes the degenerate
 /// case of two clients on one tty deterministic (by tmux's own output order) rather than
 /// arbitrary — mirroring the walk's first-match-short-circuits rule.
-pub(crate) fn select_pane(clients: &[(u32, u32)], tty_dev: u32) -> Option<u32> {
+pub fn select_pane(clients: &[(u32, u32)], tty_dev: u32) -> Option<u32> {
     clients
         .iter()
         .find(|(dev, _)| *dev == tty_dev)
@@ -144,14 +252,14 @@ pub(crate) fn select_pane(clients: &[(u32, u32)], tty_dev: u32) -> Option<u32> {
 /// A tab using a non-default socket (`tmux -L work`) has a server this query cannot see, so it
 /// simply never matches and the tab keeps today's behaviour; the cost of that permanent miss is
 /// bounded to the one memoised spawn per tick, not one per tab.
-fn fetch_rows(exe: &Path) -> Vec<(PathBuf, u32)> {
+fn fetch_rows(exe: &Path) -> Vec<ClientRow> {
     // Bumped *before* the spawn, so a failed spawn still counts — which is what makes the
     // "at most one per tick" assertion meaningful rather than vacuous on the failure path.
     #[cfg(test)]
     super::probe::TMUX_LIST.bump(1);
 
     let out = match Command::new(exe)
-        .args(["list-clients", "-F", "#{client_tty} #{pane_pid}"])
+        .args(["list-clients", "-F", CLIENTS_FORMAT])
         .output()
     {
         Ok(out) => out,
@@ -178,6 +286,10 @@ struct Entry {
     /// Already-resolved `(rdev, pane_pid)` — not `(PathBuf, pane_pid)`, so selection is pure
     /// integer comparison and the `stat`s happen once per tick rather than once per tab.
     clients: Vec<(u32, u32)>,
+    /// The parsed rows the map was resolved from, kept for one lookup: the window of the pane
+    /// [`select_pane`] chose (session-flow-viewer D9). Never consulted for the selection itself,
+    /// so the card's root is decided exactly as before.
+    rows: Vec<ClientRow>,
 }
 
 impl Memo {
@@ -192,22 +304,55 @@ impl Memo {
     /// wall-clock time, and `SetActive` (fired the moment a user switches tabs) is exactly where
     /// a stale map would be most visible.
     fn get(&self, tick: u64) -> Option<&[(u32, u32)]> {
+        self.fresh(tick).map(|e| e.clients.as_slice())
+    }
+
+    fn fresh(&self, tick: u64) -> Option<&Entry> {
         self.entry
             .as_ref()
             .filter(|e| e.tick == tick && e.fetched_at.elapsed() < TICK)
-            .map(|e| e.clients.as_slice())
+    }
+
+    /// The client row showing `pane`, from the same fresh entry [`Memo::get`] served.
+    ///
+    /// Looked up by pane pid rather than by device because the rows are kept unresolved. Two
+    /// clients showing one pane are showing one window (a grouped session aside, whose other
+    /// name lists the same panes), so the first such row names the right pane set.
+    fn client_showing(&self, tick: u64, pane: u32) -> Option<&ClientRow> {
+        self.fresh(tick)?.rows.iter().find(|r| r.pane_pid == pane)
     }
 
     /// Every fetch attempt writes an entry — **including a failed one**, which stores an empty
     /// row set. Caching only successes would mean a machine with N tmux tabs and no reachable
     /// server re-spawns once per *tab* per tick.
-    fn put(&mut self, tick: u64, clients: Vec<(u32, u32)>) {
+    fn put_rows(&mut self, tick: u64, clients: Vec<(u32, u32)>, rows: Vec<ClientRow>) {
         self.entry = Some(Entry {
             tick,
             fetched_at: Instant::now(),
             clients,
+            rows,
         });
     }
+
+    /// [`Memo::put_rows`] with no rows, for the memo tests that predate the window column.
+    #[cfg(test)]
+    fn put(&mut self, tick: u64, clients: Vec<(u32, u32)>) {
+        self.put_rows(tick, clients, Vec::new());
+    }
+}
+
+/// The client a re-rooted tab is attached to, and the tmux binary that found it — the second is
+/// what [`panes_for`] spawns `list-panes` with, for [`fetch_rows`]' `PATH` reason.
+pub(crate) struct Attached {
+    pub(crate) client: ClientRow,
+    pub(crate) exe: PathBuf,
+}
+
+/// [`effective_root`]'s answer plus, when it re-rooted, the client it re-rooted through
+/// (session-flow-viewer D9). `attached` is `Some` only when `root` is a tmux pane.
+pub(crate) struct Rooted {
+    pub(crate) root: u32,
+    pub(crate) attached: Option<Attached>,
 }
 
 /// The derivation root for `pid`: the tmux client's active `pane_pid` when this tab is running
@@ -218,7 +363,14 @@ impl Memo {
 /// or a pane that has since exited) resolves to the pid that was passed in, which is precisely
 /// today's behaviour.
 pub(crate) fn effective_root(memo: &mut Memo, pid: u32, tick: u64) -> u32 {
-    effective_root_with(
+    rooted(memo, pid, tick).root
+}
+
+/// [`effective_root`] keeping the client it re-rooted through, for the worker's pane pass
+/// (session-flow-viewer D9). Both run the one body, so the card's root cannot drift from the
+/// `root` this returns.
+pub(crate) fn rooted(memo: &mut Memo, pid: u32, tick: u64) -> Rooted {
+    rooted_with(
         memo,
         pid,
         tick,
@@ -237,42 +389,159 @@ pub(crate) fn effective_root(memo: &mut Memo, pid: u32, tick: u64) -> u32 {
 /// presence gate closes immediately, so the memo re-use, the negative-cache and the liveness
 /// branches are all unreachable and their "measurements" would be tautologies rather than
 /// counts. With it, every branch is exercised against fakes — no tmux, no live tty, no live pid.
-#[allow(clippy::too_many_arguments)] // five seams + the three real inputs; the alternative is a
-                                     // params struct that no production caller would ever build
+#[allow(clippy::too_many_arguments)]
+// five seams + the three real inputs; the alternative is a
+// params struct that no production caller would ever build
+#[cfg(test)]
 fn effective_root_with(
     memo: &mut Memo,
     pid: u32,
     tick: u64,
     gate: impl Fn(u32) -> Option<TmuxClient>,
     tty_of: impl Fn(u32) -> Option<u32>,
-    fetch: impl Fn(&Path) -> Vec<(PathBuf, u32)>,
+    fetch: impl Fn(&Path) -> Vec<ClientRow>,
     rdev_of: impl Fn(&Path) -> Option<u32>,
     alive: impl Fn(u32) -> bool,
 ) -> u32 {
+    rooted_with(memo, pid, tick, gate, tty_of, fetch, rdev_of, alive).root
+}
+
+/// [`rooted`]'s body: [`effective_root_with`]'s seams, returning the client as well.
+#[allow(clippy::too_many_arguments)] // as `effective_root_with`
+fn rooted_with(
+    memo: &mut Memo,
+    pid: u32,
+    tick: u64,
+    gate: impl Fn(u32) -> Option<TmuxClient>,
+    tty_of: impl Fn(u32) -> Option<u32>,
+    fetch: impl Fn(&Path) -> Vec<ClientRow>,
+    rdev_of: impl Fn(&Path) -> Option<u32>,
+    alive: impl Fn(u32) -> bool,
+) -> Rooted {
+    let unrooted = Rooted {
+        root: pid,
+        attached: None,
+    };
     // Presence gate first: a tab with no tmux pays nothing beyond this — no spawn, no tty read.
     let Some(client) = gate(pid) else {
-        return pid;
+        return unrooted;
     };
     let Some(tty_dev) = tty_of(pid) else {
-        return pid;
+        return unrooted;
     };
 
     if memo.get(tick).is_none() {
         let rows = fetch(&client.exe);
         let resolved = resolve_rdevs(&rows, &rdev_of);
-        memo.put(tick, resolved);
+        memo.put_rows(tick, resolved, rows);
     }
     let Some(clients) = memo.get(tick) else {
-        return pid;
+        return unrooted;
     };
 
     match select_pane(clients, tty_dev) {
         // A resolved-but-dead pane is worse than no re-root: every downstream read would come
         // back absent and the tab card would go *blank*, where today it still shows the tab
         // shell's own branch and agent. One syscall buys that back.
-        Some(pane) if alive(pane) => pane,
-        _ => pid,
+        Some(pane) if alive(pane) => Rooted {
+            root: pane,
+            attached: memo.client_showing(tick, pane).map(|row| Attached {
+                client: row.clone(),
+                exe: client.exe,
+            }),
+        },
+        _ => unrooted,
     }
+}
+
+/// One `list-panes -a` against the default socket, on [`fetch_rows`]' terms: a non-zero exit
+/// (no server) or a failed spawn is no rows, which [`panes_of`] turns into an unsplit tab
+/// (session-flow-viewer D14, R6.7).
+fn fetch_panes(exe: &Path) -> Vec<PaneRow> {
+    // Bumped before the spawn, for `fetch_rows`' reason: a failed spawn must still count.
+    #[cfg(test)]
+    super::probe::TMUX_PANES.bump(1);
+
+    let out = match Command::new(exe)
+        .args(["list-panes", "-a", "-F", PANES_FORMAT])
+        .output()
+    {
+        Ok(out) => out,
+        Err(_) => return Vec::new(),
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    parse_panes(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The per-tick pane list — [`Memo`]'s shape and validity rule (tick **and** wall clock), one
+/// entry replaced wholesale, a failed fetch cached as empty (session-flow-viewer D9).
+pub(crate) struct PaneMemo {
+    entry: Option<PaneEntry>,
+}
+
+struct PaneEntry {
+    tick: u64,
+    fetched_at: Instant,
+    panes: Vec<PaneRow>,
+}
+
+impl PaneMemo {
+    pub(crate) fn new() -> PaneMemo {
+        PaneMemo { entry: None }
+    }
+
+    /// A memo already holding `panes` for `tick`, so a sibling module's test can drive the
+    /// pane pass without a tmux server (the fresh-memo path spawns nothing).
+    #[cfg(test)]
+    pub(crate) fn seeded(tick: u64, panes: Vec<PaneRow>) -> PaneMemo {
+        let mut memo = PaneMemo::new();
+        memo.put(tick, panes);
+        memo
+    }
+
+    fn get(&self, tick: u64) -> Option<&[PaneRow]> {
+        self.entry
+            .as_ref()
+            .filter(|e| e.tick == tick && e.fetched_at.elapsed() < TICK)
+            .map(|e| e.panes.as_slice())
+    }
+
+    fn put(&mut self, tick: u64, panes: Vec<PaneRow>) {
+        self.entry = Some(PaneEntry {
+            tick,
+            fetched_at: Instant::now(),
+            panes,
+        });
+    }
+}
+
+/// The panes of the window a tab's client shows ([`panes_of`]), listing the server at most once
+/// per tick. A tab with no client spawns nothing: the list is fetched only for a tab that
+/// [`rooted`] actually re-rooted.
+pub(crate) fn panes_for(
+    memo: &mut PaneMemo,
+    attached: Option<&Attached>,
+    tick: u64,
+) -> Vec<PaneRow> {
+    panes_for_with(memo, attached, tick, fetch_panes)
+}
+
+/// [`panes_for`] with its one spawn injected.
+fn panes_for_with(
+    memo: &mut PaneMemo,
+    attached: Option<&Attached>,
+    tick: u64,
+    fetch: impl Fn(&Path) -> Vec<PaneRow>,
+) -> Vec<PaneRow> {
+    let Some(attached) = attached else {
+        return Vec::new();
+    };
+    if memo.get(tick).is_none() {
+        memo.put(tick, fetch(&attached.exe));
+    }
+    panes_of(Some(&attached.client), memo.get(tick).unwrap_or_default())
 }
 
 /// The unmemoised form, for the event-driven consumer (the ai-monitor overlay's session hint),
@@ -407,12 +676,13 @@ mod tests {
     #[test]
     fn parse_clients_reads_one_row_per_client_in_order() {
         // R3.2 — the measured output shape, order preserved (D11 depends on it).
-        let got = parse_clients("/dev/ttys002 74877\n/dev/ttys004 38200\n");
+        // (session-flow-viewer D9 added the window column; the rows carry it.)
+        let got = parse_clients("/dev/ttys002 74877 main:0\n/dev/ttys004 38200 work:1\n");
         assert_eq!(
             got,
             vec![
-                (PathBuf::from("/dev/ttys002"), 74877),
-                (PathBuf::from("/dev/ttys004"), 38200),
+                row("/dev/ttys002", 74877, "main:0"),
+                row("/dev/ttys004", 38200, "work:1"),
             ]
         );
     }
@@ -421,14 +691,235 @@ mod tests {
     fn parse_clients_drops_bad_rows_individually() {
         // R3.3 — one unparseable client must not blind the tab to a valid one.
         let got = parse_clients(
-            "/dev/ttys002 74877\n\
+            "/dev/ttys002 74877 main:0\n\
              /dev/ttys003\n\
-             /dev/ttys004 notanumber\n\
+             /dev/ttys004 notanumber main:0\n\
              \n\
-             /dev/ttys005 0\n",
+             /dev/ttys005 0 main:0\n\
+             /dev/ttys006 4100\n",
         );
-        assert_eq!(got, vec![(PathBuf::from("/dev/ttys002"), 74877)]);
+        assert_eq!(got, vec![row("/dev/ttys002", 74877, "main:0")]);
         assert!(parse_clients("").is_empty());
+    }
+
+    /// A parsed client row, for the fixtures below.
+    fn row(tty: &str, pane_pid: u32, window: &str) -> ClientRow {
+        ClientRow {
+            tty: PathBuf::from(tty),
+            pane_pid,
+            window: window.to_string(),
+        }
+    }
+
+    // ---- pane enumeration (session-flow-viewer R6.1-R6.4, R6.7) ----
+
+    fn pane(window: &str, active: bool, pid: u32) -> PaneRow {
+        PaneRow {
+            window: window.to_string(),
+            active,
+            pid,
+        }
+    }
+
+    #[test]
+    fn parse_clients_keeps_a_session_name_with_spaces() {
+        let got = parse_clients("/dev/ttys004 4100 my work:1\n");
+        assert_eq!(got, vec![row("/dev/ttys004", 4100, "my work:1")]);
+    }
+
+    #[test]
+    fn parse_panes_reads_rows_and_skips_malformed_lines() {
+        let got = parse_panes(
+            "work:1 1 4100\nwork:1 0 4200\nmisc:0 1 5000\ngarbage\nwork:1 2 4300\nwork:1 0 0\n \
+             0 4400\nmy work:2 0 4500\n",
+        );
+        assert_eq!(
+            got,
+            vec![
+                pane("work:1", true, 4100),
+                pane("work:1", false, 4200),
+                pane("misc:0", true, 5000),
+                pane("my work:2", false, 4500),
+            ]
+        );
+        assert!(parse_panes("").is_empty());
+    }
+
+    #[test]
+    fn panes_of_marks_the_clients_pane_active_whatever_tmux_said() {
+        let client = row("/dev/ttys004", 4100, "work:1");
+        // tmux claims 4200 is active; the client's pid wins.
+        let panes = [
+            pane("work:1", false, 4100),
+            pane("work:1", true, 4200),
+            pane("misc:0", true, 5000),
+        ];
+        let got = panes_of(Some(&client), &panes);
+        assert_eq!(
+            got,
+            vec![pane("work:1", true, 4100), pane("work:1", false, 4200)]
+        );
+        // No pane is the client's → empty, not a guess.
+        let stale = row("/dev/ttys004", 9999, "work:1");
+        assert!(panes_of(Some(&stale), &panes).is_empty());
+    }
+
+    #[test]
+    fn panes_of_is_empty_for_one_pane_no_client_or_no_panes() {
+        let client = row("/dev/ttys004", 4100, "work:1");
+        assert!(panes_of(Some(&client), &[pane("work:1", true, 4100)]).is_empty());
+        assert!(panes_of(
+            None,
+            &[pane("work:1", true, 4100), pane("work:1", false, 1)]
+        )
+        .is_empty());
+        assert!(panes_of(Some(&client), &[]).is_empty());
+    }
+
+    #[test]
+    fn panes_of_caps_at_max_panes_keeping_the_active_one() {
+        // Ten panes with the client's last: the first seven others plus it.
+        let panes: Vec<PaneRow> = (1..=10).map(|i| pane("w:0", false, i)).collect();
+        let client = row("/dev/ttys004", 10, "w:0");
+        let got = panes_of(Some(&client), &panes);
+        assert_eq!(got.len(), MAX_PANES);
+        assert_eq!(
+            got.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6, 7, 10]
+        );
+        assert_eq!(got.iter().filter(|p| p.active).count(), 1);
+        // The active one first: it and the next seven.
+        let first = row("/dev/ttys004", 1, "w:0");
+        let got = panes_of(Some(&first), &panes);
+        assert_eq!(
+            got.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            (1..=8).collect::<Vec<_>>()
+        );
+        // Exactly MAX_PANES panes are all kept.
+        let eight: Vec<PaneRow> = (1..=8).map(|i| pane("w:0", false, i)).collect();
+        assert_eq!(panes_of(Some(&first), &eight).len(), MAX_PANES);
+    }
+
+    #[test]
+    fn panes_for_lists_once_per_tick_and_never_without_a_client() {
+        let fetches = RefCell::new(0usize);
+        let fetch = |_: &Path| {
+            *fetches.borrow_mut() += 1;
+            parse_panes("work:1 1 4100\nwork:1 0 4200\n")
+        };
+        let attached = Attached {
+            client: row("/dev/ttys004", 4100, "work:1"),
+            exe: PathBuf::from("/opt/homebrew/bin/tmux"),
+        };
+        let mut memo = PaneMemo::new();
+        assert!(panes_for_with(&mut memo, None, 3, fetch).is_empty());
+        assert_eq!(*fetches.borrow(), 0, "no client -> no spawn");
+        for _ in 0..5 {
+            assert_eq!(
+                panes_for_with(&mut memo, Some(&attached), 3, fetch).len(),
+                2
+            );
+        }
+        assert_eq!(*fetches.borrow(), 1, "one list-panes per tick");
+        panes_for_with(&mut memo, Some(&attached), 4, fetch);
+        assert_eq!(*fetches.borrow(), 2, "a new tick refetches");
+        // A failed fetch is cached as empty and degrades to unsplit.
+        let mut failed = PaneMemo::new();
+        let empty = |_: &Path| {
+            *fetches.borrow_mut() += 1;
+            Vec::new()
+        };
+        assert!(panes_for_with(&mut failed, Some(&attached), 9, empty).is_empty());
+        assert!(panes_for_with(&mut failed, Some(&attached), 9, empty).is_empty());
+        assert_eq!(*fetches.borrow(), 3, "the failure was cached");
+    }
+
+    /// A shell script standing in for `tmux`: prints `stdout` and exits with `code`, so the
+    /// exit-status check in the fetchers is exercised with real process output.
+    fn fake_tmux(tag: &str, stdout: &str, code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = std::env::temp_dir().join(format!("fake-tmux-{}-{tag}", std::process::id()));
+        std::fs::write(&p, format!("#!/bin/sh\nprintf '{stdout}'\nexit {code}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_non_zero_exit_discards_whatever_tmux_printed() {
+        // The exit status, not the output, decides (D9): a server that prints rows and then
+        // fails must not be trusted, and a clean exit with the same rows must be.
+        let _g = super::super::probe::serial();
+        let panes = "work:1 1 4100\\n";
+        let ok = fake_tmux("panes-ok", panes, 0);
+        let bad = fake_tmux("panes-bad", panes, 1);
+        assert_eq!(fetch_panes(&ok).len(), 1);
+        assert!(fetch_panes(&bad).is_empty());
+        let clients = "/dev/ttys004 4100 work:1\\n";
+        let ok = fake_tmux("clients-ok", clients, 0);
+        let bad = fake_tmux("clients-bad", clients, 1);
+        assert_eq!(fetch_rows(&ok).len(), 1);
+        assert!(fetch_rows(&bad).is_empty());
+        for tag in ["panes-ok", "panes-bad", "clients-ok", "clients-bad"] {
+            let _ = std::fs::remove_file(
+                std::env::temp_dir().join(format!("fake-tmux-{}-{tag}", std::process::id())),
+            );
+        }
+    }
+
+    #[test]
+    fn panes_for_serves_a_fresh_memo_without_spawning() {
+        // The production entry point, not the injected one: a list already fetched this tick
+        // is the answer, so even a bogus binary path spawns nothing and the window's panes
+        // come back (D9's one `list-panes` per tick).
+        let attached = Attached {
+            client: row("/dev/ttys004", 4100, "work:1"),
+            exe: PathBuf::from("/definitely/not/a/tmux/binary"),
+        };
+        let mut memo = PaneMemo::new();
+        memo.put(7, parse_panes("work:1 1 4100\nwork:1 0 4200\n"));
+        let got = panes_for(&mut memo, Some(&attached), 7);
+        assert_eq!(got.iter().map(|p| p.pid).collect::<Vec<_>>(), [4100, 4200]);
+    }
+
+    #[test]
+    fn a_failed_list_panes_spawn_is_no_rows_and_still_counts() {
+        let _g = super::super::probe::serial();
+        super::super::probe::reset_all();
+        assert!(fetch_panes(Path::new("/definitely/not/a/tmux/binary")).is_empty());
+        assert_eq!(super::super::probe::TMUX_PANES.get(), 1);
+    }
+
+    #[test]
+    fn rooted_carries_the_client_it_re_rooted_through() {
+        let mut memo = Memo::new();
+        let got = rooted_with(
+            &mut memo,
+            1,
+            0,
+            tmux_gate(),
+            |_| Some(TAB_DEV),
+            two_clients,
+            fake_rdev,
+            |_| true,
+        );
+        assert_eq!(got.root, 74877);
+        let attached = got.attached.expect("re-rooted -> attached");
+        assert_eq!(attached.client, row("/dev/ttys002", 74877, "main:0"));
+        assert_eq!(attached.exe, PathBuf::from("/opt/homebrew/bin/tmux"));
+        // Not re-rooted (dead pane) → no client.
+        let mut memo = Memo::new();
+        let got = rooted_with(
+            &mut memo,
+            1,
+            0,
+            tmux_gate(),
+            |_| Some(TAB_DEV),
+            two_clients,
+            fake_rdev,
+            |_| false,
+        );
+        assert_eq!(got.root, 1);
+        assert!(got.attached.is_none());
     }
 
     // ---- device resolution + selection (R4.1-R4.6) ----
@@ -441,7 +932,7 @@ mod tests {
     fn resolve_rdevs_maps_each_tty_once() {
         // R4.1
         let table = HashMap::from([("/dev/ttys002", 0x1000_0002u32)]);
-        let rows = vec![(PathBuf::from("/dev/ttys002"), 74877)];
+        let rows = vec![row("/dev/ttys002", 74877, "main:0")];
         assert_eq!(
             resolve_rdevs(&rows, devs(&table)),
             vec![(0x1000_0002, 74877)]
@@ -453,8 +944,8 @@ mod tests {
         // R4.2 — an absent tty is dropped, not fatal.
         let table = HashMap::from([("/dev/ttys004", 0x1000_0004u32)]);
         let rows = vec![
-            (PathBuf::from("/dev/ttys002"), 74877),
-            (PathBuf::from("/dev/ttys004"), 38200),
+            row("/dev/ttys002", 74877, "main:0"),
+            row("/dev/ttys004", 38200, "main:0"),
         ];
         assert_eq!(
             resolve_rdevs(&rows, devs(&table)),
@@ -664,8 +1155,8 @@ mod tests {
         }
     }
     const TAB_DEV: u32 = 0x1000_0002;
-    fn two_clients(_: &Path) -> Vec<(PathBuf, u32)> {
-        parse_clients("/dev/ttys002 74877\n/dev/ttys004 38200\n")
+    fn two_clients(_: &Path) -> Vec<ClientRow> {
+        parse_clients("/dev/ttys002 74877 main:0\n/dev/ttys004 38200 work:1\n")
     }
     fn fake_rdev(p: &Path) -> Option<u32> {
         match p.to_string_lossy().as_ref() {
@@ -851,8 +1342,8 @@ mod tests {
         // R5.2 / R5.6 — the map is cached, never the resolved root, so switching tmux windows
         // moves the card on the very next tick.
         let mut memo = Memo::new();
-        let pane_a = |_: &Path| parse_clients("/dev/ttys002 74877\n");
-        let pane_b = |_: &Path| parse_clients("/dev/ttys002 99999\n");
+        let pane_a = |_: &Path| parse_clients("/dev/ttys002 74877 main:0\n");
+        let pane_b = |_: &Path| parse_clients("/dev/ttys002 99999 main:1\n");
         let first = effective_root_with(
             &mut memo,
             1,
@@ -887,7 +1378,7 @@ mod tests {
         assert!(is_tmux(&client.exe));
 
         // Two attached clients, as measured on a real machine — one belongs to this tab.
-        let rows = parse_clients("/dev/ttys002 74877\n/dev/ttys004 38200\n");
+        let rows = parse_clients("/dev/ttys002 74877 main:0\n/dev/ttys004 38200 work:1\n");
         let table = HashMap::from([
             ("/dev/ttys002", 0x1000_0002u32),
             ("/dev/ttys004", 0x1000_0004u32),

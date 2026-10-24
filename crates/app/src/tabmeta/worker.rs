@@ -19,9 +19,12 @@ use std::time::{Duration, SystemTime};
 use crate::session::TabId;
 
 use super::activity::ActivityMemo;
-use super::git::Memo as GitMemo;
-use super::tmux::Memo as TmuxMemo;
-use super::{Agent, AgentKind, AgentState, Cmd, TabMeta, TabMetaShared, TabPid};
+use super::git::{Memo as GitMemo, RepoId, RepoMemo};
+use super::tmux::{Memo as TmuxMemo, PaneMemo};
+use super::{
+    Agent, AgentKind, AgentState, Cmd, GraphPublish, PaneMeta, PanePass, TabMeta, TabMetaShared,
+    TabPid,
+};
 
 /// The base cadence. Active tabs refresh every tick (500 ms); background tabs every
 /// `BG_INTERVAL`th tick (2 s), striped by tab slot so they never burst (D4).
@@ -37,6 +40,57 @@ fn should_refresh(is_active: bool, tick_index: u64, tab_slot: usize) -> bool {
     is_active || (tick_index % BG_INTERVAL == tab_slot as u64 % BG_INTERVAL)
 }
 
+/// Whether a tab's panes and repository identity are derived on this pass (session-flow-viewer
+/// D9, R6.6, as `pane_pass`; session-flow-graph D10).
+///
+/// `wanted` is the flow graph's switch ([`super::TabMetaHandle::set_graph_wanted`]); while it is
+/// off nothing graph-related runs, which is the graph-closed-costs-nothing constraint (G1).
+/// `just_enabled` is the pass right after the switch turned on: it derives every tab whatever
+/// its slot, so split tabs and groups appear within one tick of opening rather than after a
+/// background stripe. Otherwise they ride the tab's ordinary schedule (`due`,
+/// [`should_refresh`]).
+pub fn graph_pass(wanted: bool, just_enabled: bool, due: bool) -> PanePass {
+    if wanted && (just_enabled || due) {
+        PanePass::Derive
+    } else {
+        PanePass::Skip
+    }
+}
+
+/// The graph readiness and clearing a publish carries (session-flow-graph D10, R4.7).
+///
+/// `full_pass_done` is "this publish's pass derived every tab" — the off→on edge's
+/// stagger-free pass. Readiness is set by exactly that, kept by every ordinary pass while the
+/// graph stays wanted, and dropped with every published identity the moment it is not, so a
+/// reopen starts from `ready: false` rather than from the previous open's groups.
+pub fn publish_graph_state(wanted: bool, full_pass_done: bool, prev_ready: bool) -> GraphPublish {
+    GraphPublish {
+        ready: wanted && (full_pass_done || prev_ready),
+        clear: !wanted,
+    }
+}
+
+/// `published` with every tab's `panes`, `repo`, `graph_agent` and `graph_task` emptied —
+/// the on→off edge of the graph's switch. Pure and syscall-free, so closing the graph
+/// clears it without deriving anything.
+fn strip_graph(published: &[(TabId, TabMeta)]) -> Vec<(TabId, TabMeta)> {
+    published
+        .iter()
+        .map(|(id, m)| {
+            (
+                *id,
+                TabMeta {
+                    panes: Vec::new(),
+                    repo: None,
+                    graph_agent: None,
+                    graph_task: None,
+                    ..m.clone()
+                },
+            )
+        })
+        .collect()
+}
+
 /// Owns the per-tick derivation state: the two cwd-keyed memos (D9/D7), the resolved
 /// Claude projects root, the display toggles (D12), and the once-per-transition log guard
 /// for R6.5. Extracted from the thread body so a derivation pass is unit-testable without
@@ -47,6 +101,16 @@ struct Deriver {
     /// The per-tick tmux client→pane map. The third memo of the same kind, so its lifetime is
     /// the worker's and it needs no plumbing through `pass()` or `run()`.
     tmux_memo: TmuxMemo,
+    /// The per-tick `list-panes -a` (session-flow-viewer D9) — touched only while
+    /// `graph_wanted`.
+    pane_memo: PaneMemo,
+    /// The cwd-keyed repository memo (session-flow-graph D10) — touched only while
+    /// `graph_wanted`.
+    repo_memo: RepoMemo,
+    /// The flow graph's switch, and the one-pass flag its off→on edge raises ([`graph_pass`]).
+    /// Both default off, so a worker nobody asked for the graph behaves exactly as before.
+    graph_wanted: bool,
+    graph_just_enabled: bool,
     projects_root: Option<PathBuf>,
     /// `~/.claude/sessions` — where `claude` records which session each pid is running.
     /// Held beside `projects_root` and threaded into resolution rather than read from
@@ -70,6 +134,12 @@ struct Deriver {
     agent_of: fn(u32) -> Option<super::agent::Detected>,
     cwd_of: fn(u32) -> Option<PathBuf>,
     start_ms_of: fn(u32) -> Option<u64>,
+    /// The tmux re-root ([`super::tmux::rooted`]), injected on the same terms as the three
+    /// reads above. Its presence gate reads the live process tree, so without this seam no
+    /// test can put a tab behind a tmux pane, and the branches that only exist for a re-rooted
+    /// tab — the dead-pane retry from the tab's own shell, the pane pass — had no coverage
+    /// (cargo mutants: both survived).
+    rooted_of: fn(&mut TmuxMemo, u32, u64) -> super::tmux::Rooted,
     /// Antigravity's per-pid resolution and tail (agent-card-status D11), and where they
     /// read from — injected on the same terms as the three reads above, so a test drives an
     /// Antigravity tab over a temp tree and never the real `~/.gemini`.
@@ -83,6 +153,10 @@ impl Deriver {
             git_memo: GitMemo::new(),
             act_memo: ActivityMemo::new(),
             tmux_memo: TmuxMemo::new(),
+            pane_memo: PaneMemo::new(),
+            repo_memo: RepoMemo::new(),
+            graph_wanted: false,
+            graph_just_enabled: false,
             projects_root: ai_monitor::claude_projects_dir(),
             sessions_root: ai_monitor::claude_sessions_dir(),
             debug_seen: HashMap::new(),
@@ -91,6 +165,7 @@ impl Deriver {
             agent_of: super::agent::agent_of_pid,
             cwd_of: super::proc::cwd_of_pid,
             start_ms_of: super::proc::start_ms_of_pid,
+            rooted_of: super::tmux::rooted,
             antigravity_memo: super::antigravity::Memo::default(),
             antigravity: super::antigravity::Sources::real(),
         }
@@ -99,7 +174,23 @@ impl Deriver {
     /// Derive one tab. cwd is resolved once and shared by the git and activity paths (D10)
     /// **and published on `TabMeta`** (tmux-pane-cwd R1.1). The git and agent sources are each
     /// skipped when their toggle is off (R1.8); the root and cwd never are (D13).
+    ///
+    /// This entry point is an explicit refresh — a tab switch, a test — so it counts as `due`
+    /// for the graph decision: panes and identity are derived iff the graph is wanted.
     fn tab(&mut self, tp: &TabPid, tick: u64, now: SystemTime, is_active: bool) -> TabMeta {
+        let graph = graph_pass(self.graph_wanted, false, true);
+        self.tab_with(tp, tick, now, is_active, graph)
+    }
+
+    /// [`Deriver::tab`] with the graph decision given, as [`Deriver::pass`] computes it.
+    fn tab_with(
+        &mut self,
+        tp: &TabPid,
+        tick: u64,
+        now: SystemTime,
+        is_active: bool,
+        graph: PanePass,
+    ) -> TabMeta {
         // Re-root at the tmux pane when this tab runs a client. Absent tmux this is `tp.pid`,
         // so every downstream read is byte-identical to today.
         //
@@ -111,14 +202,22 @@ impl Deriver {
         // preferences* silently restore the wrong-directory bug this feature exists to fix —
         // with nothing on screen connecting cause to effect. The toggles still skip the
         // expensive work (`.git` I/O, the agent walk); they no longer skip a `proc_pidinfo`.
-        let root = super::tmux::effective_root(&mut self.tmux_memo, tp.pid, tick);
+        //
+        // `rooted` is `effective_root` keeping the client it re-rooted through, which the pane
+        // pass below needs (session-flow-viewer D9); `root` is computed by the same body.
+        let rooted = (self.rooted_of)(&mut self.tmux_memo, tp.pid, tick);
+        let (root, mut attached) = (rooted.root, rooted.attached);
         let (root, cwd) = match (self.cwd_of)(root) {
             Some(c) => (root, Some(c)),
             // The pane died between `effective_root`'s liveness check and here: retry from
             // the tab's own shell so the card degrades to today's metadata rather than
             // going blank. The rebound `root` also redirects `agent_of_pid` below, so
             // branch and agent never describe different processes.
-            None if root != tp.pid => (tp.pid, (self.cwd_of)(tp.pid)),
+            None if root != tp.pid => {
+                // No longer rooted at a pane, so there is no client window to enumerate.
+                attached = None;
+                (tp.pid, (self.cwd_of)(tp.pid))
+            }
             None => (tp.pid, None),
         };
 
@@ -150,7 +249,15 @@ impl Deriver {
         // The panel only ever asks about the **active** tab, so that is the whole requirement:
         // with the toggle off the added cost is one walk per tick for one tab, not one per tab.
         // Everything else stays exactly as gated as today.
-        let detected = (self.enabled_agent || is_active)
+        //
+        // The session graph is the third gate (session-flow-graph, user decision 2026-10-22):
+        // it ignores the toggle, so on a pass that derives the graph every tab is walked and
+        // classified as if the toggle were on — the same work a non-active pane already gets
+        // ([`Deriver::pane`]). Its result reaches the graph through `graph_agent` only; what the
+        // card reads (`agent`, `task`) stays behind the toggle. On a `Skip` pass — every pass
+        // while the graph is closed — this is exactly the gate above.
+        let graph_derive = graph == PanePass::Derive;
+        let detected = (self.enabled_agent || is_active || graph_derive)
             .then(|| (self.agent_of)(root))
             .flatten();
         // D9 — scoped to the kind the panel tracks. Already true today (`ClaudeId` is built
@@ -161,11 +268,11 @@ impl Deriver {
             (kind == AgentKind::Claude).then_some(pid)
         });
 
-        let (agent, task) = match detected {
-            // `agent`, `task` — and `activity`'s log reads — stay behind their existing toggle.
-            // Turning the display off still stops the `.git` I/O and the log reads; only the
-            // walk itself, and only for the active tab, is now unconditional.
-            Some(super::agent::Detected { kind, pid }) if self.enabled_agent => {
+        let (classified, label, log) = match detected {
+            // `agent`, `task` — and `activity`'s log reads — stay behind their existing toggle
+            // while the graph is closed. Turning the display off still stops the `.git` I/O and
+            // the log reads; only the walk itself, and only for the active tab, is unconditional.
+            Some(super::agent::Detected { kind, pid }) if self.enabled_agent || graph_derive => {
                 // The tab's own agent process, paired with its start time — the identity
                 // that lets resolution name this tab's session instead of ranking the
                 // project directory. One `proc_pidinfo` on a pid the walk just touched; it
@@ -185,10 +292,39 @@ impl Deriver {
                     pid,
                     start_ms: (self.start_ms_of)(pid),
                 });
-                let (state, task) = self.activity(kind, pid, cwd.as_deref(), claude, tick, now);
-                (Some(Agent { kind, state }), task)
+                let (state, task, log) =
+                    self.activity(kind, pid, cwd.as_deref(), claude, tick, now);
+                (Some(Agent { kind, state }), task, log)
             }
-            _ => (None, None),
+            _ => (None, None, None),
+        };
+        // The card's fields keep the toggle; the graph's copies do not. `log` is read by the
+        // graph alone (its subagent source), so it needs no split.
+        let agent = classified.filter(|_| self.enabled_agent);
+        let task = label.clone().filter(|_| self.enabled_agent);
+        let graph_agent = classified.filter(|_| graph_derive);
+        let graph_task = label.filter(|_| graph_derive);
+
+        let (panes, repo) = match graph {
+            PanePass::Derive => {
+                // R14.5 — the walk's pid of **any** detected kind, not `agent_pid`: that one
+                // stays Claude-only (D9 above), while every detected agent is a graph session
+                // and so needs its repository. Still nothing while the graph is closed.
+                let repo = detected.and_then(|super::agent::Detected { pid, .. }| {
+                    self.session_repo(pid, cwd.as_deref(), tick)
+                });
+                let tab = PaneMeta {
+                    pane_pid: 0,
+                    active: true,
+                    agent: graph_agent,
+                    log: log.clone(),
+                    cwd: cwd.clone(),
+                    branch: branch.clone(),
+                    repo: repo.clone(),
+                };
+                (self.panes(attached.as_ref(), tick, now, &tab), repo)
+            }
+            PanePass::Skip => (Vec::new(), None),
         };
 
         TabMeta {
@@ -197,6 +333,103 @@ impl Deriver {
             task,
             cwd,
             agent_pid,
+            panes,
+            log,
+            repo,
+            graph_agent,
+            graph_task,
+        }
+    }
+
+    /// The repository of the agent session at `agent_pid`, of any kind (session-flow-graph
+    /// D10, R14.5): resolved
+    /// from that process's own cwd, falling back to `shell_cwd` when it cannot be read (the
+    /// process exited between the walk and here).
+    fn session_repo(
+        &mut self,
+        agent_pid: u32,
+        shell_cwd: Option<&Path>,
+        tick: u64,
+    ) -> Option<RepoId> {
+        let cwd = (self.cwd_of)(agent_pid).or_else(|| shell_cwd.map(Path::to_path_buf))?;
+        super::git::repo_of_cwd(&mut self.repo_memo, &cwd, tick)
+    }
+
+    /// The tab's panes (session-flow-viewer D9): the client window's panes from
+    /// [`super::tmux::panes_for`], the active one carrying the tab's own derivation (`tab`'s
+    /// fields under the row's pid) and every other one derived by [`Deriver::pane`]. Empty for a
+    /// tab with no client, which spawns nothing.
+    fn panes(
+        &mut self,
+        attached: Option<&super::tmux::Attached>,
+        tick: u64,
+        now: SystemTime,
+        tab: &PaneMeta,
+    ) -> Vec<PaneMeta> {
+        super::tmux::panes_for(&mut self.pane_memo, attached, tick)
+            .into_iter()
+            .map(|row| {
+                if row.active {
+                    PaneMeta {
+                        pane_pid: row.pid,
+                        active: true,
+                        agent: tab.agent,
+                        log: tab.log.clone(),
+                        cwd: tab.cwd.clone(),
+                        branch: tab.branch.clone(),
+                        repo: tab.repo.clone(),
+                    }
+                } else {
+                    self.pane(row.pid, tick, now)
+                }
+            })
+            .collect()
+    }
+
+    /// One non-active pane, through the tab's own chain: `agent_of_pid` on the pane's shell,
+    /// then [`Deriver::activity`] (`resolve_log` → `state_of_found` for Claude) against that
+    /// shell's cwd.
+    ///
+    /// **Not behind `enabled_agent`.** That toggle is the sidebar card's display preference; a
+    /// non-active pane is never on the card, and this runs only while the session graph is open
+    /// and has asked for it — the graph being open is the gate (G1). The cwd is read only once
+    /// an agent is found, so a plain shell pane costs one walk.
+    ///
+    /// The pane's `cwd` and `branch` are its **shell**'s, for the card's folder and branch lines;
+    /// its `repo` is its agent's (any kind, R14.5), by the tab's rule ([`Deriver::session_repo`]).
+    fn pane(&mut self, pid: u32, tick: u64, now: SystemTime) -> PaneMeta {
+        let Some(super::agent::Detected { kind, pid: apid }) = (self.agent_of)(pid) else {
+            return PaneMeta {
+                pane_pid: pid,
+                active: false,
+                agent: None,
+                log: None,
+                cwd: None,
+                branch: None,
+                repo: None,
+            };
+        };
+        let cwd = (self.cwd_of)(pid);
+        let claude = (kind == AgentKind::Claude).then(|| super::ClaudeId {
+            pid: apid,
+            start_ms: (self.start_ms_of)(apid),
+        });
+        let (state, _task, log) = self.activity(kind, apid, cwd.as_deref(), claude, tick, now);
+        let branch = if self.enabled_git {
+            cwd.as_deref()
+                .and_then(|c| super::git::branch_of_cwd(&mut self.git_memo, c, tick))
+        } else {
+            None
+        };
+        let repo = self.session_repo(apid, cwd.as_deref(), tick);
+        PaneMeta {
+            pane_pid: pid,
+            active: false,
+            agent: Some(Agent { kind, state }),
+            log,
+            cwd,
+            branch,
+            repo,
         }
     }
 
@@ -216,7 +449,9 @@ impl Deriver {
         claude: Option<super::ClaudeId>,
         tick: u64,
         now: SystemTime,
-    ) -> (AgentState, Option<String>) {
+    ) -> (AgentState, Option<String>, Option<PathBuf>) {
+        // The third value is the resolved `Found.log`, published as `TabMeta.log`
+        // (session-flow-viewer D9) — the same file the state was classified from.
         // agent-card-status D11 — the walk's own `agy` pid, which names its transcript
         // through the lock it holds. Not the published `agent_pid`: that stays Claude-only
         // (D9 above), and widening it would re-point the panel on every tick. No label: the
@@ -229,10 +464,10 @@ impl Deriver {
                 tick,
                 now,
             );
-            return (state, None);
+            return (state, None, None);
         }
         if kind != AgentKind::Claude {
-            return (AgentState::Unknown, None);
+            return (AgentState::Unknown, None, None);
         }
         // Destructured once, rather than `self.projects_root.clone()` twice inside the
         // pattern: the clones existed only to end the `&self` borrow before `&mut
@@ -245,10 +480,10 @@ impl Deriver {
             ..
         } = self
         else {
-            return (AgentState::Unknown, None);
+            return (AgentState::Unknown, None, None);
         };
         let Some(cwd) = cwd else {
-            return (AgentState::Unknown, None);
+            return (AgentState::Unknown, None, None);
         };
         match super::activity::resolve_log(act_memo, projects, sessions, cwd, claude, tick) {
             super::activity::Resolution::Found(found) => {
@@ -256,12 +491,12 @@ impl Deriver {
                 // A pure memo read: `state_of_found` just warmed the entry for this exact
                 // log, so the label costs no further I/O (R4.2).
                 let label = super::activity::label_of_log(act_memo, &found.log);
-                (state, label)
+                (state, label, Some(found.log))
             }
             // The session is named and has written nothing yet: an agent is here, but there
             // is no task to show. Never a neighbour's log.
             super::activity::Resolution::NamedButUnwritten | super::activity::Resolution::None => {
-                (AgentState::Unknown, None)
+                (AgentState::Unknown, None, None)
             }
         }
     }
@@ -277,10 +512,17 @@ impl Deriver {
         prev: &[(TabId, TabMeta)],
     ) -> Vec<(TabId, TabMeta)> {
         let mut next = Vec::with_capacity(roster.len());
+        // Consumed by this pass, whatever the roster holds: the off→on edge buys exactly one
+        // stagger-free pass (session-flow-viewer D9).
+        let just_enabled = std::mem::take(&mut self.graph_just_enabled);
         for (slot, tp) in roster.iter().enumerate() {
             let is_active = active == Some(tp.id);
-            let meta = if should_refresh(is_active, tick, slot) {
-                self.tab(tp, tick, now, is_active)
+            let due = should_refresh(is_active, tick, slot);
+            let graph = graph_pass(self.graph_wanted, just_enabled, due);
+            // A not-due tab is re-derived whole when its panes are owed: a pane list beside a
+            // stale tab-level `agent` could name a different active pane than the card.
+            let meta = if due || graph == PanePass::Derive {
+                self.tab_with(tp, tick, now, is_active, graph)
             } else {
                 prev.iter()
                     .find(|(id, _)| *id == tp.id)
@@ -291,6 +533,41 @@ impl Deriver {
             next.push((tp.id, meta));
         }
         next
+    }
+
+    /// The graph switch's edge (session-flow-viewer D9/R6.6, session-flow-graph D10/R4.7): the
+    /// next publication and readiness, or `None` when `wanted` did not move the switch.
+    ///
+    /// Off→on raises the one-pass flag and runs the stagger-free pass over **every** tab now —
+    /// the full pass that sets readiness. On→off derives nothing: it only clears what was
+    /// published, readiness included. Both go through [`publish_graph_state`].
+    #[allow(clippy::too_many_arguments)] // `pass`'s inputs plus the readiness it updates
+    fn graph_edge(
+        &mut self,
+        wanted: bool,
+        roster: &[TabPid],
+        active: Option<TabId>,
+        tick: u64,
+        now: SystemTime,
+        published: &[(TabId, TabMeta)],
+        prev_ready: bool,
+    ) -> Option<(Vec<(TabId, TabMeta)>, bool)> {
+        if std::mem::replace(&mut self.graph_wanted, wanted) == wanted {
+            return None;
+        }
+        let next = if wanted {
+            self.graph_just_enabled = true;
+            self.pass(roster, active, tick, now, published)
+        } else {
+            published.to_vec()
+        };
+        let state = publish_graph_state(wanted, wanted, prev_ready);
+        let next = if state.clear {
+            strip_graph(&next)
+        } else {
+            next
+        };
+        Some((next, state.ready))
     }
 
     /// R6.5: emit one `debug!` per `(TabId, AgentKind)` transition when a *detected* agent
@@ -328,6 +605,14 @@ pub(crate) fn run(shared: Arc<TabMetaShared>, rx: Receiver<Cmd>, wake: impl Fn()
     // on arm, cleared on fire or disarm. A local rather than shared state: it is read and
     // written only here, on this thread, so it needs neither a lock nor an atomic.
     let mut panel_deadline: Option<u64> = None;
+    // The graph readiness last published (session-flow-graph D10). Run-local for the same
+    // reason as the deadline; every publish carries it, so a flip alone still bumps the
+    // generation.
+    let mut graph_ready = false;
+    // The open that readiness belongs to (D10): adopted from every `wanted: true` command and
+    // published beside `graph_ready`, so a reopen can tell this open's readiness from the
+    // last one's.
+    let mut graph_epoch = 0;
 
     loop {
         // Empty roster → block with no timeout: zero wakeups, zero syscalls until a
@@ -354,7 +639,13 @@ pub(crate) fn run(shared: Arc<TabMetaShared>, rx: Receiver<Cmd>, wake: impl Fn()
                         let meta = deriver.tab(&tp, tick_index, SystemTime::now(), true);
                         deriver.note_activity_gap(id, &meta);
                         let next = upsert_meta(&published, id, meta);
-                        publish_if_changed(&shared, &mut published, next, &wake);
+                        publish_if_changed(
+                            &shared,
+                            &mut published,
+                            next,
+                            (graph_ready, graph_epoch),
+                            &wake,
+                        );
                     }
                 }
             }
@@ -364,13 +655,55 @@ pub(crate) fn run(shared: Arc<TabMetaShared>, rx: Receiver<Cmd>, wake: impl Fn()
                 // Recompute now so a disabled source's field clears on this publish and
                 // its work stops from here on (R1.8).
                 let next = deriver.pass(&roster, active, tick_index, SystemTime::now(), &published);
-                publish_if_changed(&shared, &mut published, next, &wake);
+                publish_if_changed(
+                    &shared,
+                    &mut published,
+                    next,
+                    (graph_ready, graph_epoch),
+                    &wake,
+                );
             }
             Ok(Cmd::SetPanelDeadline(at)) => panel_deadline = at,
+            Ok(Cmd::SetGraphWanted { wanted, epoch }) => {
+                let edge = deriver.graph_edge(
+                    wanted,
+                    &roster,
+                    active,
+                    tick_index,
+                    SystemTime::now(),
+                    &published,
+                    graph_ready,
+                );
+                // Every `true` names the open asking, edge or not: a repeat with a new epoch
+                // is an open whose readiness is already true, and it must still be told so.
+                if wanted {
+                    graph_epoch = epoch;
+                }
+                let next = match edge {
+                    Some((next, ready)) => {
+                        graph_ready = ready;
+                        next
+                    }
+                    None => published.clone(),
+                };
+                publish_if_changed(
+                    &shared,
+                    &mut published,
+                    next,
+                    (graph_ready, graph_epoch),
+                    &wake,
+                );
+            }
             Err(RecvTimeoutError::Timeout) => {
                 tick_index = tick_index.wrapping_add(1);
                 let next = deriver.pass(&roster, active, tick_index, SystemTime::now(), &published);
-                publish_if_changed(&shared, &mut published, next, &wake);
+                publish_if_changed(
+                    &shared,
+                    &mut published,
+                    next,
+                    (graph_ready, graph_epoch),
+                    &wake,
+                );
             }
             Err(RecvTimeoutError::Disconnected) => break, // handle dropped → shut down
         }
@@ -482,13 +815,25 @@ fn epoch_ms() -> u64 {
 /// 2 Hz re-clone it warns about is still impossible. The difference is pinned by
 /// `tests::r3_1_a_passed_deadline_produces_exactly_one_wake`, because a source scan cannot see
 /// the difference between one wake and one wake per tick.
+///
+/// `graph_ready` (session-flow-graph D10) is part of what "changed" means: a readiness flip
+/// with every `TabMeta` unchanged — the graph opened over tabs with nothing to resolve — must
+/// still reach the UI, or it would read `resolving…` until some unrelated field moved. The
+/// worker is its only writer, so reading it back here is reading the last publish. `graph`
+/// is `(graph_ready, graph_epoch)`: the epoch names the open that readiness belongs to, and
+/// an epoch change alone publishes for the same reason a readiness flip does.
 fn publish_if_changed(
     shared: &TabMetaShared,
     published: &mut Vec<(TabId, TabMeta)>,
     next: Vec<(TabId, TabMeta)>,
+    graph: (bool, u64),
     wake: &(impl Fn() + Send + 'static),
 ) {
-    if next == *published {
+    let (graph_ready, graph_epoch) = graph;
+    if next == *published
+        && graph_ready == shared.graph_ready.load(Ordering::Acquire)
+        && graph_epoch == shared.graph_epoch.load(Ordering::Acquire)
+    {
         return;
     }
     *published = next.clone();
@@ -499,6 +844,9 @@ fn publish_if_changed(
         };
         *guard = next;
     }
+    // Before the bump: a reader that `Acquire`s the new generation sees this value.
+    shared.graph_ready.store(graph_ready, Ordering::Release);
+    shared.graph_epoch.store(graph_epoch, Ordering::Release);
     shared.generation.fetch_add(1, Ordering::Release);
     wake();
 }
@@ -513,6 +861,9 @@ mod tests {
         Arc::new(TabMetaShared {
             generation: AtomicU64::new(0),
             tabs: Mutex::new(Vec::new()),
+            graph_ready: std::sync::atomic::AtomicBool::new(false),
+            graph_epoch: AtomicU64::new(0),
+            graph_opens: AtomicU64::new(0),
         })
     }
 
@@ -537,14 +888,19 @@ mod tests {
                 task: None,
                 cwd: None,
                 agent_pid: None,
+                panes: Vec::new(),
+                log: None,
+                repo: None,
+                graph_agent: None,
+                graph_task: None,
             },
         )];
-        publish_if_changed(&s, &mut published, one.clone(), &wake);
+        publish_if_changed(&s, &mut published, one.clone(), (false, 0), &wake);
         assert_eq!(s.generation.load(Ordering::Acquire), 1);
         assert_eq!(woke.load(Ordering::Relaxed), 1);
 
         // Same content again → no publish, no wake, no generation bump (R3.3).
-        publish_if_changed(&s, &mut published, one, &wake);
+        publish_if_changed(&s, &mut published, one, (false, 0), &wake);
         assert_eq!(
             s.generation.load(Ordering::Acquire),
             1,
@@ -561,9 +917,14 @@ mod tests {
                 task: None,
                 cwd: None,
                 agent_pid: None,
+                panes: Vec::new(),
+                log: None,
+                repo: None,
+                graph_agent: None,
+                graph_task: None,
             },
         )];
-        publish_if_changed(&s, &mut published, two, &wake);
+        publish_if_changed(&s, &mut published, two, (false, 0), &wake);
         assert_eq!(s.generation.load(Ordering::Acquire), 2);
         assert_eq!(woke.load(Ordering::Relaxed), 2);
     }
@@ -716,7 +1077,8 @@ mod tests {
     }
 
     /// The fake tree the `pass()` tests run over. Every tab reports `THE_CWD`, every process
-    /// started at 1_000, and the tab's shell at pid N runs a `claude` at **pid N + `AGENT_PID_OFFSET`**.
+    /// started at 1_000, and the tab's shell at pid N runs a `claude` at
+    /// **pid N + `AGENT_PID_OFFSET`**.
     ///
     /// **The offset is load-bearing, not decoration.** An earlier version used the identity
     /// (`|pid| Detected { pid }`) with the comment "deliberately not pid+1 … an identity
@@ -1080,7 +1442,7 @@ mod tests {
         let mut published = Vec::new();
         for _ in 0..10 {
             let next = vec![(TabId(900_101), first.clone())];
-            publish_if_changed(&s, &mut published, next, &wake);
+            publish_if_changed(&s, &mut published, next, (false, 0), &wake);
         }
         assert_eq!(
             woke.load(Ordering::Relaxed),
@@ -1119,17 +1481,608 @@ mod tests {
     }
 
     #[test]
-    fn tabmeta_still_has_exactly_its_five_published_fields() {
-        // R6.5 — a compile-time assertion. If a field is added, removed or retyped this stops
-        // building, which is the point: the renderer and the snapshot contract are downstream
-        // and this feature promised not to move them.
+    fn tabmeta_has_exactly_its_ten_published_fields() {
+        // R6.5, now session-flow-graph R4.6 — a compile-time assertion. If a field is added,
+        // removed or retyped this stops building, which is the point: the renderer and the
+        // snapshot contract are downstream and each feature that moves them says so.
+        // session-flow-viewer D9 moved it from five to seven (`panes`, `log`);
+        // session-flow-graph D10 to eight (`repo`); the 2026-10-22 decision that the graph
+        // ignores `[sidebar].show_agent_status` to ten (`graph_agent`, `graph_task`).
         let TabMeta {
             branch: _,
             agent: _,
             cwd: _,
             task: _,
             agent_pid: _,
+            panes: _,
+            log: _,
+            repo: _,
+            graph_agent: _,
+            graph_task: _,
         } = TabMeta::default();
+    }
+
+    #[test]
+    fn pane_meta_has_exactly_its_seven_fields() {
+        // session-flow-graph R4.6 — `cwd`, `branch` and `repo` joined the four
+        // session-flow-viewer published.
+        let PaneMeta {
+            pane_pid: _,
+            active: _,
+            agent: _,
+            log: _,
+            cwd: _,
+            branch: _,
+            repo: _,
+        } = blank_pane(0);
+    }
+
+    #[test]
+    fn tab_meta_shared_carries_graph_ready() {
+        // session-flow-graph R4.6 — the readiness rides the shared cache, beside the
+        // generation it is published under.
+        let TabMetaShared {
+            generation: _,
+            tabs: _,
+            graph_ready,
+            graph_epoch: _,
+            graph_opens: _,
+        } = &*shared();
+        assert!(
+            !graph_ready.load(Ordering::Relaxed),
+            "a new cache is not ready"
+        );
+    }
+
+    fn blank_pane(pid: u32) -> PaneMeta {
+        PaneMeta {
+            pane_pid: pid,
+            active: false,
+            agent: None,
+            log: None,
+            cwd: None,
+            branch: None,
+            repo: None,
+        }
+    }
+
+    fn some_repo() -> RepoId {
+        RepoId {
+            common: PathBuf::from("/r/.git"),
+            main_root: PathBuf::from("/r"),
+            linked: false,
+        }
+    }
+
+    // ---- graph gating (session-flow-viewer R6.6, session-flow-graph R4.7) ----
+
+    #[test]
+    fn graph_pass_covers_all_eight_inputs() {
+        for just in [false, true] {
+            for due in [false, true] {
+                assert_eq!(graph_pass(false, just, due), PanePass::Skip, "{just} {due}");
+            }
+        }
+        assert_eq!(graph_pass(true, true, false), PanePass::Derive);
+        assert_eq!(graph_pass(true, true, true), PanePass::Derive);
+        assert_eq!(graph_pass(true, false, true), PanePass::Derive);
+        assert_eq!(graph_pass(true, false, false), PanePass::Skip);
+    }
+
+    #[test]
+    fn publish_graph_state_covers_all_eight_inputs() {
+        // R4.7
+        for full in [false, true] {
+            for prev in [false, true] {
+                assert_eq!(
+                    publish_graph_state(false, full, prev),
+                    GraphPublish {
+                        ready: false,
+                        clear: true
+                    },
+                    "{full} {prev}"
+                );
+                assert_eq!(
+                    publish_graph_state(true, full, prev),
+                    GraphPublish {
+                        ready: full || prev,
+                        clear: false
+                    },
+                    "{full} {prev}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strip_graph_empties_every_tabs_graph_fields_and_nothing_else() {
+        let pane = PaneMeta {
+            active: true,
+            repo: Some(some_repo()),
+            ..blank_pane(7)
+        };
+        let meta = TabMeta {
+            branch: Some("main".into()),
+            panes: vec![pane],
+            log: Some(PathBuf::from("/l.jsonl")),
+            repo: Some(some_repo()),
+            graph_agent: Some(Agent {
+                kind: AgentKind::Claude,
+                state: AgentState::Busy,
+            }),
+            graph_task: Some("t".into()),
+            ..Default::default()
+        };
+        let got = strip_graph(&[(TabId(1), meta.clone()), (TabId(2), meta.clone())]);
+        let want = TabMeta {
+            panes: Vec::new(),
+            repo: None,
+            graph_agent: None,
+            graph_task: None,
+            ..meta
+        };
+        assert_eq!(got, vec![(TabId(1), want.clone()), (TabId(2), want)]);
+    }
+
+    #[test]
+    fn panes_are_never_enumerated_while_unwanted() {
+        // The default is off, and off spawns no `list-panes` and publishes no pane — even on a
+        // just-enabled flag left over (which only the wanted edge raises).
+        let _g = super::super::probe::serial();
+        super::super::probe::reset_all();
+        let (projects, sessions) = fixture_roots("panes-unwanted");
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        assert!(!d.graph_wanted);
+        let out = pass_over(&mut d, &[tp(900_301), tp(900_302)], 0);
+        assert!(out.iter().all(|(_, m)| m.panes.is_empty()));
+        assert_eq!(super::super::probe::TMUX_PANES.get(), 0);
+    }
+
+    #[test]
+    fn the_just_enabled_pass_derives_every_tab_and_is_consumed() {
+        let _g = super::super::probe::serial();
+        // R6.6 — with the flag raised, a background tab whose slot is not due this tick is
+        // still re-derived (its cwd appears), and the flag is cleared by the pass.
+        let (projects, sessions) = fixture_roots("panes-just-enabled");
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        let roster = [tp(900_311), tp(900_312), tp(900_313), tp(900_314)];
+        let prev: Vec<(TabId, TabMeta)> = Vec::new();
+        // Without panes wanted, tick 0 refreshes only slot 0; the rest come from `prev`.
+        let cold = d.pass(&roster, None, 0, SystemTime::now(), &prev);
+        assert_eq!(cold.iter().filter(|(_, m)| m.cwd.is_some()).count(), 1);
+        d.graph_wanted = true;
+        d.graph_just_enabled = true;
+        let all = d.pass(&roster, None, 0, SystemTime::now(), &prev);
+        assert_eq!(all.iter().filter(|(_, m)| m.cwd.is_some()).count(), 4);
+        assert!(!d.graph_just_enabled, "the flag buys exactly one pass");
+        let after = d.pass(&roster, None, 0, SystemTime::now(), &prev);
+        assert_eq!(after.iter().filter(|(_, m)| m.cwd.is_some()).count(), 1);
+    }
+
+    #[test]
+    fn a_claude_tab_publishes_its_resolved_log() {
+        let _g = super::super::probe::serial();
+        // session-flow-viewer R6.5 — `TabMeta.log` is the `Found.log` the state came from.
+        let (projects, sessions) = fixture_roots("tab-log");
+        let cwd = Path::new(THE_CWD);
+        let log = write_log(&projects, cwd, SID_A, &prompt_line("the task"));
+        write_registry(&sessions, agent_pid(900_321), SID_A, cwd, 1_000);
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        let m = d.tab(&tp(900_321), 0, SystemTime::now(), true);
+        assert_eq!(m.log, Some(log));
+        // A non-tmux tab has no panes even when they are wanted.
+        d.graph_wanted = true;
+        assert!(d
+            .tab(&tp(900_321), 1, SystemTime::now(), true)
+            .panes
+            .is_empty());
+    }
+
+    /// R14.5's fixture: a main repository `<tmp>/r` and its linked worktree `<tmp>/r-w`, as
+    /// `git worktree add` lays them out. A function rather than a value because the kernel
+    /// reads are plain `fn` pointers and cannot capture it.
+    fn r14_5_base() -> PathBuf {
+        std::env::temp_dir().join(format!("tabmeta-wk-{}-r14-5-repo", std::process::id()))
+    }
+
+    fn r14_5_worktree() -> PathBuf {
+        r14_5_base().join("r-w")
+    }
+
+    fn r14_5_layout() -> PathBuf {
+        let base = r14_5_base();
+        let _ = std::fs::remove_dir_all(&base);
+        let r = base.join("r");
+        let g = r.join(".git/worktrees/w");
+        std::fs::create_dir_all(&g).expect("mkdir gitdir");
+        std::fs::write(r.join(".git/HEAD"), "ref: refs/heads/main\n").expect("write HEAD");
+        std::fs::write(g.join("HEAD"), "ref: refs/heads/w\n").expect("write wt HEAD");
+        std::fs::write(g.join("commondir"), "../..\n").expect("write commondir");
+        std::fs::create_dir_all(r14_5_worktree()).expect("mkdir worktree");
+        std::fs::write(
+            r14_5_worktree().join(".git"),
+            format!("gitdir: {}\n", g.display()),
+        )
+        .expect("write .git file");
+        r
+    }
+
+    #[test]
+    fn r14_5_a_non_claude_agent_resolves_its_repository() {
+        let _g = super::super::probe::serial();
+        // session-flow-graph R14.5 — with the graph wanted, a tab (and a non-active pane)
+        // whose detected agent is Codex, in a linked worktree of R, publishes R's identity
+        // with `linked: true`; the same tab with no agent publishes `repo: None`.
+        let r = r14_5_layout();
+        let want = Some(RepoId {
+            common: r.join(".git"),
+            main_root: r.clone(),
+            linked: true,
+        });
+        let (projects, sessions) = fixture_roots("r14-5");
+        let mut d = deriver_at(projects, sessions);
+        d.cwd_of = |_| Some(r14_5_worktree());
+        d.agent_of = |pid| {
+            Some(super::super::agent::Detected {
+                kind: AgentKind::Codex,
+                pid: pid + AGENT_PID_OFFSET,
+            })
+        };
+        d.start_ms_of = |_| None;
+
+        // Closed graph: nothing is resolved (G1), whatever the agent.
+        let closed = d.tab(&tp(900_351), 0, SystemTime::now(), true);
+        assert_eq!(
+            closed.repo, None,
+            "nothing resolves while the graph is closed"
+        );
+
+        d.graph_wanted = true;
+        let m = d.tab(&tp(900_351), 1, SystemTime::now(), true);
+        assert_eq!(m.agent.map(|a| a.kind), Some(AgentKind::Codex));
+        assert_eq!(
+            m.agent_pid, None,
+            "the published pid stays Claude-only (D9)"
+        );
+        assert_eq!(m.repo, want, "a Codex tab resolves its repository");
+        let p = d.pane(900_352, 1, SystemTime::now());
+        assert_eq!(
+            p.repo, want,
+            "a Codex non-active pane resolves its repository"
+        );
+
+        d.agent_of = |_| None;
+        let none = d.tab(&tp(900_351), 2, SystemTime::now(), true);
+        assert_eq!(none.agent, None);
+        assert_eq!(
+            none.repo, None,
+            "a tab with no agent publishes no repository"
+        );
+        let _ = std::fs::remove_dir_all(r14_5_base());
+    }
+
+    // ---- The graph ignores `[sidebar].show_agent_status` (user decision 2026-10-22) ----
+
+    /// The toggle-off graph tests' one-tab graph: `m` as the only tab, selected.
+    fn graph_of_one(id: u32, m: &TabMeta) -> renderer::graph_layout::FlowGraph {
+        let row = renderer::sidebar_row::SidebarRow {
+            tab_id: id as u64,
+            title: "t".into(),
+            ..Default::default()
+        };
+        let metas = HashMap::from([(TabId(id as u64), m.clone())]);
+        crate::flow::build_graph(
+            &[row],
+            &metas,
+            None,
+            &HashMap::new(),
+            &crate::flow::FoldSet::new(),
+            0,
+        )
+        .0
+    }
+
+    fn session_nodes(
+        g: &renderer::graph_layout::FlowGraph,
+    ) -> Vec<&renderer::graph_layout::FlowNode> {
+        g.nodes
+            .iter()
+            .filter(|n| n.kind == renderer::graph_layout::NodeKind::Session)
+            .collect()
+    }
+
+    #[test]
+    fn toggle_off_an_unsplit_claude_tab_is_a_graph_session_with_its_real_status() {
+        // (a) With the graph wanted and the toggle off, an unsplit Claude tab — the active one
+        // and a background one alike — is a graph session whose card is exactly the card the
+        // toggle-on derivation gives: same status, same label, same subagent log.
+        let _g = super::super::probe::serial();
+        let (projects, sessions) = fixture_roots("graph-toggle-off-claude");
+        let cwd = Path::new(THE_CWD);
+        let log = write_log(&projects, cwd, SID_A, &prompt_line("the graph task"));
+        write_registry(&sessions, agent_pid(900_361), SID_A, cwd, 1_000);
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        d.graph_wanted = true;
+        let now = SystemTime::now();
+
+        let on = d.tab(&tp(900_361), 0, now, true);
+        let real = on.agent.expect("toggle on: the Claude agent is classified");
+        assert_eq!(real.kind, AgentKind::Claude);
+        assert_ne!(
+            real.state,
+            AgentState::Unknown,
+            "a resolved log has a state"
+        );
+
+        d.enabled_agent = false;
+        for (tick, is_active) in [(1, true), (2, false)] {
+            let off = d.tab(&tp(900_361), tick, now, is_active);
+            assert_eq!(off.agent, None, "the card's field keeps the toggle");
+            assert_eq!(off.graph_agent, Some(real), "active={is_active}");
+            assert_eq!(off.graph_task.as_deref(), Some("the graph task"));
+            assert_eq!(
+                off.log.as_ref(),
+                Some(&log),
+                "the subagent source is published"
+            );
+            let g = graph_of_one(900_361, &off);
+            let nodes = session_nodes(&g);
+            assert_eq!(nodes.len(), 1, "one session, active={is_active}");
+            assert_eq!(
+                nodes[0].status,
+                crate::sidebar_model::resolve_status(Some(&real), false, false, None),
+                "its real status, active={is_active}"
+            );
+            assert_eq!(
+                g,
+                graph_of_one(900_361, &on),
+                "identical to the toggle-on graph"
+            );
+        }
+    }
+
+    #[test]
+    fn toggle_off_an_unsplit_codex_tab_is_a_graph_session_in_its_repository() {
+        // (a) The repository half (R14.5) for a non-Claude kind: with the toggle off the
+        // session is grouped under its project, not left as a repo with no session.
+        let _g = super::super::probe::serial();
+        let r = r14_5_layout();
+        let (projects, sessions) = fixture_roots("graph-toggle-off-codex");
+        let mut d = deriver_at(projects, sessions);
+        d.cwd_of = |_| Some(r14_5_worktree());
+        d.agent_of = |pid| {
+            Some(super::super::agent::Detected {
+                kind: AgentKind::Codex,
+                pid: pid + AGENT_PID_OFFSET,
+            })
+        };
+        d.start_ms_of = |_| None;
+        d.enabled_agent = false;
+        d.graph_wanted = true;
+        let m = d.tab(&tp(900_362), 0, SystemTime::now(), true);
+        let codex = m.graph_agent.expect("the graph sees the Codex agent");
+        assert_eq!(codex.kind, AgentKind::Codex);
+        assert_eq!(m.agent, None);
+        assert_eq!(m.repo.as_ref().map(|r| &r.main_root), Some(&r));
+        let g = graph_of_one(900_362, &m);
+        let nodes = session_nodes(&g);
+        assert_eq!(nodes.len(), 1, "the Codex tab is a session");
+        assert_eq!(
+            nodes[0].status,
+            crate::sidebar_model::resolve_status(Some(&codex), false, false, None)
+        );
+        assert_eq!(nodes[0].skin, crate::sidebar_model::skin_for(Some(&codex)));
+        let project = nodes[0].parent.expect("grouped under its repository");
+        assert_eq!(
+            g.nodes[project].kind,
+            renderer::graph_layout::NodeKind::Project
+        );
+        let _ = std::fs::remove_dir_all(r14_5_base());
+    }
+
+    #[test]
+    fn toggle_off_the_sidebar_card_is_unchanged_with_the_graph_open() {
+        // (b) The graph's toggle-free fields never reach the card: with the toggle off, the
+        // card read from a graph-pass meta equals the card read from a graph-closed one, and
+        // shows no agent — the plain-shell status, the generic skin, no task label.
+        let _g = super::super::probe::serial();
+        let (projects, sessions) = fixture_roots("graph-toggle-off-card");
+        let cwd = Path::new(THE_CWD);
+        write_log(&projects, cwd, SID_A, &prompt_line("hidden from the card"));
+        write_registry(&sessions, agent_pid(900_363), SID_A, cwd, 1_000);
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        d.enabled_agent = false;
+        let now = SystemTime::now();
+        let closed = d.tab(&tp(900_363), 0, now, true);
+        d.graph_wanted = true;
+        let open = d.tab(&tp(900_363), 1, now, true);
+        assert!(open.graph_agent.is_some(), "the graph pass did classify it");
+
+        let row = renderer::sidebar_row::SidebarRow {
+            tab_id: 900_363,
+            title: "t".into(),
+            ..Default::default()
+        };
+        let card = crate::sidebar_model::row_meta(&row, Some(&open), None);
+        assert_eq!(
+            card,
+            crate::sidebar_model::row_meta(&row, Some(&closed), None),
+            "the card does not move when the graph opens"
+        );
+        assert_eq!(card.status, renderer::sidebar_card::CardStatus::Shell);
+        assert_eq!(card.skin, crate::sidebar_model::skin_for(None));
+        assert_ne!(card.line1, "hidden from the card");
+        assert_eq!((open.agent, open.task), (None, None));
+    }
+
+    static TOGGLE_OFF_WALKS: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn toggle_off_with_the_graph_closed_does_no_extra_agent_work() {
+        // (c) G1: graph closed + toggle off is exactly the old gate — the active tab is walked
+        // (the ai-monitor's pid) and nothing else; no tab is classified, so no log is resolved
+        // and no graph field is published, though every tab here runs a Claude with a log.
+        let _g = super::super::probe::serial();
+        let (projects, sessions) = fixture_roots("graph-closed-toggle-off");
+        let cwd = Path::new(THE_CWD);
+        write_log(&projects, cwd, SID_A, &prompt_line("never read"));
+        let roster = [tp(900_371), tp(900_372), tp(900_373), tp(900_374)];
+        for t in &roster {
+            write_registry(&sessions, agent_pid(t.pid), SID_A, cwd, 1_000);
+        }
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        d.agent_of = |pid| {
+            TOGGLE_OFF_WALKS.fetch_add(1, Ordering::Relaxed);
+            Some(super::super::agent::Detected {
+                kind: AgentKind::Claude,
+                pid: pid + AGENT_PID_OFFSET,
+            })
+        };
+        d.enabled_agent = false;
+        assert!(!d.graph_wanted);
+        TOGGLE_OFF_WALKS.store(0, Ordering::Relaxed);
+        let mut out: Vec<(TabId, TabMeta)> = Vec::new();
+        for tick in 0..BG_INTERVAL {
+            out = d.pass(&roster, Some(roster[0].id), tick, SystemTime::now(), &out);
+        }
+        assert_eq!(
+            TOGGLE_OFF_WALKS.load(Ordering::Relaxed),
+            BG_INTERVAL,
+            "one walk per tick, for the active tab only"
+        );
+        for (id, m) in &out {
+            assert_eq!(
+                (m.agent, m.graph_agent, &m.graph_task, &m.log),
+                (None, None, &None, &None),
+                "{id:?} is not classified"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_active_pane_runs_the_tabs_chain_on_its_own_shell() {
+        let _g = super::super::probe::serial();
+        // session-flow-viewer D9 — `Deriver::pane` walks the pane's shell, resolves that
+        // agent's log and classifies it, exactly as `tab` does for the tab.
+        let (projects, sessions) = fixture_roots("pane-chain");
+        let cwd = Path::new(THE_CWD);
+        let log = write_log(&projects, cwd, SID_B, &prompt_line("pane task"));
+        write_registry(&sessions, agent_pid(900_331), SID_B, cwd, 1_000);
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        let p = d.pane(900_331, 0, SystemTime::now());
+        assert_eq!(p.pane_pid, 900_331);
+        assert!(!p.active);
+        assert_eq!(p.agent.map(|a| a.kind), Some(AgentKind::Claude));
+        assert_ne!(p.agent.map(|a| a.state), Some(AgentState::Unknown));
+        assert_eq!(p.log, Some(log));
+        // A pane with no agent publishes neither.
+        with_dead_tree(&mut d);
+        let empty = d.pane(900_332, 0, SystemTime::now());
+        assert_eq!((empty.agent, empty.log), (None, None));
+    }
+
+    #[test]
+    fn non_active_claude_panes_resolve_their_own_sessions_by_identity() {
+        // `pane` builds the `ClaudeId` exactly when the agent IS Claude. Two panes in one
+        // project, each registry record keyed on its own `claude` pid: identity names each
+        // pane's own log. Without the id (the `==` flipped) both fall to mtime ranking and
+        // collapse onto one log — the two-sessions-one-label defect, per pane.
+        let _g = super::super::probe::serial();
+        let (projects, sessions) = fixture_roots("pane-identity");
+        let cwd = Path::new(THE_CWD);
+        let log_a = write_log(&projects, cwd, SID_A, &prompt_line("pane 441 task"));
+        std::thread::sleep(Duration::from_millis(20));
+        let log_b = write_log(&projects, cwd, SID_B, &prompt_line("pane 442 task"));
+        write_registry(&sessions, agent_pid(900_441), SID_A, cwd, 1_000);
+        write_registry(&sessions, agent_pid(900_442), SID_B, cwd, 1_000);
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        let now = SystemTime::now();
+        assert_eq!(d.pane(900_441, 0, now).log, Some(log_a));
+        assert_eq!(d.pane(900_442, 0, now).log, Some(log_b));
+    }
+
+    /// The tab shell the re-root tests use, and the tmux pane `rooted_of` sends it to.
+    const ROOTED_TAB: u32 = 900_561;
+    const ROOTED_PANE: u32 = 900_562;
+    const OTHER_PANE: u32 = 900_563;
+
+    fn rooted_at_pane(_: &mut TmuxMemo, _: u32, _: u64) -> super::super::tmux::Rooted {
+        super::super::tmux::Rooted {
+            root: ROOTED_PANE,
+            attached: Some(super::super::tmux::Attached {
+                client: super::super::tmux::ClientRow {
+                    tty: PathBuf::from("/dev/ttys099"),
+                    pane_pid: ROOTED_PANE,
+                    window: "work:1".to_string(),
+                },
+                exe: PathBuf::from("/definitely/not/a/tmux/binary"),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_dead_pane_falls_back_to_the_tabs_own_shell() {
+        // tmux-pane-cwd: the pane died between the re-root and the cwd read. The card must
+        // degrade to the tab shell's own cwd and agent, not go blank — and no longer claim the
+        // client it re-rooted through.
+        let (projects, sessions) = fixture_roots("dead-pane");
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        d.rooted_of = rooted_at_pane;
+        d.cwd_of = |pid| (pid != ROOTED_PANE).then(|| PathBuf::from(THE_CWD));
+        d.graph_wanted = true;
+        d.pane_memo = PaneMemo::seeded(
+            0,
+            super::super::tmux::parse_panes(&format!(
+                "work:1 1 {ROOTED_PANE}\nwork:1 0 {OTHER_PANE}\n"
+            )),
+        );
+        let m = d.tab(&tp(ROOTED_TAB), 0, SystemTime::now(), true);
+        assert_eq!(m.cwd, Some(PathBuf::from(THE_CWD)), "the shell's cwd");
+        assert_eq!(
+            m.agent_pid,
+            Some(agent_pid(ROOTED_TAB)),
+            "the shell's agent"
+        );
+        assert!(m.panes.is_empty(), "no longer attached: no pane pass");
+    }
+
+    #[test]
+    fn a_re_rooted_tab_publishes_its_windows_panes() {
+        // session-flow-viewer D9: while the graph is wanted, a tab behind a tmux client
+        // publishes every pane of the client's window — the active one carrying the tab's own
+        // derivation, the rest derived on their own shells.
+        let (projects, sessions) = fixture_roots("pane-pass");
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        d.rooted_of = rooted_at_pane;
+        d.graph_wanted = true;
+        d.pane_memo = PaneMemo::seeded(
+            0,
+            super::super::tmux::parse_panes(&format!(
+                "work:1 1 {ROOTED_PANE}\nwork:1 0 {OTHER_PANE}\nother:0 1 1\n"
+            )),
+        );
+        let m = d.tab(&tp(ROOTED_TAB), 0, SystemTime::now(), true);
+        let got: Vec<(u32, bool)> = m.panes.iter().map(|p| (p.pane_pid, p.active)).collect();
+        assert_eq!(got, [(ROOTED_PANE, true), (OTHER_PANE, false)]);
+        assert_eq!(
+            m.panes[0].cwd, m.cwd,
+            "the active pane carries the tab's derivation"
+        );
+        assert_eq!(
+            m.panes[1].agent.map(|a| a.kind),
+            Some(AgentKind::Claude),
+            "the other pane is derived on its own shell"
+        );
     }
 
     #[test]
@@ -1208,6 +2161,9 @@ mod tests {
         let s = TabMetaShared {
             generation: Default::default(),
             tabs: std::sync::Mutex::new(Vec::new()),
+            graph_ready: Default::default(),
+            graph_epoch: Default::default(),
+            graph_opens: Default::default(),
         };
         let woke = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let w = woke.clone();
@@ -1225,15 +2181,20 @@ mod tests {
                     task: None,
                     cwd: Some(PathBuf::from(dir)),
                     agent_pid: None,
+                    panes: Vec::new(),
+                    log: None,
+                    repo: None,
+                    graph_agent: None,
+                    graph_task: None,
                 },
             )]
         };
 
-        publish_if_changed(&s, &mut published, at("/proj/a"), &wake);
+        publish_if_changed(&s, &mut published, at("/proj/a"), (false, 0), &wake);
         assert_eq!(woke.load(Ordering::Relaxed), 1, "first publish");
 
         // Only the cwd differs — everything else is byte-identical.
-        publish_if_changed(&s, &mut published, at("/proj/b"), &wake);
+        publish_if_changed(&s, &mut published, at("/proj/b"), (false, 0), &wake);
         assert_eq!(
             woke.load(Ordering::Relaxed),
             2,
@@ -1242,7 +2203,7 @@ mod tests {
         assert_eq!(s.generation.load(Ordering::Acquire), 2);
 
         // ...and an unchanged cwd still must not, so the G1 idle-CPU property holds.
-        publish_if_changed(&s, &mut published, at("/proj/b"), &wake);
+        publish_if_changed(&s, &mut published, at("/proj/b"), (false, 0), &wake);
         assert_eq!(
             woke.load(Ordering::Relaxed),
             2,
@@ -1273,6 +2234,9 @@ mod tests {
         let s = TabMetaShared {
             generation: Default::default(),
             tabs: std::sync::Mutex::new(Vec::new()),
+            graph_ready: Default::default(),
+            graph_epoch: Default::default(),
+            graph_opens: Default::default(),
         };
         let woke = std::sync::Arc::new(AtomicU64::new(0));
         let w = woke.clone();
@@ -1289,14 +2253,14 @@ mod tests {
                 },
             )]
         };
-        publish_if_changed(&s, &mut published, at(Some(10)), &wake);
-        publish_if_changed(&s, &mut published, at(Some(11)), &wake);
+        publish_if_changed(&s, &mut published, at(Some(10)), (false, 0), &wake);
+        publish_if_changed(&s, &mut published, at(Some(11)), (false, 0), &wake);
         assert_eq!(
             woke.load(Ordering::Relaxed),
             2,
             "a pid-only change must publish, or the panel never learns the session moved"
         );
-        publish_if_changed(&s, &mut published, at(Some(11)), &wake);
+        publish_if_changed(&s, &mut published, at(Some(11)), (false, 0), &wake);
         assert_eq!(
             woke.load(Ordering::Relaxed),
             2,
@@ -1742,6 +2706,11 @@ mod tests {
             task: None,
             cwd: None,
             agent_pid: None,
+            panes: Vec::new(),
+            log: None,
+            repo: None,
+            graph_agent: None,
+            graph_task: None,
         };
         d.note_activity_gap(id, &unknown);
         assert_eq!(d.debug_seen.get(&id), Some(&AgentKind::Aider));
@@ -1760,6 +2729,11 @@ mod tests {
             task: None,
             cwd: None,
             agent_pid: None,
+            panes: Vec::new(),
+            log: None,
+            repo: None,
+            graph_agent: None,
+            graph_task: None,
         };
         d.note_activity_gap(id, &busy);
         assert!(!d.debug_seen.contains_key(&id));
@@ -1790,6 +2764,25 @@ mod tests {
         let mut d = Deriver::new();
         let meta = d.tab(&tp(900_199), 0, SystemTime::now(), true);
         assert_eq!(meta, TabMeta::default());
+    }
+
+    #[test]
+    fn an_unrooted_tab_whose_cwd_is_gone_reads_it_once() {
+        // The shell-retry arm is for a **re-rooted** tab whose pane died; a tab already rooted
+        // at its own shell has nothing to retry, and asking again would be a second
+        // `proc_pidinfo` per refresh for every tab whose cwd cannot be read.
+        static CALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let _g = super::super::probe::serial();
+        let (projects, sessions) = fixture_roots("cwd-once");
+        let mut d = deriver_at(projects, sessions);
+        with_dead_tree(&mut d);
+        d.cwd_of = |_| {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            None
+        };
+        CALLS.store(0, Ordering::Relaxed);
+        let _ = d.tab(&tp(900_198), 0, SystemTime::now(), true);
+        assert_eq!(CALLS.load(Ordering::Relaxed), 1);
     }
 
     /// The same for `pid: 0`, which **does** need the injected fixture.
@@ -2077,5 +3070,310 @@ mod tests {
         handle
             .join()
             .expect("the worker thread exits on disconnect");
+    }
+
+    // ---- repository identity and graph readiness (session-flow-graph D10, R4.6, R4.7) ----
+
+    /// A fixed per-process fixture directory, nameable from a non-capturing `fn` — the
+    /// `cwd_of` seam is a function pointer, so it cannot close over a `tmpdir` result.
+    fn repo_fixture(name: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("tabmeta-wk-repo-{}", std::process::id()))
+            .join(name)
+    }
+
+    /// Two main repositories: `shell/` (where every tab's shell sits) and `agent/` (where
+    /// every `claude` runs), so a test can tell which cwd an identity was resolved from.
+    fn make_repo_fixtures() {
+        for name in ["shell", "agent"] {
+            let git = repo_fixture(name).join(".git");
+            std::fs::create_dir_all(&git).expect("mkdir .git");
+            std::fs::write(git.join("HEAD"), format!("ref: refs/heads/{name}-br\n"))
+                .expect("write HEAD");
+        }
+    }
+
+    fn main_repo(name: &str) -> Option<RepoId> {
+        Some(RepoId {
+            common: repo_fixture(name).join(".git"),
+            main_root: repo_fixture(name),
+            linked: false,
+        })
+    }
+
+    /// Shell pids (`900_xxx`) sit in `shell/`, agent pids (`901_xxx`) in `agent/` — except an
+    /// agent pid ending in `99`, whose cwd cannot be read (it exited after the walk).
+    fn with_split_cwds(d: &mut Deriver) {
+        with_fake_tree(d);
+        d.cwd_of = |pid| match pid {
+            p if p >= 900_000 + AGENT_PID_OFFSET && p % 100 == 99 => None,
+            p if p >= 900_000 + AGENT_PID_OFFSET => Some(repo_fixture("agent")),
+            _ => Some(repo_fixture("shell")),
+        };
+    }
+
+    #[test]
+    fn a_wanted_tab_publishes_its_claudes_repository_not_its_shells() {
+        let _g = super::super::probe::serial();
+        make_repo_fixtures();
+        let (projects, sessions) = fixture_roots("repo-agent-cwd");
+        let mut d = deriver_at(projects, sessions);
+        with_split_cwds(&mut d);
+        d.graph_wanted = true;
+        let m = d.tab(&tp(900_401), 0, SystemTime::now(), true);
+        assert_eq!(
+            m.cwd,
+            Some(repo_fixture("shell")),
+            "the card's cwd stays the shell's"
+        );
+        assert_eq!(
+            m.repo,
+            main_repo("agent"),
+            "G5: grouped by where claude runs"
+        );
+        // The claude's cwd unreadable → the shell's.
+        let m = d.tab(&tp(900_499), 1, SystemTime::now(), true);
+        assert_eq!(m.repo, main_repo("shell"));
+    }
+
+    #[test]
+    fn identity_is_resolved_only_while_wanted_and_for_any_agent() {
+        let _g = super::super::probe::serial();
+        make_repo_fixtures();
+        let (projects, sessions) = fixture_roots("repo-gated");
+        let mut d = deriver_at(projects, sessions);
+        with_split_cwds(&mut d);
+        super::super::probe::reset_all();
+        let m = d.tab(&tp(900_402), 0, SystemTime::now(), true);
+        assert_eq!(m.repo, None, "graph closed: nothing resolved");
+        assert_eq!(
+            super::super::probe::GIT_STAT.get(),
+            0,
+            "and nothing paid (G1)"
+        );
+        d.graph_wanted = true;
+        d.agent_of = |pid| {
+            Some(super::super::agent::Detected {
+                kind: AgentKind::Codex,
+                pid: pid + AGENT_PID_OFFSET,
+            })
+        };
+        let m = d.tab(&tp(900_402), 1, SystemTime::now(), true);
+        // R14.5 (amended 2026-10-21): every detected agent is a session, so a Codex tab
+        // resolves from its own process's cwd exactly as a Claude tab does.
+        assert_eq!(m.repo, main_repo("agent"), "a Codex session's repository");
+        with_dead_tree(&mut d);
+        assert_eq!(d.tab(&tp(900_402), 2, SystemTime::now(), true).repo, None);
+    }
+
+    #[test]
+    fn a_non_active_pane_publishes_its_shells_folder_and_its_claudes_repository() {
+        let _g = super::super::probe::serial();
+        make_repo_fixtures();
+        let (projects, sessions) = fixture_roots("repo-pane");
+        let mut d = deriver_at(projects, sessions);
+        with_split_cwds(&mut d);
+        d.enabled_git = true;
+        let p = d.pane(900_403, 0, SystemTime::now());
+        assert_eq!(p.cwd, Some(repo_fixture("shell")));
+        assert_eq!(
+            p.branch.as_deref(),
+            Some("shell-br"),
+            "the branch of its own cwd"
+        );
+        assert_eq!(p.repo, main_repo("agent"));
+        let p = d.pane(900_499, 1, SystemTime::now());
+        assert_eq!(
+            p.repo,
+            main_repo("shell"),
+            "fallback to the pane's shell cwd"
+        );
+        // The branch is the sidebar card's, so it follows the card's toggle.
+        d.enabled_git = false;
+        let p = d.pane(900_403, 2, SystemTime::now());
+        assert_eq!((p.branch, p.repo), (None, main_repo("agent")));
+        // A non-Claude agent is a session too (R14.5): its own process's repository.
+        d.agent_of = |pid| {
+            Some(super::super::agent::Detected {
+                kind: AgentKind::Codex,
+                pid: pid + AGENT_PID_OFFSET,
+            })
+        };
+        let p = d.pane(900_403, 3, SystemTime::now());
+        assert_eq!((p.cwd.is_some(), p.repo), (true, main_repo("agent")));
+        // No agent: nothing at all, and no cwd read.
+        with_dead_tree(&mut d);
+        assert_eq!(d.pane(900_404, 4, SystemTime::now()), blank_pane(900_404));
+    }
+
+    #[test]
+    fn the_graph_edge_sets_readiness_with_a_full_pass_and_clears_on_close() {
+        let _g = super::super::probe::serial();
+        make_repo_fixtures();
+        let (projects, sessions) = fixture_roots("repo-edge");
+        let mut d = deriver_at(projects, sessions);
+        with_split_cwds(&mut d);
+        let roster = [tp(900_411), tp(900_412), tp(900_413), tp(900_414)];
+        // Closed: one ordinary pass publishes no identity anywhere.
+        let closed = d.pass(&roster, None, 1, SystemTime::now(), &[]);
+        assert!(closed.iter().all(|(_, m)| m.repo.is_none()));
+        // A no-op edge (already closed) does nothing.
+        assert!(d
+            .graph_edge(false, &roster, None, 1, SystemTime::now(), &closed, false)
+            .is_none());
+
+        // Open: every tab — not only tick 1's stripe — resolves, and the pass sets readiness.
+        let (open, ready) = d
+            .graph_edge(true, &roster, None, 1, SystemTime::now(), &closed, false)
+            .expect("off→on is an edge");
+        assert!(ready);
+        assert!(d.graph_wanted);
+        assert!(
+            open.iter().all(|(_, m)| m.repo == main_repo("agent")),
+            "{open:?}"
+        );
+        assert!(
+            !d.graph_just_enabled,
+            "the edge's flag was consumed by its pass"
+        );
+        // Re-sending `true` is not an edge.
+        assert!(d
+            .graph_edge(true, &roster, None, 1, SystemTime::now(), &open, ready)
+            .is_none());
+
+        // Close: nothing derived, every identity and the readiness cleared.
+        super::super::probe::reset_all();
+        let (shut, ready) = d
+            .graph_edge(false, &roster, None, 2, SystemTime::now(), &open, true)
+            .expect("on→off is an edge");
+        assert!(!ready);
+        assert!(!d.graph_wanted);
+        assert_eq!(shut, strip_graph(&open));
+        assert_eq!(
+            super::super::probe::GIT_STAT.get(),
+            0,
+            "closing derives nothing"
+        );
+        assert_eq!(super::super::probe::PROC_CWD.get(), 0);
+    }
+
+    #[test]
+    fn a_readiness_flip_alone_publishes_and_wakes() {
+        // With nothing to resolve (no tabs), opening changes no `TabMeta`; the flip itself
+        // must still bump the generation, or the UI would read `resolving…` indefinitely.
+        let s = shared();
+        let woke = Arc::new(AtomicU64::new(0));
+        let w = woke.clone();
+        let wake = move || {
+            w.fetch_add(1, Ordering::Relaxed);
+        };
+        let mut published = Vec::new();
+        publish_if_changed(&s, &mut published, Vec::new(), (false, 0), &wake);
+        assert_eq!(woke.load(Ordering::Relaxed), 0, "nothing changed");
+        publish_if_changed(&s, &mut published, Vec::new(), (true, 0), &wake);
+        assert_eq!(woke.load(Ordering::Relaxed), 1);
+        assert_eq!(s.generation.load(Ordering::Acquire), 1);
+        assert!(s.graph_ready.load(Ordering::Acquire));
+        publish_if_changed(&s, &mut published, Vec::new(), (true, 0), &wake);
+        assert_eq!(
+            woke.load(Ordering::Relaxed),
+            1,
+            "unchanged readiness: no wake"
+        );
+        publish_if_changed(&s, &mut published, Vec::new(), (false, 0), &wake);
+        assert_eq!(s.generation.load(Ordering::Acquire), 2);
+        assert!(!s.graph_ready.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_repeated_open_with_a_new_epoch_publishes_that_epoch() {
+        // session-flow-graph D10: a `true` with no edge still names the open asking. Were the
+        // epoch adopted only on the off→on edge, that open would wait under `resolving…` for
+        // an epoch the worker never publishes.
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel::<Cmd>();
+        let (woke_tx, woke_rx) = mpsc::channel::<()>();
+        let s = shared();
+        let worker_shared = Arc::clone(&s);
+        let handle = std::thread::spawn(move || {
+            run(worker_shared, rx, move || {
+                let _ = woke_tx.send(());
+            })
+        });
+        tx.send(Cmd::SetGraphWanted {
+            wanted: true,
+            epoch: 1,
+        })
+        .expect("worker alive");
+        tx.send(Cmd::SetGraphWanted {
+            wanted: true,
+            epoch: 2,
+        })
+        .expect("worker alive");
+        for _ in 0..2 {
+            woke_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("each epoch publishes");
+        }
+        assert!(s.graph_ready.load(Ordering::Acquire));
+        assert_eq!(s.graph_epoch.load(Ordering::Acquire), 2);
+        drop(tx);
+        handle
+            .join()
+            .expect("the worker thread exits on disconnect");
+    }
+
+    #[test]
+    fn the_worker_loop_publishes_readiness_on_open_and_clears_it_on_close() {
+        // R4.7 through `run`: the `SetGraphWanted` arm, with an empty roster so no process is
+        // walked. FIFO again makes the wake counts exact without sleeping.
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel::<Cmd>();
+        let (woke_tx, woke_rx) = mpsc::channel::<()>();
+        let s = shared();
+        let worker_shared = Arc::clone(&s);
+        let handle = std::thread::spawn(move || {
+            run(worker_shared, rx, move || {
+                let _ = woke_tx.send(());
+            })
+        });
+        tx.send(Cmd::SetGraphWanted {
+            wanted: true,
+            epoch: 1,
+        })
+        .expect("worker alive");
+        woke_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("opening publishes readiness");
+        assert!(s.graph_ready.load(Ordering::Acquire));
+        assert_eq!(
+            s.graph_epoch.load(Ordering::Acquire),
+            1,
+            "readiness names the open"
+        );
+        tx.send(Cmd::SetGraphWanted {
+            wanted: true,
+            epoch: 1,
+        })
+        .expect("worker alive");
+        tx.send(Cmd::SetGraphWanted {
+            wanted: false,
+            epoch: 0,
+        })
+        .expect("worker alive");
+        woke_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("closing publishes the cleared readiness");
+        assert!(!s.graph_ready.load(Ordering::Acquire));
+        assert_eq!(
+            s.generation.load(Ordering::Acquire),
+            2,
+            "the redundant `true` published nothing"
+        );
+        drop(tx);
+        handle
+            .join()
+            .expect("the worker thread exits on disconnect");
+        assert!(woke_rx.try_recv().is_err(), "exactly two wakes");
     }
 }

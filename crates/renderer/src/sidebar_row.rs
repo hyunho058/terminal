@@ -29,7 +29,7 @@ use crate::sidebar_card::{build_card, card_state, folder_text, CardInput, CardSt
 use crate::sidebar_icons::{push_icon, Icon};
 use crate::sidebar_layout::OpenMenu;
 use crate::sidebar_shapes::{Fill, SidebarShape, SidebarShapePipeline};
-use crate::sidebar_text::{CardAtlases, CardFace};
+use crate::sidebar_text::{CardAtlases, CardFace, CardMeasure};
 use crate::sidebar_theme::{linear, AgentSkin, CardMetrics, SidebarMetrics, SidebarTheme};
 use crate::tab_bar::char_cols;
 use crate::{DrawLayer, FrameCtx};
@@ -694,12 +694,12 @@ pub fn tab_at(x: f32, y: f32, sidebar_w: f32, tab_h: f32, count: usize) -> Optio
 
 /// A textured glyph quad in physical px sampling the atlas coverage.
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct TextInstance {
-    rect: [f32; 4],
-    uv0: [f32; 2],
-    uv1: [f32; 2],
-    color: [f32; 4],
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub(crate) struct TextInstance {
+    pub(crate) rect: [f32; 4],
+    pub(crate) uv0: [f32; 2],
+    pub(crate) uv1: [f32; 2],
+    pub(crate) color: [f32; 4],
 }
 
 #[repr(C)]
@@ -775,7 +775,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 /// Which atlas a text batch samples: the grid's (band, popup, fallback) or one of the
 /// sidebar's own card atlases (sidebar-weather-cards D2).
 #[derive(Clone, Copy)]
-enum TextAtlas<'b> {
+pub(crate) enum TextAtlas<'b> {
     Grid,
     Card(&'b crate::atlas::Atlas),
 }
@@ -784,7 +784,7 @@ enum TextAtlas<'b> {
 /// buffer (`upload_resident`, never `create_buffer_init` per frame — G1). The bind group
 /// is rebuilt on the key `(format, atlas.epoch())` so a live `apply_config` atlas swap
 /// cannot leave it sampling the replaced texture (atlas-swap-bind-invalidation D2/D4).
-struct SidebarTextPipeline {
+pub(crate) struct SidebarTextPipeline {
     format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
@@ -804,12 +804,12 @@ struct SidebarTextPipeline {
     rebuilds: u32,
     /// How many times `draw` wrote the instance buffer — a test hook (R17.1).
     #[cfg(test)]
-    uploads: u32,
+    pub(crate) uploads: u32,
     instances: Option<wgpu::Buffer>,
 }
 
 impl SidebarTextPipeline {
-    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> SidebarTextPipeline {
+    pub(crate) fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> SidebarTextPipeline {
         let quad = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sidebar-text-quad"),
             contents: bytemuck::cast_slice(&crate::QUAD),
@@ -872,7 +872,7 @@ impl SidebarTextPipeline {
         }
     }
 
-    fn ensure<'a>(
+    pub(crate) fn ensure<'a>(
         slot: &'a mut Option<SidebarTextPipeline>,
         ctx: &FrameCtx<'_>,
     ) -> &'a mut SidebarTextPipeline {
@@ -886,7 +886,12 @@ impl SidebarTextPipeline {
         slot.as_mut().expect("just built")
     }
 
-    fn draw(&mut self, ctx: &mut FrameCtx<'_>, source: TextAtlas<'_>, text: &[TextInstance]) {
+    pub(crate) fn draw(
+        &mut self,
+        ctx: &mut FrameCtx<'_>,
+        source: TextAtlas<'_>,
+        text: &[TextInstance],
+    ) {
         if text.is_empty() {
             return;
         }
@@ -974,7 +979,7 @@ impl SidebarTextPipeline {
     /// Draw the first `count` instances the last [`draw`](SidebarTextPipeline::draw)
     /// uploaded, **writing no buffer** and keeping the bind group it built — for a frame
     /// whose text and atlases are unchanged since then (sidebar-weather-cards D20).
-    fn redraw(&mut self, ctx: &mut FrameCtx<'_>, count: u32) {
+    pub(crate) fn redraw(&mut self, ctx: &mut FrameCtx<'_>, count: u32) {
         self.pass(ctx, count);
     }
 
@@ -1088,6 +1093,59 @@ fn push_run(
             color: run.color,
         });
     });
+}
+
+/// Where [`resolve_card_runs`] writes: one buffer per card face, plus the grid-atlas
+/// fallback for a face whose own atlas could not be built (R2.6).
+pub(crate) struct CardGlyphs<'a> {
+    pub(crate) title: &'a mut Vec<TextInstance>,
+    pub(crate) meta: &'a mut Vec<TextInstance>,
+    pub(crate) fallback: &'a mut Vec<TextInstance>,
+}
+
+/// Resolve `build_card`'s text runs to glyph instances — the one copy of this step, shared
+/// by the sidebar and the session graph (session-flow-graph D14). Returns how many passes
+/// it took.
+///
+/// Each run goes to its face's atlas when that atlas is built, else to `grid` (R2.6, the
+/// same `get` that [`CardAtlases::measure`] reads). Guarded against an eviction in the
+/// middle of it (D18/R2.5): `pack` evicts when a card atlas fills and invalidates the UVs
+/// already resolved this frame, so a generation that moved during the pass means the runs
+/// are resolved once more, against the repacked texture, before anything is submitted.
+/// `after_run` is called after every run — a test seam for driving that eviction.
+pub(crate) fn resolve_card_runs(
+    cards: &mut CardAtlases,
+    grid: &mut crate::atlas::Atlas,
+    queue: &wgpu::Queue,
+    runs: &[TextRun],
+    measure: CardMeasure,
+    out: CardGlyphs<'_>,
+    mut after_run: impl FnMut(&mut CardAtlases),
+) -> u8 {
+    let mut passes = 0;
+    for _pass in 0..2 {
+        out.title.clear();
+        out.meta.clear();
+        out.fallback.clear();
+        let before = CardFace::ALL.map(|f| cards.generation(f));
+        for run in runs {
+            let (col, line) = measure.of(run.face);
+            let buf = match run.face {
+                CardFace::Title => &mut *out.title,
+                CardFace::Meta => &mut *out.meta,
+            };
+            match cards.get_mut(run.face) {
+                Some(atlas) => push_run(buf, atlas, queue, run, col, line),
+                None => push_run(out.fallback, grid, queue, run, col, line),
+            }
+            after_run(cards);
+        }
+        passes += 1;
+        if CardFace::ALL.map(|f| cards.generation(f)) == before {
+            break;
+        }
+    }
+    passes
 }
 
 // ---------------------------------------------------------------------------
@@ -1533,17 +1591,13 @@ impl DrawLayer for TabBar {
         let scale = ctx.scale_factor;
         // A face whose card atlas could not be built draws from the grid atlas at cell
         // size instead (R2.6) — so it also measures by the grid cell.
-        let title_ok = self.cards.get(CardFace::Title).is_some();
-        let meta_ok = self.cards.get(CardFace::Meta).is_some();
-        let measure = |face: CardFace, ok: bool| {
-            if ok {
-                (face.column_px(scale), face.line_px(scale))
-            } else {
-                (cell[0], cell[1])
-            }
-        };
-        let (title_col, title_line) = measure(CardFace::Title, title_ok);
-        let (meta_col, meta_line) = measure(CardFace::Meta, meta_ok);
+        let card_measure = self.cards.measure(scale, cell);
+        let CardMeasure {
+            title_col,
+            title_line,
+            meta_col,
+            meta_line,
+        } = card_measure;
         let menu_row = menu.as_ref().map(|open| open.row);
         let default_meta = RowMeta::default();
         let mut runs = std::mem::take(&mut self.run_buf);
@@ -1643,50 +1697,36 @@ impl DrawLayer for TabBar {
             });
         }
 
-        // ---- Resolve the card runs to glyph instances. Guarded against an eviction in
-        // the middle of it (D18/R2.5): `pack` evicts when a card atlas fills and
-        // invalidates the UVs already resolved this frame, so a generation that moved
-        // during the pass means the runs are resolved once more, against the repacked
-        // texture, before anything is submitted.
+        // ---- Resolve the card runs to glyph instances (the step shared with the session
+        // graph, `resolve_card_runs`, which also carries the mid-frame eviction guard).
         let mut title_text = std::mem::take(&mut self.title_buf);
         let mut meta_text = std::mem::take(&mut self.meta_buf);
         let mut fallback = std::mem::take(&mut self.fallback_buf);
         #[cfg(test)]
         let mut evict_hook = self.evict_during_resolve.take();
-        #[cfg(test)]
-        {
-            self.resolve_passes = 0;
-        }
-        for _pass in 0..2 {
-            title_text.clear();
-            meta_text.clear();
-            fallback.clear();
-            let before = CardFace::ALL.map(|f| self.cards.generation(f));
-            for run in &runs {
-                let (col, line, out) = match run.face {
-                    CardFace::Title => (title_col, title_line, &mut title_text),
-                    CardFace::Meta => (meta_col, meta_line, &mut meta_text),
-                };
-                // The same `get` that measured the face above: a built atlas resolves
-                // here, a missing one falls back to the grid atlas (R2.6).
-                match self.cards.get_mut(run.face) {
-                    Some(atlas) => push_run(out, atlas, ctx.queue, run, col, line),
-                    None => push_run(&mut fallback, ctx.atlas, ctx.queue, run, col, line),
-                }
+        let _passes = resolve_card_runs(
+            &mut self.cards,
+            ctx.atlas,
+            ctx.queue,
+            &runs,
+            card_measure,
+            CardGlyphs {
+                title: &mut title_text,
+                meta: &mut meta_text,
+                fallback: &mut fallback,
+            },
+            |_cards| {
                 #[cfg(test)]
                 if let Some(face) = evict_hook.take() {
-                    if let Some(atlas) = self.cards.get_mut(face) {
+                    if let Some(atlas) = _cards.get_mut(face) {
                         atlas.evict_for_test();
                     }
                 }
-            }
-            #[cfg(test)]
-            {
-                self.resolve_passes += 1;
-            }
-            if CardFace::ALL.map(|f| self.cards.generation(f)) == before {
-                break;
-            }
+            },
+        );
+        #[cfg(test)]
+        {
+            self.resolve_passes = _passes;
         }
         #[cfg(test)]
         if std::mem::take(&mut self.evict_grid_during_compose) {

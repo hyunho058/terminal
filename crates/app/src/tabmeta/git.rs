@@ -10,10 +10,17 @@
 //! Reads are hard-capped: [`HEAD_READ_CAP`] bytes, so a pathological HEAD cannot push an
 //! unbounded string into a struct the UI clones (R7.10); the parsed branch is capped at
 //! [`BRANCH_MAX`] chars.
+//!
+//! Beside the branch memo sits the **repository identity** the session-flow graph groups by
+//! (session-flow-graph D10): [`repo_of`] resolves a cwd to the repository's common git dir and
+//! main worktree, and [`RepoMemo`] memoises it by cwd on the same terms — a warm entry
+//! revalidates by `stat` alone (the found `.git`, plus `commondir` for a linked worktree), a
+//! miss expires after [`NEG_MEMO_TTL_TICKS`].
 
 use std::collections::HashMap;
+use std::fs::Metadata;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Ancestors examined before giving up (R7.6).
@@ -70,20 +77,24 @@ impl Memo {
     /// `MEMO_MAX` (R1.6). Called at the end of every derivation, so a shell that `cd`s
     /// through hundreds of directories cannot grow the map without bound.
     fn reclaim(&mut self, tick: u64) {
-        self.entries
-            .retain(|_, e| tick.saturating_sub(e.last_read_tick) < MEMO_TTL_TICKS);
-        while self.entries.len() > MEMO_MAX {
-            let oldest = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.last_read_tick)
-                .map(|(k, _)| k.clone());
-            match oldest {
-                Some(k) => {
-                    self.entries.remove(&k);
-                }
-                None => break,
+        reclaim_map(&mut self.entries, tick, |e| e.last_read_tick);
+    }
+}
+
+/// The reclamation both memos share: drop entries untouched for `MEMO_TTL_TICKS`, then evict
+/// oldest-touched down to `MEMO_MAX` (R1.6).
+fn reclaim_map<E>(entries: &mut HashMap<PathBuf, E>, tick: u64, last: fn(&E) -> u64) {
+    entries.retain(|_, e| tick.saturating_sub(last(e)) < MEMO_TTL_TICKS);
+    while entries.len() > MEMO_MAX {
+        let oldest = entries
+            .iter()
+            .min_by_key(|(_, e)| last(e))
+            .map(|(k, _)| k.clone());
+        match oldest {
+            Some(k) => {
+                entries.remove(&k);
             }
+            None => break,
         }
     }
 }
@@ -268,6 +279,238 @@ fn cap_branch(name: &str) -> String {
     name.chars().take(BRANCH_MAX).collect()
 }
 
+// ---------------------------------------------------------------------------
+// Repository identity (session-flow-graph D10).
+// ---------------------------------------------------------------------------
+
+/// Which repository a session runs in, and which worktree of it (session-flow-graph D10).
+///
+/// Sessions group by `common`; the project card shows `main_root`. Both paths are lexically
+/// normalised (no `.` or `..` left) but never canonicalised, so two sessions reaching the same
+/// repository by the same spelling compare equal without a `realpath` per tick.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct RepoId {
+    /// The repository's common git directory — `<main>/.git`, or a submodule's own git dir.
+    pub common: PathBuf,
+    /// The main worktree: the directory `common` belongs to (a submodule's checkout for one).
+    pub main_root: PathBuf,
+    /// `true` for a linked worktree (`git worktree add`), `false` for the main one.
+    pub linked: bool,
+}
+
+/// What a warm [`RepoMemo`] entry revalidates against: whether the path is a directory and,
+/// for a file, its `(mtime, len)`. A `.git` **directory**'s mtime moves on every git write
+/// inside it, so for a directory only its kind is compared — the property that matters is that
+/// it still exists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Stamp {
+    dir: bool,
+    mtime: SystemTime,
+    len: u64,
+}
+
+fn stamp(meta: &Metadata) -> Stamp {
+    if meta.is_dir() {
+        Stamp {
+            dir: true,
+            mtime: UNIX_EPOCH,
+            len: 0,
+        }
+    } else {
+        Stamp {
+            dir: false,
+            mtime: meta.modified().unwrap_or(UNIX_EPOCH),
+            len: meta.len(),
+        }
+    }
+}
+
+/// A cold resolution: the identity plus the paths a warm lookup re-`stat`s.
+#[derive(Debug)]
+struct Resolved {
+    id: RepoId,
+    /// The `.git` the walk found, and its stamp.
+    dot_git: (PathBuf, Stamp),
+    /// `<g>/commondir` for a linked worktree, and its stamp.
+    commondir: Option<(PathBuf, Stamp)>,
+}
+
+/// The repository `cwd` runs in, per session-flow-graph D10. Uncached — the worker goes
+/// through [`repo_of_cwd`]; this is the pure rule the acceptance tests pin.
+///
+/// - the first `.git` within `MAX_GIT_ANCESTORS` is a **directory** → the main worktree;
+/// - a `gitdir: <g>` **file** with a `<g>/commondir` → a linked worktree, `common` =
+///   `<g>/<commondir>`, `main_root` = `common`'s parent;
+/// - a `gitdir:` file with no `commondir` (a submodule) → its own main worktree,
+///   `common` = `<g>`;
+/// - no `.git`, `cwd` itself missing, a `.git` file with no `gitdir:` line, or an unreadable
+///   `commondir` → `None`.
+///
+/// The existence check on `cwd` is load-bearing: linked worktrees also live **inside** the
+/// main one (`<repo>/.claude/worktrees/<name>`), and once such a directory is removed its
+/// ancestor walk would otherwise land on the main `.git` and regroup the session as a main one.
+pub fn repo_of(cwd: &Path) -> Option<RepoId> {
+    resolve_repo(cwd).map(|r| r.id)
+}
+
+fn resolve_repo(cwd: &Path) -> Option<Resolved> {
+    meta_of(cwd)?;
+    let mut dir: &Path = cwd;
+    for _ in 0..MAX_GIT_ANCESTORS {
+        let dot_git = dir.join(".git");
+        if let Some(meta) = meta_of(&dot_git) {
+            return resolve_dot_git(dir, dot_git, &meta);
+        }
+        dir = dir.parent()?;
+    }
+    None
+}
+
+/// The identity a found `.git` (at `dir/.git`, with `meta`) names.
+fn resolve_dot_git(dir: &Path, dot_git: PathBuf, meta: &Metadata) -> Option<Resolved> {
+    let found = (dot_git.clone(), stamp(meta));
+    if meta.is_dir() {
+        return Some(Resolved {
+            id: RepoId {
+                common: dot_git,
+                main_root: dir.to_path_buf(),
+                linked: false,
+            },
+            dot_git: found,
+            commondir: None,
+        });
+    }
+    let data = read_capped(&dot_git)?;
+    let gitdir = parse_gitdir_file(&String::from_utf8_lossy(&data))?;
+    let g = normalise(&dir.join(gitdir));
+    let commondir = g.join("commondir");
+    let Some(cmeta) = meta_of(&commondir) else {
+        // A submodule: its git dir is its own common dir.
+        return Some(Resolved {
+            id: RepoId {
+                common: g,
+                main_root: dir.to_path_buf(),
+                linked: false,
+            },
+            dot_git: found,
+            commondir: None,
+        });
+    };
+    let text = read_capped(&commondir)?;
+    let rel = String::from_utf8_lossy(&text).trim().to_string();
+    if rel.is_empty() {
+        return None;
+    }
+    let common = normalise(&g.join(rel));
+    let main_root = common.parent()?.to_path_buf();
+    Some(Resolved {
+        id: RepoId {
+            common,
+            main_root,
+            linked: true,
+        },
+        dot_git: found,
+        commondir: Some((commondir, stamp(&cmeta))),
+    })
+}
+
+/// Lexical normalisation: drop `.` and resolve `..` against the preceding component. No
+/// filesystem access, so a symlinked component is kept as spelled. (`Path::join` with an
+/// absolute right-hand side replaces the left, so an absolute `gitdir:` or `commondir` comes
+/// through unchanged.)
+fn normalise(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The cwd-keyed repository memo (session-flow-graph D10), reclaimed exactly as [`Memo`].
+pub(crate) struct RepoMemo {
+    entries: HashMap<PathBuf, RepoEntry>,
+}
+
+struct RepoEntry {
+    kind: RepoKind,
+    last_read_tick: u64,
+}
+
+enum RepoKind {
+    /// A resolved repository: revalidated by `stat`-ing what it was found from.
+    Repo(Resolved),
+    /// No repository; expires so a later `git init` (or a re-created worktree) is noticed.
+    None { checked_at: u64 },
+}
+
+impl RepoMemo {
+    pub(crate) fn new() -> RepoMemo {
+        RepoMemo {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Test-only view of the entry count (for the reclamation tests).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// `cwd`'s repository at `tick`, via the memo. A warm hit costs one `stat` (two for a linked
+/// worktree) and no read; anything that no longer matches re-resolves cold, which is where a
+/// removed worktree's missing cwd turns into `None` (D16).
+pub(crate) fn repo_of_cwd(memo: &mut RepoMemo, cwd: &Path, tick: u64) -> Option<RepoId> {
+    let result = match repo_lookup(memo, cwd, tick) {
+        Some(answer) => answer,
+        None => repo_resolve(memo, cwd, tick),
+    };
+    reclaim_map(&mut memo.entries, tick, |e| e.last_read_tick);
+    result
+}
+
+/// `Some(answer)` when the memo answered; `None` when a cold resolve is needed.
+fn repo_lookup(memo: &mut RepoMemo, cwd: &Path, tick: u64) -> Option<Option<RepoId>> {
+    let entry = memo.entries.get_mut(cwd)?;
+    entry.last_read_tick = tick;
+    match &entry.kind {
+        RepoKind::Repo(r) => (still(&r.dot_git) && r.commondir.as_ref().is_none_or(still))
+            .then(|| Some(r.id.clone())),
+        RepoKind::None { checked_at } => {
+            (tick.saturating_sub(*checked_at) < NEG_MEMO_TTL_TICKS).then_some(None)
+        }
+    }
+}
+
+/// Does `path` still `stat` to the stamp it was found with? One `stat`.
+fn still((path, was): &(PathBuf, Stamp)) -> bool {
+    meta_of(path).map(|m| stamp(&m)) == Some(*was)
+}
+
+fn repo_resolve(memo: &mut RepoMemo, cwd: &Path, tick: u64) -> Option<RepoId> {
+    let (kind, id) = match resolve_repo(cwd) {
+        Some(r) => {
+            let id = r.id.clone();
+            (RepoKind::Repo(r), Some(id))
+        }
+        None => (RepoKind::None { checked_at: tick }, None),
+    };
+    memo.entries.insert(
+        cwd.to_path_buf(),
+        RepoEntry {
+            kind,
+            last_read_tick: tick,
+        },
+    );
+    id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +537,15 @@ mod tests {
         assert_eq!(parse_head(""), None);
         assert_eq!(parse_head("not a head file"), None);
         assert_eq!(parse_head("ref: refs/remotes/origin/main"), None);
+        // A detached SHA needs BOTH halves: forty characters AND every one hex. Hex alone
+        // (an abbreviated or truncated SHA) and length alone (forty non-hex bytes) are not
+        // a HEAD and must not render as `@…` (cargo mutants: `&&` → `||` survived).
+        assert_eq!(parse_head("deadbeef\n"), None, "short hex is not a SHA");
+        assert_eq!(
+            parse_head(&format!("{}\n", "z".repeat(40))),
+            None,
+            "forty non-hex bytes are not a SHA"
+        );
     }
 
     #[test]
@@ -415,6 +667,26 @@ mod tests {
     }
 
     #[test]
+    fn a_same_length_checkout_is_seen_through_the_mtime() {
+        let _g = super::super::probe::serial();
+        // R7.8 — `main` → `mai2` keeps HEAD's length, so only its mtime can reveal the
+        // change: the revalidation must need BOTH to match, not either.
+        let root = tmpdir("checkout-same-len");
+        let head = root.join(".git/HEAD");
+        write(&head, b"ref: refs/heads/main\n");
+        let mut memo = Memo::new();
+        assert_eq!(branch_of_cwd(&mut memo, &root, 0).as_deref(), Some("main"));
+        write(&head, b"ref: refs/heads/mai2\n");
+        let later = SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&head)
+            .and_then(|f| f.set_modified(later))
+            .expect("set mtime");
+        assert_eq!(branch_of_cwd(&mut memo, &root, 1).as_deref(), Some("mai2"));
+    }
+
+    #[test]
     fn git_init_in_memoised_non_repo_expires() {
         let _g = super::super::probe::serial();
         // R7.9 — a NotARepo entry expires, and a later `.git` is then found.
@@ -487,5 +759,280 @@ mod tests {
             branch_of_cwd(&mut memo, &d, 0);
         }
         assert!(memo.len() <= MEMO_MAX, "memo grew past the cap");
+    }
+
+    // ---- repository identity (session-flow-graph R4.1–R4.5, D10, D16) ----
+
+    /// A main repository at `<tmp>/r` with one linked worktree `w1` registered beside it
+    /// (`<tmp>/r-w1`) and the same registration checked out inside it
+    /// (`<tmp>/r/.claude/worktrees/w1`) — the two placements D10 measured.
+    fn repo_with_worktree(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = tmpdir(tag);
+        let r = base.join("r");
+        write(&r.join(".git/HEAD"), b"ref: refs/heads/main\n");
+        let g = r.join(".git/worktrees/w1");
+        write(&g.join("HEAD"), b"ref: refs/heads/w1\n");
+        write(&g.join("commondir"), b"../..\n");
+        let gitdir = format!("gitdir: {}\n", g.display());
+        let beside = base.join("r-w1");
+        let inside = r.join(".claude/worktrees/w1");
+        write(&beside.join(".git"), gitdir.as_bytes());
+        write(&inside.join(".git"), gitdir.as_bytes());
+        (r, beside, inside)
+    }
+
+    fn main_of(r: &Path, linked: bool) -> Option<RepoId> {
+        Some(RepoId {
+            common: r.join(".git"),
+            main_root: r.to_path_buf(),
+            linked,
+        })
+    }
+
+    #[test]
+    fn a_main_worktree_resolves_from_a_subdirectory() {
+        let _g = super::super::probe::serial();
+        // R4.1
+        let (r, _, _) = repo_with_worktree("repo-main");
+        let cwd = r.join("src/x");
+        std::fs::create_dir_all(&cwd).expect("mkdir cwd");
+        assert_eq!(repo_of(&cwd), main_of(&r, false));
+        assert_eq!(repo_of(&r), main_of(&r, false));
+    }
+
+    #[test]
+    fn a_linked_worktree_beside_or_inside_resolves_to_its_main() {
+        let _g = super::super::probe::serial();
+        // R4.2 — both placements, and a subdirectory of one; no `..` survives.
+        let (r, beside, inside) = repo_with_worktree("repo-linked");
+        assert_eq!(repo_of(&beside), main_of(&r, true));
+        assert_eq!(repo_of(&inside), main_of(&r, true));
+        let deep = inside.join("a/b");
+        std::fs::create_dir_all(&deep).expect("mkdir deep");
+        assert_eq!(repo_of(&deep), main_of(&r, true));
+        let got = repo_of(&beside).expect("linked");
+        assert!(!got
+            .common
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir)));
+    }
+
+    #[test]
+    fn a_relative_gitdir_and_an_absolute_commondir_both_resolve() {
+        let _g = super::super::probe::serial();
+        let base = tmpdir("repo-relgitdir");
+        let r = base.join("r");
+        let g = r.join(".git/worktrees/w2");
+        write(
+            &g.join("commondir"),
+            r.join(".git").display().to_string().as_bytes(),
+        );
+        let wt = base.join("w2");
+        write(&wt.join(".git"), b"gitdir: ../r/./.git/worktrees/w2\n");
+        assert_eq!(repo_of(&wt), main_of(&r, true));
+    }
+
+    #[test]
+    fn a_submodule_is_its_own_repository() {
+        let _g = super::super::probe::serial();
+        // R4.3
+        let p = tmpdir("repo-submodule");
+        std::fs::create_dir_all(p.join(".git/modules/s")).expect("mkdir modules");
+        let s = p.join("s");
+        write(&s.join(".git"), b"gitdir: ../.git/modules/s\n");
+        assert_eq!(
+            repo_of(&s),
+            Some(RepoId {
+                common: p.join(".git/modules/s"),
+                main_root: s.clone(),
+                linked: false,
+            })
+        );
+    }
+
+    #[test]
+    fn no_repository_cases_are_none() {
+        let _g = super::super::probe::serial();
+        // R4.4 — no ancestor, missing cwd, malformed `.git`, unreadable / empty commondir.
+        let plain = tmpdir("repo-none");
+        assert_eq!(repo_of(&plain), None);
+        assert_eq!(repo_of(&plain.join("gone")), None);
+
+        let bad = tmpdir("repo-badfile");
+        write(&bad.join(".git"), b"not a gitdir line\n");
+        assert_eq!(repo_of(&bad), None);
+
+        let (r, beside, _) = repo_with_worktree("repo-unreadable");
+        let cd = r.join(".git/worktrees/w1/commondir");
+        std::fs::remove_file(&cd).expect("rm commondir");
+        std::fs::create_dir_all(&cd).expect("commondir as a directory: unreadable");
+        assert_eq!(repo_of(&beside), None);
+
+        let (_, beside, _) = repo_with_worktree("repo-emptycd");
+        write(&beside.join("../r/.git/worktrees/w1/commondir"), b"  \n");
+        assert_eq!(repo_of(&beside), None);
+    }
+
+    #[test]
+    fn a_removed_inside_worktree_does_not_regroup_as_main() {
+        let _g = super::super::probe::serial();
+        // D10's measured trap: the ancestor walk from a deleted inside worktree would find
+        // the main `.git` two levels up. The cwd-existence check stops it.
+        let (_, _, inside) = repo_with_worktree("repo-removed-inside");
+        std::fs::remove_dir_all(&inside).expect("rm worktree");
+        assert_eq!(repo_of(&inside), None);
+    }
+
+    #[test]
+    fn the_repo_walk_is_capped() {
+        let _g = super::super::probe::serial();
+        // R4.4 — a repository more than MAX_GIT_ANCESTORS levels up is not found.
+        let base = tmpdir("repo-deep");
+        write(&base.join(".git/HEAD"), b"ref: refs/heads/main\n");
+        let mut deep = base.clone();
+        for i in 0..MAX_GIT_ANCESTORS {
+            deep.push(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).expect("mkdir deep");
+        assert_eq!(repo_of(&deep), None, "41 levels down is out of reach");
+        let one_up = deep.parent().expect("parent").to_path_buf();
+        assert_eq!(
+            repo_of(&one_up),
+            main_of(&base, false),
+            "40 levels is in reach"
+        );
+    }
+
+    #[test]
+    fn normalise_drops_dot_and_resolves_dotdot() {
+        assert_eq!(normalise(Path::new("/a/./b/../c")), PathBuf::from("/a/c"));
+        assert_eq!(normalise(Path::new("/a/b/../../..")), PathBuf::from("/"));
+        assert_eq!(normalise(Path::new("/a/b")), PathBuf::from("/a/b"));
+    }
+
+    #[test]
+    fn a_warm_linked_entry_costs_two_stats_and_notices_removal() {
+        let _g = super::super::probe::serial();
+        // R4.5
+        let (r, beside, _) = repo_with_worktree("repo-memo-linked");
+        let mut memo = RepoMemo::new();
+        assert_eq!(repo_of_cwd(&mut memo, &beside, 0), main_of(&r, true));
+        super::super::probe::reset_all();
+        assert_eq!(repo_of_cwd(&mut memo, &beside, 1), main_of(&r, true));
+        assert!(super::super::probe::GIT_STAT.get() <= 2);
+        assert_eq!(super::super::probe::GIT_READ.get(), 0);
+        std::fs::remove_dir_all(&beside).expect("rm worktree");
+        assert_eq!(repo_of_cwd(&mut memo, &beside, 2), None);
+    }
+
+    #[test]
+    fn a_warm_main_entry_costs_one_stat() {
+        let _g = super::super::probe::serial();
+        let (r, _, _) = repo_with_worktree("repo-memo-main");
+        let mut memo = RepoMemo::new();
+        assert_eq!(repo_of_cwd(&mut memo, &r, 0), main_of(&r, false));
+        super::super::probe::reset_all();
+        assert_eq!(repo_of_cwd(&mut memo, &r, 1), main_of(&r, false));
+        assert_eq!(super::super::probe::GIT_STAT.get(), 1);
+        assert_eq!(super::super::probe::GIT_READ.get(), 0);
+        // A write inside `.git` moves the directory's mtime; that is not a change of identity.
+        write(&r.join(".git/index.lock"), b"x");
+        super::super::probe::reset_all();
+        assert_eq!(repo_of_cwd(&mut memo, &r, 2), main_of(&r, false));
+        assert_eq!(super::super::probe::GIT_READ.get(), 0, "still warm");
+    }
+
+    #[test]
+    fn a_rewritten_gitdir_or_commondir_re_resolves() {
+        let _g = super::super::probe::serial();
+        // A warm entry compares the `.git` file's and `commondir`'s (mtime, len): a rewrite of
+        // either is a cold resolve, not a stale answer.
+        let (r, beside, _) = repo_with_worktree("repo-memo-rewrite");
+        let mut memo = RepoMemo::new();
+        assert_eq!(repo_of_cwd(&mut memo, &beside, 0), main_of(&r, true));
+        // commondir now points one level higher.
+        write(&r.join(".git/worktrees/w1/commondir"), b"../../..\n");
+        assert_eq!(
+            repo_of_cwd(&mut memo, &beside, 1).map(|id| id.common),
+            Some(r.clone())
+        );
+        // The `.git` file now names a submodule-shaped dir (no commondir).
+        let sub = r.join(".git/modules/m");
+        std::fs::create_dir_all(&sub).expect("mkdir module dir");
+        write(
+            &beside.join(".git"),
+            format!("gitdir: {}\n", sub.display()).as_bytes(),
+        );
+        assert_eq!(
+            repo_of_cwd(&mut memo, &beside, 2),
+            Some(RepoId {
+                common: sub,
+                main_root: beside.clone(),
+                linked: false,
+            })
+        );
+    }
+
+    #[test]
+    fn a_removed_commondir_is_a_miss() {
+        let _g = super::super::probe::serial();
+        // The second of the two warm stats is load-bearing on its own.
+        let (r, beside, _) = repo_with_worktree("repo-memo-cdgone");
+        let mut memo = RepoMemo::new();
+        assert_eq!(repo_of_cwd(&mut memo, &beside, 0), main_of(&r, true));
+        std::fs::remove_file(r.join(".git/worktrees/w1/commondir")).expect("rm commondir");
+        assert_eq!(
+            repo_of_cwd(&mut memo, &beside, 1).map(|id| id.linked),
+            Some(false),
+            "without commondir it reads as a submodule-shaped gitdir"
+        );
+    }
+
+    #[test]
+    fn a_repo_miss_is_memoised_then_expires() {
+        let _g = super::super::probe::serial();
+        let dir = tmpdir("repo-memo-neg");
+        let mut memo = RepoMemo::new();
+        assert_eq!(repo_of_cwd(&mut memo, &dir, 0), None);
+        write(&dir.join(".git/HEAD"), b"ref: refs/heads/main\n");
+        super::super::probe::reset_all();
+        assert_eq!(repo_of_cwd(&mut memo, &dir, NEG_MEMO_TTL_TICKS - 1), None);
+        assert_eq!(
+            super::super::probe::GIT_STAT.get(),
+            0,
+            "fresh miss: no walk"
+        );
+        assert_eq!(
+            repo_of_cwd(&mut memo, &dir, NEG_MEMO_TTL_TICKS),
+            main_of(&dir, false)
+        );
+    }
+
+    #[test]
+    fn the_repo_memo_reclaims_by_disuse_and_is_capped() {
+        let _g = super::super::probe::serial();
+        let a = tmpdir("repo-reclaim-a");
+        let b = tmpdir("repo-reclaim-b");
+        let mut memo = RepoMemo::new();
+        repo_of_cwd(&mut memo, &a, 0);
+        repo_of_cwd(&mut memo, &b, 0);
+        assert_eq!(memo.len(), 2);
+        repo_of_cwd(&mut memo, &a, MEMO_TTL_TICKS - 1);
+        assert_eq!(memo.len(), 2, "b is one tick short of its TTL");
+        repo_of_cwd(&mut memo, &a, MEMO_TTL_TICKS);
+        assert_eq!(memo.len(), 1, "the untouched entry was reclaimed");
+        let mut memo = RepoMemo::new();
+        for i in 0..(MEMO_MAX + 5) {
+            repo_of_cwd(&mut memo, &tmpdir(&format!("repo-cap{i}")), i as u64);
+        }
+        assert_eq!(memo.len(), MEMO_MAX, "capped, oldest evicted");
+        assert!(memo
+            .entries
+            .contains_key(&tmpdir_path(&format!("repo-cap{}", MEMO_MAX + 4))));
+        assert!(!memo.entries.contains_key(&tmpdir_path("repo-cap0")));
+    }
+
+    fn tmpdir_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("tabmeta-git-{}-{}", std::process::id(), tag))
     }
 }

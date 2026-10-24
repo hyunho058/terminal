@@ -15,6 +15,8 @@ pub mod box_draw;
 pub mod cursor_layer;
 pub mod font_set;
 pub mod glyph;
+pub mod graph_layout;
+pub mod graph_panel;
 pub mod image_layer;
 pub mod link_layer;
 pub mod monitor_layout;

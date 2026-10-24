@@ -2128,7 +2128,10 @@ impl Overlay for AiMonitorOverlay {
         }
     }
 
-    fn on_press(&mut self, point: [f32; 2]) -> Handled {
+    /// `_ctx` is unused: a fold click changes this panel's own document and asks the app for
+    /// nothing (session-flow-viewer D7 gave the press a context for the session
+    /// graph's `ActivateTab`).
+    fn on_press(&mut self, point: [f32; 2], _ctx: &mut AppCtx) -> Handled {
         if !self.visible {
             return Handled::Passthrough;
         }
@@ -2662,12 +2665,17 @@ mod tests {
         o.handle = clickable_handle(4, 100.0);
         o.visible = true;
         o.folds = vec![false; 6];
+        let mut sink = Vec::new();
+        let mut ctx = AppCtx::new(&mut sink, 1, 0, None);
 
-        assert_eq!(o.on_press([850.0, 155.0]), Handled::Consumed);
+        assert_eq!(o.on_press([850.0, 155.0], &mut ctx), Handled::Consumed);
         assert!(o.folds[1], "the pressed section folded");
         assert!(!o.folds[0] && !o.folds[2], "its neighbours did not move");
+        // session-flow-viewer R8.4: the press now carries a context, and a fold asks the app
+        // for nothing through it.
+        assert!(ctx.take_requests().is_empty(), "a fold queues no request");
 
-        assert_eq!(o.on_press([850.0, 155.0]), Handled::Consumed);
+        assert_eq!(o.on_press([850.0, 155.0], &mut ctx), Handled::Consumed);
         assert!(!o.folds[1], "the second press is the way back");
     }
 
@@ -2679,10 +2687,13 @@ mod tests {
         let mut o = AiMonitorOverlay::detached();
         o.handle = clickable_handle(4, 100.0);
         o.visible = true;
-        assert_eq!(o.on_press([850.0, 115.0]), Handled::Consumed);
+        let mut sink = Vec::new();
+        let mut ctx = AppCtx::new(&mut sink, 1, 0, None);
+        assert_eq!(o.on_press([850.0, 115.0], &mut ctx), Handled::Consumed);
         // and a closed panel claims nothing at all
         o.visible = false;
-        assert_eq!(o.on_press([850.0, 115.0]), Handled::Passthrough);
+        assert_eq!(o.on_press([850.0, 115.0], &mut ctx), Handled::Passthrough);
+        assert!(ctx.take_requests().is_empty());
     }
 
     #[test]

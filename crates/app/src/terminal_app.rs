@@ -62,7 +62,8 @@ use crate::input::{
     self, encode_key, font_action, hover_card, hover_cursor, is_double_click,
     is_sidebar_toggle_chord, pixel_to_cell, press_dismisses_modals, sidebar_press, sidebar_region,
     suppress_key, tab_action, wheel_bytes, wheel_lines, wheel_scroll, FontAction, PersistTarget,
-    PressRoute, ReleaseTarget, ResizeDrag, ResizeEdge, SidebarAction, TabAction, WheelDelta,
+    PointerOwner, PressRoute, ReleaseTarget, ResizeDrag, ResizeEdge, SidebarAction, TabAction,
+    WheelDelta,
 };
 use crate::seam::{
     AppCtx, AppRequest, Handled, InputRouter, KeyInput, OverlayCommand, OverlayHost, Registrations,
@@ -883,6 +884,65 @@ impl Running {
         }
     }
 
+    /// Offer a left press to the visible overlays (the window-covering graph first, else the
+    /// right band), with the same `AppCtx` the key path builds (session-flow-viewer D7), and
+    /// hand back what they asked for. The caller applies the requests once this returns,
+    /// because the context borrows the active tab's writer and `apply_requests` needs
+    /// `&mut Tabs`.
+    ///
+    /// The writer is probed as at both key dispatch points (terminal-scroll D4): no press
+    /// handler writes today, but one that did would be sending the user's bytes, and must
+    /// snap a scrolled-back viewport like any other input.
+    ///
+    /// `covering` picks the route (session-flow-graph D6): `true` offers the press to the
+    /// open window-covering graph only, `false` to the visible band overlays.
+    fn press_overlays(&mut self, p: [f32; 2], covering: bool) -> (Handled, Vec<AppRequest>) {
+        let active = self.tabs.active_index();
+        let count = self.tabs.len();
+        let cwd = self.tabs.active_cwd(&self.tabmeta_snapshot);
+        let active_tab = self.tabs.active().id;
+        let shell_pid = self.tabs.active_shell_pid();
+        let mut probe = WriteProbe::new(&mut self.tabs.active_mut().writer);
+        let mut ctx = AppCtx::new(&mut probe, count, active, cwd)
+            .with_active_tab(active_tab, None)
+            .with_shell_pid(shell_pid);
+        let handled = if covering {
+            self.overlays.press_covering(p, &mut ctx)
+        } else {
+            self.overlays.press(p, &mut ctx)
+        };
+        let requests = ctx.take_requests();
+        if probe.wrote() {
+            self.snap_active_after_input();
+        }
+        (handled, requests)
+    }
+
+    /// Who the pointer at `last_cursor` belongs to (session-flow-graph D6) — the three
+    /// flags of [`input::pointer_owner`], read from the live window. The press, wheel and
+    /// cursor-moved arms all ask here, so they cannot disagree about who owns a point.
+    fn pointer_owner(&self) -> PointerOwner {
+        // An open graph owns every point, so the hit-tests below could not change the
+        // answer; skipping them keeps a pointer move under the graph geometry-free.
+        if self.overlays.covering_visible() {
+            return PointerOwner::Graph;
+        }
+        let p = [self.last_cursor.0 as f32, self.last_cursor.1 as f32];
+        let in_monitor_band = input::in_monitor_panel(
+            self.last_cursor.0,
+            self.viewport_w(),
+            self.renderer.right_inset(),
+        );
+        let in_sidebar =
+            sidebar_layout::hit_test(p, self.scroll, &self.sidebar_input(), self.collapsed())
+                .is_some();
+        input::pointer_owner(
+            self.overlays.covering_visible(),
+            in_monitor_band,
+            in_sidebar,
+        )
+    }
+
     /// Apply the tab mutations recorded during dispatch (sticky-tab-title R1.4/R3.6),
     /// then resync + redraw if anything actually changed.
     ///
@@ -934,6 +994,17 @@ impl Running {
                     // the chord is the one gesture D8 lets write `[ai_monitor].open`
                     // (R6.3). The launch restore calls the other one.
                     self.toggle_monitor(open);
+                }
+                AppRequest::ActivateTab(id) => {
+                    // session-flow-graph D7 — a graph card click. Through
+                    // `do_tab_action` so composition, rename and menu teardown happen exactly
+                    // as for a sidebar click. A tab that closed between the press and this
+                    // apply resolves to nothing, and nothing happens (R8.3).
+                    if let Some(i) = self.tabs.position(id) {
+                        if !self.do_tab_action(TabAction::Jump(i)) {
+                            return false;
+                        }
+                    }
                 }
             }
         }
@@ -1863,10 +1934,22 @@ impl Running {
     /// forbids. Unconditional on `consumed` rather than sniffing which chord it was: an
     /// overlay that takes a key is asserting it owns the interaction. (Ordinary typing is
     /// `Passthrough` and leaves the menu up — R3.8 names only outside-click, Esc and tab
-    /// chords as dismissals.)
-    fn finish_consumed_key(&mut self, menu_was_open: bool, wants_redraw: bool) {
-        if menu_was_open {
+    /// chords as dismissals.) The one exception is the window-covering graph, decided by
+    /// [`consumed_key_closes_menu`] from `covered_before` and the state after dispatch.
+    fn finish_consumed_key(
+        &mut self,
+        menu_was_open: bool,
+        covered_before: bool,
+        wants_redraw: bool,
+    ) {
+        let covered_after = self.overlays.covering_visible();
+        if consumed_key_closes_menu(menu_was_open, covered_before, covered_after) {
             self.close_card_menu();
+        }
+        if cover_ends_resize(covered_before, covered_after, self.resize_drag.is_some()) {
+            // Commit the width as it stands; the release then finds nothing armed.
+            self.finish_resize();
+            self.clear_hover();
         }
         if wants_redraw {
             self.redraw();
@@ -2146,15 +2229,18 @@ impl Running {
     /// Dispatch a key through the seam, then default input (R3.3/R4). Returns
     /// false if the app should exit.
     fn on_key(&mut self, input: KeyInput) -> bool {
+        // Whether the session-flow graph covered the window when this key arrived — read
+        // before dispatch, because the key itself may open or close it (D5).
+        let covered_before = self.overlays.covering_visible();
         // Esc dismisses an open card menu before anything else sees it
         // (sticky-tab-title R3.8) — ahead of the overlays and of `encode_key`, which
-        // would otherwise send the ESC on to the shell while the popup stayed up.
-        if self.open_menu.is_some()
-            && matches!(
-                input.key,
-                winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
-            )
-        {
+        // would otherwise send the ESC on to the shell while the popup stayed up. Not
+        // under the graph: there Esc is the graph's close key (session-flow-graph D5).
+        let is_esc = matches!(
+            input.key,
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
+        );
+        if esc_dismisses_menu(self.open_menu.is_some(), is_esc, covered_before) {
             self.close_card_menu();
             return true;
         }
@@ -2218,7 +2304,7 @@ impl Running {
                 return false; // the last tab closed — the app exits
             }
             if consumed {
-                self.finish_consumed_key(menu_was_open, wants_redraw);
+                self.finish_consumed_key(menu_was_open, covered_before, wants_redraw);
                 return true;
             }
         }
@@ -2259,7 +2345,7 @@ impl Running {
                 return false; // the last tab closed — the app exits
             }
             if consumed {
-                self.finish_consumed_key(menu_was_open, wants_redraw);
+                self.finish_consumed_key(menu_was_open, covered_before, wants_redraw);
                 return true;
             }
         }
@@ -2606,6 +2692,14 @@ impl ApplicationHandler<UserEvent> for App {
                     inner.drive_resize(drag);
                     return;
                 }
+                // An open session-flow graph covers the window, so the hover is its and no one
+                // else's (session-flow-graph D6): no card or link lights up under a surface the
+                // user cannot see. The continuous redraw (C6) paints the change.
+                if inner.pointer_owner() == PointerOwner::Graph {
+                    let p = [inner.last_cursor.0 as f32, inner.last_cursor.1 as f32];
+                    inner.overlays.hover_covering(Some(p));
+                    return;
+                }
                 inner.refresh_hover(); // one hit_test feeds both hover fields (D8)
                 inner.refresh_link_hover(LinkTrigger::Pointer); // trigger 3 (D24)
 
@@ -2638,6 +2732,9 @@ impl ApplicationHandler<UserEvent> for App {
                 inner.clear_link_hover();
             }
             WindowEvent::CursorLeft { .. } => {
+                // The graph's hover ends with the pointer (session-flow-graph D3/D6); a no-op
+                // while no window-covering overlay is up.
+                inner.overlays.hover_covering(None);
                 inner.clear_hover();
                 // Trigger 3, the leaving half (hyperlinks D24): nothing is under the
                 // pointer, and `last_cursor` keeps its stale value — so the flag is
@@ -2651,17 +2748,34 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                // The ai-monitor panel resolves FIRST, by pointer position alone — the same
-                // order and the same reason as the wheel above (D7/D10). The panel reserves
+                let p = [inner.last_cursor.0 as f32, inner.last_cursor.1 as f32];
+                let owner = inner.pointer_owner();
+                // An open session-flow graph takes the press before every other handler, and
+                // keeps it whether or not it lands on a card (session-flow-graph D6/R2.3): a
+                // press falling through would start a selection under a covered screen.
+                if owner == PointerOwner::Graph {
+                    let (_, requests) = inner.press_overlays(p, true);
+                    if !inner.apply_requests(requests) {
+                        event_loop.exit();
+                        return;
+                    }
+                    inner.window.request_redraw();
+                    return;
+                }
+                // The ai-monitor panel resolves next, by pointer position alone — the same
+                // order and the same reason as the wheel below (D7/D10). The panel reserves
                 // its columns rather than covering them, so a press inside its band was
                 // never the grid's to begin with.
-                if input::in_monitor_panel(
-                    inner.last_cursor.0,
-                    inner.viewport_w(),
-                    inner.renderer.right_inset(),
-                ) {
-                    let p = [inner.last_cursor.0 as f32, inner.last_cursor.1 as f32];
-                    if inner.overlays.press(p) == Handled::Consumed {
+                if owner == PointerOwner::Monitor {
+                    let (handled, requests) = inner.press_overlays(p, false);
+                    // What the press asked for — a graph card's `ActivateTab` (session-flow-
+                    // graph D7) — is applied before anything else runs, so it is never
+                    // dropped, consumed or not.
+                    if !inner.apply_requests(requests) {
+                        event_loop.exit();
+                        return;
+                    }
+                    if handled == Handled::Consumed {
                         // A fold changes the document, so the panel must re-lay out; the
                         // grid did not move, so the cheap request is the right one.
                         inner.window.request_redraw();
@@ -2854,17 +2968,23 @@ impl ApplicationHandler<UserEvent> for App {
                 // (`cursor_cell` would reject it, making a visible strip inert for no
                 // visible reason) and the whole window when the sidebar is collapsed.
                 let p = [inner.last_cursor.0 as f32, inner.last_cursor.1 as f32];
-                // The ai-monitor panel resolves FIRST, and only by where the pointer is
+                let cell_h = inner.renderer.cell_size().1;
+                let owner = inner.pointer_owner();
+                // An open session-flow graph scrolls, wherever the pointer is — never the
+                // monitor, the scrollback or the sidebar under it (session-flow-graph D6).
+                // Its `Passthrough` (at an end) falls through to nothing.
+                if owner == PointerOwner::Graph {
+                    if inner.overlays.wheel_covering(wd, cell_h) == Handled::Consumed {
+                        inner.window.request_redraw();
+                    }
+                // The ai-monitor panel resolves next, and only by where the pointer is
                 // (D7/D10). This is a trade, not an addition: wheeling the scrollback with
                 // the pointer parked over the panel stops working, and D9 gives it back only
                 // at the panel's two ends. `Passthrough` is the panel declining — it is at
                 // that end and the gesture pushes further into it — so the event falls
                 // through to the grid below.
-                if input::in_monitor_panel(
-                    inner.last_cursor.0,
-                    inner.viewport_w(),
-                    inner.renderer.right_inset(),
-                ) && inner.overlays.wheel(wd, inner.renderer.cell_size().1) == Handled::Consumed
+                } else if owner == PointerOwner::Monitor
+                    && inner.overlays.wheel(wd, cell_h) == Handled::Consumed
                 {
                     // Panel-only change: the grid's snapshot did not move, so the cheap
                     // request is right — `redraw()` would mark it dirty for nothing.
@@ -3051,6 +3171,35 @@ fn patch_dialog_rows(model: &TabModelHandle, flipped: &[(TabId, bool)]) -> bool 
     flipped.iter().fold(false, |any, &(id, level)| {
         model.set_blocking_dialog(id.0, level) || any
     })
+}
+
+/// Whether `Esc` dismisses an open card menu before any overlay sees it (sticky-tab-title
+/// R3.8) — unless the window-covering graph is open, whose close key it is
+/// (session-flow-graph D5). The menu waits under the graph and is still there after.
+fn esc_dismisses_menu(menu_open: bool, is_esc: bool, covered: bool) -> bool {
+    menu_open && is_esc && !covered
+}
+
+/// Whether a key an overlay consumed tears down a card menu that was open when it arrived
+/// (D8a.1). Not when the window-covering graph was open before the key or is open after
+/// it (session-flow-graph D5): the graph does not stack a second modal on the popup, it
+/// covers it, and every key while it is open is the graph's — so the menu receives nothing
+/// and is still there when the graph closes. Pure, like [`drain_effects`], so the rule is
+/// testable without a window.
+fn consumed_key_closes_menu(
+    menu_was_open: bool,
+    covered_before: bool,
+    covered_after: bool,
+) -> bool {
+    menu_was_open && !covered_before && !covered_after
+}
+
+/// Whether a key that opened the window-covering graph ends an edge resize in flight
+/// (session-flow-graph D6). The graph owns every pointer event while it is open, so a
+/// drag left armed would keep resizing the sidebar or panel underneath a surface the user
+/// cannot see. Pure, like [`consumed_key_closes_menu`].
+fn cover_ends_resize(covered_before: bool, covered_after: bool, resize_armed: bool) -> bool {
+    resize_armed && !covered_before && covered_after
 }
 
 /// Whether a viewport move landed on the live bottom from somewhere above it — the wheel's
@@ -3298,6 +3447,154 @@ fn should_clear_font_override(
 mod tests {
     use super::*;
 
+    // ---- session-flow-graph D5: a card menu survives the graph ----
+
+    /// A band overlay that consumes every key — the shape of rename or the ai-monitor
+    /// claiming its chord, which D8a.1 says dismisses a menu underneath.
+    struct Claims;
+    impl crate::seam::Overlay for Claims {
+        fn priority(&self) -> i32 {
+            100
+        }
+        fn visible(&self) -> bool {
+            true
+        }
+        fn on_key(&mut self, _: &KeyInput, _: &mut AppCtx) -> Handled {
+            Handled::Consumed
+        }
+        fn layer(&self) -> Box<dyn renderer::DrawLayer> {
+            unreachable!("never drawn in this test")
+        }
+    }
+
+    /// `on_key`'s card-menu steps, in its order, over a real `OverlayHost`: the Esc
+    /// prologue, the overlay dispatch, then `finish_consumed_key`'s decision. `menu_open`
+    /// stands in for `open_menu`.
+    fn key_with_menu(host: &mut OverlayHost, menu_open: &mut bool, key: &KeyInput) {
+        let covered_before = host.covering_visible();
+        let is_esc = key.key == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape);
+        if esc_dismisses_menu(*menu_open, is_esc, covered_before) {
+            *menu_open = false;
+            return;
+        }
+        let menu_was_open = *menu_open;
+        let mut sink = Vec::new();
+        let mut ctx = AppCtx::new(&mut sink, 1, 0, None);
+        if host.dispatch(key, &mut ctx) == Handled::Consumed
+            && consumed_key_closes_menu(menu_was_open, covered_before, host.covering_visible())
+        {
+            *menu_open = false;
+        }
+    }
+
+    fn graph_key(key: winit::keyboard::Key, mods: ModifiersState) -> KeyInput {
+        KeyInput {
+            key,
+            text: None,
+            mods,
+            physical: winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyF),
+        }
+    }
+
+    fn cmd_shift_f() -> KeyInput {
+        graph_key(
+            winit::keyboard::Key::Character("F".into()),
+            ModifiersState::SUPER | ModifiersState::SHIFT,
+        )
+    }
+
+    fn esc() -> KeyInput {
+        graph_key(
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape),
+            ModifiersState::empty(),
+        )
+    }
+
+    fn flow_host() -> OverlayHost {
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let mut host = OverlayHost::default();
+        host.register(Box::new(crate::flow::FlowOverlay::new(
+            wake,
+            None,
+            renderer::graph_panel::FlowHandle::default(),
+        )));
+        host
+    }
+
+    #[test]
+    fn d5_a_card_menu_is_still_open_after_the_graph_opens_and_closes_over_it() {
+        let mut host = flow_host();
+        let mut menu = true;
+        key_with_menu(&mut host, &mut menu, &cmd_shift_f());
+        assert!(host.covering_visible(), "Cmd+Shift+F opened the graph");
+        assert!(menu, "opening the graph tore down the card menu under it");
+        // Anything typed while covered is the graph's and leaves the menu alone.
+        key_with_menu(
+            &mut host,
+            &mut menu,
+            &graph_key(
+                winit::keyboard::Key::Character("a".into()),
+                ModifiersState::empty(),
+            ),
+        );
+        assert!(menu);
+        // Esc is the graph's close key, not the menu's dismissal, while the graph is up.
+        key_with_menu(&mut host, &mut menu, &esc());
+        assert!(!host.covering_visible(), "Esc closed the graph");
+        assert!(menu, "the menu is still there when the graph closes");
+        // Uncovered again, Esc dismisses the menu as it always did (sticky-tab-title R3.8).
+        key_with_menu(&mut host, &mut menu, &esc());
+        assert!(!menu);
+    }
+
+    #[test]
+    fn d5_closing_the_graph_by_its_chord_also_keeps_the_menu() {
+        let mut host = flow_host();
+        let mut menu = true;
+        key_with_menu(&mut host, &mut menu, &cmd_shift_f());
+        key_with_menu(&mut host, &mut menu, &cmd_shift_f());
+        assert!(!host.covering_visible());
+        assert!(menu);
+    }
+
+    #[test]
+    fn d8a_1_a_band_overlay_claiming_a_key_still_dismisses_the_menu() {
+        // Every overlay but the covering graph is unchanged.
+        let mut host = OverlayHost::default();
+        host.register(Box::new(Claims));
+        let mut menu = true;
+        key_with_menu(&mut host, &mut menu, &cmd_shift_f());
+        assert!(!menu);
+    }
+
+    #[test]
+    fn menu_decisions_are_exact() {
+        assert!(esc_dismisses_menu(true, true, false));
+        assert!(!esc_dismisses_menu(false, true, false));
+        assert!(!esc_dismisses_menu(true, false, false));
+        assert!(!esc_dismisses_menu(true, true, true));
+        assert!(consumed_key_closes_menu(true, false, false));
+        assert!(!consumed_key_closes_menu(false, false, false));
+        assert!(!consumed_key_closes_menu(true, true, false));
+        assert!(!consumed_key_closes_menu(true, false, true));
+        assert!(!consumed_key_closes_menu(true, true, true));
+    }
+
+    #[test]
+    fn only_the_opening_edge_of_the_graph_ends_a_resize() {
+        assert!(cover_ends_resize(false, true, true));
+        assert!(!cover_ends_resize(false, true, false), "no drag in flight");
+        assert!(!cover_ends_resize(false, false, true));
+        assert!(
+            !cover_ends_resize(true, true, true),
+            "already covered: nothing new to end"
+        );
+        assert!(
+            !cover_ends_resize(true, false, true),
+            "closing hands the pointer back"
+        );
+    }
+
     // ---- closing the last tab: no event runs against an empty tab set ----
 
     #[test]
@@ -3475,6 +3772,11 @@ mod tests {
             // because `TabMeta` is destructured exhaustively by a pin in `tabmeta::worker`, so
             // every literal states every field deliberately.
             agent_pid: None,
+            panes: Vec::new(),
+            log: None,
+            repo: None,
+            graph_agent: None,
+            graph_task: None,
         }
     }
 

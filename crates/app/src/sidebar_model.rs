@@ -64,18 +64,41 @@ impl MetaSource for SidebarMetaSource {
 /// Free and pure so the join is unit-testable without a worker thread or a GPU frame —
 /// `TabMetaSnapshot`'s fields are private to its own module, so a test can construct this
 /// function's inputs and not `fill`'s.
-fn row_meta(
+///
+/// `pub` for the session graph (session-flow-graph D3): its session cards take their
+/// status from this same join, which is what makes them agree with the card by
+/// construction rather than by a second classifier.
+pub fn row_meta(
     row: &SidebarRow,
     meta: Option<&crate::tabmeta::TabMeta>,
     home: Option<&Path>,
 ) -> RowMeta {
-    let agent = meta.and_then(|m| m.agent.as_ref());
+    row_meta_with(
+        row,
+        meta,
+        meta.and_then(|m| m.agent.as_ref()),
+        meta.and_then(|m| m.task.as_deref()),
+        home,
+    )
+}
+
+/// [`row_meta`] with the agent and task label given rather than read from `meta.agent` /
+/// `meta.task` — the session graph's entry, which passes `TabMeta::graph_agent` /
+/// `graph_task` so the graph ignores `[sidebar].show_agent_status` (user decision 2026-10-22)
+/// while its status still comes from this one join and [`resolve_status`]. Every other field
+/// is read from `meta` exactly as [`row_meta`] reads it.
+pub fn row_meta_with(
+    row: &SidebarRow,
+    meta: Option<&crate::tabmeta::TabMeta>,
+    agent: Option<&Agent>,
+    task: Option<&str>,
+    home: Option<&Path>,
+) -> RowMeta {
     // Resolve line 1 HERE (sticky-tab-title D7/R1.5): this is the one place that
     // sees all four sources at once with the AI-task label *fresh*. `Tabs::titles`
     // cannot do it — it runs on tab actions, while the task label arrives on this
     // per-frame pull, so resolving there would freeze the auto label until the
     // next tab switch.
-    let task = meta.and_then(|m| m.task.as_deref());
     // The folder name belongs on this pull for exactly the same reason, and did not used to
     // be here (card-live-cwd D1). `TabMeta::cwd` is republished whenever the shell moves,
     // while `row.title` was resolved by `Tabs::titles` on the last tab action — so reading
@@ -335,6 +358,11 @@ mod tests {
             // because `TabMeta` is destructured exhaustively by a pin in `tabmeta::worker`, so
             // every literal states every field deliberately.
             agent_pid: None,
+            panes: Vec::new(),
+            log: None,
+            repo: None,
+            graph_agent: None,
+            graph_task: None,
         }
     }
 

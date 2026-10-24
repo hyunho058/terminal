@@ -758,6 +758,41 @@ pub fn in_monitor_panel(pointer_x: f64, viewport_w: f32, right_inset: f32) -> bo
     right_inset > 0.0 && viewport_w.is_finite() && (pointer_x as f32) >= viewport_w - right_inset
 }
 
+/// Who a press, a wheel event or a hover belongs to (session-flow-graph D6/R2) — the answer
+/// of [`pointer_owner`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PointerOwner {
+    /// The session-flow graph covers the window: every pointer event is its, wherever it lands.
+    Graph,
+    /// The ai-monitor panel's band.
+    Monitor,
+    /// The sidebar.
+    Sidebar,
+    /// The terminal grid — everything nothing else claimed.
+    Grid,
+}
+
+/// Route one pointer event (session-flow-graph D6, R2.1/R2.2) — the precedence
+/// `terminal_app`'s press, wheel and cursor-moved arms apply, as a function rather than as
+/// the order their `if` arms happen to sit in.
+///
+/// An open graph owns **everything**, whatever the other two flags say: it covers the whole
+/// window, so a press or a notch that fell through would act on a terminal, a sidebar or a
+/// monitor the user cannot see (D6 rejected hit-testing only its cards for that reason).
+/// With the graph closed this is today's order exactly — the monitor's band first, by
+/// position alone (ai-monitor D10), then the sidebar, then the grid.
+pub fn pointer_owner(graph_visible: bool, in_monitor_band: bool, in_sidebar: bool) -> PointerOwner {
+    if graph_visible {
+        PointerOwner::Graph
+    } else if in_monitor_band {
+        PointerOwner::Monitor
+    } else if in_sidebar {
+        PointerOwner::Sidebar
+    } else {
+        PointerOwner::Grid
+    }
+}
+
 /// Physical px of travel one wheel event asks the ai-monitor panel for.
 ///
 /// Positive is toward the top of the document — winit's convention, and the same sign
@@ -1058,6 +1093,41 @@ pub fn pixel_to_cell(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r2_1_an_open_graph_owns_every_pointer_event() {
+        // session-flow-graph R2.1 — all four combinations of the other two flags, because a
+        // graph that lost one of them (a press over the monitor band reaching the monitor)
+        // would act on a surface the user cannot see.
+        for in_monitor_band in [false, true] {
+            for in_sidebar in [false, true] {
+                assert_eq!(
+                    pointer_owner(true, in_monitor_band, in_sidebar),
+                    PointerOwner::Graph,
+                    "monitor {in_monitor_band}, sidebar {in_sidebar}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r2_2_a_closed_graph_leaves_todays_routing() {
+        // session-flow-graph R2.2 — monitor band, then sidebar, then grid. The (true, true)
+        // row is the precedence cell: a band over the sidebar is the monitor's.
+        let cells = [
+            (false, false, PointerOwner::Grid),
+            (false, true, PointerOwner::Sidebar),
+            (true, false, PointerOwner::Monitor),
+            (true, true, PointerOwner::Monitor),
+        ];
+        for (in_monitor_band, in_sidebar, owner) in cells {
+            assert_eq!(
+                pointer_owner(false, in_monitor_band, in_sidebar),
+                owner,
+                "monitor {in_monitor_band}, sidebar {in_sidebar}"
+            );
+        }
+    }
 
     /// `pixel_to_cell` with no panel open — the shape every pre-panel test used.
     fn cell_at(cursor: (f64, f64), cols: u16, rows: u16) -> Option<(u16, u16)> {
