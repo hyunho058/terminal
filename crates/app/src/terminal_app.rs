@@ -59,11 +59,11 @@ use crate::hyperlink::{
 };
 use crate::ime_chord::{self, CmdEventFacts, Replay};
 use crate::input::{
-    self, encode_key, font_action, hover_card, hover_cursor, is_double_click,
-    is_sidebar_toggle_chord, pixel_to_cell, press_dismisses_modals, sidebar_press, sidebar_region,
-    suppress_key, tab_action, wheel_bytes, wheel_lines, wheel_scroll, FontAction, PersistTarget,
-    PointerOwner, PressRoute, ReleaseTarget, ResizeDrag, ResizeEdge, SidebarAction, TabAction,
-    WheelDelta,
+    self, encode_key, font_action, grid_press_action, grid_release_action, hover_card, hover_cursor,
+    is_double_click, is_sidebar_toggle_chord, pixel_to_cell, press_dismisses_modals, sidebar_press,
+    sidebar_region, suppress_key, tab_action, wheel_bytes, wheel_lines, wheel_scroll, FontAction,
+    GridPressAction, GridReleaseAction, PersistTarget, PointerOwner, PressRoute, ReleaseTarget,
+    ResizeDrag, ResizeEdge, SidebarAction, TabAction, WheelDelta,
 };
 use crate::seam::{
     AppCtx, AppRequest, Handled, InputRouter, KeyInput, OverlayCommand, OverlayHost, Registrations,
@@ -275,6 +275,8 @@ struct Running {
     /// What the in-flight drag swallowed, replayed on release (terminal-scroll D6).
     /// Meaningless while `dragging` is false; reset at each press.
     drag_latch: DragLatch,
+    /// Active grid mouse button press forwarded to the child application PTY (mouse-button-reporting D4).
+    mouse_reported: Option<(MouseButton, u16, u16)>,
     /// The mouse cursor shape currently set on the window (tab-resize D11). Mirrored here
     /// so `set_cursor_icon` can skip a platform call when the shape has not changed —
     /// `refresh_hover` runs on every `CursorMoved`.
@@ -534,6 +536,7 @@ impl App {
             dragging: false,
             drag: None,
             drag_latch: DragLatch::default(),
+            mouse_reported: None,
             cursor_icon: CursorIcon::Default,
             resize_drag: None,
             config_path,
@@ -2745,139 +2748,194 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
-                button: MouseButton::Left,
+                button,
                 ..
             } => {
                 let p = [inner.last_cursor.0 as f32, inner.last_cursor.1 as f32];
                 let owner = inner.pointer_owner();
-                // An open session-flow graph takes the press before every other handler, and
-                // keeps it whether or not it lands on a card (session-flow-graph D6/R2.3): a
-                // press falling through would start a selection under a covered screen.
-                if owner == PointerOwner::Graph {
-                    let (_, requests) = inner.press_overlays(p, true);
-                    if !inner.apply_requests(requests) {
-                        event_loop.exit();
-                        return;
-                    }
-                    inner.window.request_redraw();
-                    return;
-                }
-                // The ai-monitor panel resolves next, by pointer position alone — the same
-                // order and the same reason as the wheel below (D7/D10). The panel reserves
-                // its columns rather than covering them, so a press inside its band was
-                // never the grid's to begin with.
-                if owner == PointerOwner::Monitor {
-                    let (handled, requests) = inner.press_overlays(p, false);
-                    // What the press asked for — a graph card's `ActivateTab` (session-flow-
-                    // graph D7) — is applied before anything else runs, so it is never
-                    // dropped, consumed or not.
-                    if !inner.apply_requests(requests) {
-                        event_loop.exit();
-                        return;
-                    }
-                    if handled == Handled::Consumed {
-                        // A fold changes the document, so the panel must re-lay out; the
-                        // grid did not move, so the cheap request is the right one.
+
+                if button == MouseButton::Left {
+                    // An open session-flow graph takes the press before every other handler, and
+                    // keeps it whether or not it lands on a card (session-flow-graph D6/R2.3): a
+                    // press falling through would start a selection under a covered screen.
+                    if owner == PointerOwner::Graph {
+                        let (_, requests) = inner.press_overlays(p, true);
+                        if !inner.apply_requests(requests) {
+                            event_loop.exit();
+                            return;
+                        }
                         inner.window.request_redraw();
                         return;
                     }
-                }
-                // Resolve the press through the sibling's ONE ordered hit_test (D1) — the
-                // app performs no geometry (SD2). Cards + new-tab route through the same
-                // path as chords (D2); hide/restore toggle; inert regions are swallowed.
-                let inp = inner.sidebar_input();
-                let collapsed = inner.collapsed();
-                let action = sidebar_press(inner.last_cursor, &inp, inner.scroll, collapsed);
-                // Every press disarms the link gesture first (hyperlinks D22); only
-                // the grid fallthrough below re-arms it. A ⌘-click the sidebar claims
-                // therefore keeps its existing meaning and opens nothing (R4.12).
-                inner.link_cmd_at_press = false;
-                // Any press that is not ON the open menu dismisses it (sticky-tab-title
-                // R3.8) — including a press over the grid, which resolves to no sidebar
-                // action at all. The press still does its own job afterwards: dismissing
-                // is not swallowing, the same rule D8a.2 gives tab chords.
-                if press_dismisses_modals(action) {
-                    inner.close_card_menu();
-                    // …and the rename field, which D8 gives the same rule ("a sidebar
-                    // click cancels the edit"). Enforcing it only for the menu left the
-                    // field open behind a press that dismissed everything else — and
-                    // collapsing the sidebar then hid a field that was still consuming
-                    // EVERY keystroke, with nothing on screen to explain why. One press,
-                    // one dismissal rule, both surfaces.
-                    //
-                    // Safe for the double-click path: this runs BEFORE the action, and
-                    // `begin_rename_row` opens the field afterwards.
-                    inner.overlays.command(&OverlayCommand::Cancel);
-                }
-                // R9.5/D17: the sidebar-then-panel-then-grid order is `input::press_route`'s
-                // decision, not this `match`'s shape — reordering these arms now changes
-                // nothing, and changing the rule fails a test.
-                match input::press_route(action, inner.in_monitor_grab_band()) {
-                    PressRoute::Sidebar(action) => match action {
-                        SidebarAction::Switch(i) => {
-                            // A second click on the SAME card opens the rename field on it
-                            // (sticky-tab-title): the title is edited by clicking the title,
-                            // not only through the menu. The first click still switches —
-                            // this adds a gesture, it does not replace one.
-                            let now = inner.epoch.elapsed().as_millis();
-                            let double = is_double_click(inner.last_card_click, i, now);
-                            inner.last_card_click = Some((i, now));
-                            if !inner.do_tab_action(TabAction::Jump(i)) {
-                                event_loop.exit();
-                            } else if double {
-                                inner.begin_rename_row(i);
-                            }
+                    // The ai-monitor panel resolves next, by pointer position alone — the same
+                    // order and the same reason as the wheel below (D7/D10). The panel reserves
+                    // its columns rather than covering them, so a press inside its band was
+                    // never the grid's to begin with.
+                    if owner == PointerOwner::Monitor {
+                        let (handled, requests) = inner.press_overlays(p, false);
+                        // What the press asked for — a graph card's `ActivateTab` (session-flow-
+                        // graph D7) — is applied before anything else runs, so it is never
+                        // dropped, consumed or not.
+                        if !inner.apply_requests(requests) {
+                            event_loop.exit();
+                            return;
                         }
-                        SidebarAction::SwitchWaiting(i) => {
-                            // Resolve the band row to its tab index, then switch — which
-                            // acknowledges + clears the item (D12/R2.1). A stale row (tab
-                            // gone) is a no-op.
-                            if let Some(idx) = inner.waiting_row_tab_index(i) {
-                                if !inner.do_tab_action(TabAction::Jump(idx)) {
+                        if handled == Handled::Consumed {
+                            // A fold changes the document, so the panel must re-lay out; the
+                            // grid did not move, so the cheap request is the right one.
+                            inner.window.request_redraw();
+                            return;
+                        }
+                    }
+                    // Resolve the press through the sibling's ONE ordered hit_test (D1) — the
+                    // app performs no geometry (SD2). Cards + new-tab route through the same
+                    // path as chords (D2); hide/restore toggle; inert regions are swallowed.
+                    let inp = inner.sidebar_input();
+                    let collapsed = inner.collapsed();
+                    let action = sidebar_press(inner.last_cursor, &inp, inner.scroll, collapsed);
+                    // Every press disarms the link gesture first (hyperlinks D22); only
+                    // the grid fallthrough below re-arms it. A ⌘-click the sidebar claims
+                    // therefore keeps its existing meaning and opens nothing (R4.12).
+                    inner.link_cmd_at_press = false;
+                    // Any press that is not ON the open menu dismisses it (sticky-tab-title
+                    // R3.8) — including a press over the grid, which resolves to no sidebar
+                    // action at all. The press still does its own job afterwards: dismissing
+                    // is not swallowing, the same rule D8a.2 gives tab chords.
+                    if press_dismisses_modals(action) {
+                        inner.close_card_menu();
+                        // …and the rename field, which D8 gives the same rule ("a sidebar
+                        // click cancels the edit"). Enforcing it only for the menu left the
+                        // field open behind a press that dismissed everything else — and
+                        // collapsing the sidebar then hid a field that was still consuming
+                        // EVERY keystroke, with nothing on screen to explain why. One press,
+                        // one dismissal rule, both surfaces.
+                        //
+                        // Safe for the double-click path: this runs BEFORE the action, and
+                        // `begin_rename_row` opens the field afterwards.
+                        inner.overlays.command(&OverlayCommand::Cancel);
+                    }
+                    // R9.5/D17: the sidebar-then-panel-then-grid order is `input::press_route`'s
+                    // decision, not this `match`'s shape — reordering these arms now changes
+                    // nothing, and changing the rule fails a test.
+                    match input::press_route(action, inner.in_monitor_grab_band()) {
+                        PressRoute::Sidebar(action) => match action {
+                            SidebarAction::Switch(i) => {
+                                // A second click on the SAME card opens the rename field on it
+                                // (sticky-tab-title): the title is edited by clicking the title,
+                                // not only through the menu. The first click still switches —
+                                // this adds a gesture, it does not replace one.
+                                let now = inner.epoch.elapsed().as_millis();
+                                let double = is_double_click(inner.last_card_click, i, now);
+                                inner.last_card_click = Some((i, now));
+                                if !inner.do_tab_action(TabAction::Jump(i)) {
+                                    event_loop.exit();
+                                } else if double {
+                                    inner.begin_rename_row(i);
+                                }
+                            }
+                            SidebarAction::SwitchWaiting(i) => {
+                                // Resolve the band row to its tab index, then switch — which
+                                // acknowledges + clears the item (D12/R2.1). A stale row (tab
+                                // gone) is a no-op.
+                                if let Some(idx) = inner.waiting_row_tab_index(i) {
+                                    if !inner.do_tab_action(TabAction::Jump(idx)) {
+                                        event_loop.exit();
+                                    }
+                                }
+                            }
+                            SidebarAction::NewTab => {
+                                if !inner.do_tab_action(TabAction::New) {
                                     event_loop.exit();
                                 }
                             }
-                        }
-                        SidebarAction::NewTab => {
-                            if !inner.do_tab_action(TabAction::New) {
-                                event_loop.exit();
+                            SidebarAction::Collapse => inner.toggle_sidebar(true),
+                            SidebarAction::Expand => inner.toggle_sidebar(false),
+                            SidebarAction::OpenMenu(i) => inner.open_card_menu(i),
+                            SidebarAction::MenuItem(i) => {
+                                if !inner.activate_menu_item(i) {
+                                    event_loop.exit();
+                                }
+                            }
+                            SidebarAction::BeginResize => inner.begin_resize(ResizeEdge::Sidebar),
+                            SidebarAction::Inert => {}
+                        },
+                        PressRoute::MonitorEdge => inner.begin_resize(ResizeEdge::Monitor),
+                        PressRoute::Grid => {
+                            if let Some(cell) = inner.cursor_cell() {
+                                let active = inner.tabs.active();
+                                let term = &active.terminal;
+                                match grid_press_action(
+                                    term.mouse_protocol(),
+                                    term.mouse_encoding(),
+                                    button,
+                                    cell,
+                                    &inner.mods,
+                                ) {
+                                    GridPressAction::Report(bytes) => {
+                                        if let Err(e) = inner.tabs.active_mut().write(&bytes) {
+                                            tracing::warn!("pty write failed: {e}");
+                                        }
+                                        inner.mouse_reported = Some((button, cell.0, cell.1));
+                                    }
+                                    GridPressAction::Drag => {
+                                        let active = inner.tabs.active();
+                                        inner.drag = Some(SelectionDrag::press(
+                                            active.id,
+                                            cell,
+                                            &active.terminal,
+                                        ));
+                                        inner.dragging = true;
+                                        inner.link_cmd_at_press = inner.mods.super_key();
+                                        inner.drag_latch = DragLatch::default();
+                                    }
+                                    GridPressAction::Ignore => {}
+                                }
                             }
                         }
-                        SidebarAction::Collapse => inner.toggle_sidebar(true),
-                        SidebarAction::Expand => inner.toggle_sidebar(false),
-                        SidebarAction::OpenMenu(i) => inner.open_card_menu(i),
-                        SidebarAction::MenuItem(i) => {
-                            if !inner.activate_menu_item(i) {
-                                event_loop.exit();
+                    }
+                } else if owner == PointerOwner::Grid {
+                    // Right or Middle click over the grid when mouse reporting is active (D5).
+                    if let Some(cell) = inner.cursor_cell() {
+                        let active = inner.tabs.active();
+                        let term = &active.terminal;
+                        if let GridPressAction::Report(bytes) = grid_press_action(
+                            term.mouse_protocol(),
+                            term.mouse_encoding(),
+                            button,
+                            cell,
+                            &inner.mods,
+                        ) {
+                            if let Err(e) = inner.tabs.active_mut().write(&bytes) {
+                                tracing::warn!("pty write failed: {e}");
                             }
-                        }
-                        SidebarAction::BeginResize => inner.begin_resize(ResizeEdge::Sidebar),
-                        SidebarAction::Inert => {}
-                    },
-                    PressRoute::MonitorEdge => inner.begin_resize(ResizeEdge::Monitor),
-                    PressRoute::Grid => {
-                        if let Some(cell) = inner.cursor_cell() {
-                            // Over a real grid cell → anchor a selection and arm the drag
-                            // (selection-input). Nothing is shown until the pointer leaves
-                            // this cell; a press in the dead band (cursor_cell → None)
-                            // arms nothing. The anchor becomes a content point HERE, at
-                            // press time, inside `SelectionDrag::press` (D3/R3.1).
-                            let active = inner.tabs.active();
-                            inner.drag =
-                                Some(SelectionDrag::press(active.id, cell, &active.terminal));
-                            inner.dragging = true;
-                            // Sample ⌘ at press (hyperlinks D22). The drag is armed exactly
-                            // as before either way — ⌘ adds a gesture here, it removes none.
-                            inner.link_cmd_at_press = inner.mods.super_key();
-                            // Start a fresh latch (terminal-scroll D6). The drag freezes the
-                            // viewport while `scrollback` D2's auto-increment keeps drifting
-                            // it, so any snap raised in that window is recorded here and
-                            // replayed on release rather than lost.
-                            inner.drag_latch = DragLatch::default();
+                            inner.mouse_reported = Some((button, cell.0, cell.1));
                         }
                     }
                 }
             }
+
+            // End a mouse report forward to the PTY (mouse-button-reporting D4).
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button,
+                ..
+            } if inner.mouse_reported.is_some_and(|(b, _, _)| b == button) => {
+                let rep = inner.mouse_reported.take();
+                let active = inner.tabs.active();
+                let term = &active.terminal;
+                if let GridReleaseAction::Report(bytes) = grid_release_action(
+                    rep,
+                    term.mouse_protocol(),
+                    term.mouse_encoding(),
+                    button,
+                    &inner.mods,
+                ) {
+                    if let Err(e) = inner.tabs.active_mut().write(&bytes) {
+                        tracing::warn!("pty write failed: {e}");
+                    }
+                }
+            }
+
 
             // End a resize (tab-resize D17/R7.3). A SEPARATE arm placed BEFORE the
             // selection one — not a `||`-widened guard on it: Rust runs exactly one match
@@ -3053,6 +3111,20 @@ impl ApplicationHandler<UserEvent> for App {
                 // behaves exactly as today" true if that synthetic event ever stops
                 // arriving.
                 inner.disarm_link_hover();
+                // Release an in-flight mouse report if focus is lost (mouse-button-reporting D4).
+                if let Some((btn, col, row)) = inner.mouse_reported.take() {
+                    let active = inner.tabs.active();
+                    let term = &active.terminal;
+                    if let GridReleaseAction::Report(bytes) = grid_release_action(
+                        Some((btn, col, row)),
+                        term.mouse_protocol(),
+                        term.mouse_encoding(),
+                        btn,
+                        &inner.mods,
+                    ) {
+                        let _ = inner.tabs.active_mut().write(&bytes);
+                    }
+                }
             }
 
             WindowEvent::KeyboardInput {

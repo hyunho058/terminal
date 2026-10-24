@@ -4,7 +4,8 @@
 //! chord table is unit-tested without a window.
 
 use renderer::sidebar_layout::{self, ChromeRegion, SidebarLayoutInput, SidebarRegion};
-use term_core::MouseEncoding;
+use term_core::{MouseEncoding, MouseProtocol};
+use winit::event::{ElementState, MouseButton};
 use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::CursorIcon;
 
@@ -3325,5 +3326,359 @@ mod wheel_bytes_tests {
     fn the_per_gesture_line_count_is_clamped() {
         let b = wheel_bytes(true, MouseEncoding::Sgr, 100_000, (0, 0)).expect("reports");
         assert_eq!(b.len(), "\x1b[<64;1;1M".len() * 50, "clamped at 50 reports");
+    }
+}
+
+/// Routing decision for mouse button events over the grid.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseButtonRoute {
+    /// Forward button reports to the child application.
+    Report,
+    /// Keep the gesture for the terminal (selection drag, hyperlink open).
+    Bypass,
+}
+
+/// Decide whether a grid mouse button event should be forwarded as an application
+/// report or kept for terminal handling (mouse-button-reporting D1, D3).
+///
+/// Bypassed when mouse reporting is disabled, or when Cmd (super) or Shift is held.
+/// ⌘-click is reserved for hyperlinks (specs/hyperlinks/spec.md D17/R4.11), and
+/// Shift-click allows manual text selection in mouse-enabled TUIs.
+pub fn mouse_button_route(protocol: MouseProtocol, mods: &ModifiersState) -> MouseButtonRoute {
+    if !protocol.is_on() || mods.super_key() || mods.shift_key() {
+        MouseButtonRoute::Bypass
+    } else {
+        MouseButtonRoute::Report
+    }
+}
+
+/// Encode one mouse button press or release report (mouse-button-reporting D2).
+///
+/// `button`: Left=0, Middle=1, Right=2. Other buttons return `None`.
+/// `state`: Pressed or Released.
+/// `col`/`row`: 0-based grid cells; the wire format uses 1-based coordinates.
+///
+/// Encodings:
+/// - [`MouseEncoding::Sgr`] (?1006): `ESC [ < b ; col ; row M` (press) or `m` (release).
+/// - [`MouseEncoding::Legacy`]: `ESC [ M b+32 col+32 row+32`. Coordinates > 223 return `None`.
+///   Release encodes button code 3.
+pub fn encode_mouse_button_report(
+    encoding: MouseEncoding,
+    button: MouseButton,
+    state: ElementState,
+    col: u16,
+    row: u16,
+    _mods: &ModifiersState,
+) -> Option<Vec<u8>> {
+    let btn_code: u16 = match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+        _ => return None,
+    };
+    let (cx, cy) = (col.saturating_add(1), row.saturating_add(1));
+    match encoding {
+        MouseEncoding::Sgr => {
+            let action = if state == ElementState::Pressed {
+                'M'
+            } else {
+                'm'
+            };
+            Some(format!("\x1b[<{btn_code};{cx};{cy}{action}").into_bytes())
+        }
+        MouseEncoding::Legacy => {
+            if cx > 223 || cy > 223 {
+                return None;
+            }
+            let b = if state == ElementState::Pressed {
+                btn_code
+            } else {
+                3
+            };
+            Some(vec![
+                0x1b,
+                b'[',
+                b'M',
+                (b + 32) as u8,
+                (cx + 32) as u8,
+                (cy + 32) as u8,
+            ])
+        }
+    }
+}
+
+/// The bytes a mouse button event should write to the PTY, or `None` when the terminal
+/// bypasses reporting (mouse-button-reporting D1, D2).
+pub fn mouse_button_bytes(
+    protocol: MouseProtocol,
+    encoding: MouseEncoding,
+    button: MouseButton,
+    state: ElementState,
+    (col, row): (u16, u16),
+    mods: &ModifiersState,
+) -> Option<Vec<u8>> {
+    if mouse_button_route(protocol, mods) != MouseButtonRoute::Report {
+        return None;
+    }
+    // MouseProtocol::X10 emits press reports only, never release.
+    if protocol == MouseProtocol::X10 && state == ElementState::Released {
+        return None;
+    }
+    encode_mouse_button_report(encoding, button, state, col, row, mods)
+}
+
+/// Action to take on a mouse button press over the terminal grid (mouse-button-reporting D1, D4).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum GridPressAction {
+    /// Send encoded report bytes to the PTY and latch `mouse_reported`.
+    Report(Vec<u8>),
+    /// Arm terminal text selection drag (MouseButton::Left only).
+    Drag,
+    /// Ignore the press (e.g. Right/Middle clicks when reporting is bypassed).
+    Ignore,
+}
+
+/// Decide the action for a mouse press over the terminal grid.
+pub fn grid_press_action(
+    protocol: MouseProtocol,
+    encoding: MouseEncoding,
+    button: MouseButton,
+    pos: (u16, u16),
+    mods: &ModifiersState,
+) -> GridPressAction {
+    match mouse_button_route(protocol, mods) {
+        MouseButtonRoute::Report => {
+            if let Some(bytes) =
+                mouse_button_bytes(protocol, encoding, button, ElementState::Pressed, pos, mods)
+            {
+                GridPressAction::Report(bytes)
+            } else {
+                GridPressAction::Ignore
+            }
+        }
+        MouseButtonRoute::Bypass => {
+            if button == MouseButton::Left {
+                GridPressAction::Drag
+            } else {
+                GridPressAction::Ignore
+            }
+        }
+    }
+}
+
+/// Action to take on a mouse button release over the terminal grid (mouse-button-reporting D1, D4).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum GridReleaseAction {
+    /// Send encoded report bytes to the PTY.
+    Report(Vec<u8>),
+    /// Omit report (e.g. X10 mode, coordinate drop, button mismatch).
+    Ignore,
+}
+
+/// Decide the release report for an in-flight grid mouse press.
+pub fn grid_release_action(
+    reported: Option<(MouseButton, u16, u16)>,
+    protocol: MouseProtocol,
+    encoding: MouseEncoding,
+    button: MouseButton,
+    mods: &ModifiersState,
+) -> GridReleaseAction {
+    let Some((rep_btn, col, row)) = reported else {
+        return GridReleaseAction::Ignore;
+    };
+    if rep_btn != button {
+        return GridReleaseAction::Ignore;
+    }
+    if let Some(bytes) = mouse_button_bytes(
+        protocol,
+        encoding,
+        button,
+        ElementState::Released,
+        (col, row),
+        mods,
+    ) {
+        GridReleaseAction::Report(bytes)
+    } else {
+        GridReleaseAction::Ignore
+    }
+}
+
+#[cfg(test)]
+mod mouse_button_tests {
+    use super::*;
+
+    fn s(b: Vec<u8>) -> String {
+        String::from_utf8_lossy(&b).replace('\x1b', "ESC")
+    }
+
+    #[test]
+    fn r1_1_sgr_press_encoding() {
+        let b = mouse_button_bytes(
+            MouseProtocol::Normal,
+            MouseEncoding::Sgr,
+            MouseButton::Left,
+            ElementState::Pressed,
+            (10, 5),
+            &ModifiersState::empty(),
+        )
+        .expect("bytes");
+        assert_eq!(s(b), "ESC[<0;11;6M");
+    }
+
+    #[test]
+    fn r1_2_sgr_release_encoding() {
+        let b = mouse_button_bytes(
+            MouseProtocol::Normal,
+            MouseEncoding::Sgr,
+            MouseButton::Left,
+            ElementState::Released,
+            (10, 5),
+            &ModifiersState::empty(),
+        )
+        .expect("bytes");
+        assert_eq!(s(b), "ESC[<0;11;6m");
+    }
+
+    #[test]
+    fn r1_3_legacy_press_encoding() {
+        let b = mouse_button_bytes(
+            MouseProtocol::Normal,
+            MouseEncoding::Legacy,
+            MouseButton::Left,
+            ElementState::Pressed,
+            (10, 5),
+            &ModifiersState::empty(),
+        )
+        .expect("bytes");
+        assert_eq!(b, vec![0x1b, b'[', b'M', 32, 10 + 1 + 32, 5 + 1 + 32]);
+    }
+
+    #[test]
+    fn r1_4_legacy_release_encoding() {
+        let b = mouse_button_bytes(
+            MouseProtocol::Normal,
+            MouseEncoding::Legacy,
+            MouseButton::Left,
+            ElementState::Released,
+            (10, 5),
+            &ModifiersState::empty(),
+        )
+        .expect("bytes");
+        assert_eq!(b, vec![0x1b, b'[', b'M', 32 + 3, 10 + 1 + 32, 5 + 1 + 32]);
+    }
+
+    #[test]
+    fn r1_5_x10_omits_release() {
+        assert!(mouse_button_bytes(
+            MouseProtocol::X10,
+            MouseEncoding::Sgr,
+            MouseButton::Left,
+            ElementState::Released,
+            (10, 5),
+            &ModifiersState::empty(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn r1_6_legacy_coordinate_clamp() {
+        assert!(mouse_button_bytes(
+            MouseProtocol::Normal,
+            MouseEncoding::Legacy,
+            MouseButton::Left,
+            ElementState::Pressed,
+            (250, 5),
+            &ModifiersState::empty(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn r2_modifier_bypasses() {
+        assert_eq!(
+            mouse_button_route(MouseProtocol::AnyEvent, &ModifiersState::SUPER),
+            MouseButtonRoute::Bypass
+        );
+        assert_eq!(
+            mouse_button_route(MouseProtocol::AnyEvent, &ModifiersState::SHIFT),
+            MouseButtonRoute::Bypass
+        );
+        assert_eq!(
+            mouse_button_route(MouseProtocol::Off, &ModifiersState::empty()),
+            MouseButtonRoute::Bypass
+        );
+        assert_eq!(
+            mouse_button_route(MouseProtocol::AnyEvent, &ModifiersState::empty()),
+            MouseButtonRoute::Report
+        );
+    }
+
+    #[test]
+    fn r3_grid_press_and_release_lifecycle() {
+        // R3.1 / R3.3 / R3.4: Press
+        let action = grid_press_action(
+            MouseProtocol::AnyEvent,
+            MouseEncoding::Sgr,
+            MouseButton::Left,
+            (12, 4),
+            &ModifiersState::empty(),
+        );
+        assert_eq!(action, GridPressAction::Report(b"\x1b[<0;13;5M".to_vec()));
+
+        let right_action = grid_press_action(
+            MouseProtocol::AnyEvent,
+            MouseEncoding::Sgr,
+            MouseButton::Right,
+            (12, 4),
+            &ModifiersState::empty(),
+        );
+        assert_eq!(
+            right_action,
+            GridPressAction::Report(b"\x1b[<2;13;5M".to_vec())
+        );
+
+        // Bypass Left -> Drag
+        assert_eq!(
+            grid_press_action(
+                MouseProtocol::Off,
+                MouseEncoding::Sgr,
+                MouseButton::Left,
+                (12, 4),
+                &ModifiersState::empty(),
+            ),
+            GridPressAction::Drag
+        );
+
+        // Bypass Right -> Ignore
+        assert_eq!(
+            grid_press_action(
+                MouseProtocol::Off,
+                MouseEncoding::Sgr,
+                MouseButton::Right,
+                (12, 4),
+                &ModifiersState::empty(),
+            ),
+            GridPressAction::Ignore
+        );
+
+        // R3.2: Release
+        let rel = grid_release_action(
+            Some((MouseButton::Left, 12, 4)),
+            MouseProtocol::AnyEvent,
+            MouseEncoding::Sgr,
+            MouseButton::Left,
+            &ModifiersState::empty(),
+        );
+        assert_eq!(rel, GridReleaseAction::Report(b"\x1b[<0;13;5m".to_vec()));
+
+        // R3.5: Release under X10 -> Ignore
+        let x10_rel = grid_release_action(
+            Some((MouseButton::Left, 12, 4)),
+            MouseProtocol::X10,
+            MouseEncoding::Sgr,
+            MouseButton::Left,
+            &ModifiersState::empty(),
+        );
+        assert_eq!(x10_rel, GridReleaseAction::Ignore);
     }
 }

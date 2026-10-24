@@ -89,6 +89,10 @@ pub use input::pointer_owner;
 pub use input::PointerOwner;
 /// `crates/app/tests/tt11_graph_wheel.rs` wheels the open graph (session-flow-graph R11.3).
 pub use input::WheelDelta;
+pub use input::{
+    encode_mouse_button_report, grid_press_action, grid_release_action, mouse_button_bytes,
+    mouse_button_route, GridPressAction, GridReleaseAction, MouseButtonRoute,
+};
 /// `crates/app/tests/tt3_graph_monitor.rs` dispatches the monitor's chord beside a closed
 /// graph (session-flow-graph R3.1, R3.2).
 pub use overlay::AiMonitorOverlay;
