@@ -409,6 +409,9 @@ the changed files leaves no survivor that is not argued equivalent.
 
 ### D13: A reply after background work is not a finished turn
 - **Status**: resolved (user, from the inversion probe)
+- **Amended by `specs/agy-background-working` D1**: a reply whose turn started a background
+  task or subagent that has not yet reported back (no completion `SYSTEM_MESSAGE`) reads
+  `AssistantBusy` → `Working`, at any age. Everything below still holds when nothing is pending.
 - **Decision**: a tool-less `PLANNER_RESPONSE` is treated as a finished turn (`Waiting`, D2)
   only when **every** step since the last `USER_INPUT` is known foreground work: no step has
   `status: RUNNING`, there is no `INVOKE_SUBAGENT` step, and every dispatched tool is in the
@@ -501,6 +504,8 @@ the changed files leaves no survivor that is not argued equivalent.
   `Ready` (34 of 90 measured) and does not enter the band; and a reply written *while*
   background work still runs reads `Ready` from 10 s after it until the next step (21
   measured, up to 96 s) although the agent is still working.
+  *(Second half amended by `specs/agy-background-working` D1: while that work has not reported
+  back, the reply reads `Working`.)*
 - **Codex, Gemini and Aider have no state** (D3 hides it). Their dialogs are detected only if
   they happen to match Claude's rule (two of its markers) or Antigravity's (a question row with
   the first choice under it).
