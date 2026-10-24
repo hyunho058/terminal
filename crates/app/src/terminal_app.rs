@@ -59,11 +59,11 @@ use crate::hyperlink::{
 };
 use crate::ime_chord::{self, CmdEventFacts, Replay};
 use crate::input::{
-    self, encode_key, font_action, grid_press_action, grid_release_action, hover_card, hover_cursor,
-    is_double_click, is_sidebar_toggle_chord, pixel_to_cell, press_dismisses_modals, sidebar_press,
-    sidebar_region, suppress_key, tab_action, wheel_bytes, wheel_lines, wheel_scroll, FontAction,
-    GridPressAction, GridReleaseAction, PersistTarget, PointerOwner, PressRoute, ReleaseTarget,
-    ResizeDrag, ResizeEdge, SidebarAction, TabAction, WheelDelta,
+    self, encode_key, font_action, grid_press_action, grid_release_action, hover_card,
+    hover_cursor, is_double_click, is_sidebar_toggle_chord, pixel_to_cell, press_dismisses_modals,
+    sidebar_press, sidebar_region, suppress_key, tab_action, wheel_bytes, wheel_lines,
+    wheel_scroll, FontAction, GridPressAction, GridReleaseAction, PersistTarget, PointerOwner,
+    PressRoute, ReleaseTarget, ResizeDrag, ResizeEdge, SidebarAction, TabAction, WheelDelta,
 };
 use crate::seam::{
     AppCtx, AppRequest, Handled, InputRouter, KeyInput, OverlayCommand, OverlayHost, Registrations,
@@ -2935,7 +2935,6 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
-
 
             // End a resize (tab-resize D17/R7.3). A SEPARATE arm placed BEFORE the
             // selection one — not a `||`-widened guard on it: Rust runs exactly one match
