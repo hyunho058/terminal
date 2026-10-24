@@ -151,7 +151,16 @@ pub enum AppRequest {
     ///
     /// A window property, not a tab property — the panel is one per window and re-points
     /// on a tab switch (D13), so this names no [`TabId`].
+    ///
+    /// The band is the monitor's alone (session-flow-graph D4): the session-flow graph
+    /// covers the whole window instead of sharing it, so this is again a bare `bool`.
     SetMonitorOpen(bool),
+    /// Switch to tab `id` (session-flow-graph D7) — a click on a session graph card. Applied
+    /// through `do_tab_action(TabAction::Jump(i))` so composition, rename and menu teardown
+    /// happen exactly as for a sidebar click. An id, not an index, for the reason every tab
+    /// variant here carries one: the roster may shift between the press and the apply, and
+    /// a closed tab's id resolves to nothing rather than to its neighbour.
+    ActivateTab(TabId),
 }
 
 impl<'a> AppCtx<'a> {
@@ -231,6 +240,12 @@ impl<'a> AppCtx<'a> {
         self.requests.push(AppRequest::SetMonitorOpen(open));
     }
 
+    /// Ask the app to switch to tab `id` (session-flow-viewer D7). Applied after the press
+    /// returns, like every other request.
+    pub fn activate_tab(&mut self, id: TabId) {
+        self.requests.push(AppRequest::ActivateTab(id));
+    }
+
     /// Drain the requests recorded during dispatch, in the order they were made. Called
     /// by `terminal_app` once the `AppCtx` borrow is released.
     pub fn take_requests(&mut self) -> Vec<AppRequest> {
@@ -281,9 +296,34 @@ pub trait Overlay {
     /// `Consumed` means the overlay acted on it; `Passthrough` means the press landed on
     /// nothing it owns and the surface below should get it.
     ///
+    /// `ctx` is the route back to the app (session-flow-graph D7): a graph card click
+    /// queues [`AppRequest::ActivateTab`] on it, and the press site applies the queue once
+    /// this returns — the same deferred path the key dispatch uses. Rejected: a pending-request
+    /// side channel polled by the host, which would be a second request path beside `AppCtx`.
+    ///
     /// Default: not mine.
-    fn on_press(&mut self, _point: [f32; 2]) -> Handled {
+    fn on_press(&mut self, _point: [f32; 2], _ctx: &mut AppCtx) -> Handled {
         Handled::Passthrough
+    }
+    /// The pointer moved to `point` (window px), or left the window with `None`
+    /// (session-flow-graph D3/D6) — the hover feed of an overlay that owns the pointer.
+    ///
+    /// Delivered only to a visible overlay that [`covers_window`](Self::covers_window), and
+    /// only while the app's [`crate::input::pointer_owner`] says the graph owns the pointer:
+    /// no band-sized overlay hears it, so none of them changes.
+    ///
+    /// Default: nothing to track.
+    fn on_hover(&mut self, _point: Option<[f32; 2]>) {}
+    /// Whether this overlay, **while visible**, covers the whole window and so owns every
+    /// press, wheel and hover in it (session-flow-graph D4/D6).
+    ///
+    /// The app reads it through [`OverlayHost::covering_visible`] as the `graph_visible`
+    /// input of [`crate::input::pointer_owner`]; the answer is about the overlay's *kind*,
+    /// and `visible()` stays the one source of whether it is up.
+    ///
+    /// Default: no — every other overlay owns a band at most, reached by the app's hit-test.
+    fn covers_window(&self) -> bool {
+        false
     }
     /// The overlay's draw layer, registered with the renderer.
     ///
@@ -488,13 +528,59 @@ impl OverlayHost {
     ///
     /// Visibility gates this for the reason it gates `wheel`: a band that is not on screen
     /// owns no pixels, so a press there belongs to whatever is drawn instead.
-    pub fn press(&mut self, point: [f32; 2]) -> Handled {
+    ///
+    /// Requests the taker records land in `ctx`; the caller drains them with
+    /// [`AppCtx::take_requests`] (session-flow-viewer D7), so an `ActivateTab` is never
+    /// dropped.
+    pub fn press(&mut self, point: [f32; 2], ctx: &mut AppCtx) -> Handled {
         for o in &mut self.overlays {
-            if o.visible() && o.on_press(point) == Handled::Consumed {
+            if o.visible() && o.on_press(point, ctx) == Handled::Consumed {
                 return Handled::Consumed;
             }
         }
         Handled::Passthrough
+    }
+
+    /// Is a window-covering overlay up (session-flow-graph D6)? The `graph_visible` input
+    /// of [`crate::input::pointer_owner`], read from the overlay's own `visible()`.
+    pub fn covering_visible(&self) -> bool {
+        self.overlays
+            .iter()
+            .any(|o| o.covers_window() && o.visible())
+    }
+
+    /// Offer one left press to the visible window-covering overlays **only**
+    /// (session-flow-graph D6) — the `PointerOwner::Graph` route, taken before the sidebar,
+    /// monitor and grid handlers. A band overlay is never offered it: it is covered.
+    pub fn press_covering(&mut self, point: [f32; 2], ctx: &mut AppCtx) -> Handled {
+        for o in &mut self.overlays {
+            if o.covers_window() && o.visible() && o.on_press(point, ctx) == Handled::Consumed {
+                return Handled::Consumed;
+            }
+        }
+        Handled::Passthrough
+    }
+
+    /// The wheel twin of [`press_covering`](Self::press_covering): the graph scrolls, never
+    /// the monitor, the scrollback or the sidebar under it (session-flow-graph D6).
+    pub fn wheel_covering(&mut self, delta: crate::input::WheelDelta, cell_h: f32) -> Handled {
+        for o in &mut self.overlays {
+            if o.covers_window() && o.visible() && o.on_wheel(delta, cell_h) == Handled::Consumed {
+                return Handled::Consumed;
+            }
+        }
+        Handled::Passthrough
+    }
+
+    /// Feed the pointer position to the visible window-covering overlays
+    /// (session-flow-graph D3/D6); `None` when it left the window. Every one hears it —
+    /// hover is a state, not an event to claim.
+    pub fn hover_covering(&mut self, point: Option<[f32; 2]>) {
+        for o in &mut self.overlays {
+            if o.covers_window() && o.visible() {
+                o.on_hover(point);
+            }
+        }
     }
 
     /// Offer the key to every overlay (priority order), visible or not; first
@@ -1043,6 +1129,48 @@ mod tests {
         assert!(!probe.wrote());
     }
 
+    /// A writer that counts flushes and can be told to fail them.
+    struct Flushes {
+        count: usize,
+        fail: bool,
+    }
+    impl Write for Flushes {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.count += 1;
+            if self.fail {
+                Err(std::io::Error::other("pty gone"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn write_probe_forwards_flush_and_its_error() {
+        // The probe wraps the active tab's PTY writer; a handler's `flush` must reach the PTY
+        // (an unflushed paste sits in a buffer), and a dead PTY's error must reach the caller.
+        let mut ok = Flushes {
+            count: 0,
+            fail: false,
+        };
+        WriteProbe::new(&mut ok)
+            .flush()
+            .expect("a live writer flushes");
+        assert_eq!(ok.count, 1, "the flush reached the inner writer");
+
+        let mut dead = Flushes {
+            count: 0,
+            fail: true,
+        };
+        assert!(
+            WriteProbe::new(&mut dead).flush().is_err(),
+            "the inner writer's flush error is not swallowed"
+        );
+    }
+
     #[test]
     fn router_first_consumed_wins_and_stops() {
         let mut buf: Vec<u8> = Vec::new();
@@ -1289,11 +1417,13 @@ mod tests {
         let mut ctx = AppCtx::new(&mut sink, 1, 0, None);
         ctx.set_monitor_open(true);
         ctx.set_monitor_open(false); // the close half of the same chord
+        ctx.activate_tab(TabId(7));
         assert_eq!(
             ctx.take_requests(),
             vec![
                 AppRequest::SetMonitorOpen(true),
                 AppRequest::SetMonitorOpen(false),
+                AppRequest::ActivateTab(TabId(7)),
             ],
             "order is preserved — the last state recorded is the one that is applied"
         );
@@ -1419,6 +1549,201 @@ mod tests {
         };
         assert_eq!(host.command(&restore), Handled::Consumed);
         assert_eq!(seen.get(), 1, "one panel per window, so one taker");
+    }
+
+    /// An overlay whose press queues an `ActivateTab` — the session graph's shape (D7).
+    /// `covers` makes it a window-covering one (session-flow-graph D6); every pointer event
+    /// it hears bumps `pressed`, and every hover is recorded in `hovers`.
+    struct Presses {
+        vis: bool,
+        covers: bool,
+        pressed: std::rc::Rc<std::cell::Cell<usize>>,
+        hovers: std::rc::Rc<std::cell::RefCell<Vec<Option<[f32; 2]>>>>,
+    }
+    impl Presses {
+        fn new(vis: bool, pressed: &std::rc::Rc<std::cell::Cell<usize>>) -> Self {
+            Presses {
+                vis,
+                covers: false,
+                pressed: pressed.clone(),
+                hovers: Default::default(),
+            }
+        }
+    }
+    impl Overlay for Presses {
+        fn priority(&self) -> i32 {
+            10
+        }
+        fn visible(&self) -> bool {
+            self.vis
+        }
+        fn covers_window(&self) -> bool {
+            self.covers
+        }
+        fn on_key(&mut self, _: &KeyInput, _: &mut AppCtx) -> Handled {
+            Handled::Passthrough
+        }
+        fn on_press(&mut self, _point: [f32; 2], ctx: &mut AppCtx) -> Handled {
+            self.pressed.set(self.pressed.get() + 1);
+            ctx.activate_tab(TabId(3));
+            Handled::Consumed
+        }
+        fn on_wheel(&mut self, _: crate::input::WheelDelta, _: f32) -> Handled {
+            self.pressed.set(self.pressed.get() + 1);
+            Handled::Consumed
+        }
+        fn on_hover(&mut self, point: Option<[f32; 2]>) {
+            self.hovers.borrow_mut().push(point);
+        }
+    }
+
+    #[test]
+    fn covering_routes_reach_only_a_visible_window_covering_overlay() {
+        // session-flow-graph D6: the `PointerOwner::Graph` route must not hand a press, a
+        // wheel or a hover to a band overlay (the ai-monitor under the graph), and must not
+        // reach a covering overlay that is closed.
+        let band = std::rc::Rc::new(std::cell::Cell::new(0));
+        let graph = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut host = OverlayHost::default();
+        // The band overlay outranks the graph here, so priority order alone would pick it.
+        let mut b = Presses::new(true, &band);
+        b.covers = false;
+        host.register(Box::new(b));
+        let mut g = Presses::new(false, &graph);
+        g.covers = true;
+        let hovers = g.hovers.clone();
+        host.register(Box::new(g));
+        let mut sink = Vec::new();
+        let mut ctx = AppCtx::new(&mut sink, 1, 0, None);
+
+        assert!(!host.covering_visible(), "a closed graph covers nothing");
+        assert_eq!(
+            host.press_covering([1.0, 1.0], &mut ctx),
+            Handled::Passthrough
+        );
+        assert_eq!(
+            host.wheel_covering(crate::input::WheelDelta::Lines(1.0), 10.0),
+            Handled::Passthrough
+        );
+        host.hover_covering(Some([1.0, 1.0]));
+        assert!(hovers.borrow().is_empty());
+        assert_eq!((band.get(), graph.get()), (0, 0));
+        assert!(ctx.take_requests().is_empty());
+    }
+
+    #[test]
+    fn covering_routes_deliver_to_the_open_graph_and_skip_the_band() {
+        let band = std::rc::Rc::new(std::cell::Cell::new(0));
+        let graph = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut host = OverlayHost::default();
+        host.register(Box::new(Presses::new(true, &band)));
+        let mut g = Presses::new(true, &graph);
+        g.covers = true;
+        let hovers = g.hovers.clone();
+        host.register(Box::new(g));
+        let mut sink = Vec::new();
+        let mut ctx = AppCtx::new(&mut sink, 1, 0, None);
+
+        assert!(host.covering_visible());
+        assert_eq!(host.press_covering([1.0, 1.0], &mut ctx), Handled::Consumed);
+        assert_eq!(ctx.take_requests(), vec![AppRequest::ActivateTab(TabId(3))]);
+        assert_eq!(
+            host.wheel_covering(crate::input::WheelDelta::Lines(1.0), 10.0),
+            Handled::Consumed
+        );
+        host.hover_covering(Some([4.0, 5.0]));
+        host.hover_covering(None);
+        assert_eq!(*hovers.borrow(), vec![Some([4.0, 5.0]), None]);
+        assert_eq!(graph.get(), 2, "the press and the wheel reached the graph");
+        assert_eq!(band.get(), 0, "the covered band heard nothing");
+    }
+
+    #[test]
+    fn on_hover_defaults_to_a_no_op_and_nothing_covers_by_default() {
+        // Every existing overlay is unchanged by the new hooks.
+        let mut m = Mute;
+        m.on_hover(Some([0.0, 0.0]));
+        assert!(!m.covers_window());
+    }
+
+    #[test]
+    fn a_press_reaches_only_visible_overlays_and_carries_their_requests() {
+        // session-flow-viewer R8.4: the press path now has the context the key path has, so
+        // a request made inside `on_press` survives to the caller; and a hidden overlay is
+        // still never offered the press.
+        let shown = std::rc::Rc::new(std::cell::Cell::new(0));
+        let hidden = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut host = OverlayHost::default();
+        host.register(Box::new(Presses::new(false, &hidden)));
+        host.register(Box::new(Presses::new(true, &shown)));
+        let mut sink = Vec::new();
+        let mut ctx = AppCtx::new(&mut sink, 1, 0, None);
+        assert_eq!(host.press([1.0, 1.0], &mut ctx), Handled::Consumed);
+        assert_eq!(ctx.take_requests(), vec![AppRequest::ActivateTab(TabId(3))]);
+        assert_eq!(shown.get(), 1);
+        assert_eq!(hidden.get(), 0, "a hidden overlay owns no pixels");
+    }
+
+    #[test]
+    fn a_redraw_is_requested_only_when_a_handler_asks_for_one() {
+        // The deferred redraw (D4): `terminal_app` redraws after dispatch iff this reads true.
+        // Stuck true is a redraw per keystroke; a no-op `request_redraw` is a chord whose
+        // effect never reaches the screen.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut ctx = AppCtx::new(&mut buf, 1, 0, None);
+        assert!(!ctx.redraw_requested(), "nothing asked: no redraw");
+        ctx.request_redraw();
+        assert!(ctx.redraw_requested(), "a handler asked: redraw");
+    }
+
+    /// An overlay whose `poll` answers a fixed value.
+    struct Polls(bool);
+    impl Overlay for Polls {
+        fn priority(&self) -> i32 {
+            0
+        }
+        fn visible(&self) -> bool {
+            false
+        }
+        fn on_key(&mut self, _: &KeyInput, _: &mut AppCtx) -> Handled {
+            Handled::Passthrough
+        }
+        fn poll(&mut self) -> bool {
+            self.0
+        }
+    }
+
+    #[test]
+    fn poll_all_reports_a_change_iff_any_overlay_changed() {
+        // R1.3: one changed overlay among quiet ones is a redraw, wherever it sits; all
+        // quiet is none — `OverlayPending` is shared, so most wakes are someone else's.
+        let mut quiet = OverlayHost::default();
+        quiet.register(Box::new(Polls(false)));
+        quiet.register(Box::new(Mute));
+        assert!(!quiet.poll_all(), "no overlay changed: no redraw");
+
+        let mut first = OverlayHost::default();
+        first.register(Box::new(Polls(true)));
+        first.register(Box::new(Polls(false)));
+        assert!(
+            first.poll_all(),
+            "a change is not erased by a later quiet overlay"
+        );
+
+        let mut last = OverlayHost::default();
+        last.register(Box::new(Polls(false)));
+        last.register(Box::new(Polls(true)));
+        assert!(last.poll_all(), "a change after a quiet overlay is seen");
+    }
+
+    #[test]
+    fn the_default_poll_and_layer_are_inert() {
+        // An overlay that implements neither (`Mute`) has no background work, so it never
+        // asks for a redraw; and its layer is a neutral z=0 placeholder, the base layer's own
+        // z, neither ahead of nor behind any registered layer by choice.
+        let mut m = Mute;
+        assert!(!m.poll());
+        assert_eq!(m.layer().z_order(), 0);
     }
 
     #[test]

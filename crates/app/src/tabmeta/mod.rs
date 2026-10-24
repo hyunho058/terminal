@@ -32,8 +32,13 @@ pub(crate) mod proc;
 pub(crate) mod tmux;
 mod worker;
 
+/// Re-exported for the crate root's test-facing surface (session-flow-viewer D17,
+/// session-flow-graph R4); `worker` and `git` themselves stay private.
+pub use git::{repo_of, RepoId};
+pub use worker::{graph_pass, publish_graph_state};
+
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -92,6 +97,82 @@ pub struct TabMeta {
     /// **Not gated on `[sidebar].show_agent_status`** for the active tab — see `Deriver::tab`.
     /// A display preference must not be able to silently disable the panel's staleness check.
     pub agent_pid: Option<u32>,
+    /// The panes of the tmux window this tab's client shows, in tmux's order
+    /// (session-flow-viewer D9). **Empty** unless the flow graph has asked for them
+    /// ([`TabMetaHandle::set_graph_wanted`]) and the window has at least two panes — so a
+    /// non-tmux tab, a single-pane window, a dead server and a closed graph all publish the
+    /// same "unsplit" answer (D14). Exactly one entry is `active`: the pane whose pid the card's
+    /// `agent` was derived from, never tmux's `#{pane_active}`.
+    pub panes: Vec<PaneMeta>,
+    /// The session log the tab's Claude status was classified from — `activity::Found.log`,
+    /// published so the session graph reads that session's subagents from the same file the card
+    /// read its state from (session-flow-viewer D9/D10). `None` with no Claude agent or no
+    /// resolvable log.
+    pub log: Option<PathBuf>,
+    /// The repository the tab's agent session runs in (session-flow-graph D10, R14.5), resolved
+    /// from the detected agent process's own cwd, of any [`AgentKind`] — not the shell's, so a
+    /// `cd` does not regroup a session that never moved (G5). `None` means "no repository"
+    /// **only while [`TabMetaSnapshot::graph_ready`]**; with the graph closed it is always
+    /// `None`, because nothing is resolved then (G1). `None` too for a tab with no detected
+    /// agent.
+    pub repo: Option<RepoId>,
+    /// The tab's detected agent **as the session graph sees it** — [`TabMeta::agent`] without
+    /// `[sidebar].show_agent_status` applied (session-flow-graph, user decision 2026-10-22: the
+    /// graph ignores that toggle). Classified by the same `activity` chain as `agent`, so with
+    /// the toggle on the two are equal; with it off `agent` is `None` and this is not.
+    ///
+    /// Set only on a pass that derives the graph and `None` otherwise, like `panes` and `repo`
+    /// — a closed graph publishes nothing here and pays nothing for it (G1). Read by the graph
+    /// alone ([`crate::flow::build_graph`], which falls back to `agent`/`task` when this is
+    /// `None`); the sidebar card, the title and the dialog scan keep reading `agent`, so the
+    /// toggle governs them exactly as before.
+    pub graph_agent: Option<Agent>,
+    /// [`TabMeta::task`] without the toggle, on the same terms as `graph_agent` — the graph
+    /// card's line 1 is the label the card would show with the toggle on.
+    pub graph_task: Option<String>,
+}
+
+/// One pane of a split tab (session-flow-viewer D9).
+///
+/// For the `active` pane, `agent` and `log` are copies of the tab's own
+/// [`TabMeta::graph_agent`] and [`TabMeta::log`] — one derivation, not two, so the graph
+/// cannot disagree with the card. For every other pane they come from the same
+/// `agent_of_pid → resolve_log → state_of_found` chain run against that pane's shell.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PaneMeta {
+    pub pane_pid: u32,
+    pub active: bool,
+    pub agent: Option<Agent>,
+    pub log: Option<PathBuf>,
+    /// The pane's shell cwd and its branch, for the pane card's folder and branch lines
+    /// (session-flow-graph D3/D10); the active pane's are the tab's own. Read only once an agent
+    /// is found, so a plain shell pane publishes `None` and still costs one walk. `branch` stays
+    /// behind `[sidebar].show_git_branch`, exactly as the tab's does — the card it feeds is the
+    /// sidebar's card.
+    pub cwd: Option<PathBuf>,
+    pub branch: Option<String>,
+    /// The pane's agent session's repository (any kind), by the same rule as [`TabMeta::repo`].
+    pub repo: Option<RepoId>,
+}
+
+/// The worker's per-tab graph decision ([`graph_pass`], session-flow-viewer R6.6 —
+/// `pane_pass` there): whether this pass derives the tab's panes and repository identity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PanePass {
+    /// Publish no panes and run no `list-panes` for this tab.
+    Skip,
+    /// Enumerate the tab's panes and derive each one.
+    Derive,
+}
+
+/// What the worker publishes for the graph after a pass ([`publish_graph_state`],
+/// session-flow-graph R4.7).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GraphPublish {
+    /// [`TabMetaSnapshot::graph_ready`]'s next value.
+    pub ready: bool,
+    /// Publish every `repo`, every pane list (and so every `PaneMeta`) empty.
+    pub clear: bool,
 }
 
 /// A running agent: which one, and what it is doing. `Copy` — `Option<Agent>` on
@@ -196,6 +277,18 @@ pub struct TabPid {
 pub(crate) struct TabMetaShared {
     pub(crate) generation: AtomicU64,
     pub(crate) tabs: Mutex<Vec<(TabId, TabMeta)>>,
+    /// Whether the graph's identity has been resolved for every tab since it was last wanted
+    /// (session-flow-graph D10). Written only by the worker, before the generation bump it
+    /// rides, so a reader that saw the new generation sees it too.
+    pub(crate) graph_ready: AtomicBool,
+    /// Which open of the graph `graph_ready` describes — the epoch the worker last adopted
+    /// from a `SetGraphWanted { wanted: true, .. }` (session-flow-graph D10). Written with
+    /// `graph_ready`, before the same bump. A reopen reads the previous open's readiness until
+    /// the worker reaches its own command; this is what tells the two apart.
+    pub(crate) graph_epoch: AtomicU64,
+    /// The last epoch [`TabMetaHandle::set_graph_wanted`] handed out. UI-side only: the worker
+    /// never reads it, it learns each epoch from the command that carries it.
+    pub(crate) graph_opens: AtomicU64,
 }
 
 /// Commands the UI thread sends to the worker; they arrive on the channel the worker
@@ -216,6 +309,16 @@ pub(crate) enum Cmd {
     /// guarantees the ordering an atomic would not: an arm that overtakes a disarm would
     /// leave a wake pending for a panel that had closed.
     SetPanelDeadline(Option<u64>),
+    /// Whether the flow graph wants per-pane metadata and repository identity
+    /// (session-flow-viewer D9, session-flow-graph D10). Off by default; while off the worker
+    /// runs no `list-panes`, derives no pane and resolves no repository.
+    ///
+    /// `epoch` names this open (0 when `wanted` is false); the worker publishes it beside the
+    /// readiness so the overlay can ignore a readiness left over from an earlier open.
+    SetGraphWanted {
+        wanted: bool,
+        epoch: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +341,9 @@ impl TabMetaHandle {
         let shared = Arc::new(TabMetaShared {
             generation: AtomicU64::new(0),
             tabs: Mutex::new(Vec::new()),
+            graph_ready: AtomicBool::new(false),
+            graph_epoch: AtomicU64::new(0),
+            graph_opens: AtomicU64::new(0),
         });
         let (tx, rx) = mpsc::channel();
         let worker_shared = Arc::clone(&shared);
@@ -284,6 +390,55 @@ impl TabMetaHandle {
         let _ = self.tx.send(Cmd::SetPanelDeadline(at));
     }
 
+    /// Turn pane enumeration and repository identity on or off (session-flow-viewer D9, R6.6;
+    /// session-flow-graph D10). The flow graph sends `true` on open and `false` on close, so an
+    /// app with the graph closed spends nothing new (G1).
+    ///
+    /// On the off→on edge the worker derives **every** tab at once, ignoring the background
+    /// stagger, so split tabs and groups appear within one tick of opening, and that pass sets
+    /// [`TabMetaSnapshot::graph_ready`]. On the on→off edge it clears every published `panes`
+    /// and `repo` and the readiness without deriving anything, so a reopen starts unresolved.
+    ///
+    /// Returns the epoch that names this open (0 for `false`). The readiness the worker
+    /// publishes for it carries the same [`TabMetaSnapshot::graph_epoch`]; until a snapshot
+    /// does, its readiness belongs to an earlier open, because the channel is FIFO and the
+    /// worker may not have reached this command (or the close before it) yet.
+    pub fn set_graph_wanted(&self, wanted: bool) -> u64 {
+        let epoch = if wanted {
+            self.shared.graph_opens.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            0
+        };
+        let _ = self.tx.send(Cmd::SetGraphWanted { wanted, epoch });
+        epoch
+    }
+
+    /// A handle with no worker behind it, for tests in sibling modules: the test holds the
+    /// command inbox and plays the worker through [`publish_for_test`](Self::publish_for_test),
+    /// so it can order a publish against queued commands — which a live worker never lets a
+    /// test do (session-flow-graph D10's reopen race lives in exactly that gap).
+    #[cfg(test)]
+    pub(crate) fn detached() -> (TabMetaHandle, mpsc::Receiver<Cmd>) {
+        let (tx, rx) = mpsc::channel();
+        let shared = Arc::new(TabMetaShared {
+            generation: AtomicU64::new(0),
+            tabs: Mutex::new(Vec::new()),
+            graph_ready: AtomicBool::new(false),
+            graph_epoch: AtomicU64::new(0),
+            graph_opens: AtomicU64::new(0),
+        });
+        (TabMetaHandle { shared, tx }, rx)
+    }
+
+    /// Publish as the worker would — tabs, readiness and epoch, then the bump.
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, tabs: Vec<(TabId, TabMeta)>, ready: bool, epoch: u64) {
+        *self.shared.tabs.lock().expect("tabs lock") = tabs;
+        self.shared.graph_ready.store(ready, Ordering::Release);
+        self.shared.graph_epoch.store(epoch, Ordering::Release);
+        self.shared.generation.fetch_add(1, Ordering::Release);
+    }
+
     /// The current publication generation. Monotonic; starts at 0; bumped only when a
     /// publish actually changed something (D4).
     pub fn generation(&self) -> u64 {
@@ -304,6 +459,8 @@ impl TabMetaHandle {
         };
         out.tabs.clear();
         out.tabs.extend(tabs.iter().cloned());
+        out.graph_ready = self.shared.graph_ready.load(Ordering::Acquire);
+        out.graph_epoch = self.shared.graph_epoch.load(Ordering::Acquire);
         out.generation = g;
         true
     }
@@ -315,6 +472,8 @@ impl TabMetaHandle {
 pub struct TabMetaSnapshot {
     generation: u64,
     tabs: Vec<(TabId, TabMeta)>,
+    graph_ready: bool,
+    graph_epoch: u64,
 }
 
 impl TabMetaSnapshot {
@@ -329,10 +488,33 @@ impl TabMetaSnapshot {
     /// suite green.
     #[cfg(test)]
     pub(crate) fn from_entries(entries: Vec<(TabId, TabMeta)>) -> TabMetaSnapshot {
+        TabMetaSnapshot::for_test(entries, false)
+    }
+
+    /// A published snapshot for the crate's acceptance tests (session-flow-graph R7.2): the
+    /// same stand-in as `from_entries`, with the graph readiness stated. Generation 1, as a
+    /// first publish would be.
+    pub fn for_test(entries: Vec<(TabId, TabMeta)>, graph_ready: bool) -> TabMetaSnapshot {
         TabMetaSnapshot {
             generation: 1,
             tabs: entries,
+            graph_ready,
+            graph_epoch: 0,
         }
+    }
+
+    /// Whether the worker has resolved every tab's repository identity since the graph was
+    /// last wanted (session-flow-graph D10, R7.2). Until it has, a `repo: None` means "not
+    /// resolved yet" rather than "no repository", and the graph reads `resolving…`.
+    pub fn graph_ready(&self) -> bool {
+        self.graph_ready
+    }
+
+    /// The open of the graph [`graph_ready`](Self::graph_ready) belongs to — the epoch
+    /// [`TabMetaHandle::set_graph_wanted`] returned for it (session-flow-graph D10). 0 until
+    /// the graph was first wanted, and in a `for_test` stand-in.
+    pub fn graph_epoch(&self) -> u64 {
+        self.graph_epoch
     }
 
     /// This tab's metadata, if present in the last publish.
@@ -505,6 +687,8 @@ pub(crate) mod probe {
     pub(crate) static PROC_TTY: Counter = Counter::new();
     pub(crate) static TTY_STAT: Counter = Counter::new();
     pub(crate) static TMUX_LIST: Counter = Counter::new();
+    /// tmux.rs (session-flow-viewer D9) — one `list-panes -a` spawn attempt.
+    pub(crate) static TMUX_PANES: Counter = Counter::new();
     // activity.rs (T5) — the log-resolution + tail-read entry points (D13(6)).
     pub(crate) static LOG_RESOLVE: Counter = Counter::new();
     pub(crate) static LOG_STAT: Counter = Counter::new();
@@ -524,6 +708,7 @@ pub(crate) mod probe {
             &PROC_TTY,
             &TTY_STAT,
             &TMUX_LIST,
+            &TMUX_PANES,
             &GIT_STAT,
             &GIT_READ,
             &GIT_READ_BYTES,
@@ -575,6 +760,63 @@ mod tests {
     }
 
     #[test]
+    fn sync_copies_the_graph_readiness_with_the_tabs() {
+        // session-flow-graph R7.2's seam: the readiness reaches a snapshot by `sync`, under the
+        // same generation as the tabs it describes, and `for_test` states it directly.
+        let (tx, _rx) = mpsc::channel();
+        let h = TabMetaHandle {
+            shared: Arc::new(TabMetaShared {
+                generation: AtomicU64::new(0),
+                tabs: Mutex::new(Vec::new()),
+                graph_ready: AtomicBool::new(false),
+                graph_epoch: AtomicU64::new(0),
+                graph_opens: AtomicU64::new(0),
+            }),
+            tx,
+        };
+        let mut snap = TabMetaSnapshot::default();
+        assert!(!snap.graph_ready());
+        h.shared.graph_ready.store(true, Ordering::Release);
+        h.shared.generation.store(1, Ordering::Release);
+        assert!(h.sync(&mut snap));
+        assert!(snap.graph_ready());
+        h.shared.graph_ready.store(false, Ordering::Release);
+        h.shared.generation.store(2, Ordering::Release);
+        assert!(h.sync(&mut snap));
+        assert!(!snap.graph_ready());
+
+        let t = TabMetaSnapshot::for_test(vec![(TabId(4), TabMeta::default())], true);
+        assert!(t.graph_ready());
+        assert_eq!(t.generation(), 1);
+        assert!(t.get(TabId(4)).is_some());
+        assert!(!TabMetaSnapshot::for_test(Vec::new(), false).graph_ready());
+    }
+
+    #[test]
+    fn wanting_the_graph_through_the_handle_reaches_the_worker() {
+        // The one line between the overlay's open and the worker's edge: a no-op
+        // `set_graph_wanted` would leave the graph reading `resolving…` forever.
+        let (woke_tx, woke_rx) = mpsc::channel::<()>();
+        let h = TabMetaHandle::spawn(move || {
+            let _ = woke_tx.send(());
+        })
+        .expect("spawn worker");
+        let mut snap = TabMetaSnapshot::default();
+        h.set_graph_wanted(true);
+        woke_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("opening the graph publishes its readiness");
+        assert!(h.sync(&mut snap));
+        assert!(snap.graph_ready());
+        h.set_graph_wanted(false);
+        woke_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("closing the graph publishes the cleared readiness");
+        assert!(h.sync(&mut snap));
+        assert!(!snap.graph_ready());
+    }
+
+    #[test]
     fn snapshot_get_iter_lookup() {
         // Construct a snapshot directly (fields are module-private, so this in-module
         // test is the only place that can) to exercise get/iter/is_empty.
@@ -582,6 +824,8 @@ mod tests {
         let b = TabId(2);
         let snap = TabMetaSnapshot {
             generation: 3,
+            graph_ready: false,
+            graph_epoch: 0,
             tabs: vec![
                 (
                     a,
@@ -591,6 +835,11 @@ mod tests {
                         task: None,
                         cwd: None,
                         agent_pid: None,
+                        panes: Vec::new(),
+                        log: None,
+                        repo: None,
+                        graph_agent: None,
+                        graph_task: None,
                     },
                 ),
                 (
@@ -604,6 +853,11 @@ mod tests {
                         task: None,
                         cwd: None,
                         agent_pid: None,
+                        panes: Vec::new(),
+                        log: None,
+                        repo: None,
+                        graph_agent: None,
+                        graph_task: None,
                     },
                 ),
             ],
@@ -672,6 +926,134 @@ mod tests {
     }
 
     #[test]
+    fn the_three_setters_each_send_their_command_to_the_worker() {
+        // `set_roster`, `set_active` and `set_enabled` are the whole of how the app tells the
+        // worker what to watch; each is one `send`, and a no-op body left every test green
+        // (cargo mutants). The detached handle holds the inbox, so the command itself is the
+        // observable — no worker timing involved.
+        let (h, rx) = TabMetaHandle::detached();
+        let roster = [TabPid {
+            id: TabId(7),
+            pid: 4242,
+        }];
+        h.set_roster(&roster);
+        h.set_active(Some(TabId(7)));
+        h.set_enabled(false, true);
+
+        match rx.try_recv() {
+            Ok(Cmd::SetRoster(r)) => assert_eq!(r, roster.to_vec()),
+            _ => panic!("set_roster sent no SetRoster"),
+        }
+        assert!(
+            matches!(rx.try_recv(), Ok(Cmd::SetActive(Some(TabId(7))))),
+            "set_active sent no SetActive(Some(7))"
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Ok(Cmd::SetEnabled {
+                    git: false,
+                    agent: true
+                })
+            ),
+            "set_enabled sent no SetEnabled {{ git: false, agent: true }}"
+        );
+        assert!(rx.try_recv().is_err(), "one command per call");
+    }
+
+    #[test]
+    fn the_pump_reports_a_change_exactly_once_per_generation_bump() {
+        // D3: the pump's `poll` is the redraw trigger for metadata. It must say `true` on the
+        // wake after a publish and `false` on every other wake (tabmeta and the ai-monitor
+        // share the `OverlayPending` event, so most wakes are not this worker's).
+        let (h, _rx) = TabMetaHandle::detached();
+        let mut pump = TabMetaPump::new(h.clone());
+        assert!(!pump.poll(), "nothing published: no redraw");
+        h.publish_for_test(Vec::new(), false, 0);
+        assert!(pump.poll(), "a publish bumped the generation: redraw");
+        assert!(!pump.poll(), "the same generation again: no second redraw");
+        h.publish_for_test(Vec::new(), false, 0);
+        assert!(pump.poll(), "the next publish is seen too");
+    }
+
+    #[test]
+    fn a_synced_snapshot_reports_the_generation_it_was_filled_at() {
+        // card-live-cwd D5: consumers (the waiting band, the flow graph's rebuild key) detect
+        // "metadata moved" by comparing this against a stored value, so it must move with
+        // every publish — a constant would freeze the band after the first one.
+        let (h, _rx) = TabMetaHandle::detached();
+        let mut snap = TabMetaSnapshot::default();
+        assert_eq!(snap.generation(), 0, "never filled");
+        h.publish_for_test(Vec::new(), false, 0);
+        assert!(h.sync(&mut snap));
+        assert_eq!(snap.generation(), 1);
+        h.publish_for_test(Vec::new(), false, 0);
+        assert!(h.sync(&mut snap));
+        assert_eq!(snap.generation(), 2, "the second publish moved it again");
+    }
+
+    #[test]
+    fn the_pump_is_headless_and_behind_everything() {
+        // D3: permanently invisible (it owns no pixels, so a press or a covering route must
+        // never be offered to it) and its layer sorts behind every real layer.
+        let (h, _rx) = TabMetaHandle::detached();
+        let pump = TabMetaPump::new(h);
+        assert!(!pump.visible());
+        assert_eq!(pump.priority(), i32::MIN);
+        assert_eq!(pump.layer().z_order(), i32::MIN);
+    }
+
+    /// Set only in the child process [`the_locator_returns_the_installed_handle`] spawns.
+    const LOCATOR_CHILD: &str = "MAC_TERMINAL_TABMETA_LOCATOR_CHILD";
+
+    /// The child half: installs into the process-global `OnceLock`. A no-op unless
+    /// [`LOCATOR_CHILD`] is set, because installing in the shared test process would hand
+    /// every later test a handle — `feature_overlays` builds the flow overlay from
+    /// `global()`, and its tests rely on that being `None`.
+    #[test]
+    fn locator_child_installs_and_finds_the_handle() {
+        if std::env::var_os(LOCATOR_CHILD).is_none() {
+            return;
+        }
+        assert!(global().is_none(), "nothing is installed before install");
+        let (h, _rx) = TabMetaHandle::detached();
+        let mine = Arc::clone(&h.shared);
+        install(h);
+        let found = global().expect("install must make the handle reachable");
+        assert!(
+            Arc::ptr_eq(&found.shared, &mine),
+            "global returns the installed handle"
+        );
+    }
+
+    #[test]
+    fn the_locator_returns_the_installed_handle() {
+        // `install`/`global` are how `main.rs` hands `tabs.rs` the handle every roster change
+        // goes through; a no-op `install` or a `global` that always answers `None` left the
+        // suite green (cargo mutants) while the sidebar's metadata silently stopped. The
+        // global is a `OnceLock`, so the check runs in a child process of this test binary.
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "tabmeta::tests::locator_child_installs_and_finds_the_handle",
+                "--test-threads=1",
+            ])
+            .env(LOCATOR_CHILD, "1")
+            .output()
+            .expect("run the child test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child test did not run:\n{stdout}"
+        );
+    }
+
+    #[test]
     fn default_tabmeta_is_blank() {
         assert_eq!(
             TabMeta::default(),
@@ -681,6 +1063,11 @@ mod tests {
                 task: None,
                 cwd: None,
                 agent_pid: None,
+                panes: Vec::new(),
+                log: None,
+                repo: None,
+                graph_agent: None,
+                graph_task: None,
             }
         );
     }

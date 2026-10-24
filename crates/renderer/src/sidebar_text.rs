@@ -72,6 +72,41 @@ pub fn line_px(ppem: f32) -> f32 {
     (ppem * 1.2).round().max(1.0)
 }
 
+/// Column width and line height of each card face, physical px — what `build_card`'s
+/// `title_col` / `title_line` / `meta_col` / `meta_line` take.
+///
+/// One value for the two layers that draw cards (the sidebar and the session graph,
+/// session-flow-graph D14), so "a face whose atlas could not be built measures by the
+/// grid cell" (R2.6) is decided in one place, by [`CardAtlases::measure`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CardMeasure {
+    pub title_col: f32,
+    pub title_line: f32,
+    pub meta_col: f32,
+    pub meta_line: f32,
+}
+
+impl CardMeasure {
+    /// Both faces measured by their own atlases at `scale` — the answer once both are
+    /// built, and what a pure layout assumes when it is not told otherwise.
+    pub fn of_faces(scale: f64) -> CardMeasure {
+        CardMeasure {
+            title_col: CardFace::Title.column_px(scale),
+            title_line: CardFace::Title.line_px(scale),
+            meta_col: CardFace::Meta.column_px(scale),
+            meta_line: CardFace::Meta.line_px(scale),
+        }
+    }
+
+    /// `(column, line)` for `face`.
+    pub fn of(&self, face: CardFace) -> (f32, f32) {
+        match face {
+            CardFace::Title => (self.title_col, self.title_line),
+            CardFace::Meta => (self.meta_col, self.meta_line),
+        }
+    }
+}
+
 /// The identity of a font set: each family's regular face, by the address of its
 /// mapping and its face index. A clone shares its `Arc`s and so has the same identity —
 /// the same fonts, so no rebuild — while a fresh [`FontSet::load`] maps anew.
@@ -160,6 +195,28 @@ impl CardAtlases {
     /// How many (re)builds have happened — a test hook.
     pub fn builds(&self) -> u64 {
         self.builds
+    }
+
+    /// How card text measures right now: each face by its own atlas when that atlas is
+    /// built, else by the grid `cell` — the size its text is then drawn at, from the grid
+    /// atlas (R2.6). Read after [`ensure`](CardAtlases::ensure).
+    pub fn measure(&self, scale: f64, cell: [f32; 2]) -> CardMeasure {
+        let faces = CardMeasure::of_faces(scale);
+        let pick = |face: CardFace| {
+            if self.get(face).is_some() {
+                faces.of(face)
+            } else {
+                (cell[0], cell[1])
+            }
+        };
+        let (title_col, title_line) = pick(CardFace::Title);
+        let (meta_col, meta_line) = pick(CardFace::Meta);
+        CardMeasure {
+            title_col,
+            title_line,
+            meta_col,
+            meta_line,
+        }
     }
 }
 
@@ -259,6 +316,47 @@ mod tests {
             th > mh,
             "17px title glyph ({th}) is taller than 12.5px ({mh})"
         );
+    }
+
+    #[test]
+    fn measure_is_each_faces_own_size_or_the_grid_cell() {
+        let faces = CardMeasure::of_faces(2.0);
+        assert_eq!(
+            faces,
+            CardMeasure {
+                title_col: 20.0,
+                title_line: 41.0,
+                meta_col: 15.0,
+                meta_line: 30.0,
+            }
+        );
+        assert_eq!(faces.of(CardFace::Title), (20.0, 41.0));
+        assert_eq!(faces.of(CardFace::Meta), (15.0, 30.0));
+        // Unbuilt (or failed) atlases measure by the grid cell.
+        let cell = [11.0, 23.0];
+        let none = CardAtlases::new().measure(2.0, cell);
+        assert_eq!(none.of(CardFace::Title), (11.0, 23.0));
+        assert_eq!(none.of(CardFace::Meta), (11.0, 23.0));
+        let Some((device, _queue)) = crate::headless() else {
+            eprintln!("skipping: no GPU");
+            return;
+        };
+        let Some(fonts) = fonts() else {
+            eprintln!("skipping: no system font");
+            return;
+        };
+        let mut cards = CardAtlases::new();
+        cards.ensure(&device, &fonts, 2.0);
+        assert_eq!(cards.measure(2.0, cell), faces);
+        // One face missing: only that face falls back.
+        cards.atlases[CardFace::Meta.index()] = None;
+        let half = cards.measure(2.0, cell);
+        assert_eq!(half.of(CardFace::Title), (20.0, 41.0));
+        assert_eq!(half.of(CardFace::Meta), (11.0, 23.0));
+        cards.atlases[CardFace::Meta.index()] = cards.atlases[CardFace::Title.index()].take();
+        let swapped = cards.measure(2.0, cell);
+        assert_eq!(swapped.of(CardFace::Title), (11.0, 23.0));
+        assert_eq!(swapped.of(CardFace::Meta), (15.0, 30.0));
     }
 
     #[test]

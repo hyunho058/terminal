@@ -394,3 +394,53 @@ idle behaviour. See G1 for what the caches do and do not buy against it.
   Cmd+F-keys, Cmd+PageUp/PageDown and Cmd+ForwardDelete. If the IM commits on them too
   (unmeasured for named keys), each logs only a `chord-replay skipped` line, because no Cmd
   matcher reads them. Cmd+Tab is not listed: macOS takes it before the app sees it.
+- **G10** The **session graph** (`specs/session-flow-graph`, Cmd+Shift+F, revising
+  `specs/session-flow-viewer`) is a **full-window overlay**, not a dock occupant. Its layer
+  (`renderer::graph_panel::FlowPanel`, z 110, above the ai-monitor's 100) paints an opaque
+  backdrop over the whole viewport and reserves no inset, so opening it never reflows the grid
+  (G4's truncating `Grid::resize` is not involved). The right dock is therefore **the
+  ai-monitor's alone again**: the session-flow-viewer's shared `RightDock`/`ToggleDock` seam
+  was reverted, and the monitor toggles and persists exactly as on `main`; the graph covers an
+  open monitor rather than replacing it, and is never restored open. The `FlowOverlay` sits at
+  priority **300**, above rename (200), and while open it owns the keyboard — `Esc` and the
+  chord close it, every other key (and IME text) is swallowed — and, through
+  `input::pointer_owner`, every press, wheel and hover in the window. That makes the graph a
+  thing to look at, not to type beside: the sidebar stays the live surface while typing (the
+  spec's "glance while typing" gap). A session is an **agent session**: a tab (or tmux pane)
+  whose detected agent is any `AgentKind` the sidebar knows — Claude, Antigravity, Codex,
+  Gemini or Aider (R14, amended 2026-10-21); a tab or pane with no agent is not a node. Sessions
+  group by repository through the tabmeta worker's `RepoId`, resolved from the detected agent
+  process's cwd (any kind) and published only while the graph is open; until the first full
+  pass the header reads `resolving…` and no card is drawn. **Subagents are Claude-only**: they
+  come from Claude's session log, which no other agent writes, so a non-Claude session has no
+  column-2 children and its log is never followed. The graph **ignores
+  `[sidebar].show_agent_status`** (user decision 2026-10-22): while it is open the worker
+  classifies every tab's agent whatever the toggle and publishes it as
+  `TabMeta.graph_agent`/`graph_task`, which only the graph reads, so the sidebar card still
+  shows no agent status with the toggle off and a closed graph does no agent work the toggle
+  did not already allow. Four notes follow, the first three carried over from the panel; each
+  is recorded here because it reads as a bug when met cold:
+
+  - **Non-active tmux panes are log-only** (old D13). A split tab's *active* pane takes the
+    card's own `row_meta` status, blocking-dialog override included; every other pane takes
+    `resolve_status(pane.agent, false, false, None)`, because the dialog matcher reads the
+    tab's grid, which is the active pane's screen only. A permission dialog pending in a
+    background pane therefore reads as the log says (`Working`). **"A pane card disagrees with
+    what that pane shows" should be read as "is it the active pane?"** before anything else.
+  - **Foreground subagents appear only on return.** The graph's subagents come from the parent
+    log (`flow_telemetry`), and Claude Code 2.1.28x writes an `Agent` `tool_use` only once the
+    tool returns (G8). A foreground subagent is therefore first seen already finished, behind
+    `N finished`; only a background launch, whose receipt returns at once, is ever drawn as
+    running. The parent session reads `Working` meanwhile, with no child.
+  - **Panes, repositories and subagents cost only while the graph is open.** The worker's
+    `list-panes` pass and repository resolution run behind `set_graph_wanted`, the subagent
+    thread lives from open to close, and the layer builds its card atlases on its first visible
+    frame. Closing the graph stops all of it — the thread is told to stop and never joined, so a
+    close during a large backfill cannot stall the loop — and clears the published panes and
+    repositories. What keeps a reopen on `resolving…` rather than the last open's groups is
+    the per-open **epoch**: `set_graph_wanted(true)` returns one, the worker publishes it with
+    `graph_ready`, and the overlay accepts readiness only for its own epoch — clearing alone
+    would lose the race against a close the worker has not processed yet.
+  - **A sidebar card menu survives the graph** (D5). Opening the graph over an open card menu,
+    and closing it with `Esc` or the chord, leaves the menu as it was; only an ordinary overlay
+    consuming a key still dismisses it.

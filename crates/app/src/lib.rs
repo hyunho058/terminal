@@ -49,6 +49,8 @@ pub(crate) mod clipboard;
 pub(crate) mod copy;
 pub(crate) mod dashboard;
 pub(crate) mod drag;
+pub(crate) mod flow;
+pub(crate) mod flow_telemetry;
 pub(crate) mod hyperlink;
 pub(crate) mod ime_chord;
 pub(crate) mod input;
@@ -70,18 +72,62 @@ pub(crate) mod waiting;
 // that consumer is the only thing keeping the item out of the dead-code lint.
 /// `crates/app/tests/vertical_slice.rs` drags a selection over a real shell's output.
 pub use drag::{is_click as release_is_click, release as release_drag, SelectionDrag};
+/// `crates/app/tests/tt1_graph_keys.rs`, `crates/app/tests/tt3_graph_monitor.rs` and the other
+/// session-flow-graph acceptance tests drive the graph overlay (session-flow-graph R1, R3, R9);
+/// `crates/app/tests/tt5_graph_shape.rs` and its siblings build the graph (R5, R6, R8).
+pub use flow::{build_graph, FlowOverlay, FoldSet};
+/// `crates/app/tests/tt7_flow_telemetry.rs` drives the session graph's subagent thread
+/// (session-flow-viewer R7).
+pub use flow_telemetry::{spawn as spawn_flow_telemetry, FlowTelemetry, SubagentSlot};
 /// `crates/app/tests/vertical_slice.rs` types through the real encoder.
 pub use input::encode_key;
+/// `crates/app/tests/tt2_graph_pointer.rs` drives the pointer router (session-flow-graph
+/// R2.1, R2.2).
+pub use input::pointer_owner;
+/// `crates/app/tests/tt2_graph_pointer.rs` names the router's answer (session-flow-graph
+/// R2.1, R2.2).
+pub use input::PointerOwner;
+/// `crates/app/tests/tt11_graph_wheel.rs` wheels the open graph (session-flow-graph R11.3).
+pub use input::WheelDelta;
+/// `crates/app/tests/tt3_graph_monitor.rs` dispatches the monitor's chord beside a closed
+/// graph (session-flow-graph R3.1, R3.2).
+pub use overlay::AiMonitorOverlay;
 /// The SD4 seam: named in the signatures below and asserted by
 /// `crates/app/tests/wiring.rs`.
 pub use overlay::{no_deadline, ArmDeadline};
+/// `crates/app/tests/tt3_graph_monitor.rs` / `crates/app/tests/tt9_graph_click.rs` build the
+/// dispatch context and read the requests it queued (session-flow-graph R3.1, R9).
+pub use seam::{AppCtx, AppRequest, Handled, KeyInput, OverlayCommand, OverlayHost};
 pub use seam::{InputHandler, Overlay, Registrations};
 /// `crates/app/tests/vertical_slice.rs` drives a real shell through a session.
 pub use session::{Session, TabId, Wake};
 /// `main.rs` installs the sidebar's metadata source.
 pub use sidebar_model::SidebarMetaSource;
+/// `crates/app/tests/tt6_graph_status.rs` compares the graph's session status against the
+/// card's own join (session-flow-graph R6).
+pub use sidebar_model::{resolve_status, row_meta};
+/// `crates/app/tests/tt6_tmux_panes.rs` parses and joins tmux output (session-flow-viewer
+/// R6.1-R6.4, R6.7).
+pub use tabmeta::tmux::{
+    panes_of, parse_clients, parse_panes, select_pane, ClientRow, PaneRow, MAX_PANES,
+};
+/// `crates/app/tests/tt7_graph_header.rs` stands in a published snapshot, readiness included
+/// (session-flow-graph R7.2).
+pub use tabmeta::TabMetaSnapshot;
+/// `crates/app/tests/tt6_tmux_panes.rs` drives the graph pass gate and the published pane
+/// shape (session-flow-viewer R6.6); the flow graph's tests name the metadata types.
+pub use tabmeta::{graph_pass, Agent, AgentKind, AgentState, PaneMeta, PanePass, TabMeta};
 /// `main.rs` spawns the process-global metadata worker and installs its handle.
 pub use tabmeta::{install as install_tabmeta, TabMetaHandle};
+/// `crates/app/tests/tt4_graph_repo.rs` drives the graph readiness publish step
+/// (session-flow-graph R4.7).
+pub use tabmeta::{publish_graph_state, GraphPublish};
+/// `crates/app/tests/tt4_graph_repo.rs` resolves repository identity (session-flow-graph
+/// R4.1-R4.4).
+pub use tabmeta::{repo_of, RepoId};
+/// `crates/app/tests/tt9_graph_click.rs` resolves a tab id to its strip index
+/// (session-flow-graph R9).
+pub use tabs::{tab_position, Tabs};
 /// `main.rs` builds and runs the app.
 pub use terminal_app::{App, UserEvent};
 
@@ -89,7 +135,6 @@ use winit::event_loop::EventLoopProxy;
 
 use clipboard::{ClipboardHandler, ImagePresenter};
 use copy::{CopyHandler, SelectionPresenter};
-use overlay::AiMonitorOverlay;
 
 /// Everything `main` hands to [`terminal_app::App::new`], assembled.
 ///
@@ -171,7 +216,22 @@ pub fn feature_overlays(
             let _ = p.send_event(UserEvent::OverlayPending);
         }
     });
+    let flow_proxy = proxy.clone();
+    let flow_wake: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        if let Some(p) = flow_proxy.as_ref() {
+            let _ = p.send_event(UserEvent::OverlayPending);
+        }
+    });
     vec![
+        // session-flow-graph: the Cmd+Shift+F full-window session graph. First, at 300: open,
+        // it covers the rename field and the ai-monitor and owns every key (D5). Its subagent
+        // thread wakes the loop the capture way, and it reaches the metadata worker through
+        // the installed global — `None` in tests, where it builds from a stood-in snapshot.
+        Box::new(flow::FlowOverlay::new(
+            flow_wake,
+            tabmeta::global().cloned(),
+            renderer::graph_panel::FlowHandle::default(),
+        )),
         // sticky-tab-title: the Cmd+Shift+R rename field. Ahead of the ai-monitor
         // so an open field owns the keyboard (D8a.1).
         Box::new(rename::RenameOverlay::new()),
