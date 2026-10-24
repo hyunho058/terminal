@@ -265,6 +265,30 @@ idle behaviour. See G1 for what the caches do and do not buy against it.
     toward a false `Waiting for input`. A renamed `ask_question` would lose its `Waiting`
     the same way. **"Antigravity never reads Waiting any more" should be read as "check
     the step names first".**
+  - **Claude Code's background-work records** (`specs/claude-background-working`). A Claude
+    card whose last turn ended (`end_turn`) reads `Working`, not `Waiting for input`, while
+    background work started since the last human prompt has not reported back.
+    `ai_monitor::activity` reads this from typed fields, not text:
+    - **starts**, a closed list of `type: "user"` `toolUseResult` shapes: `backgroundTaskId`
+      (a background `Bash`); `agentId` with `isAsync: true` + `status: "async_launched"` (a
+      background `Agent`) or with `background: true` + `status: "forked"` (a forked skill);
+      `resumedAgentId`/`revivedAgentId` (`SendMessage` resuming an agent);
+    - **completions**, four forms naming the id in their first `<task-id>`: a
+      `queue-operation` `enqueue` whose `content` begins `<task-notification>`; a `user`
+      record with `origin.kind: "task-notification"`; an `attachment` `queued_command` with
+      `commandMode: "task-notification"`; and a `TaskStop` result (`toolUseResult.task_id`),
+      since stopping writes no notification;
+    - **the human prompt** that bounds the turn: a `user` record that is not a tool result,
+      not `isMeta`, and whose `origin.kind` is not `task-notification` or `peer`.
+
+    Each rename degrades differently. A renamed start field reads nothing pending, which is
+    today's `Waiting`. A renamed `origin.kind` value can make a notification read as a prompt,
+    which ends the walk early, also `Waiting`. Only if **all three** notification forms are
+    renamed does every background turn read `Working` until the next prompt. A background
+    task that never reports (a dev server the user is meant to try, a process killed outside
+    `TaskStop`) holds `Working` until the user types, by design (D6). **"A finished Claude
+    tab reads Working" should be read as "grep the log's newest `queue-operation` for
+    `<task-notification>`".**
   - **Both agents' dialog wording and layout.** `prompt.rs` matches Claude Code's permission
     dialog by two of its question, footer and chooser lines, and the Antigravity CLI's by its
     question row with the first choice (`1. Yes, …`) as the next non-blank row. Antigravity's
