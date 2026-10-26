@@ -277,8 +277,6 @@ fn turn_verdict(window: &str) -> Turn {
 
 /// The `Tool is running as a background task` marker (`agy-background-working` D2 form 1).
 const TASK_START: &str = "Tool is running as a background task with task id: ";
-/// The header of an `invoke_subagent` result (D2 form 2).
-const SUBAGENT_HEADER: &str = "Created the following subagents:";
 /// A completion notice's header line, up to its timestamp (D3).
 const NOTICE_HEADER: &str = "[Message] timestamp=";
 /// A task's completion text, up to its quoted id (D3).
@@ -307,8 +305,18 @@ fn task_start(step: &Value) -> Option<&str> {
     task_id_at(body.strip_prefix(TASK_START)?)
 }
 
+/// Strip singular or plural subagent creation header (`Created the following subagent(s):`).
+fn strip_subagent_header(body: &str) -> Option<&str> {
+    let rest = body.strip_prefix("Created the following subagent")?;
+    if let Some(after) = rest.strip_prefix("s:") {
+        Some(after)
+    } else {
+        rest.strip_prefix(':')
+    }
+}
+
 /// D2 form 2: content that *begins* `Created At: <line>\n`, optionally `Completed At:
-/// <line>\n`, then [`SUBAGENT_HEADER`]; every `"conversationId": "<uuid>"` after it. Keyed on
+/// <line>\n`, then `Created the following subagent(s):`; every `"conversationId": "<uuid>"` after it. Keyed on
 /// the header, not the step's `type`: current `agy` writes `GENERIC` here, the fixture
 /// `INVOKE_SUBAGENT`.
 fn subagent_starts(step: &Value) -> Vec<&str> {
@@ -316,7 +324,7 @@ fn subagent_starts(step: &Value) -> Vec<&str> {
         return Vec::new();
     };
     let body = after_line(body, "Completed At: ").unwrap_or(body);
-    let Some(list) = body.strip_prefix(SUBAGENT_HEADER) else {
+    let Some(list) = strip_subagent_header(body) else {
         return Vec::new();
     };
     list.split("\"conversationId\"")
