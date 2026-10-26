@@ -154,11 +154,13 @@ fn ag_tool(name: &str) -> Option<(ToolKind, &'static str, Option<&'static str>)>
             "VIEW_FILE",
             Some("AbsolutePath"),
         ),
+        "read_file" => m(ToolKind::File(FileOp::Read), "GENERIC", Some("Path")),
         "write_to_file" | "replace_file_content" => m(
             ToolKind::File(FileOp::Write),
             "CODE_ACTION",
             Some("TargetFile"),
         ),
+        "write_file" | "edit_file" => m(ToolKind::File(FileOp::Write), "GENERIC", Some("Path")),
         "grep_search" => m(
             ToolKind::File(FileOp::Grep),
             "GREP_SEARCH",
@@ -465,6 +467,8 @@ struct AgCall {
     /// `toolSummary`, present on all 773 measured calls: a short human-written label
     /// and the natural display string, so nothing is synthesised from the tool name.
     summary: Option<String>,
+    subagent_type: Option<String>,
+    description: Option<String>,
 }
 
 /// The accumulator. Fold lines in with [`apply`](SessionTelemetry::apply); read the
@@ -834,21 +838,54 @@ impl SessionTelemetry {
             // AG3 — a turn is a REPLY. The tool-bearing planner steps are dispatch,
             // and they are the overwhelming majority (772 against 61), so counting
             // them here is not a small over-count: it reports a different quantity.
-            "PLANNER_RESPONSE" => match v.get("tool_calls") {
-                None => self.turns_assistant = self.turns_assistant.saturating_add(1),
-                // An empty array dispatched nothing, so it is a reply like any other.
-                Some(Value::Array(calls)) if calls.is_empty() => {
-                    self.turns_assistant = self.turns_assistant.saturating_add(1)
+            "PLANNER_RESPONSE" => {
+                let inp = v.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                let out = v.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+                let cr = v
+                    .get("cache_read_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if inp > 0 || out > 0 || cr > 0 {
+                    self.total_input = self.total_input.saturating_add(inp);
+                    self.total_output = self.total_output.saturating_add(out);
+                    self.total_cache_read = self.total_cache_read.saturating_add(cr);
+                    let used = inp.saturating_add(cr);
+                    self.context_used = used;
+                    self.context_high_water = self.context_high_water.max(used);
                 }
-                Some(Value::Array(calls)) => {
-                    for c in calls {
-                        self.ag_dispatch(c, ts);
+
+                match v.get("tool_calls") {
+                    None => self.turns_assistant = self.turns_assistant.saturating_add(1),
+                    // An empty array dispatched nothing, so it is a reply like any other.
+                    Some(Value::Array(calls)) if calls.is_empty() => {
+                        self.turns_assistant = self.turns_assistant.saturating_add(1)
+                    }
+                    Some(Value::Array(calls)) => {
+                        for c in calls {
+                            self.ag_dispatch(c, ts);
+                        }
+                    }
+                    // Present but not an array: structurally unexpected (R2.7). Counting a
+                    // turn here would be a guess about which half of the step is intact.
+                    Some(_) => self.parse_errors += 1,
+                }
+            }
+            "SYSTEM_MESSAGE" => {
+                if let Some(c) = content {
+                    for id in ag_completed_senders(c) {
+                        if let Some(a) = self
+                            .subagents
+                            .iter_mut()
+                            .find(|a| a.id == id || a.agent_id.as_deref() == Some(id))
+                        {
+                            a.completed = true;
+                            if let Some(new_ts) = ts {
+                                a.end_ms = Some(a.end_ms.map_or(new_ts, |old| old.max(new_ts)));
+                            }
+                        }
                     }
                 }
-                // Present but not an array: structurally unexpected (R2.7). Counting a
-                // turn here would be a guess about which half of the step is intact.
-                Some(_) => self.parse_errors += 1,
-            },
+            }
             _ => self.ag_result(step_type, v, content, ts),
         }
     }
@@ -889,6 +926,18 @@ impl SessionTelemetry {
                 Some((ag_arg_str(args, "name"), ag_arg_str(args, "description")));
         }
 
+        let (subagent_type, description) = if name == "invoke_subagent" {
+            let t = ag_arg_str(args, "TypeName");
+            let r = ag_arg_str(args, "Role");
+            if t.is_some() || r.is_some() {
+                (t, r)
+            } else {
+                self.ag_subagent_def.clone().unwrap_or_default()
+            }
+        } else {
+            (None, None)
+        };
+
         self.ag_pending.push_back(AgCall {
             name: name.to_string(),
             kind,
@@ -896,6 +945,8 @@ impl SessionTelemetry {
             start_ms: ts,
             path,
             summary: ag_arg_str(args, "toolSummary"),
+            subagent_type,
+            description,
         });
         while self.ag_pending.len() > PENDING_CAP {
             self.ag_pending.pop_front();
@@ -994,43 +1045,31 @@ impl SessionTelemetry {
                 FILES_CAP,
             ),
             ToolKind::Agent => {
-                let (name, description) = self.ag_subagent_def.clone().unwrap_or_default();
-                // AG5 — the status the panel shows is the invocation step's own.
-                // `RUNNING` is the format's only non-`DONE` status and it was measured
-                // exclusively on `RUN_COMMAND`, so this arm reading it is defensive:
-                // an invocation still in flight must not be frozen at a duration it
-                // never took (`agent_elapsed` keeps climbing while `end_ms` is `None`).
-                let completed = v.get("status").and_then(Value::as_str) == Some("DONE");
+                let (name, description) =
+                    if call.subagent_type.is_some() || call.description.is_some() {
+                        (call.subagent_type.clone(), call.description.clone())
+                    } else {
+                        self.ag_subagent_def.clone().unwrap_or_default()
+                    };
+                let is_spawn_receipt = content.is_some_and(|c| {
+                    c.contains("Created the following subagent:")
+                        || c.contains("Created the following subagents:")
+                });
+                let completed = if is_spawn_receipt {
+                    false
+                } else {
+                    v.get("status").and_then(Value::as_str) == Some("DONE")
+                };
                 push_capped(
                     &mut self.subagents,
                     Subagent {
-                        // The child's own conversation id, which AG5 retains as the
-                        // join key to its `brain/<id>/` transcript — a transcript this
-                        // fold deliberately does not tail, because each child has its
-                        // own `USER_INPUT` steps and interleaving them would multiply
-                        // the parent's turn counts (R2.6).
                         id: content.and_then(ag_conversation_id).unwrap_or_default(),
                         subagent_type: name,
                         description,
-                        // AG5 — the invocation's `Subagents[]` carries a model, but it
-                        // is a JSON array inside a string that truncates (2 of 6
-                        // measured), and it names nothing the card needs.
                         model: None,
                         start_ms: call.start_ms,
-                        // Unlike the Claude path, the entry is opened at the RESULT
-                        // step rather than at the dispatch: the conversation id exists
-                        // only there, so an in-flight invocation has no identity to
-                        // show yet (G7).
                         end_ms: completed.then_some(ts).flatten(),
                         completed,
-                        // Both fields belong to the Claude path's task-notification
-                        // machinery, which this format has no counterpart for: an
-                        // Antigravity invocation completes from its own step's `status`
-                        // and is never notified out of band. `None` is therefore honest
-                        // rather than a placeholder — nothing can ever join against it —
-                        // and `true` matches the initial value every un-notified agent
-                        // carries on the other path, since `RUNNING` and `DONE` are the
-                        // only statuses this format has and neither is a failure.
                         agent_id: None,
                         ended_ok: true,
                     },
@@ -1851,12 +1890,38 @@ fn ag_line_after(content: &str, key: &str) -> Option<String> {
 /// Strictly a widening. A step this does not rewrite pairs exactly as it did before, so the
 /// only calls it can newly claim are ones that were being dropped.
 fn ag_reported_type<'a>(step_type: &'a str, content: Option<&str>) -> &'a str {
-    /// The sentence every command result carries, in both the typed and the untyped shape.
-    const COMMAND_RESULT: &str = "The command exited with code";
-    if step_type == "GENERIC" && content.is_some_and(|c| c.contains(COMMAND_RESULT)) {
-        return "RUN_COMMAND";
+    const COMMAND_RESULT_LEGACY: &str = "The command exited with code";
+    const COMMAND_RESULT_147: &str = "Command exited with code";
+    const COMMAND_RESULT_ASYNC: &str = "Tool is running as a background task";
+    const SUBAGENT_HEADER_PLURAL: &str = "Created the following subagents:";
+    const SUBAGENT_HEADER_SINGULAR: &str = "Created the following subagent:";
+
+    if step_type == "GENERIC" {
+        if let Some(c) = content {
+            if c.contains(COMMAND_RESULT_147)
+                || c.contains(COMMAND_RESULT_LEGACY)
+                || c.contains(COMMAND_RESULT_ASYNC)
+            {
+                return "RUN_COMMAND";
+            }
+            if c.contains(SUBAGENT_HEADER_SINGULAR) || c.contains(SUBAGENT_HEADER_PLURAL) {
+                return "INVOKE_SUBAGENT";
+            }
+        }
     }
     step_type
+}
+
+fn ag_completed_senders(content: &str) -> Vec<&str> {
+    const NOTICE_HEADER: &str = "[Message] timestamp=";
+    content
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix(NOTICE_HEADER)?;
+            rest.split_whitespace()
+                .find_map(|kv| kv.strip_prefix("sender="))
+        })
+        .collect()
 }
 
 fn ag_conversation_id(content: &str) -> Option<String> {

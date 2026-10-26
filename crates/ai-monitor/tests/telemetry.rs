@@ -2882,8 +2882,8 @@ fn antigravity_fixture_folds_to_expected_telemetry() {
         Some("Reviews a diff for correctness")
     );
     assert_eq!(a.id, "ed14342c-0000-4000-8000-00000000beef");
-    assert!(a.completed, "the step's status is DONE");
-    assert_eq!(a.end_ms, Some(AG_FIX_T0 + 14_000));
+    assert!(!a.completed, "spawn receipt leaves subagent in flight");
+    assert_eq!(a.end_ms, None);
 
     // R2.6 — the child has its own `USER_INPUT`; folding it would double the turns.
     // Nothing here reads it, so the parent's count is the parent's alone.
@@ -3100,9 +3100,34 @@ fn r2_5_a_subagent_is_named_by_the_preceding_definition() {
         a.id, "ed14342c-0000-4000-8000-00000000beef",
         "the join key to the child's own transcript, which AG5 does not tail"
     );
-    assert!(a.completed, "status DONE");
+    assert!(!a.completed, "spawn receipt leaves subagent in flight");
+    assert_eq!(a.end_ms, None);
     // Both calls are still calls, under their own names.
     assert_eq!(s.total_tool_calls, 2);
+
+    // Followed by a SYSTEM_MESSAGE completing the subagent:
+    let completed = ag_fold(&format!(
+        "{}\n{}\n{}\n{}",
+        ag_call(
+            1,
+            "define_subagent",
+            "GENERIC",
+            r#""name":"\"code-reviewer\"","description":"\"Reviews a diff\"""#
+        ),
+        ag_dispatch(
+            3,
+            "invoke_subagent",
+            r#""Subagents":"[{\"Model\":\"gemini\",\"Prompt\":\"review\"}]""#
+        ),
+        ag_step(
+            4,
+            "INVOKE_SUBAGENT",
+            r#","content":"Created the following subagents:\n{\n  \"conversationId\": \"ed14342c-0000-4000-8000-00000000beef\"\n}""#
+        ),
+        r#"{"step_index":5,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","created_at":"2026-08-14T03:05:00Z","content":"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-08-14T03:05:00Z sender=ed14342c-0000-4000-8000-00000000beef priority=MESSAGE_PRIORITY_HIGH content=done\n</SYSTEM_MESSAGE>"}"#
+    ));
+    assert!(completed.subagents[0].completed);
+    assert!(completed.subagents[0].end_ms.is_some());
 
     // A `RUNNING` invocation is not finished, and its timer must not be frozen at a
     // duration it never took.

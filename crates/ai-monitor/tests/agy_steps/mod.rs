@@ -130,6 +130,41 @@ pub fn sub(ids: &[&str]) -> Value {
     with_content(step("GENERIC"), &sub_text(ids))
 }
 
+/// The header of an Antigravity 1.4.7 single `invoke_subagent` result naming `id`.
+pub fn sub_text_singular(id: &str) -> String {
+    format!(
+        "Created At: 2026-10-24T11:38:22-07:00\nCompleted At: 2026-10-24T11:38:22-07:00\n\
+         Created the following subagent:\n{{\n  \"conversationId\": \"{id}\",\n  \"logAbsoluteUri\": \"file:///tmp\"\n}}"
+    )
+}
+
+/// Sub singular in 1.4.7: a `GENERIC` step whose content begins with singular subagent header.
+pub fn sub_singular(id: &str) -> Value {
+    with_content(step("GENERIC"), &sub_text_singular(id))
+}
+
+/// Antigravity 1.4.7 command output text: "Command exited with code {code}."
+pub fn cmd_output_147(code: i32) -> String {
+    format!("Created At: 2026-10-24T11:26:44-07:00\nCompleted At: 2026-10-24T11:26:44-07:00\nCommand exited with code {code}.\n\nCommand output:\n")
+}
+
+/// Planner response step carrying Antigravity 1.4.7 token usage.
+pub fn planner_with_tokens(
+    tool_calls: Option<Vec<Value>>,
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    output_tokens: u64,
+) -> Value {
+    let mut s = step("PLANNER_RESPONSE");
+    s["input_tokens"] = json!(input_tokens);
+    s["cache_read_tokens"] = json!(cache_read_tokens);
+    s["output_tokens"] = json!(output_tokens);
+    if let Some(calls) = tool_calls {
+        s["tool_calls"] = json!(calls);
+    }
+    s
+}
+
 /// Notice(id, body): a `SYSTEM_MESSAGE` carrying the `[Message] … sender=<id>` header.
 pub fn notice(id: &str, body: &str) -> Value {
     with_content(
