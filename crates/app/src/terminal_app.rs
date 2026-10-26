@@ -61,9 +61,10 @@ use crate::ime_chord::{self, CmdEventFacts, Replay};
 use crate::input::{
     self, encode_key, font_action, grid_press_action, grid_release_action, hover_card,
     hover_cursor, is_double_click, is_sidebar_toggle_chord, pixel_to_cell, press_dismisses_modals,
-    sidebar_press, sidebar_region, suppress_key, tab_action, wheel_bytes, wheel_lines,
-    wheel_scroll, FontAction, GridPressAction, GridReleaseAction, PersistTarget, PointerOwner,
-    PressRoute, ReleaseTarget, ResizeDrag, ResizeEdge, SidebarAction, TabAction, WheelDelta,
+    should_snap_on_click, sidebar_press, sidebar_region, suppress_key, tab_action, wheel_bytes,
+    wheel_lines, wheel_scroll, FontAction, GridPressAction, GridReleaseAction, PersistTarget,
+    PointerOwner, PressRoute, ReleaseTarget, ResizeDrag, ResizeEdge, SidebarAction, TabAction,
+    WheelDelta,
 };
 use crate::seam::{
     AppCtx, AppRequest, Handled, InputRouter, KeyInput, OverlayCommand, OverlayHost, Registrations,
@@ -2974,12 +2975,19 @@ impl ApplicationHandler<UserEvent> for App {
                 // (`drag::is_click`): it neither opens the link lit there nor clears
                 // that tab's selection.
                 let active = inner.tabs.active().id;
+                let is_click = drag::is_click(inner.drag, active);
                 let url = url_to_open(ClickInput {
                     cmd_at_press: inner.link_cmd_at_press,
                     cmd_at_release: inner.mods.super_key(),
-                    drag_moved: !drag::is_click(inner.drag, active),
+                    drag_moved: !is_click,
                     lit: inner.link_handle.span(),
                 });
+                let should_snap = should_snap_on_click(
+                    is_click,
+                    url.is_some(),
+                    &inner.mods,
+                    inner.tabs.active().terminal.at_bottom(),
+                );
                 // End the drag (selection-input). A plain click — the pointer never
                 // left the press cell — clears any selection; a real drag leaves the
                 // selection standing for Cmd+C. Unchanged by the open above: an
@@ -3004,6 +3012,9 @@ impl ApplicationHandler<UserEvent> for App {
                 let latch = std::mem::take(&mut inner.drag_latch);
                 if let Some(id) = drag_release_snap(latch) {
                     inner.snap_tab_to_live(id);
+                }
+                if should_snap {
+                    inner.snap_tab_to_live(active);
                 }
                 // Last, so the browser handoff cannot reorder anything above it. The
                 // URL goes to macOS and nothing else happens: no PTY write, no grid

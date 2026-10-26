@@ -91,7 +91,7 @@ pub use input::PointerOwner;
 pub use input::WheelDelta;
 pub use input::{
     encode_mouse_button_report, grid_press_action, grid_release_action, mouse_button_bytes,
-    mouse_button_route, GridPressAction, GridReleaseAction, MouseButtonRoute,
+    mouse_button_route, should_snap_on_click, GridPressAction, GridReleaseAction, MouseButtonRoute,
 };
 /// `crates/app/tests/tt3_graph_monitor.rs` dispatches the monitor's chord beside a closed
 /// graph (session-flow-graph R3.1, R3.2).

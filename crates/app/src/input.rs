@@ -3503,6 +3503,22 @@ pub fn grid_release_action(
     }
 }
 
+/// Decide whether a grid mouse button release should snap the viewport to live bottom (scroll-snap-on-click D1).
+///
+/// Snaps when:
+/// 1. The gesture was a click without movement (`is_click == true`),
+/// 2. No hyperlink was opened (`!has_url`),
+/// 3. No modifier keys were held (`mods.is_empty()`),
+/// 4. The viewport is not already at live bottom (`!at_bottom`).
+pub fn should_snap_on_click(
+    is_click: bool,
+    has_url: bool,
+    mods: &ModifiersState,
+    at_bottom: bool,
+) -> bool {
+    is_click && !has_url && mods.is_empty() && !at_bottom
+}
+
 #[cfg(test)]
 mod mouse_button_tests {
     use super::*;
