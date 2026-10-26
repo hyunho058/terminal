@@ -841,7 +841,10 @@ impl SessionTelemetry {
             "PLANNER_RESPONSE" => {
                 let inp = v.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
                 let out = v.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
-                let cr = v.get("cache_read_tokens").and_then(Value::as_u64).unwrap_or(0);
+                let cr = v
+                    .get("cache_read_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
                 if inp > 0 || out > 0 || cr > 0 {
                     self.total_input = self.total_input.saturating_add(inp);
                     self.total_output = self.total_output.saturating_add(out);
@@ -1042,11 +1045,12 @@ impl SessionTelemetry {
                 FILES_CAP,
             ),
             ToolKind::Agent => {
-                let (name, description) = if call.subagent_type.is_some() || call.description.is_some() {
-                    (call.subagent_type.clone(), call.description.clone())
-                } else {
-                    self.ag_subagent_def.clone().unwrap_or_default()
-                };
+                let (name, description) =
+                    if call.subagent_type.is_some() || call.description.is_some() {
+                        (call.subagent_type.clone(), call.description.clone())
+                    } else {
+                        self.ag_subagent_def.clone().unwrap_or_default()
+                    };
                 let is_spawn_receipt = content.is_some_and(|c| {
                     c.contains("Created the following subagent:")
                         || c.contains("Created the following subagents:")

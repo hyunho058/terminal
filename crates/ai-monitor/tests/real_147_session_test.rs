@@ -57,7 +57,10 @@ fn test_live_session_29b623ae_file_if_present() {
         .find(|a| a.description.as_deref() == Some("Spec Reviewer"))
         .expect("Spec Reviewer subagent should be captured from args");
     assert_eq!(reviewer.subagent_type.as_deref(), Some("research"));
-    assert!(reviewer.completed, "Spec Reviewer completed via SYSTEM_MESSAGE");
+    assert!(
+        reviewer.completed,
+        "Spec Reviewer completed via SYSTEM_MESSAGE"
+    );
 
     // 2. FILE ACTIVITY was empty before; now it must capture read_file and edit_file!
     assert!(
