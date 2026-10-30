@@ -1091,6 +1091,43 @@ pub fn pixel_to_cell(
     Some((col.min(cols - 1), row.min(rows - 1)))
 }
 
+/// [`pixel_to_cell`] for a drag the running app owns: every point maps to a cell, the
+/// nearest one on the grid's edge (mouse-drag-reporting D4).
+///
+/// A point left of the grid (the sidebar), above it (the top inset), or outside the
+/// window with a negative coordinate clamps to column/row 0; the monitor band and
+/// anything past the right or bottom edge clamp to the last column/row. macOS keeps
+/// delivering `CursorMoved` outside the window while a button is held, and xterm and
+/// iTerm2 report those moves at the edge rather than dropping them. `None` only for
+/// degenerate geometry — the same guards as [`pixel_to_cell`]. A *press* keeps using
+/// [`pixel_to_cell`]: a press outside the grid is not a grid press.
+#[allow(clippy::too_many_arguments)]
+pub fn pixel_to_cell_clamped(
+    cursor: (f64, f64),
+    cell: (f32, f32),
+    left_inset: f32,
+    top_inset: f32,
+    viewport_w: f32,
+    right_inset: f32,
+    cols: u16,
+    rows: u16,
+) -> Option<(u16, u16)> {
+    let (cw, ch) = cell;
+    if cw <= 0.0 || ch <= 0.0 || cols == 0 || rows == 0 {
+        return None;
+    }
+    let (px, py) = (cursor.0 as f32, cursor.1 as f32);
+    // `.max(0.0)` takes the sidebar, the top inset and negative coordinates to cell 0;
+    // `as u16` saturates and `.min` binds to the last cell.
+    let col = if right_inset > 0.0 && px >= viewport_w - right_inset {
+        cols - 1 // the monitor band
+    } else {
+        (((px - left_inset).max(0.0) / cw) as u16).min(cols - 1)
+    };
+    let row = (((py - top_inset).max(0.0) / ch) as u16).min(rows - 1);
+    Some((col, row))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3476,12 +3513,18 @@ pub enum GridReleaseAction {
 }
 
 /// Decide the release report for an in-flight grid mouse press.
+///
+/// Modifiers held at release are ignored (mouse-drag-reporting D3): the press already
+/// committed the gesture to the app, so a drag that ends with ⌘ or Shift down still
+/// closes. Routing the release through the ⌘/Shift bypass would strand the app's
+/// selection with no `m`, and its copy-on-release would never fire. `_mods` stays so
+/// the signature and its callers do not change.
 pub fn grid_release_action(
     reported: Option<(MouseButton, u16, u16)>,
     protocol: MouseProtocol,
     encoding: MouseEncoding,
     button: MouseButton,
-    mods: &ModifiersState,
+    _mods: &ModifiersState,
 ) -> GridReleaseAction {
     let Some((rep_btn, col, row)) = reported else {
         return GridReleaseAction::Ignore;
@@ -3495,12 +3538,88 @@ pub fn grid_release_action(
         button,
         ElementState::Released,
         (col, row),
-        mods,
+        &ModifiersState::empty(),
     ) {
         GridReleaseAction::Report(bytes)
     } else {
         GridReleaseAction::Ignore
     }
+}
+
+/// Whether the button-held motion of a latched press goes to the app: only under
+/// `?1002` (button-event) and `?1003` (any-event) tracking (mouse-drag-reporting D1).
+fn reports_drag_motion(protocol: MouseProtocol) -> bool {
+    matches!(
+        protocol,
+        MouseProtocol::ButtonEvent | MouseProtocol::AnyEvent
+    )
+}
+
+/// Whether a reported drag owns the pointer: a press is latched and the app asked for
+/// its motion (mouse-drag-reporting D6). While it does, `CursorMoved` reports motion
+/// instead of refreshing hover, and ⌘ lights no link. A held `?1000`/`?9` press keeps
+/// hover exactly as before, because those apps never see the drag.
+pub fn drag_owns_pointer(latch: Option<(MouseButton, u16, u16)>, protocol: MouseProtocol) -> bool {
+    latch.is_some() && reports_drag_motion(protocol)
+}
+
+/// Encode one button-held motion report (mouse-drag-reporting D1).
+///
+/// The button code is `32 + b` (Left=0, Middle=1, Right=2); other buttons give `None`.
+/// SGR is `ESC [ < 32+b ; col ; row M` — motion always ends in `M`. Legacy is
+/// `ESC [ M` plus three `value + 32` bytes, and `None` past 223, as for press/release.
+pub fn encode_mouse_motion_report(
+    encoding: MouseEncoding,
+    button: MouseButton,
+    col: u16,
+    row: u16,
+) -> Option<Vec<u8>> {
+    let code: u16 = match button {
+        MouseButton::Left => 32,
+        MouseButton::Middle => 33,
+        MouseButton::Right => 34,
+        _ => return None,
+    };
+    let (cx, cy) = (col.saturating_add(1), row.saturating_add(1));
+    match encoding {
+        MouseEncoding::Sgr => Some(format!("\x1b[<{code};{cx};{cy}M").into_bytes()),
+        MouseEncoding::Legacy => {
+            if cx > 223 || cy > 223 {
+                return None;
+            }
+            Some(vec![
+                0x1b,
+                b'[',
+                b'M',
+                (code + 32) as u8,
+                (cx + 32) as u8,
+                (cy + 32) as u8,
+            ])
+        }
+    }
+}
+
+/// One step of a reported drag: the motion report for `cell`, if any, and the latch
+/// moved onto it (mouse-drag-reporting D2, D3).
+///
+/// `None` — with `latch` untouched — when nothing is latched, the pointer is still in
+/// the latched cell (one report per cell, as xterm), the app did not ask for motion
+/// (D1), or the cell cannot be encoded (legacy past 223). Otherwise the latch moves to
+/// `cell`, so the release that follows lands where the drag ended. The latch moves
+/// here, not in the event loop, so press → motion → release is testable without a window.
+pub fn reported_drag_motion(
+    latch: &mut Option<(MouseButton, u16, u16)>,
+    protocol: MouseProtocol,
+    encoding: MouseEncoding,
+    cell: (u16, u16),
+) -> Option<Vec<u8>> {
+    let (button, col, row) = (*latch)?;
+    if (col, row) == cell || !reports_drag_motion(protocol) {
+        return None;
+    }
+    let bytes = encode_mouse_motion_report(encoding, button, cell.0, cell.1)?;
+    *latch = Some((button, cell.0, cell.1));
+    Some(bytes)
 }
 
 /// Decide whether a grid mouse button release should snap the viewport to live bottom (scroll-snap-on-click D1).
@@ -3696,5 +3815,200 @@ mod mouse_button_tests {
             &ModifiersState::empty(),
         );
         assert_eq!(x10_rel, GridReleaseAction::Ignore);
+    }
+}
+
+#[cfg(test)]
+mod mouse_drag_tests {
+    use super::*;
+
+    const L: MouseButton = MouseButton::Left;
+
+    #[test]
+    fn motion_codes_are_32_plus_the_button() {
+        let sgr = |b| encode_mouse_motion_report(MouseEncoding::Sgr, b, 0, 0);
+        assert_eq!(sgr(L), Some(b"\x1b[<32;1;1M".to_vec()));
+        assert_eq!(sgr(MouseButton::Middle), Some(b"\x1b[<33;1;1M".to_vec()));
+        assert_eq!(sgr(MouseButton::Right), Some(b"\x1b[<34;1;1M".to_vec()));
+        assert_eq!(sgr(MouseButton::Back), None);
+        assert_eq!(
+            encode_mouse_motion_report(MouseEncoding::Sgr, L, 10, 5),
+            Some(b"\x1b[<32;11;6M".to_vec())
+        );
+    }
+
+    #[test]
+    fn legacy_motion_offsets_every_byte_and_stops_past_223() {
+        assert_eq!(
+            encode_mouse_motion_report(MouseEncoding::Legacy, L, 10, 5),
+            Some(vec![0x1b, b'[', b'M', 64, 43, 38])
+        );
+        // 222 + 1 = 223 is the last encodable coordinate; 223 + 1 is not.
+        assert!(encode_mouse_motion_report(MouseEncoding::Legacy, L, 222, 222).is_some());
+        assert!(encode_mouse_motion_report(MouseEncoding::Legacy, L, 223, 0).is_none());
+        assert!(encode_mouse_motion_report(MouseEncoding::Legacy, L, 0, 223).is_none());
+    }
+
+    #[test]
+    fn a_new_cell_reports_and_moves_the_latch() {
+        for p in [MouseProtocol::ButtonEvent, MouseProtocol::AnyEvent] {
+            let mut latch = Some((L, 2, 5));
+            let b = reported_drag_motion(&mut latch, p, MouseEncoding::Sgr, (3, 5));
+            assert_eq!(b, Some(b"\x1b[<32;4;6M".to_vec()), "{p:?}");
+            assert_eq!(latch, Some((L, 3, 5)), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn nothing_moves_without_a_reportable_new_cell() {
+        // Same cell; click-only and off protocols; no latch; a legacy cell past 223.
+        let cases = [
+            (
+                Some((L, 2, 5)),
+                MouseProtocol::AnyEvent,
+                MouseEncoding::Sgr,
+                (2, 5),
+            ),
+            (
+                Some((L, 2, 5)),
+                MouseProtocol::Normal,
+                MouseEncoding::Sgr,
+                (3, 5),
+            ),
+            (
+                Some((L, 2, 5)),
+                MouseProtocol::X10,
+                MouseEncoding::Sgr,
+                (3, 5),
+            ),
+            (
+                Some((L, 2, 5)),
+                MouseProtocol::Off,
+                MouseEncoding::Sgr,
+                (3, 5),
+            ),
+            (None, MouseProtocol::AnyEvent, MouseEncoding::Sgr, (3, 5)),
+            (
+                Some((L, 2, 5)),
+                MouseProtocol::ButtonEvent,
+                MouseEncoding::Legacy,
+                (250, 5),
+            ),
+        ];
+        for (start, p, e, cell) in cases {
+            let mut latch = start;
+            assert_eq!(
+                reported_drag_motion(&mut latch, p, e, cell),
+                None,
+                "{p:?} {cell:?}"
+            );
+            assert_eq!(latch, start, "latch kept for {p:?} {cell:?}");
+        }
+    }
+
+    #[test]
+    fn a_drag_releases_where_it_ended() {
+        let (p, e, none) = (
+            MouseProtocol::AnyEvent,
+            MouseEncoding::Sgr,
+            ModifiersState::empty(),
+        );
+        let mut out = Vec::new();
+        let GridPressAction::Report(b) = grid_press_action(p, e, L, (2, 5), &none) else {
+            panic!("press reports");
+        };
+        out.extend(b);
+        let mut latch = Some((L, 2, 5));
+        out.extend(reported_drag_motion(&mut latch, p, e, (3, 5)).expect("move 1"));
+        out.extend(reported_drag_motion(&mut latch, p, e, (6, 5)).expect("move 2"));
+        let GridReleaseAction::Report(b) = grid_release_action(latch, p, e, L, &none) else {
+            panic!("release reports");
+        };
+        out.extend(b);
+        assert_eq!(
+            out,
+            b"\x1b[<0;3;6M\x1b[<32;4;6M\x1b[<32;7;6M\x1b[<0;7;6m".to_vec()
+        );
+    }
+
+    #[test]
+    fn narrowing_to_1000_mid_drag_releases_at_the_last_moved_cell() {
+        let e = MouseEncoding::Sgr;
+        let mut latch = Some((L, 2, 5));
+        assert!(reported_drag_motion(&mut latch, MouseProtocol::AnyEvent, e, (4, 5)).is_some());
+        assert_eq!(
+            reported_drag_motion(&mut latch, MouseProtocol::Normal, e, (7, 5)),
+            None
+        );
+        assert_eq!(
+            grid_release_action(latch, MouseProtocol::Normal, e, L, &ModifiersState::empty()),
+            GridReleaseAction::Report(b"\x1b[<0;5;6m".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_latched_release_ignores_modifiers_but_not_tracking_off() {
+        let latch = Some((L, 6, 5));
+        let e = MouseEncoding::Sgr;
+        for m in [ModifiersState::SUPER, ModifiersState::SHIFT] {
+            assert_eq!(
+                grid_release_action(latch, MouseProtocol::AnyEvent, e, L, &m),
+                GridReleaseAction::Report(b"\x1b[<0;7;6m".to_vec()),
+                "{m:?}"
+            );
+        }
+        assert_eq!(
+            grid_release_action(latch, MouseProtocol::Off, e, L, &ModifiersState::SUPER),
+            GridReleaseAction::Ignore
+        );
+    }
+
+    #[test]
+    fn only_a_latched_motion_reporting_press_owns_the_pointer() {
+        let latch = Some((L, 2, 5));
+        assert!(drag_owns_pointer(latch, MouseProtocol::AnyEvent));
+        assert!(drag_owns_pointer(latch, MouseProtocol::ButtonEvent));
+        assert!(!drag_owns_pointer(latch, MouseProtocol::Normal));
+        assert!(!drag_owns_pointer(latch, MouseProtocol::X10));
+        assert!(!drag_owns_pointer(latch, MouseProtocol::Off));
+        assert!(!drag_owns_pointer(None, MouseProtocol::AnyEvent));
+    }
+
+    fn clamped(cursor: (f64, f64), insets: (f32, f32, f32)) -> Option<(u16, u16)> {
+        let (left, top, right) = insets;
+        pixel_to_cell_clamped(cursor, (10.0, 20.0), left, top, 1000.0, right, 80, 24)
+    }
+
+    #[test]
+    fn off_grid_points_clamp_to_the_edge() {
+        // Sidebar + top inset, and negative (outside-the-window) coordinates.
+        assert_eq!(clamped((50.0, 10.0), (200.0, 30.0, 0.0)), Some((0, 0)));
+        assert_eq!(clamped((-40.0, -15.0), (200.0, 30.0, 0.0)), Some((0, 0)));
+        assert_eq!(clamped((215.0, 29.0), (200.0, 30.0, 0.0)), Some((1, 0)));
+        // Monitor band and past the bottom.
+        assert_eq!(clamped((950.0, 5000.0), (0.0, 0.0, 200.0)), Some((79, 23)));
+        // Just left of the band is still an ordinary cell.
+        assert_eq!(clamped((795.0, 0.0), (0.0, 0.0, 200.0)), Some((79, 0)));
+        assert_eq!(clamped((785.0, 0.0), (0.0, 0.0, 200.0)), Some((78, 0)));
+        // Past the right edge with no panel.
+        assert_eq!(clamped((5000.0, 0.0), (0.0, 0.0, 0.0)), Some((79, 0)));
+    }
+
+    #[test]
+    fn in_grid_points_match_pixel_to_cell() {
+        let unclamped = pixel_to_cell((125.0, 45.0), (10.0, 20.0), 0.0, 0.0, 1000.0, 0.0, 80, 24);
+        assert_eq!(unclamped, Some((12, 2)));
+        assert_eq!(clamped((125.0, 45.0), (0.0, 0.0, 0.0)), unclamped);
+    }
+
+    #[test]
+    fn degenerate_geometry_has_no_cell() {
+        let f = |cell, cols, rows| {
+            pixel_to_cell_clamped((5.0, 5.0), cell, 0.0, 0.0, 100.0, 0.0, cols, rows)
+        };
+        assert_eq!(f((0.0, 20.0), 80, 24), None);
+        assert_eq!(f((10.0, 0.0), 80, 24), None);
+        assert_eq!(f((10.0, 20.0), 0, 24), None);
+        assert_eq!(f((10.0, 20.0), 80, 0), None);
     }
 }

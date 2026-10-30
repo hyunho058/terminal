@@ -89,6 +89,12 @@ pub use input::pointer_owner;
 pub use input::PointerOwner;
 /// `crates/app/tests/tt11_graph_wheel.rs` wheels the open graph (session-flow-graph R11.3).
 pub use input::WheelDelta;
+/// The reported-drag pieces (mouse-drag-reporting), asserted by
+/// `crates/app/tests/tt1_mouse_motion_encoding.rs` … `tt4_drag_bypass.rs`.
+pub use input::{
+    drag_owns_pointer, encode_mouse_motion_report, pixel_to_cell, pixel_to_cell_clamped,
+    reported_drag_motion,
+};
 pub use input::{
     encode_mouse_button_report, grid_press_action, grid_release_action, mouse_button_bytes,
     mouse_button_route, should_snap_on_click, GridPressAction, GridReleaseAction, MouseButtonRoute,
