@@ -1,25 +1,23 @@
-//! TT6 — acceptance tests for `specs/session-flow-graph` R6 (old D2, old D13): a session
-//! card's status in the graph is the sidebar card's, computed by the card's own join.
+//! TT6 — acceptance tests for `specs/session-flow-graph` R6 (old D2, old D13), carried by
+//! `specs/session-overview-ui` (D3 of the graph spec is kept): a session's state in the
+//! Agent Monitor overview is the sidebar card's, computed by the card's own join, then split
+//! into a bucket by `app::overview::bucket_of` (overview D2).
 //!
 //! * An unsplit session and a split tab's **active** pane take `row_meta(..).status`, the
 //!   blocking-dialog override included (R6.1).
-//! * A **non-active** pane is log-only — `resolve_status(Some(&agent), false, false, None)` —
-//!   and an `Unknown` Claude state is still a session node, drawn undotted (R6.2).
+//! * A **non-active** pane is log-only — `resolve_status(Some(&agent), false, false, None)`,
+//!   never the tab's dialog — and an `Unknown` Claude state is still a session row, in the
+//!   `Agent` bucket (R6.2).
 //!
 //! Every fixture is hand-built data: no tmux, no logs, no process table. Every app item is
-//! reached through the `app` crate root; the graph's types through `renderer::graph_layout`.
-//! Panes are told apart by D1's "inside a split tab, pane order": both pane sessions here
-//! sit outside any repository, so they form the non-git tail in pane order.
+//! reached through the `app` crate root; the model's types through `renderer::overview_model`.
+//! Rows sort by bucket, so panes are told apart by their pane pid, not their position.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 
-use ai_monitor::telemetry::Subagent;
-use app::{
-    build_graph, resolve_status, row_meta, Agent, AgentKind, AgentState, FoldSet, PaneMeta, TabId,
-    TabMeta,
-};
-use renderer::graph_layout::{FlowGraph, FlowNode, FlowTarget, NodeKind};
+use app::overview::{bucket_of, build_overview, ExpandSet};
+use app::{resolve_status, row_meta, Agent, AgentKind, AgentState, PaneMeta, TabId, TabMeta};
+use renderer::overview_model::{Bucket, Filter, OverviewModel, SessionRowData};
 use renderer::sidebar_card::CardStatus;
 use renderer::sidebar_row::SidebarRow;
 
@@ -57,6 +55,8 @@ fn unsplit_meta(state: AgentState) -> TabMeta {
 
 fn pane(pid: u32, active: bool, agent: Option<Agent>) -> PaneMeta {
     PaneMeta {
+        graph_agent_cwd: None,
+        graph_asks_user: false,
         pane_pid: pid,
         active,
         agent,
@@ -67,31 +67,35 @@ fn pane(pid: u32, active: bool, agent: Option<Agent>) -> PaneMeta {
     }
 }
 
-/// `build_graph` over one row and its meta, with no subagents and no folds.
-fn graph_of(row: &SidebarRow, meta: TabMeta) -> FlowGraph {
+/// `build_overview` over one row and its meta, with no digests and nothing expanded.
+fn model_of(row: &SidebarRow, meta: TabMeta) -> OverviewModel {
     let mut metas = HashMap::new();
     metas.insert(TabId(row.tab_id), meta);
-    let subagents: HashMap<PathBuf, Vec<Subagent>> = HashMap::new();
-    let folds = FoldSet::new();
     // The active strip index only decides `selected`, which R6 does not read.
-    let (graph, _) = build_graph(
+    let (model, _) = build_overview(
         std::slice::from_ref(row),
         &metas,
         None,
-        &subagents,
-        &folds,
+        &HashMap::new(),
+        &ExpandSet::new(),
+        Filter::All,
         0,
+        1_793_404_800_000,
     );
-    graph
+    model
 }
 
-/// The session nodes of tab `TAB`, in node order.
-fn sessions(graph: &FlowGraph) -> Vec<&FlowNode> {
-    graph
-        .nodes
-        .iter()
-        .filter(|n| n.kind == NodeKind::Session && n.target == FlowTarget::Node(TAB))
-        .collect()
+/// The session rows of tab `TAB`, in model order.
+fn sessions(model: &OverviewModel) -> Vec<&SessionRowData> {
+    model.rows.iter().filter(|r| r.tab == TAB).collect()
+}
+
+/// Tab `TAB`'s row for pane `pid`.
+fn pane_row(model: &OverviewModel, pid: u32) -> &SessionRowData {
+    sessions(model)
+        .into_iter()
+        .find(|r| r.pane == pid)
+        .unwrap_or_else(|| panic!("a row for pane {pid}: {:#?}", model.rows))
 }
 
 // R6.1
@@ -102,16 +106,17 @@ fn r6_1_unsplit_session_status_equals_the_cards_in_every_combination() {
             let r = row(dialog);
             let meta = unsplit_meta(state);
             let card = row_meta(&r, Some(&meta), None).status;
-            let graph = graph_of(&r, meta);
-            let got = sessions(&graph);
+            let model = model_of(&r, meta);
+            let got = sessions(&model);
             assert_eq!(
                 got.len(),
                 1,
-                "one session node expected (state={state:?}, dialog={dialog})"
+                "one session row expected (state={state:?}, dialog={dialog})"
             );
             assert_eq!(
-                got[0].status, card,
-                "session status must equal row_meta(..).status (state={state:?}, dialog={dialog})"
+                got[0].bucket,
+                bucket_of(card, dialog, false),
+                "the session's bucket must be row_meta(..).status's (state={state:?}, dialog={dialog})"
             );
         }
     }
@@ -129,18 +134,17 @@ fn r6_1_active_pane_takes_the_cards_status_and_the_other_pane_does_not() {
         ],
         ..Default::default()
     };
-    let graph = graph_of(&r, meta);
-    let got = sessions(&graph);
-    assert_eq!(got.len(), 2, "one session node per Claude pane");
-    // Pane order (D1): pane 10 first, pane 11 second.
+    let model = model_of(&r, meta);
+    assert_eq!(sessions(&model).len(), 2, "one session row per Claude pane");
     assert_eq!(
-        got[0].status,
-        CardStatus::WaitingForInput,
+        pane_row(&model, 10).bucket,
+        bucket_of(CardStatus::WaitingForInput, true, false),
         "active pane 10 takes the card's status, dialog override included"
     );
+    assert_eq!(pane_row(&model, 10).bucket, Bucket::NeedsYou);
     assert_eq!(
-        got[1].status,
-        CardStatus::Working,
+        pane_row(&model, 11).bucket,
+        Bucket::Working,
         "non-active pane 11 ignores the tab's blocking dialog"
     );
 }
@@ -159,25 +163,32 @@ fn r6_2_non_active_pane_is_log_only() {
         ],
         ..Default::default()
     };
-    let graph = graph_of(&r, meta);
-    let got = sessions(&graph);
-    assert_eq!(got.len(), 2, "one session node per Claude pane");
+    let model = model_of(&r, meta);
+    assert_eq!(sessions(&model).len(), 2, "one session row per Claude pane");
     assert_eq!(
-        got[1].status,
-        resolve_status(Some(&waiting), false, false, None),
+        pane_row(&model, 11).bucket,
+        bucket_of(
+            resolve_status(Some(&waiting), false, false, None),
+            false,
+            false
+        ),
         "non-active pane 11's status is resolve_status(Some(&agent), false, false, None)"
     );
+    assert_eq!(pane_row(&model, 11).bucket, Bucket::Idle);
 }
 
 // R6.2
 #[test]
-fn r6_2_unknown_state_is_a_session_node_with_hidden_status() {
-    let graph = graph_of(&row(false), unsplit_meta(AgentState::Unknown));
-    let got = sessions(&graph);
+fn r6_2_unknown_state_is_a_session_row_in_the_agent_bucket() {
+    let r = row(false);
+    let meta = unsplit_meta(AgentState::Unknown);
+    assert_eq!(row_meta(&r, Some(&meta), None).status, CardStatus::Hidden);
+    let model = model_of(&r, meta);
+    let got = sessions(&model);
     assert_eq!(
         got.len(),
         1,
-        "an Unknown Claude state is still a session node"
+        "an Unknown Claude state is still a session row"
     );
-    assert_eq!(got[0].status, CardStatus::Hidden);
+    assert_eq!(got[0].bucket, Bucket::Agent);
 }

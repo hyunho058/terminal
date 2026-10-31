@@ -81,6 +81,10 @@ pub struct SidebarRow {
     ///
     /// [`running`]: SidebarRow::running
     pub blocking_dialog: bool,
+    /// What the dialog asks for, when [`blocking_dialog`](Self::blocking_dialog) is up and
+    /// the dialog's subject was read (session-overview-ui D9). Always `None` while
+    /// `blocking_dialog` is false. The sidebar card does not draw it; the overview does.
+    pub blocking_subject: Option<crate::overview_model::DialogSubject>,
 }
 
 /// One waiting-band signal's visual kind (D6). Renderer-owned so the renderer never
@@ -576,15 +580,26 @@ impl TabModelHandle {
     /// `Tabs::titles` would also re-send the roster to the metadata worker, which then
     /// re-derives and may publish again. An unknown `tab_id` (a tab closed between the scan
     /// and this) changes nothing.
-    pub fn set_blocking_dialog(&self, tab_id: u64, level: bool) -> bool {
+    ///
+    /// The dialog's subject (session-overview-ui D9) travels with the level through this one
+    /// setter so the two cannot disagree: a false level stores no subject, and a new subject
+    /// at an unchanged level is a change (D18), so an open overview rebuilds.
+    pub fn set_blocking_dialog(
+        &self,
+        tab_id: u64,
+        level: bool,
+        subject: Option<crate::overview_model::DialogSubject>,
+    ) -> bool {
+        let subject = subject.filter(|_| level);
         let mut m = self.0.borrow_mut();
         let Some(row) = m.rows.iter_mut().find(|r| r.tab_id == tab_id) else {
             return false;
         };
-        if row.blocking_dialog == level {
+        if row.blocking_dialog == level && row.blocking_subject == subject {
             return false;
         }
         row.blocking_dialog = level;
+        row.blocking_subject = subject;
         m.rows_rev = m.rows_rev.wrapping_add(1);
         true
     }
@@ -1888,18 +1903,62 @@ mod tests {
         let levels = || h.with(|m| m.rows.iter().map(|r| r.blocking_dialog).collect::<Vec<_>>());
         let start = rev();
 
-        assert!(h.set_blocking_dialog(8, true), "rising");
+        assert!(h.set_blocking_dialog(8, true, None), "rising");
         assert_eq!(levels(), vec![false, true]);
         assert_eq!(rev(), start + 1);
 
-        assert!(!h.set_blocking_dialog(8, true), "a repeat is not a change");
+        assert!(
+            !h.set_blocking_dialog(8, true, None),
+            "a repeat is not a change"
+        );
         assert_eq!(rev(), start + 1, "and bumps nothing");
 
-        assert!(!h.set_blocking_dialog(99, true), "a closed tab");
+        assert!(!h.set_blocking_dialog(99, true, None), "a closed tab");
         assert_eq!((levels(), rev()), (vec![false, true], start + 1));
 
-        assert!(h.set_blocking_dialog(8, false), "falling");
+        assert!(h.set_blocking_dialog(8, false, None), "falling");
         assert_eq!((levels(), rev()), (vec![false, false], start + 2));
+    }
+
+    #[test]
+    fn the_dialog_subject_rides_with_the_level() {
+        // session-overview-ui D9 / D18 — a subject change at an unchanged level is a change;
+        // a false level carries no subject whatever it is handed.
+        use crate::overview_model::DialogSubject::{Command, Plan};
+        reset_shared_model();
+        let h = TabModelHandle::shared();
+        h.set(TabBarModel {
+            titles: vec![SidebarRow {
+                tab_id: 8,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let rev = || h.with(|m| m.rows_rev);
+        let row = || {
+            h.with(|m| {
+                let r = &m.rows[0];
+                (r.blocking_dialog, r.blocking_subject.clone())
+            })
+        };
+        let start = rev();
+
+        assert!(h.set_blocking_dialog(8, true, Some(Command("ls".into()))));
+        assert_eq!(row(), (true, Some(Command("ls".into()))));
+        assert!(!h.set_blocking_dialog(8, true, Some(Command("ls".into()))));
+        assert_eq!(rev(), start + 1);
+
+        assert!(
+            h.set_blocking_dialog(8, true, Some(Plan)),
+            "new subject, same level"
+        );
+        assert_eq!((row(), rev()), ((true, Some(Plan)), start + 2));
+        assert!(h.set_blocking_dialog(8, true, None), "subject lost");
+        assert_eq!(row(), (true, None));
+
+        assert!(h.set_blocking_dialog(8, false, Some(Plan)));
+        assert_eq!(row(), (false, None), "no level, no subject");
+        assert!(!h.set_blocking_dialog(8, false, None));
     }
 
     #[test]

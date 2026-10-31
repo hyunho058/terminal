@@ -70,7 +70,8 @@ pub fn publish_graph_state(wanted: bool, full_pass_done: bool, prev_ready: bool)
     }
 }
 
-/// `published` with every tab's `panes`, `repo`, `graph_agent` and `graph_task` emptied —
+/// `published` with every tab's `panes`, `repo`, `graph_agent`, `graph_task`,
+/// `graph_asks_user` and `graph_agent_cwd` emptied —
 /// the on→off edge of the graph's switch. Pure and syscall-free, so closing the graph
 /// clears it without deriving anything.
 fn strip_graph(published: &[(TabId, TabMeta)]) -> Vec<(TabId, TabMeta)> {
@@ -84,6 +85,8 @@ fn strip_graph(published: &[(TabId, TabMeta)]) -> Vec<(TabId, TabMeta)> {
                     repo: None,
                     graph_agent: None,
                     graph_task: None,
+                    graph_asks_user: false,
+                    graph_agent_cwd: None,
                     ..m.clone()
                 },
             )
@@ -268,7 +271,7 @@ impl Deriver {
             (kind == AgentKind::Claude).then_some(pid)
         });
 
-        let (classified, label, log) = match detected {
+        let (classified, label, log, asks) = match detected {
             // `agent`, `task` — and `activity`'s log reads — stay behind their existing toggle
             // while the graph is closed. Turning the display off still stops the `.git` I/O and
             // the log reads; only the walk itself, and only for the active tab, is unconditional.
@@ -292,11 +295,11 @@ impl Deriver {
                     pid,
                     start_ms: (self.start_ms_of)(pid),
                 });
-                let (state, task, log) =
+                let (state, task, log, asks) =
                     self.activity(kind, pid, cwd.as_deref(), claude, tick, now);
-                (Some(Agent { kind, state }), task, log)
+                (Some(Agent { kind, state }), task, log, asks)
             }
-            _ => (None, None, None),
+            _ => (None, None, None, false),
         };
         // The card's fields keep the toggle; the graph's copies do not. `log` is read by the
         // graph alone (its subagent source), so it needs no split.
@@ -304,16 +307,26 @@ impl Deriver {
         let task = label.clone().filter(|_| self.enabled_agent);
         let graph_agent = classified.filter(|_| graph_derive);
         let graph_task = label.filter(|_| graph_derive);
+        // session-overview-ui D2 — graph-only like `graph_agent`, so a closed graph publishes
+        // `false` whatever the log says.
+        let graph_asks_user = asks && graph_derive;
 
-        let (panes, repo) = match graph {
+        let (panes, repo, graph_agent_cwd) = match graph {
             PanePass::Derive => {
                 // R14.5 — the walk's pid of **any** detected kind, not `agent_pid`: that one
                 // stays Claude-only (D9 above), while every detected agent is a graph session
                 // and so needs its repository. Still nothing while the graph is closed.
-                let repo = detected.and_then(|super::agent::Detected { pid, .. }| {
-                    self.session_repo(pid, cwd.as_deref(), tick)
-                });
+                // session-overview-ui D3 — the agent's own cwd is the one `repo` was just
+                // resolved from, published rather than read a second time.
+                let (agent_cwd, repo) = match detected {
+                    Some(super::agent::Detected { pid, .. }) => {
+                        self.session_repo(pid, cwd.as_deref(), tick)
+                    }
+                    None => (None, None),
+                };
                 let tab = PaneMeta {
+                    graph_agent_cwd: agent_cwd.clone(),
+                    graph_asks_user,
                     pane_pid: 0,
                     active: true,
                     agent: graph_agent,
@@ -322,12 +335,18 @@ impl Deriver {
                     branch: branch.clone(),
                     repo: repo.clone(),
                 };
-                (self.panes(attached.as_ref(), tick, now, &tab), repo)
+                (
+                    self.panes(attached.as_ref(), tick, now, &tab),
+                    repo,
+                    agent_cwd,
+                )
             }
-            PanePass::Skip => (Vec::new(), None),
+            PanePass::Skip => (Vec::new(), None, None),
         };
 
         TabMeta {
+            graph_agent_cwd,
+            graph_asks_user,
             branch,
             agent,
             task,
@@ -345,14 +364,23 @@ impl Deriver {
     /// D10, R14.5): resolved
     /// from that process's own cwd, falling back to `shell_cwd` when it cannot be read (the
     /// process exited between the walk and here).
+    ///
+    /// Returned beside the repository: the agent process's own cwd, as read for it — `None`
+    /// when it could not be read, even though the repository then came from `shell_cwd`. It is
+    /// published as `graph_agent_cwd` (session-overview-ui D3), which names the agent's
+    /// directory and never the shell's (G5).
     fn session_repo(
         &mut self,
         agent_pid: u32,
         shell_cwd: Option<&Path>,
         tick: u64,
-    ) -> Option<RepoId> {
-        let cwd = (self.cwd_of)(agent_pid).or_else(|| shell_cwd.map(Path::to_path_buf))?;
-        super::git::repo_of_cwd(&mut self.repo_memo, &cwd, tick)
+    ) -> (Option<PathBuf>, Option<RepoId>) {
+        let agent_cwd = (self.cwd_of)(agent_pid);
+        let repo = agent_cwd
+            .as_deref()
+            .or(shell_cwd)
+            .and_then(|c| super::git::repo_of_cwd(&mut self.repo_memo, c, tick));
+        (agent_cwd, repo)
     }
 
     /// The tab's panes (session-flow-viewer D9): the client window's panes from
@@ -371,6 +399,8 @@ impl Deriver {
             .map(|row| {
                 if row.active {
                     PaneMeta {
+                        graph_agent_cwd: tab.graph_agent_cwd.clone(),
+                        graph_asks_user: tab.graph_asks_user,
                         pane_pid: row.pid,
                         active: true,
                         agent: tab.agent,
@@ -400,6 +430,8 @@ impl Deriver {
     fn pane(&mut self, pid: u32, tick: u64, now: SystemTime) -> PaneMeta {
         let Some(super::agent::Detected { kind, pid: apid }) = (self.agent_of)(pid) else {
             return PaneMeta {
+                graph_agent_cwd: None,
+                graph_asks_user: false,
                 pane_pid: pid,
                 active: false,
                 agent: None,
@@ -414,15 +446,18 @@ impl Deriver {
             pid: apid,
             start_ms: (self.start_ms_of)(apid),
         });
-        let (state, _task, log) = self.activity(kind, apid, cwd.as_deref(), claude, tick, now);
+        let (state, _task, log, asks) =
+            self.activity(kind, apid, cwd.as_deref(), claude, tick, now);
         let branch = if self.enabled_git {
             cwd.as_deref()
                 .and_then(|c| super::git::branch_of_cwd(&mut self.git_memo, c, tick))
         } else {
             None
         };
-        let repo = self.session_repo(apid, cwd.as_deref(), tick);
+        let (agent_cwd, repo) = self.session_repo(apid, cwd.as_deref(), tick);
         PaneMeta {
+            graph_agent_cwd: agent_cwd,
+            graph_asks_user: asks,
             pane_pid: pid,
             active: false,
             agent: Some(Agent { kind, state }),
@@ -449,7 +484,11 @@ impl Deriver {
         claude: Option<super::ClaudeId>,
         tick: u64,
         now: SystemTime,
-    ) -> (AgentState, Option<String>, Option<PathBuf>) {
+    ) -> (AgentState, Option<String>, Option<PathBuf>, bool) {
+        // The fourth value is whether the session's last meaningful message is
+        // `AssistantAsksUser` (session-overview-ui D2): a memo read off the classification
+        // the state just came from, paired with that state being `Waiting` so a tail left
+        // behind an unreadable log never reads as asking.
         // The third value is the resolved `Found.log`, published as `TabMeta.log`
         // (session-flow-viewer D9) — the same file the state was classified from.
         // agent-card-status D11 — the walk's own `agy` pid, which names its transcript
@@ -464,10 +503,12 @@ impl Deriver {
                 tick,
                 now,
             );
-            return (state, None, None);
+            let asks = state == AgentState::Waiting
+                && super::antigravity::asks_user(&self.antigravity_memo, pid);
+            return (state, None, None, asks);
         }
         if kind != AgentKind::Claude {
-            return (AgentState::Unknown, None, None);
+            return (AgentState::Unknown, None, None, false);
         }
         // Destructured once, rather than `self.projects_root.clone()` twice inside the
         // pattern: the clones existed only to end the `&self` borrow before `&mut
@@ -480,10 +521,10 @@ impl Deriver {
             ..
         } = self
         else {
-            return (AgentState::Unknown, None, None);
+            return (AgentState::Unknown, None, None, false);
         };
         let Some(cwd) = cwd else {
-            return (AgentState::Unknown, None, None);
+            return (AgentState::Unknown, None, None, false);
         };
         match super::activity::resolve_log(act_memo, projects, sessions, cwd, claude, tick) {
             super::activity::Resolution::Found(found) => {
@@ -491,12 +532,15 @@ impl Deriver {
                 // A pure memo read: `state_of_found` just warmed the entry for this exact
                 // log, so the label costs no further I/O (R4.2).
                 let label = super::activity::label_of_log(act_memo, &found.log);
-                (state, label, Some(found.log))
+                let asks = state == AgentState::Waiting
+                    && super::activity::last_of_log(act_memo, &found.log)
+                        == Some(ai_monitor::activity::LastMessage::AssistantAsksUser);
+                (state, label, Some(found.log), asks)
             }
             // The session is named and has written nothing yet: an agent is here, but there
             // is no task to show. Never a neighbour's log.
             super::activity::Resolution::NamedButUnwritten | super::activity::Resolution::None => {
-                (AgentState::Unknown, None, None)
+                (AgentState::Unknown, None, None, false)
             }
         }
     }
@@ -883,6 +927,8 @@ mod tests {
         let one = vec![(
             TabId(1),
             TabMeta {
+                graph_agent_cwd: None,
+                graph_asks_user: false,
                 branch: Some("main".into()),
                 agent: None,
                 task: None,
@@ -912,6 +958,8 @@ mod tests {
         let two = vec![(
             TabId(1),
             TabMeta {
+                graph_agent_cwd: None,
+                graph_asks_user: false,
                 branch: Some("dev".into()),
                 agent: None,
                 task: None,
@@ -1487,7 +1535,8 @@ mod tests {
         // snapshot contract are downstream and each feature that moves them says so.
         // session-flow-viewer D9 moved it from five to seven (`panes`, `log`);
         // session-flow-graph D10 to eight (`repo`); the 2026-10-22 decision that the graph
-        // ignores `[sidebar].show_agent_status` to ten (`graph_agent`, `graph_task`).
+        // ignores `[sidebar].show_agent_status` to ten (`graph_agent`, `graph_task`);
+        // session-overview-ui D2/D3 to twelve (`graph_asks_user`, `graph_agent_cwd`).
         let TabMeta {
             branch: _,
             agent: _,
@@ -1499,13 +1548,16 @@ mod tests {
             repo: _,
             graph_agent: _,
             graph_task: _,
+            graph_asks_user: _,
+            graph_agent_cwd: _,
         } = TabMeta::default();
     }
 
     #[test]
-    fn pane_meta_has_exactly_its_seven_fields() {
+    fn pane_meta_has_exactly_its_nine_fields() {
         // session-flow-graph R4.6 — `cwd`, `branch` and `repo` joined the four
-        // session-flow-viewer published.
+        // session-flow-viewer published; session-overview-ui D2/D3 added `graph_asks_user` and
+        // `graph_agent_cwd`.
         let PaneMeta {
             pane_pid: _,
             active: _,
@@ -1514,6 +1566,8 @@ mod tests {
             cwd: _,
             branch: _,
             repo: _,
+            graph_asks_user: _,
+            graph_agent_cwd: _,
         } = blank_pane(0);
     }
 
@@ -1536,6 +1590,8 @@ mod tests {
 
     fn blank_pane(pid: u32) -> PaneMeta {
         PaneMeta {
+            graph_agent_cwd: None,
+            graph_asks_user: false,
             pane_pid: pid,
             active: false,
             agent: None,
@@ -1611,6 +1667,8 @@ mod tests {
                 state: AgentState::Busy,
             }),
             graph_task: Some("t".into()),
+            graph_asks_user: true,
+            graph_agent_cwd: Some(PathBuf::from("/agent")),
             ..Default::default()
         };
         let got = strip_graph(&[(TabId(1), meta.clone()), (TabId(2), meta.clone())]);
@@ -1619,6 +1677,8 @@ mod tests {
             repo: None,
             graph_agent: None,
             graph_task: None,
+            graph_asks_user: false,
+            graph_agent_cwd: None,
             ..meta
         };
         assert_eq!(got, vec![(TabId(1), want.clone()), (TabId(2), want)]);
@@ -1766,32 +1826,41 @@ mod tests {
 
     // ---- The graph ignores `[sidebar].show_agent_status` (user decision 2026-10-22) ----
 
-    /// The toggle-off graph tests' one-tab graph: `m` as the only tab, selected.
-    fn graph_of_one(id: u32, m: &TabMeta) -> renderer::graph_layout::FlowGraph {
+    /// The toggle-off overview tests' one-tab model: `m` as the only tab, selected, at a
+    /// fixed clock.
+    fn graph_of_one(id: u32, m: &TabMeta) -> renderer::overview_model::OverviewModel {
         let row = renderer::sidebar_row::SidebarRow {
             tab_id: id as u64,
             title: "t".into(),
             ..Default::default()
         };
         let metas = HashMap::from([(TabId(id as u64), m.clone())]);
-        crate::flow::build_graph(
+        crate::overview::build_overview(
             &[row],
             &metas,
             None,
             &HashMap::new(),
-            &crate::flow::FoldSet::new(),
+            &crate::overview::ExpandSet::new(),
+            renderer::overview_model::Filter::All,
             0,
+            1_793_404_800_000,
         )
         .0
     }
 
     fn session_nodes(
-        g: &renderer::graph_layout::FlowGraph,
-    ) -> Vec<&renderer::graph_layout::FlowNode> {
-        g.nodes
-            .iter()
-            .filter(|n| n.kind == renderer::graph_layout::NodeKind::Session)
-            .collect()
+        g: &renderer::overview_model::OverviewModel,
+    ) -> Vec<&renderer::overview_model::SessionRowData> {
+        g.rows.iter().collect()
+    }
+
+    /// The bucket a session with `agent` and no dialog reads (D2), from its log-only status.
+    fn bucket_for(agent: &crate::tabmeta::Agent) -> renderer::overview_model::Bucket {
+        crate::overview::bucket_of(
+            crate::sidebar_model::resolve_status(Some(agent), false, false, None),
+            false,
+            false,
+        )
     }
 
     #[test]
@@ -1833,8 +1902,8 @@ mod tests {
             let nodes = session_nodes(&g);
             assert_eq!(nodes.len(), 1, "one session, active={is_active}");
             assert_eq!(
-                nodes[0].status,
-                crate::sidebar_model::resolve_status(Some(&real), false, false, None),
+                nodes[0].bucket,
+                bucket_for(&real),
                 "its real status, active={is_active}"
             );
             assert_eq!(
@@ -1871,16 +1940,14 @@ mod tests {
         let g = graph_of_one(900_362, &m);
         let nodes = session_nodes(&g);
         assert_eq!(nodes.len(), 1, "the Codex tab is a session");
+        assert_eq!(nodes[0].bucket, bucket_for(&codex));
         assert_eq!(
-            nodes[0].status,
-            crate::sidebar_model::resolve_status(Some(&codex), false, false, None)
+            (nodes[0].agent_label.as_str(), nodes[0].agent),
+            ("Codex", renderer::overview_model::AgentTag::Codex)
         );
-        assert_eq!(nodes[0].skin, crate::sidebar_model::skin_for(Some(&codex)));
-        let project = nodes[0].parent.expect("grouped under its repository");
-        assert_eq!(
-            g.nodes[project].kind,
-            renderer::graph_layout::NodeKind::Project
-        );
+        // Grouped under its repository: the row is titled by the main worktree's name.
+        let main_name = r.file_name().map(|n| n.to_string_lossy().into_owned());
+        assert_eq!(Some(nodes[0].project.clone()), main_name);
         let _ = std::fs::remove_dir_all(r14_5_base());
     }
 
@@ -2176,6 +2243,8 @@ mod tests {
             vec![(
                 TabId(1),
                 TabMeta {
+                    graph_agent_cwd: None,
+                    graph_asks_user: false,
                     branch: Some("main".into()),
                     agent: None,
                     task: None,
@@ -2698,6 +2767,8 @@ mod tests {
         let mut d = Deriver::new();
         let id = TabId(0);
         let unknown = TabMeta {
+            graph_agent_cwd: None,
+            graph_asks_user: false,
             branch: None,
             agent: Some(Agent {
                 kind: AgentKind::Aider,
@@ -2721,6 +2792,8 @@ mod tests {
         assert!(!d.debug_seen.contains_key(&id));
         // A known (Busy) agent is not a gap either.
         let busy = TabMeta {
+            graph_agent_cwd: None,
+            graph_asks_user: false,
             branch: None,
             agent: Some(Agent {
                 kind: AgentKind::Claude,
@@ -3375,5 +3448,229 @@ mod tests {
             .join()
             .expect("the worker thread exits on disconnect");
         assert!(woke_rx.try_recv().is_err(), "exactly two wakes");
+    }
+
+    // ---- session-overview-ui T3 / R1.6: `graph_asks_user` and `graph_agent_cwd` ----
+
+    /// Where every agent process runs in these tests — deliberately not `THE_CWD`, where every
+    /// shell sits, so a test can tell the agent's cwd (D3) from the shell's (G5).
+    const AGENT_CWD: &str = "/proj/agent-cwd";
+
+    /// Shell pids (`900_xxx`) report `THE_CWD`, agent pids (`901_xxx` and up) `AGENT_CWD`.
+    fn agent_cwd_of(pid: u32) -> Option<PathBuf> {
+        Some(PathBuf::from(if pid >= 900_000 + AGENT_PID_OFFSET {
+            AGENT_CWD
+        } else {
+            THE_CWD
+        }))
+    }
+
+    /// A Claude assistant turn that called `AskUserQuestion` — `AssistantAsksUser` (D2).
+    const CLAUDE_ASKS: &str = concat!(
+        r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","#,
+        r#""content":[{"type":"tool_use","id":"toolu_01","name":"AskUserQuestion","#,
+        r#""input":{"questions":[]}}]}}"#,
+        "\n"
+    );
+    /// A finished Claude turn — `AssistantEndTurn`: `Waiting`, but not asking (D2's Idle).
+    const CLAUDE_ENDS: &str = concat!(
+        r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","#,
+        r#""content":[{"type":"text","text":"Done."}]}}"#,
+        "\n"
+    );
+
+    #[test]
+    fn r1_6_an_antigravity_tab_publishes_asks_user_and_agent_cwd_on_graph_passes_only() {
+        let _g = super::super::probe::serial();
+        fake::reset();
+        let mut d = antigravity_deriver(
+            "r1-6-ag",
+            AgentKind::Antigravity,
+            fake::holds_c,
+            &[(fake::CONV_C, fake::ASKING)],
+        );
+        d.cwd_of = agent_cwd_of;
+        let now = SystemTime::now();
+
+        d.graph_wanted = true;
+        let m = d.tab(&tp(900_601), 0, now, true);
+        assert_eq!(
+            m.graph_agent.map(|a| a.state),
+            Some(AgentState::Waiting),
+            "the ask reads Waiting"
+        );
+        assert!(m.graph_asks_user, "an ask_question last step asks the user");
+        assert_eq!(m.graph_agent_cwd, Some(PathBuf::from(AGENT_CWD)));
+        assert_eq!(
+            m.cwd,
+            Some(PathBuf::from(THE_CWD)),
+            "the shell's cwd is unchanged"
+        );
+
+        d.graph_wanted = false;
+        let m = d.tab(&tp(900_601), 1, now, true);
+        assert_eq!(
+            m.agent.map(|a| a.state),
+            Some(AgentState::Waiting),
+            "the card still classifies it"
+        );
+        assert!(!m.graph_asks_user, "a non-graph pass publishes false");
+        assert_eq!(m.graph_agent_cwd, None, "a non-graph pass publishes None");
+    }
+
+    #[test]
+    fn r1_6_the_graph_edge_publishes_both_on_open_and_clears_both_on_close() {
+        // R1.6 through the worker's own edge: the off→on pass publishes, the on→off edge
+        // strips, and an ordinary closed pass derives them as false/None again.
+        let _g = super::super::probe::serial();
+        fake::reset();
+        let mut d = antigravity_deriver(
+            "r1-6-edge",
+            AgentKind::Antigravity,
+            fake::holds_c,
+            &[(fake::CONV_C, fake::ASKING)],
+        );
+        d.cwd_of = agent_cwd_of;
+        let roster = [tp(900_611), tp(900_612)];
+        let now = SystemTime::now();
+        let (open, _) = d
+            .graph_edge(true, &roster, None, 0, now, &[], false)
+            .expect("off→on is an edge");
+        for (id, m) in &open {
+            assert!(m.graph_asks_user, "{id:?}");
+            assert_eq!(m.graph_agent_cwd, Some(PathBuf::from(AGENT_CWD)), "{id:?}");
+        }
+        let (shut, _) = d
+            .graph_edge(false, &roster, None, 1, now, &open, true)
+            .expect("on→off is an edge");
+        let closed = d.pass(&roster, Some(roster[0].id), 2, now, &shut);
+        for (id, m) in shut.iter().chain(&closed) {
+            assert_eq!(
+                (m.graph_asks_user, &m.graph_agent_cwd),
+                (false, &None),
+                "{id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn r1_6_a_finished_antigravity_turn_is_waiting_but_does_not_ask() {
+        // D2 — `Waiting` alone is not "asks the user": a finished turn publishes false even on
+        // a graph pass, which is what keeps it Idle in the overview.
+        let _g = super::super::probe::serial();
+        fake::reset();
+        let mut d = antigravity_deriver(
+            "r1-6-ag-done",
+            AgentKind::Antigravity,
+            fake::holds_c,
+            &[(fake::CONV_C, fake::FINISHED)],
+        );
+        d.cwd_of = agent_cwd_of;
+        d.graph_wanted = true;
+        let m = d.tab(&tp(900_621), 0, SystemTime::now(), true);
+        assert_eq!(m.graph_agent.map(|a| a.state), Some(AgentState::Waiting));
+        assert!(!m.graph_asks_user);
+        assert_eq!(m.graph_agent_cwd, Some(PathBuf::from(AGENT_CWD)));
+    }
+
+    #[test]
+    fn r1_6_a_claude_tab_publishes_asks_user_from_its_log() {
+        let _g = super::super::probe::serial();
+        let (projects, sessions) = fixture_roots("r1-6-claude");
+        let cwd = Path::new(THE_CWD);
+        write_log(&projects, cwd, SID_A, CLAUDE_ASKS);
+        write_log(&projects, cwd, SID_B, CLAUDE_ENDS);
+        write_registry(&sessions, agent_pid(900_631), SID_A, cwd, 1_000);
+        write_registry(&sessions, agent_pid(900_632), SID_B, cwd, 1_000);
+        let mut d = deriver_at(projects, sessions);
+        with_fake_tree(&mut d);
+        d.cwd_of = agent_cwd_of;
+        let now = SystemTime::now();
+
+        d.graph_wanted = true;
+        let asks = d.tab(&tp(900_631), 0, now, true);
+        assert_eq!(asks.graph_agent.map(|a| a.state), Some(AgentState::Waiting));
+        assert!(asks.graph_asks_user, "AskUserQuestion asks the user");
+        assert_eq!(asks.graph_agent_cwd, Some(PathBuf::from(AGENT_CWD)));
+        let ends = d.tab(&tp(900_632), 0, now, true);
+        assert_eq!(ends.graph_agent.map(|a| a.state), Some(AgentState::Waiting));
+        assert!(
+            !ends.graph_asks_user,
+            "an end_turn is Waiting but not asking"
+        );
+
+        d.graph_wanted = false;
+        let m = d.tab(&tp(900_631), 1, now, true);
+        assert_eq!(m.agent.map(|a| a.state), Some(AgentState::Waiting));
+        assert_eq!((m.graph_asks_user, m.graph_agent_cwd), (false, None));
+    }
+
+    #[test]
+    fn r1_6_panes_publish_asks_user_and_agent_cwd_on_graph_passes_only() {
+        // R1.7's input: the non-active pane is derived on its own shell and publishes its own
+        // flag and agent cwd; the active pane carries the tab's.
+        let _g = super::super::probe::serial();
+        fake::reset();
+        let mut d = antigravity_deriver(
+            "r1-6-pane",
+            AgentKind::Antigravity,
+            fake::holds_c,
+            &[(fake::CONV_C, fake::ASKING)],
+        );
+        d.cwd_of = agent_cwd_of;
+        d.rooted_of = rooted_at_pane;
+        d.graph_wanted = true;
+        d.pane_memo = PaneMemo::seeded(
+            0,
+            super::super::tmux::parse_panes(&format!(
+                "work:1 1 {ROOTED_PANE}\nwork:1 0 {OTHER_PANE}\n"
+            )),
+        );
+        let now = SystemTime::now();
+        let m = d.tab(&tp(ROOTED_TAB), 0, now, true);
+        let got: Vec<(u32, bool, bool, Option<PathBuf>)> = m
+            .panes
+            .iter()
+            .map(|p| {
+                (
+                    p.pane_pid,
+                    p.active,
+                    p.graph_asks_user,
+                    p.graph_agent_cwd.clone(),
+                )
+            })
+            .collect();
+        let agent = Some(PathBuf::from(AGENT_CWD));
+        assert_eq!(
+            got,
+            [
+                (ROOTED_PANE, true, true, agent.clone()),
+                (OTHER_PANE, false, true, agent)
+            ]
+        );
+        assert_eq!(
+            m.panes[1].cwd,
+            Some(PathBuf::from(THE_CWD)),
+            "the pane's own cwd stays its shell's"
+        );
+
+        // A non-active pane whose turn merely finished does not ask.
+        let mut done = antigravity_deriver(
+            "r1-6-pane-done",
+            AgentKind::Antigravity,
+            fake::holds_c,
+            &[(fake::CONV_C, fake::FINISHED)],
+        );
+        done.cwd_of = agent_cwd_of;
+        let p = done.pane(OTHER_PANE, 0, now);
+        assert_eq!(p.agent.map(|a| a.state), Some(AgentState::Waiting));
+        assert!(!p.graph_asks_user);
+        assert_eq!(p.graph_agent_cwd, Some(PathBuf::from(AGENT_CWD)));
+
+        // Not wanted: no panes at all, and the tab publishes neither field.
+        d.graph_wanted = false;
+        let m = d.tab(&tp(ROOTED_TAB), 1, now, true);
+        assert!(m.panes.is_empty());
+        assert_eq!((m.graph_asks_user, m.graph_agent_cwd), (false, None));
     }
 }

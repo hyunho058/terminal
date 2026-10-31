@@ -69,13 +69,83 @@ pub(crate) const TAIL_ROWS: usize = 20;
 /// the footer, or a numbered choice — makes incidental prose very unlikely to match.
 const REQUIRED_MARKERS: usize = 2;
 
-/// Whether the tail of `screen` (a viewport rendered by `GridSnapshot::to_text`) shows a
-/// prompt that blocks on a human — one agent's dialog, by that agent's rule.
+/// What a blocking dialog on `screen` asks for (session-overview-ui D9), read from the same
+/// tail [`shows_blocking_prompt`] reads: a permission dialog's command, or that a question
+/// or a plan approval is pending. `None` when no subject can be read.
 ///
-/// Verified against real captured dialogs; see `real_permission_dialog_is_detected`,
-/// `real_question_dialogs_are_detected`, `real_plan_dialogs_are_detected` and
-/// `real_antigravity_dialog_is_detected`.
-pub(crate) fn shows_blocking_prompt(screen: &str) -> bool {
+/// Each dialog is recognised by the same rule [`shows_blocking_prompt`] uses, tried in the
+/// same order, so the subject can never name a dialog the level did not see:
+///
+/// - Claude's permission dialog → `Command`: the first non-blank row after the tool-title
+///   row (`Bash command`, `Edit file`, …) under the dialog's `────` rule, trimmed;
+/// - Claude's question dialog or its review screen → `Question`;
+/// - `ExitPlanMode`'s approval → `Plan`;
+/// - Antigravity → `Command`: the first non-blank row after `Requesting permission for:`.
+///
+/// A matched dialog whose command row cannot be found reads `None`, as does a screen with no
+/// dialog. A `Command` longer than [`SUBJECT_MAX_CHARS`] keeps its first 79 characters and
+/// ends in `…`.
+pub fn blocking_subject(screen: &str) -> Option<renderer::overview_model::DialogSubject> {
+    use renderer::overview_model::DialogSubject;
+    let lines = tail_lines(screen);
+    let tail = lines.as_slice();
+    if claude_dialog(tail) {
+        claude_command(tail).map(DialogSubject::Command)
+    } else if claude_ask_dialog(tail) || claude_review_dialog(tail) {
+        Some(DialogSubject::Question)
+    } else if claude_plan_dialog(tail) {
+        Some(DialogSubject::Plan)
+    } else if antigravity_dialog(tail) {
+        antigravity_command(tail).map(DialogSubject::Command)
+    } else {
+        None
+    }
+}
+
+/// The longest `Command` subject, in characters (D9), ellipsis included.
+pub(crate) const SUBJECT_MAX_CHARS: usize = 80;
+
+/// The Claude permission dialog's command: under the last `────` rule in `tail`, the first
+/// non-blank row is the tool title (`Bash command`) and the next non-blank row is the command.
+fn claude_command(tail: &[&str]) -> Option<String> {
+    let rule = tail.iter().rposition(|r| is_rule(r))?;
+    let mut rows = tail[rule + 1..].iter().filter(|r| !r.trim().is_empty());
+    rows.next()?; // the tool title
+    rows.next().map(|r| truncate_subject(r.trim()))
+}
+
+/// Antigravity's command: the first non-blank row after `Requesting permission for:`.
+fn antigravity_command(tail: &[&str]) -> Option<String> {
+    let header = tail
+        .iter()
+        .rposition(|r| r.trim() == "Requesting permission for:")?;
+    tail[header + 1..]
+        .iter()
+        .find(|r| !r.trim().is_empty())
+        .map(|r| truncate_subject(r.trim()))
+}
+
+/// A horizontal rule: a row made only of `─`, once trimmed.
+fn is_rule(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty() && t.chars().all(|c| c == '─')
+}
+
+/// `s` itself when it fits [`SUBJECT_MAX_CHARS`]; otherwise its first `SUBJECT_MAX_CHARS - 1`
+/// characters and `…`, so the result is exactly the limit long.
+fn truncate_subject(s: &str) -> String {
+    if s.chars().count() <= SUBJECT_MAX_CHARS {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(SUBJECT_MAX_CHARS - 1).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// The rows of `screen` both readers match against: the last [`TAIL_ROWS`] rows that end at
+/// the last row with content.
+fn tail_lines(screen: &str) -> Vec<&str> {
     let mut lines: Vec<&str> = screen.lines().collect();
     // A viewport is padded with blank rows to the full grid height, and a dialog rarely
     // ends on the last row — the real capture had ~16 blank rows below it. Measuring the
@@ -84,7 +154,19 @@ pub(crate) fn shows_blocking_prompt(screen: &str) -> bool {
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
     }
-    let tail = &lines[lines.len().saturating_sub(TAIL_ROWS)..];
+    let start = lines.len().saturating_sub(TAIL_ROWS);
+    lines.split_off(start)
+}
+
+/// Whether the tail of `screen` (a viewport rendered by `GridSnapshot::to_text`) shows a
+/// prompt that blocks on a human — one agent's dialog, by that agent's rule.
+///
+/// Verified against real captured dialogs; see `real_permission_dialog_is_detected`,
+/// `real_question_dialogs_are_detected`, `real_plan_dialogs_are_detected` and
+/// `real_antigravity_dialog_is_detected`.
+pub(crate) fn shows_blocking_prompt(screen: &str) -> bool {
+    let lines = tail_lines(screen);
+    let tail = lines.as_slice();
     claude_dialog(tail)
         || claude_ask_dialog(tail)
         || claude_review_dialog(tail)
@@ -1646,5 +1728,120 @@ cancel
         assert!(!is_first_choice("1.Yes"));
         assert!(!is_first_choice("> 1. Yes, run command"));
         assert!(!is_first_choice(""));
+    }
+
+    // ---------------------------------------------------- session-overview-ui D9 / R6
+
+    use renderer::overview_model::DialogSubject;
+
+    fn command(c: &str) -> Option<DialogSubject> {
+        Some(DialogSubject::Command(c.to_string()))
+    }
+
+    #[test]
+    fn the_permission_dialog_names_its_command() {
+        // R6.1
+        assert_eq!(blocking_subject(REAL_DIALOG), command("ls -d ~/.config"));
+        // Through a real terminal viewport, blank padding and all.
+        let screen = render_in_terminal(80, 40, REAL_DIALOG);
+        assert_eq!(blocking_subject(&screen), command("ls -d ~/.config"));
+    }
+
+    #[test]
+    fn the_antigravity_dialog_names_its_command() {
+        // R6.2
+        assert_eq!(blocking_subject(REAL_ANTIGRAVITY_DIALOG), command("ls -la"));
+    }
+
+    #[test]
+    fn question_review_and_plan_screens_name_their_kind() {
+        // R6.3
+        for (name, screen) in [
+            ("single", REAL_ASK_SINGLE),
+            ("multi", REAL_ASK_MULTI),
+            ("multi-select", REAL_ASK_MULTISELECT),
+            ("narrow", REAL_ASK_NARROW),
+            ("review", REAL_ASK_REVIEW),
+        ] {
+            assert_eq!(
+                blocking_subject(screen),
+                Some(DialogSubject::Question),
+                "{name}"
+            );
+        }
+        for (name, screen) in [
+            ("wide", REAL_PLAN_WIDE),
+            ("narrow", REAL_PLAN_NARROW),
+            ("min", REAL_PLAN_MIN),
+        ] {
+            assert_eq!(
+                blocking_subject(screen),
+                Some(DialogSubject::Plan),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_dialog_has_no_subject() {
+        // R6.3's `None`, and the subject never outruns the level.
+        for screen in [
+            "",
+            "user@host ~ % ls\nCargo.toml  crates\nuser@host ~ % ",
+            REAL_ASK_ANSWERED,
+            REAL_PLAN_ANSWERED,
+            REAL_PLAN_TOO_NARROW,
+        ] {
+            assert!(!shows_blocking_prompt(screen), "{screen:?}");
+            assert_eq!(blocking_subject(screen), None, "{screen:?}");
+        }
+    }
+
+    #[test]
+    fn a_matched_dialog_without_a_command_row_has_no_subject() {
+        // Two markers and no rule: the level is up, the command is not readable.
+        let screen = "Do you want to proceed?\n❯ 1. Yes\n  2. No\n";
+        assert!(shows_blocking_prompt(screen));
+        assert_eq!(blocking_subject(screen), None);
+        // The Antigravity question over its choice, with no `Requesting permission for:`.
+        let screen = "Run this command?\n> 1. Yes, run command\n";
+        assert!(shows_blocking_prompt(screen));
+        assert_eq!(blocking_subject(screen), None);
+    }
+
+    #[test]
+    fn the_command_is_the_row_after_the_title_under_the_last_rule() {
+        let edit = REAL_DIALOG
+            .replace(" Bash command", " Edit file")
+            .replace("   ls -d ~/.config\n", "\n   src/main.rs\n");
+        assert_eq!(blocking_subject(&edit), command("src/main.rs"));
+        let agy = REAL_ANTIGRAVITY_DIALOG.replace("   ls -la\n", "\n   cargo test\n");
+        assert_eq!(blocking_subject(&agy), command("cargo test"));
+    }
+
+    #[test]
+    fn long_commands_truncate_to_eighty_chars() {
+        // R6.5
+        let long = format!("echo {}", "a".repeat(145));
+        let screen = REAL_DIALOG.replace("ls -d ~/.config", &long);
+        let Some(DialogSubject::Command(c)) = blocking_subject(&screen) else {
+            panic!("a Command subject");
+        };
+        assert_eq!(c.chars().count(), SUBJECT_MAX_CHARS);
+        assert!(c.ends_with('…'));
+        assert_eq!(c.trim_end_matches('…'), &long[..79]);
+        // At the limit nothing is cut; one past it is.
+        let exact = "x".repeat(80);
+        assert_eq!(truncate_subject(&exact), exact);
+        let over = "x".repeat(81);
+        assert_eq!(truncate_subject(&over), format!("{}…", "x".repeat(79)));
+    }
+
+    #[test]
+    fn a_rule_is_a_row_of_box_drawing_dashes_only() {
+        assert!(is_rule("  ────────  "));
+        assert!(!is_rule(""));
+        assert!(!is_rule("   "));
+        assert!(!is_rule("── Bash ──"));
     }
 }

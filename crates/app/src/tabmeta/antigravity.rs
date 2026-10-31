@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use ai_monitor::activity::TailState;
+use ai_monitor::activity::{LastMessage, TailState};
 
 use super::activity::{state_from, MEMO_MAX, MEMO_TTL_TICKS, RESOLVE_TTL_TICKS};
 use super::AgentState;
@@ -166,6 +166,18 @@ fn refresh(
     }
 }
 
+/// Whether the `agy` at `pid`'s transcript last classified as
+/// [`LastMessage::AssistantAsksUser`] — its last step an `ask_question` dispatch
+/// (session-overview-ui D2). A pure memo read, valid right after [`state`] refreshed the
+/// entry this tick; the caller pairs it with that state being `Waiting`, so a stale tail
+/// behind an unreadable transcript (state `Unknown`) never reads as asking.
+pub(super) fn asks_user(memo: &Memo, pid: u32) -> bool {
+    memo.by_pid
+        .get(&pid)
+        .and_then(|e| e.tail.as_ref())
+        .is_some_and(|t| t.last == Some(LastMessage::AssistantAsksUser))
+}
+
 /// Whether a pid last probed at `probed_at` is probed again at `tick`: at once when it never
 /// was, then once every [`RESOLVE_TTL_TICKS`] — the Claude path's own re-resolution period.
 fn probe_due(probed_at: Option<u64>, tick: u64) -> bool {
@@ -208,6 +220,14 @@ pub(super) mod fake {
         r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE"}"#,
         "\n",
         r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command","args":{}}]}"#,
+        "\n",
+    );
+
+    /// A turn whose last step is an `ask_question` dispatch: the model asked the user.
+    pub(in crate::tabmeta) const ASKING: &str = concat!(
+        r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE"}"#,
+        "\n",
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"ask_question","args":{}}]}"#,
         "\n",
     );
 

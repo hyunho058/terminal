@@ -55,6 +55,12 @@ pub(crate) mod hyperlink;
 pub(crate) mod ime_chord;
 pub(crate) mod input;
 pub(crate) mod overlay;
+// The two exceptions to the rule above, by design (`session-overview-ui` T4): the overview's
+// policy is a set of pure functions whose acceptance tests in `crates/app/tests/` call them by
+// module path (`app::overview::build_overview`, `app::overview_detail::build_detail`), so the
+// whole module is the public surface rather than a name list.
+pub mod overview;
+pub mod overview_detail;
 pub(crate) mod presence_fd;
 pub(crate) mod prompt;
 pub(crate) mod rename;
@@ -72,13 +78,13 @@ pub(crate) mod waiting;
 // that consumer is the only thing keeping the item out of the dead-code lint.
 /// `crates/app/tests/vertical_slice.rs` drags a selection over a real shell's output.
 pub use drag::{is_click as release_is_click, release as release_drag, SelectionDrag};
-/// `crates/app/tests/tt1_graph_keys.rs`, `crates/app/tests/tt3_graph_monitor.rs` and the other
-/// session-flow-graph acceptance tests drive the graph overlay (session-flow-graph R1, R3, R9);
-/// `crates/app/tests/tt5_graph_shape.rs` and its siblings build the graph (R5, R6, R8).
-pub use flow::{build_graph, FlowOverlay, FoldSet};
+/// `crates/app/tests/tt1_graph_keys.rs`, `crates/app/tests/tt3_graph_monitor.rs` and the
+/// `tt*_overview_overlay.rs` acceptance tests drive the Cmd+Shift+F overlay
+/// (session-flow-graph R1, R3; session-overview-ui R2.5, R4.5, R5, R7, R8.5, R10).
+pub use flow::FlowOverlay;
 /// `crates/app/tests/tt7_flow_telemetry.rs` drives the session graph's subagent thread
 /// (session-flow-viewer R7).
-pub use flow_telemetry::{spawn as spawn_flow_telemetry, FlowTelemetry, SubagentSlot};
+pub use flow_telemetry::{spawn as spawn_flow_telemetry, DigestSlot, FlowTelemetry, SessionDigest};
 /// `crates/app/tests/vertical_slice.rs` types through the real encoder.
 pub use input::encode_key;
 /// `crates/app/tests/tt2_graph_pointer.rs` drives the pointer router (session-flow-graph
@@ -105,6 +111,8 @@ pub use overlay::AiMonitorOverlay;
 /// The SD4 seam: named in the signatures below and asserted by
 /// `crates/app/tests/wiring.rs`.
 pub use overlay::{no_deadline, ArmDeadline};
+/// session-overview-ui D9 — reachable from `tests/` for TT6.
+pub use prompt::blocking_subject;
 /// `crates/app/tests/tt3_graph_monitor.rs` / `crates/app/tests/tt9_graph_click.rs` build the
 /// dispatch context and read the requests it queued (session-flow-graph R3.1, R9).
 pub use seam::{AppCtx, AppRequest, Handled, KeyInput, OverlayCommand, OverlayHost};
@@ -233,14 +241,14 @@ pub fn feature_overlays(
         }
     });
     vec![
-        // session-flow-graph: the Cmd+Shift+F full-window session graph. First, at 300: open,
-        // it covers the rename field and the ai-monitor and owns every key (D5). Its subagent
-        // thread wakes the loop the capture way, and it reaches the metadata worker through
+        // session-overview-ui: the Cmd+Shift+F full-window Agent Monitor (overview and
+        // detail). First, at 300: open, it covers the rename field and the ai-monitor and owns
+        // every key (carried D5). Its digest thread wakes the loop the capture way, and it reaches the metadata worker through
         // the installed global — `None` in tests, where it builds from a stood-in snapshot.
         Box::new(flow::FlowOverlay::new(
             flow_wake,
             tabmeta::global().cloned(),
-            renderer::graph_panel::FlowHandle::default(),
+            renderer::overview_panel::OverviewHandle::new(),
         )),
         // sticky-tab-title: the Cmd+Shift+R rename field. Ahead of the ai-monitor
         // so an open field owns the keyboard (D8a.1).

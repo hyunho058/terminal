@@ -2,8 +2,10 @@
 //!
 //! While the graph is open, one background thread folds every session log the tabmeta
 //! worker published (`TabMeta.log` / `PaneMeta.log`) into an
-//! [`ai_monitor::SessionTelemetry`] and publishes `log → Vec<Subagent>` into a slot the
-//! overlay reads, behind a generation counter, waking the loop the overlay way.
+//! [`ai_monitor::SessionTelemetry`] built [`with_digest`](SessionTelemetry::with_digest) and
+//! publishes `log → SessionDigest` into a slot the overlay reads, behind a generation counter,
+//! waking the loop the overlay way (`session-overview-ui` D19: the subagent list plus the
+//! overview's per-log digest — last tool, last prompt, turns, events).
 //!
 //! **Why a thread of its own, not the tabmeta worker** (D10, rejected alternative): the worker
 //! tails the last few lines of a log for a state, every 500 ms; a subagent list needs the
@@ -41,14 +43,58 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use ai_monitor::telemetry::{SessionTelemetry, Subagent};
+use ai_monitor::telemetry::{
+    Event, SessionTelemetry, Subagent, TelemetrySnapshot, ToolDigest, Turn,
+};
 
-/// Where one spawn publishes: each referenced log's subagents, in log order (D10).
+/// One log's digest, as the overview reads it (`session-overview-ui` D19).
+///
+/// The projection of a digest-flagged [`TelemetrySnapshot`] onto what the overlay draws.
+/// Everything else the snapshot carries (token totals, files, tasks …) is the ai-monitor
+/// panel's and is dropped here, so an unrelated fold — a usage line — changes nothing this
+/// compares equal on and publishes nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionDigest {
+    /// The log's subagents, **newest first** — `SessionTelemetry`'s ring order, capped at 32.
+    /// Readers that want log order reverse it and order by start (`overview::log_order`).
+    pub subagents: Vec<Subagent>,
+    /// The newest finished tool call, any name (D11).
+    pub last_tool: Option<ToolDigest>,
+    /// The newest finished tool call that is neither `Agent` nor `Task` (D4, D11).
+    pub last_work_tool: Option<ToolDigest>,
+    /// The latest human prompt (D7).
+    pub last_prompt_ms: Option<u64>,
+    /// Newest first, at most 64 (D12, D19).
+    pub turns: Vec<Turn>,
+    /// Newest first, at most 64 (D13).
+    pub events: Vec<Event>,
+    pub first_event_ms: Option<u64>,
+    /// For `claude --resume` (D22).
+    pub session_id: Option<String>,
+}
+
+impl SessionDigest {
+    /// Take the digest's fields out of `snap`.
+    pub fn from_snapshot(snap: TelemetrySnapshot) -> SessionDigest {
+        SessionDigest {
+            subagents: snap.subagents,
+            last_tool: snap.last_tool,
+            last_work_tool: snap.last_work_tool,
+            last_prompt_ms: snap.last_prompt_ms,
+            turns: snap.turns,
+            events: snap.events,
+            first_event_ms: snap.first_event_ms,
+            session_id: snap.session_id,
+        }
+    }
+}
+
+/// Where one spawn publishes: each referenced log's digest (D10, `session-overview-ui` D19).
 ///
 /// One slot **per spawn**: the overlay replaces it on every open and reads only the current
 /// one, which is half of what keeps a thread left over from a previous open out of the model
 /// (the other half is the stop check under this lock).
-pub type SubagentSlot = Arc<Mutex<HashMap<PathBuf, Vec<Subagent>>>>;
+pub type DigestSlot = Arc<Mutex<HashMap<PathBuf, SessionDigest>>>;
 
 /// How often the thread re-checks its logs for appended bytes.
 const PASS_INTERVAL: Duration = Duration::from_millis(250);
@@ -67,7 +113,7 @@ pub struct FlowTelemetry {
     stop: Arc<AtomicBool>,
     /// The next log set, taken by the thread at the start of its next pass.
     pending: Arc<Mutex<Option<Vec<PathBuf>>>>,
-    slot: SubagentSlot,
+    slot: DigestSlot,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -110,7 +156,7 @@ impl Drop for FlowTelemetry {
 /// and the overlay's cache key can never match a model built from a previous open's data.
 pub fn spawn(
     logs: Vec<PathBuf>,
-    slot: SubagentSlot,
+    slot: DigestSlot,
     generation: Arc<AtomicU64>,
     wake: Arc<dyn Fn() + Send + Sync>,
 ) -> FlowTelemetry {
@@ -155,16 +201,17 @@ struct Tail {
     telemetry: SessionTelemetry,
     /// Bytes folded so far — always just past a newline.
     offset: u64,
-    /// The last subagent list computed, `None` until the first fold.
-    subagents: Option<Vec<Subagent>>,
+    /// The last digest computed, `None` until the first fold.
+    digest: Option<SessionDigest>,
 }
 
 impl Tail {
     fn new() -> Tail {
         Tail {
-            telemetry: SessionTelemetry::new(),
+            // `session-overview-ui` D19: only this thread sets the digest flag.
+            telemetry: SessionTelemetry::new().with_digest(),
             offset: 0,
-            subagents: None,
+            digest: None,
         }
     }
 }
@@ -180,7 +227,7 @@ enum Step {
 struct Worker {
     stop: Arc<AtomicBool>,
     pending: Arc<Mutex<Option<Vec<PathBuf>>>>,
-    slot: SubagentSlot,
+    slot: DigestSlot,
     generation: Arc<AtomicU64>,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
@@ -248,9 +295,9 @@ impl Worker {
     /// Replace the slot's map with what `watched` holds. `false` when stopped — the work is
     /// discarded, and nothing is written or bumped (R7.3).
     fn publish(&self, watched: &HashMap<PathBuf, Tail>) -> bool {
-        let map: HashMap<PathBuf, Vec<Subagent>> = watched
+        let map: HashMap<PathBuf, SessionDigest> = watched
             .iter()
-            .filter_map(|(p, t)| t.subagents.clone().map(|s| (p.clone(), s)))
+            .filter_map(|(p, t)| t.digest.clone().map(|d| (p.clone(), d)))
             .collect();
         {
             let mut slot = lock(&self.slot);
@@ -289,7 +336,7 @@ impl Worker {
 fn advance(path: &Path, tail: &mut Tail, stop: &AtomicBool) -> std::io::Result<Step> {
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
-    let mut changed = tail.subagents.is_none();
+    let mut changed = tail.digest.is_none();
     if len < tail.offset {
         tail.telemetry = tail.telemetry.restarted();
         tail.offset = 0;
@@ -315,11 +362,11 @@ fn advance(path: &Path, tail: &mut Tail, stop: &AtomicBool) -> std::io::Result<S
     if !changed {
         return Ok(Step::Unchanged);
     }
-    let subagents = tail.telemetry.snapshot().subagents;
-    if tail.subagents.as_ref() == Some(&subagents) {
+    let digest = SessionDigest::from_snapshot(tail.telemetry.snapshot());
+    if tail.digest.as_ref() == Some(&digest) {
         return Ok(Step::Unchanged);
     }
-    tail.subagents = Some(subagents);
+    tail.digest = Some(digest);
     Ok(Step::Changed)
 }
 
@@ -344,11 +391,11 @@ mod tests {
         let stop = AtomicBool::new(false);
         assert_eq!(advance(&p, &mut tail, &stop).ok(), Some(Step::Changed));
         assert_eq!(tail.offset, 0, "nothing folded before the newline");
-        assert_eq!(tail.subagents.as_deref().map(<[_]>::len), Some(0));
+        assert_eq!(tail.digest.as_ref().map(|d| d.subagents.len()), Some(0));
 
         std::fs::write(&p, format!("{AGENT}\n")).expect("write");
         assert_eq!(advance(&p, &mut tail, &stop).ok(), Some(Step::Changed));
-        assert_eq!(tail.subagents.as_deref().map(<[_]>::len), Some(1));
+        assert_eq!(tail.digest.as_ref().map(|d| d.subagents.len()), Some(1));
         assert_eq!(advance(&p, &mut tail, &stop).ok(), Some(Step::Unchanged));
     }
 
@@ -362,7 +409,7 @@ mod tests {
         std::fs::write(&p, "{}\n").expect("write");
         assert_eq!(advance(&p, &mut tail, &stop).ok(), Some(Step::Changed));
         assert_eq!(tail.offset, 3);
-        assert_eq!(tail.subagents.as_deref().map(<[_]>::len), Some(0));
+        assert_eq!(tail.digest.as_ref().map(|d| d.subagents.len()), Some(0));
     }
 
     #[test]
@@ -388,8 +435,8 @@ mod tests {
         cond()
     }
 
-    fn start(p: &Path) -> (FlowTelemetry, SubagentSlot, Arc<AtomicU64>) {
-        let slot: SubagentSlot = Arc::default();
+    fn start(p: &Path) -> (FlowTelemetry, DigestSlot, Arc<AtomicU64>) {
+        let slot: DigestSlot = Arc::default();
         let generation = Arc::new(AtomicU64::new(0));
         let h = spawn(
             vec![p.to_path_buf()],
@@ -457,7 +504,7 @@ mod tests {
         assert!(within(Duration::from_secs(5), || generation
             .load(Ordering::SeqCst)
             == 1));
-        assert_eq!(lock(&slot).get(&p).map(Vec::len), Some(1));
+        assert_eq!(lock(&slot).get(&p).map(|d| d.subagents.len()), Some(1));
         // Three passes over an unchanged file: no further publish.
         std::thread::sleep(PASS_INTERVAL * 3);
         assert_eq!(generation.load(Ordering::SeqCst), 1);
@@ -468,7 +515,7 @@ mod tests {
         std::io::Write::write_all(&mut f, format!("{AGENT2}\n").as_bytes()).expect("append");
         assert!(within(Duration::from_secs(5), || lock(&slot)
             .get(&p)
-            .map(Vec::len)
+            .map(|d| d.subagents.len())
             == Some(2)));
         assert_eq!(generation.load(Ordering::SeqCst), 2);
         drop(h);
@@ -505,6 +552,6 @@ mod tests {
         std::fs::write(&p, format!("{}\n", " ".repeat(AGENT.len()))).expect("write");
         assert_eq!(advance(&p, &mut tail, &stop).ok(), Some(Step::Unchanged));
         assert_eq!(tail.offset, offset);
-        assert_eq!(tail.subagents.as_deref().map(<[_]>::len), Some(1));
+        assert_eq!(tail.digest.as_ref().map(|d| d.subagents.len()), Some(1));
     }
 }

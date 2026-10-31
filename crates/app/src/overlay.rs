@@ -5665,6 +5665,7 @@ mod tests {
                     end_ms: None,
                     agent_id: None,
                     ended_ok: true,
+                    report_preview: None,
                 }],
                 ..Default::default()
             })

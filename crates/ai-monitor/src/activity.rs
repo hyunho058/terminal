@@ -316,17 +316,24 @@ const BLOCKING_TOOLS: &[&str] = &["AskUserQuestion", "ExitPlanMode"];
 /// too, which is why the tool name — not the stop reason — is the signal); else
 /// `AssistantBusy`. `end_turn` is checked FIRST so the existing signal keeps precedence.
 fn classify_assistant(v: &Value) -> LastMessage {
-    let stop = v
-        .pointer("/message/stop_reason")
-        .and_then(Value::as_str)
-        .or_else(|| v.get("stopReason").and_then(Value::as_str));
-    if stop == Some("end_turn") {
+    if is_end_turn(v) {
         LastMessage::AssistantEndTurn
     } else if calls_blocking_tool(v) {
         LastMessage::AssistantAsksUser
     } else {
         LastMessage::AssistantBusy
     }
+}
+
+/// Whether an assistant record's stop reason is `end_turn` (`.message.stop_reason`, else
+/// top-level `.stopReason`). Shared with the telemetry digest's turn end
+/// (`session-overview-ui` D19), so the two read one rule.
+pub(crate) fn is_end_turn(v: &Value) -> bool {
+    let stop = v
+        .pointer("/message/stop_reason")
+        .and_then(Value::as_str)
+        .or_else(|| v.get("stopReason").and_then(Value::as_str));
+    stop == Some("end_turn")
 }
 
 /// Whether `v`'s content carries a `tool_use` block whose `name` is in [`BLOCKING_TOOLS`].
@@ -416,7 +423,7 @@ fn background_pending(window: &str) -> bool {
 /// (`taskId`), a foreground `Agent` (no `agentId`), `ScheduleWakeup` and cron tools start
 /// nothing; neither does an unmeasured tool, which keeps today's Waiting rather than holding
 /// Working forever. A renamed field degrades the same way (`docs/architecture.md` G8).
-fn started_ids(v: &Value) -> impl Iterator<Item = &str> {
+pub(crate) fn started_ids(v: &Value) -> impl Iterator<Item = &str> {
     let result = Some(v)
         .filter(|v| record_type(v) == Some("user"))
         .and_then(|v| v.get("toolUseResult"));
@@ -449,7 +456,7 @@ fn started_ids(v: &Value) -> impl Iterator<Item = &str> {
 /// Three independent notification recognisers, so a rename must break all three before a
 /// finished task reads pending. Any `<status>` completes (completed, failed, killed). A
 /// `peer` message completes nothing: it names no task, and its sender may still be working.
-fn completed_id(v: &Value) -> Option<&str> {
+pub(crate) fn completed_id(v: &Value) -> Option<&str> {
     let str_at = |p: &str| v.pointer(p).and_then(Value::as_str);
     match record_type(v)? {
         "queue-operation" if str_at("/operation") == Some("enqueue") => {
@@ -486,7 +493,7 @@ fn notified_id(text: &str) -> Option<&str> {
 /// So slash commands, `!` commands, accepted suggestions and continuation summaries all count
 /// (pending work does not survive a compaction), and so does a record with no text at all (an
 /// image-only paste). `origin` is not required: 263 measured records predate the field.
-fn is_human_prompt(v: &Value) -> bool {
+pub(crate) fn is_human_prompt(v: &Value) -> bool {
     let origin = v.pointer("/origin/kind").and_then(Value::as_str);
     record_type(v) == Some("user")
         && v.get("toolUseResult").is_none()

@@ -1,9 +1,10 @@
-//! TT14 — acceptance tests for `specs/session-flow-graph` R14 (amendment 2026-10-21): every
-//! agent the sidebar detects — Claude, Antigravity, Codex, Gemini, Aider — is a session, while
-//! subagents and the fold node stay Claude-only (D8).
+//! TT14 — acceptance tests for `specs/session-flow-graph` R14 (amendment 2026-10-21), carried
+//! by `specs/session-overview-ui` (R14 is kept): every agent the sidebar detects — Claude,
+//! Antigravity, Codex, Gemini, Aider — is a session row of the Agent Monitor overview, while
+//! subagents stay Claude-only (D8).
 //!
-//! Everything is hand-built data handed to `app::build_graph`; nothing reads the live machine,
-//! and the log paths are never opened.
+//! Everything is hand-built data handed to `app::overview::build_overview`; nothing reads the
+//! live machine, and the log paths are never opened.
 //!
 //! R14.5 (the worker resolves `repo` for any agent kind) is not here: the worker's per-tab
 //! derive path is not public — `graph_pass`, `publish_graph_state` and `repo_of` are the only
@@ -13,11 +14,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use ai_monitor::telemetry::Subagent;
+use app::overview::{bucket_of, build_overview, ExpandSet};
 use app::{
-    build_graph, resolve_status, row_meta, Agent, AgentKind, AgentState, FoldSet, PaneMeta, RepoId,
-    TabId, TabMeta,
+    resolve_status, row_meta, Agent, AgentKind, AgentState, PaneMeta, RepoId, SessionDigest, TabId,
+    TabMeta,
 };
-use renderer::graph_layout::{FlowGraph, FlowNode, FlowTarget, NodeKind};
+use renderer::overview_model::{AgentTag, Bucket, Counts, Filter, OverviewModel, SessionRowData};
 use renderer::sidebar_row::SidebarRow;
 
 // ---- fixtures ---------------------------------------------------------------
@@ -78,33 +80,27 @@ fn metas(entries: Vec<(u64, TabMeta)>) -> HashMap<TabId, TabMeta> {
 fn build(
     rows: &[SidebarRow],
     metas: &HashMap<TabId, TabMeta>,
-    subagents: &HashMap<PathBuf, Vec<Subagent>>,
-) -> FlowGraph {
+    digests: &HashMap<PathBuf, SessionDigest>,
+) -> OverviewModel {
     let h = home();
-    let (graph, _folds) = build_graph(
+    let (model, _expanded) = build_overview(
         rows,
         metas,
         Some(h.as_path()),
-        subagents,
-        &FoldSet::new(),
+        digests,
+        &ExpandSet::new(),
+        Filter::All,
         0,
+        1_793_404_800_000,
     );
-    graph
+    model
 }
 
-fn sessions(g: &FlowGraph) -> Vec<(usize, &FlowNode)> {
-    g.nodes
+fn row_of(m: &OverviewModel, tab: u64) -> &SessionRowData {
+    m.rows
         .iter()
-        .enumerate()
-        .filter(|(_, n)| n.kind == NodeKind::Session)
-        .collect()
-}
-
-fn children(g: &FlowGraph, parent: usize) -> Vec<&FlowNode> {
-    g.nodes
-        .iter()
-        .filter(|n| n.parent == Some(parent))
-        .collect()
+        .find(|r| r.tab == tab)
+        .unwrap_or_else(|| panic!("a session row for tab {tab}: {:#?}", m.rows))
 }
 
 fn subagent(id: &str, completed: bool) -> Subagent {
@@ -118,72 +114,82 @@ fn subagent(id: &str, completed: bool) -> Subagent {
         completed,
         agent_id: None,
         ended_ok: true,
+        report_preview: None,
+    }
+}
+
+fn digest(subagents: Vec<Subagent>) -> SessionDigest {
+    SessionDigest {
+        subagents,
+        ..SessionDigest::default()
     }
 }
 
 // ---- R14.1 ------------------------------------------------------------------
 
-/// R14.1: Antigravity, Codex, Gemini and Aider tabs are four session cards under R's one
-/// project card, in tab order; the agentless tab 5 has no node; each card is its `row_meta`.
+/// R14.1: Antigravity, Codex, Gemini and Aider tabs are four session rows of repository R, in
+/// tab order; the agentless tab 5 has no row; each row's state is its card's `row_meta`.
 #[test]
-fn r14_1_non_claude_agents_are_session_cards_grouped_by_repository() {
+fn r14_1_non_claude_agents_are_session_rows_of_their_repository() {
     let kinds = [
-        AgentKind::Antigravity,
-        AgentKind::Codex,
-        AgentKind::Gemini,
-        AgentKind::Aider,
+        (AgentKind::Antigravity, "Antigravity", AgentTag::Antigravity),
+        (AgentKind::Codex, "Codex", AgentTag::Codex),
+        (AgentKind::Gemini, "Gemini", AgentTag::Gemini),
+        (AgentKind::Aider, "Aider", AgentTag::Aider),
     ];
     let rows: Vec<SidebarRow> = (1..=5).map(row).collect();
     let mut entries: Vec<(u64, TabMeta)> = kinds
         .iter()
         .zip(1u64..)
-        .map(|(&k, t)| (t, unsplit(agent(k, AgentState::Busy), None)))
+        .map(|(&(k, _, _), t)| (t, unsplit(agent(k, AgentState::Busy), None)))
         .collect();
     entries.push((5, unsplit(None, None)));
     let metas = metas(entries);
 
-    let g = build(&rows, &metas, &HashMap::new());
+    let m = build(&rows, &metas, &HashMap::new());
 
-    let shape: Vec<(NodeKind, Option<usize>, FlowTarget)> = g
-        .nodes
-        .iter()
-        .map(|n| (n.kind, n.parent, n.target))
-        .collect();
+    let tabs: Vec<(u64, u32)> = m.rows.iter().map(|r| (r.tab, r.pane)).collect();
     assert_eq!(
-        shape,
-        vec![
-            (NodeKind::Project, None, FlowTarget::None),
-            (NodeKind::Session, Some(0), FlowTarget::Node(1)),
-            (NodeKind::Session, Some(0), FlowTarget::Node(2)),
-            (NodeKind::Session, Some(0), FlowTarget::Node(3)),
-            (NodeKind::Session, Some(0), FlowTarget::Node(4)),
-        ],
-        "one project for R, then tabs 1–4; no node for tab 5: {:#?}",
-        g.nodes
+        tabs,
+        vec![(1, 0), (2, 0), (3, 0), (4, 0)],
+        "tabs 1–4 in tab order; no row for tab 5: {:#?}",
+        m.rows
     );
-    assert_eq!(g.nodes[0].title, "terminal", "the project is R");
-    for t in 1..=4u64 {
-        let n = &g.nodes[t as usize];
+    for (t, &(_, label, tag)) in (1..=4u64).zip(kinds.iter()) {
+        let r = row_of(&m, t);
         let expected = row_meta(&row(t), metas.get(&TabId(t)), Some(Path::new(HOME)));
-        assert_eq!(n.title, expected.line1, "tab {t} title");
-        assert_eq!(n.folder, expected.cwd_display, "tab {t} folder");
-        assert_eq!(n.branch, expected.branch, "tab {t} branch");
-        assert_eq!(n.skin, expected.skin, "tab {t} skin");
-        assert_eq!(n.status, expected.status, "tab {t} status");
+        assert_eq!(r.project, "terminal", "tab {t}: the project is R");
+        assert_eq!(
+            Some(r.branch_line.clone()),
+            expected.branch,
+            "tab {t} branch"
+        );
+        assert_eq!(
+            (r.agent_label.as_str(), r.agent),
+            (label, tag),
+            "tab {t} agent"
+        );
+        assert_eq!(
+            r.bucket,
+            bucket_of(expected.status, false, false),
+            "tab {t} status"
+        );
     }
 }
 
 // ---- R14.2 ------------------------------------------------------------------
 
 /// R14.2: a split tab with a Claude active pane (main worktree) and a Codex non-active pane
-/// (linked worktree `w`) is two session cards under R — Claude's first — and the Codex card's
-/// status is `resolve_status(pane.agent, false, false, None)`.
+/// (linked worktree `w`) is two session rows of R, and the Codex row's state is
+/// `resolve_status(pane.agent, false, false, None)`.
 #[test]
 fn r14_2_mixed_agents_in_one_split_tab() {
     let claude = agent(AgentKind::Claude, AgentState::Busy);
     // Waiting, so the pane's own status differs from the tab's (Claude, Busy → Working).
     let codex = agent(AgentKind::Codex, AgentState::Waiting);
     let codex_pane = PaneMeta {
+        graph_agent_cwd: None,
+        graph_asks_user: false,
         pane_pid: 21,
         active: false,
         agent: codex,
@@ -198,9 +204,10 @@ fn r14_2_mixed_agents_in_one_split_tab() {
         branch: Some("main".to_string()),
         repo: Some(repo()),
         panes: vec![
-            // tmux order puts the linked Codex pane first; the main group must still lead.
             codex_pane.clone(),
             PaneMeta {
+                graph_agent_cwd: None,
+                graph_asks_user: false,
                 pane_pid: 20,
                 active: true,
                 agent: claude,
@@ -213,40 +220,46 @@ fn r14_2_mixed_agents_in_one_split_tab() {
         ..TabMeta::default()
     };
     let rows = vec![row(7)];
-    let claude_folder = row_meta(&row(7), Some(&tab), Some(Path::new(HOME))).cwd_display;
-    let codex_folder = row_meta(
-        &row(7),
-        Some(&TabMeta {
-            cwd: codex_pane.cwd.clone(),
-            ..TabMeta::default()
-        }),
-        Some(Path::new(HOME)),
-    )
-    .cwd_display;
     let metas = metas(vec![(7, tab)]);
 
-    let g = build(&rows, &metas, &HashMap::new());
+    let m = build(&rows, &metas, &HashMap::new());
 
-    let project = g
-        .nodes
+    assert_eq!(m.rows.len(), 2, "two session rows: {:#?}", m.rows);
+    assert!(
+        m.rows.iter().all(|r| r.project == "terminal"),
+        "both are R's"
+    );
+    let claude_row = m
+        .rows
         .iter()
-        .position(|n| n.kind == NodeKind::Project)
-        .expect("R's project card");
-    let s = sessions(&g);
-    assert_eq!(s.len(), 2, "two session cards: {:#?}", g.nodes);
-    assert!(s.iter().all(|(_, n)| n.parent == Some(project)));
-    assert_eq!(s[0].1.folder, claude_folder, "the Claude pane's card leads");
-    assert_eq!(s[1].1.folder, codex_folder, "the Codex pane's card follows");
+        .find(|r| r.pane == 20)
+        .expect("the Claude pane's row");
+    let codex_row = m
+        .rows
+        .iter()
+        .find(|r| r.pane == 21)
+        .expect("the Codex pane's row");
+    assert_eq!(claude_row.agent, AgentTag::Claude);
+    assert_eq!(claude_row.branch_line, "main");
+    assert_eq!(codex_row.agent, AgentTag::Codex);
     assert_eq!(
-        s[1].1.status,
-        resolve_status(codex.as_ref(), false, false, None)
+        codex_row.branch_line, "feat/w · w",
+        "the linked worktree's pane shows its own branch and worktree"
+    );
+    assert_eq!(
+        codex_row.bucket,
+        bucket_of(
+            resolve_status(codex.as_ref(), false, false, None),
+            false,
+            false
+        )
     );
 }
 
 // ---- R14.3 ------------------------------------------------------------------
 
-/// R14.3: with both logs in the subagent map, the Claude session gets one Subagent then one
-/// Fold node; the Codex session gets no children.
+/// R14.3: with both logs in the digest map, the Claude session shows its two subagents; the
+/// Codex session shows none.
 #[test]
 fn r14_3_subagents_only_under_claude() {
     let codex_log = PathBuf::from("/nonexistent/tt14/codex.jsonl");
@@ -265,40 +278,37 @@ fn r14_3_subagents_only_under_claude() {
             ),
         ),
     ]);
-    let subs = HashMap::from([
+    let digests = HashMap::from([
         (
             codex_log.clone(),
-            vec![subagent("c1", false), subagent("c2", true)],
+            digest(vec![subagent("c1", false), subagent("c2", true)]),
         ),
         (
             claude_log.clone(),
-            vec![subagent("a1", false), subagent("a2", true)],
+            digest(vec![subagent("a1", false), subagent("a2", true)]),
         ),
     ]);
 
-    let g = build(&rows, &metas, &subs);
+    let m = build(&rows, &metas, &digests);
 
-    let session_of = |tab: u64| {
-        sessions(&g)
-            .into_iter()
-            .find(|(_, n)| n.target == FlowTarget::Node(tab))
-            .map(|(i, _)| i)
-            .unwrap_or_else(|| panic!("a session node for tab {tab}: {:#?}", g.nodes))
-    };
-    let claude_kids: Vec<NodeKind> = children(&g, session_of(2)).iter().map(|n| n.kind).collect();
-    assert_eq!(claude_kids, [NodeKind::Subagent, NodeKind::Fold]);
+    let claude = row_of(&m, 2);
+    assert_eq!(claude.subagents.len(), 2, "{:#?}", claude);
+    assert_eq!(claude.tree.len(), 2);
+    assert_eq!(claude.subagent_summary, "1 running · 1 done");
+    let codex = row_of(&m, 1);
     assert!(
-        children(&g, session_of(1)).is_empty(),
-        "the Codex session has no child nodes"
+        codex.subagents.is_empty() && codex.tree.is_empty(),
+        "the Codex session has no subagents: {codex:#?}"
     );
+    assert_eq!(codex.subagent_summary, "—");
 }
 
 // ---- R14.4 ------------------------------------------------------------------
 
-/// R14.4: Antigravity (Working), Codex (Waiting for input) and Claude (Ready) sessions read
-/// `1 working · 1 waiting / 3`.
+/// R14.4: Antigravity (Working), Codex (Waiting for input, no dialog) and Claude (Ready)
+/// sessions are all counted — one working, two idle, three in all.
 #[test]
-fn r14_4_header_counts_every_agent_session() {
+fn r14_4_counts_every_agent_session() {
     let rows = vec![row(1), row(2), row(3)];
     let metas = metas(vec![
         (
@@ -312,7 +322,16 @@ fn r14_4_header_counts_every_agent_session() {
         (3, unsplit(agent(AgentKind::Claude, AgentState::Idle), None)),
     ]);
 
-    let g = build(&rows, &metas, &HashMap::new());
+    let m = build(&rows, &metas, &HashMap::new());
 
-    assert_eq!(g.header(), "1 working · 1 waiting / 3");
+    assert_eq!(
+        m.counts,
+        Counts {
+            all: 3,
+            needs_you: 0,
+            working: 1,
+            idle: 2,
+        }
+    );
+    assert_eq!(row_of(&m, 1).bucket, Bucket::Working);
 }

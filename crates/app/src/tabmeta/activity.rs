@@ -494,6 +494,14 @@ pub(crate) fn label_of_log(memo: &ActivityMemo, log: &Path) -> Option<String> {
     memo.role.get(log).and_then(|e| e.label.clone())
 }
 
+/// The memoised last-meaningful-message classification of `log`, read the same way as
+/// [`label_of_log`]: a pure memo read with no filesystem I/O, valid right after
+/// [`state_of_found`] warmed the entry this tick. The session overview's `graph_asks_user`
+/// (session-overview-ui D2) is this being [`LastMessage::AssistantAsksUser`].
+pub(crate) fn last_of_log(memo: &ActivityMemo, log: &Path) -> Option<LastMessage> {
+    memo.role.get(log).and_then(|e| e.last)
+}
+
 /// Minimum character count for a prompt to count as substantive (D10). Below this it reads
 /// as a short acknowledgement ("y", "네", "go") rather than a task, so it is skipped.
 const MIN_LABEL_CHARS: usize = 8;

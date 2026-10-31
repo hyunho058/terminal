@@ -1010,6 +1010,10 @@ impl Running {
                         }
                     }
                 }
+                AppRequest::CopyToClipboard(text) => {
+                    // session-overview-ui D22 — the detail's `Copy resume cmd`.
+                    crate::copy::write_clipboard_string(&text);
+                }
             }
         }
         if changed {
@@ -3296,9 +3300,14 @@ const SNAP_FLOOR: usize = 3;
 /// Patch each flipped tab's row with its new dialog level, answering whether any row
 /// changed (agent-card-status D7) — the card's half of a scan, as the waiting model's
 /// `on_agent_states` is the band's.
-fn patch_dialog_rows(model: &TabModelHandle, flipped: &[(TabId, bool)]) -> bool {
-    flipped.iter().fold(false, |any, &(id, level)| {
-        model.set_blocking_dialog(id.0, level) || any
+/// Each row takes its dialog subject with its level (session-overview-ui D9), so a new
+/// subject at an unchanged level is a row change too (D18).
+fn patch_dialog_rows(
+    model: &TabModelHandle,
+    flipped: &[(TabId, bool, Option<renderer::overview_model::DialogSubject>)],
+) -> bool {
+    flipped.iter().fold(false, |any, (id, level, subject)| {
+        model.set_blocking_dialog(id.0, *level, subject.clone()) || any
     })
 }
 
@@ -3645,7 +3654,7 @@ mod tests {
         host.register(Box::new(crate::flow::FlowOverlay::new(
             wake,
             None,
-            renderer::graph_panel::FlowHandle::default(),
+            renderer::overview_panel::OverviewHandle::new(),
         )));
         host
     }
@@ -3786,21 +3795,41 @@ mod tests {
         assert!(!patch_dialog_rows(&model, &[]));
         assert!(patch_dialog_rows(
             &model,
-            &[(TabId(1), true), (TabId(9), true)]
+            &[(TabId(1), true, None), (TabId(9), true, None)]
         ));
         assert_eq!(levels(), vec![true, false]);
         assert!(patch_dialog_rows(
             &model,
-            &[(TabId(2), true), (TabId(1), true)]
+            &[(TabId(2), true, None), (TabId(1), true, None)]
         ));
         assert_eq!(levels(), vec![true, true]);
-        assert!(!patch_dialog_rows(&model, &[(TabId(9), false)]));
+        assert!(!patch_dialog_rows(&model, &[(TabId(9), false, None)]));
         // Two real flips in one scan: both rows move, not only the first.
         assert!(patch_dialog_rows(
             &model,
-            &[(TabId(2), false), (TabId(1), false)]
+            &[(TabId(2), false, None), (TabId(1), false, None)]
         ));
         assert_eq!(levels(), vec![false, false]);
+
+        // session-overview-ui D9 / D18 — the subject rides along, and a new subject at an
+        // unchanged level is a row change.
+        use renderer::overview_model::DialogSubject::{Command, Question};
+        assert!(patch_dialog_rows(
+            &model,
+            &[(TabId(1), true, Some(Command("ls".into())))]
+        ));
+        assert!(patch_dialog_rows(
+            &model,
+            &[(TabId(1), true, Some(Question))]
+        ));
+        assert_eq!(
+            model.with(|m| m.rows[0].blocking_subject.clone()),
+            Some(Question)
+        );
+        assert!(!patch_dialog_rows(
+            &model,
+            &[(TabId(1), true, Some(Question))]
+        ));
     }
 
     #[test]
@@ -3893,6 +3922,8 @@ mod tests {
 
     fn meta_at(cwd: &str) -> crate::tabmeta::TabMeta {
         crate::tabmeta::TabMeta {
+            graph_agent_cwd: None,
+            graph_asks_user: false,
             branch: None,
             agent: None,
             cwd: Some(std::path::PathBuf::from(cwd)),

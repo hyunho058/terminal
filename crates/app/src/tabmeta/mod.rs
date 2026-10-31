@@ -122,14 +122,21 @@ pub struct TabMeta {
     /// the toggle on the two are equal; with it off `agent` is `None` and this is not.
     ///
     /// Set only on a pass that derives the graph and `None` otherwise, like `panes` and `repo`
-    /// — a closed graph publishes nothing here and pays nothing for it (G1). Read by the graph
-    /// alone ([`crate::flow::build_graph`], which falls back to `agent`/`task` when this is
-    /// `None`); the sidebar card, the title and the dialog scan keep reading `agent`, so the
+    /// — a closed graph publishes nothing here and pays nothing for it (G1). Read by the
+    /// Cmd+Shift+F overlay alone ([`crate::overview::build_overview`], which falls back to
+    /// `agent`/`task` when this is `None`); the sidebar card, the title and the dialog scan keep reading `agent`, so the
     /// toggle governs them exactly as before.
     pub graph_agent: Option<Agent>,
     /// [`TabMeta::task`] without the toggle, on the same terms as `graph_agent` — the graph
     /// card's line 1 is the label the card would show with the toggle on.
     pub graph_task: Option<String>,
+    /// Whether the agent's resolved log's last meaningful message is
+    /// `LastMessage::AssistantAsksUser` (session-overview-ui D2). Set on graph passes only,
+    /// like [`TabMeta::graph_agent`]; `false` otherwise.
+    pub graph_asks_user: bool,
+    /// The detected agent process's own cwd (session-overview-ui D3) — the one `repo` is
+    /// resolved from, not the shell's `cwd` (G5). Graph passes only; `None` otherwise.
+    pub graph_agent_cwd: Option<PathBuf>,
 }
 
 /// One pane of a split tab (session-flow-viewer D9).
@@ -153,6 +160,10 @@ pub struct PaneMeta {
     pub branch: Option<String>,
     /// The pane's agent session's repository (any kind), by the same rule as [`TabMeta::repo`].
     pub repo: Option<RepoId>,
+    /// [`TabMeta::graph_asks_user`] for this pane's session (session-overview-ui D2).
+    pub graph_asks_user: bool,
+    /// [`TabMeta::graph_agent_cwd`] for this pane's agent (session-overview-ui D3).
+    pub graph_agent_cwd: Option<PathBuf>,
 }
 
 /// The worker's per-tab graph decision ([`graph_pass`], session-flow-viewer R6.6 —
@@ -830,6 +841,8 @@ mod tests {
                 (
                     a,
                     TabMeta {
+                        graph_agent_cwd: None,
+                        graph_asks_user: false,
                         branch: Some("main".into()),
                         agent: None,
                         task: None,
@@ -845,6 +858,8 @@ mod tests {
                 (
                     b,
                     TabMeta {
+                        graph_agent_cwd: None,
+                        graph_asks_user: false,
                         branch: None,
                         agent: Some(Agent {
                             kind: AgentKind::Claude,
@@ -1058,6 +1073,8 @@ mod tests {
         assert_eq!(
             TabMeta::default(),
             TabMeta {
+                graph_agent_cwd: None,
+                graph_asks_user: false,
                 branch: None,
                 agent: None,
                 task: None,

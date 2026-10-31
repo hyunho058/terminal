@@ -339,6 +339,23 @@ idle behaviour. See G1 for what the caches do and do not buy against it.
     footer and chat rows"** (or the question and first-choice rows). Two layouts are known
     and unmatched: a question dialog drawn without its footer block (the binary's `Nt`
     condition, never seen in a capture) and the `Exit plan mode?` variant.
+  - **The dialog subject's two strings** (`specs/session-overview-ui` D9). Once a dialog is
+    matched, `prompt::blocking_subject` reads what it asks about from two more rows of the
+    same 20-row tail: Claude's permission dialog by the tool-title row (`Bash command`,
+    `Edit file`, …) under the last `────` rule, taking the next non-blank row as the
+    command; Antigravity's by the row `Requesting permission for:`, taking the next
+    non-blank row. It runs only on the scan that matched (a level held while scrolled back
+    holds its subject too). A change to either layout reads as **no subject** — the
+    overview's row says `Waiting for your input` instead of `Approval needed · {cmd}` — never
+    as a wrong one, and the Needs-you bucket itself does not depend on it. **"The overview
+    says Waiting for your input on a permission dialog" should be read as "check the
+    `waiting-scan` line for the rule and title rows".**
+  - **`end_turn` is not Needs you.** `activity::state_from` maps every plain assistant
+    `end_turn` to `AgentState::Waiting`, so the sidebar card reads `Waiting for input` after
+    any finished Claude turn, and that wording is unchanged. The overview splits
+    `WaitingForInput` (D2): Needs you only with a blocking dialog on screen or the log's
+    `AssistantAsksUser` (`graph_asks_user`), otherwise Idle. A card reading `Waiting for
+    input` beside an overview row reading Idle is the two agreeing, not disagreeing.
   - **When Claude Code writes a `tool_use`.** Claude Code 2.1.28x writes an assistant
     `tool_use` to the session log only once the tool **returns**. While a question or plan
     dialog is up, its call is not on disk, so the log reads the previous tool's
@@ -394,53 +411,86 @@ idle behaviour. See G1 for what the caches do and do not buy against it.
   Cmd+F-keys, Cmd+PageUp/PageDown and Cmd+ForwardDelete. If the IM commits on them too
   (unmeasured for named keys), each logs only a `chord-replay skipped` line, because no Cmd
   matcher reads them. Cmd+Tab is not listed: macOS takes it before the app sees it.
-- **G10** The **session graph** (`specs/session-flow-graph`, Cmd+Shift+F, revising
-  `specs/session-flow-viewer`) is a **full-window overlay**, not a dock occupant. Its layer
-  (`renderer::graph_panel::FlowPanel`, z 110, above the ai-monitor's 100) paints an opaque
+- **G10** The **overview** (`specs/session-overview-ui`, Cmd+Shift+F, revising
+  `specs/session-flow-graph`, which revised `specs/session-flow-viewer`) is the Agent Monitor:
+  a **full-window overlay**, not a dock occupant. It **replaced** the session graph in the same
+  overlay (D1): project cards, edges, `N finished` chips and the slot layout are gone, as are
+  `graph_layout.rs` and `graph_panel.rs`. Policy is app-side and pure — `app::overview`
+  (buckets, identity, now-doing, elapsed, tiles, banner, filter, squares) and
+  `app::overview_detail` (window, ticks, lanes, segments, events) — and hands the renderer plain
+  data (`renderer::overview_model`, `u64` tabs, `u32` pane pids, colour **roles**); the renderer
+  lays it out in `overview_layout`, colours it from `overview_theme` and draws it in
+  `overview_panel` (D20, D21). `app::flow::FlowOverlay` is the impure shell. The layer
+  (`OverviewPanel`, `OVERVIEW_PANEL_Z` = 110, above the ai-monitor's 100) paints an opaque
   backdrop over the whole viewport and reserves no inset, so opening it never reflows the grid
-  (G4's truncating `Grid::resize` is not involved). The right dock is therefore **the
-  ai-monitor's alone again**: the session-flow-viewer's shared `RightDock`/`ToggleDock` seam
-  was reverted, and the monitor toggles and persists exactly as on `main`; the graph covers an
-  open monitor rather than replacing it, and is never restored open. The `FlowOverlay` sits at
-  priority **300**, above rename (200), and while open it owns the keyboard — `Esc` and the
-  chord close it, every other key (and IME text) is swallowed — and, through
-  `input::pointer_owner`, every press, wheel and hover in the window. That makes the graph a
-  thing to look at, not to type beside: the sidebar stays the live surface while typing (the
-  spec's "glance while typing" gap). A session is an **agent session**: a tab (or tmux pane)
-  whose detected agent is any `AgentKind` the sidebar knows — Claude, Antigravity, Codex,
-  Gemini or Aider (R14, amended 2026-10-21); a tab or pane with no agent is not a node. Sessions
-  group by repository through the tabmeta worker's `RepoId`, resolved from the detected agent
-  process's cwd (any kind) and published only while the graph is open; until the first full
-  pass the header reads `resolving…` and no card is drawn. **Subagents are Claude-only**: they
-  come from Claude's session log, which no other agent writes, so a non-Claude session has no
-  column-2 children and its log is never followed. The graph **ignores
-  `[sidebar].show_agent_status`** (user decision 2026-10-22): while it is open the worker
-  classifies every tab's agent whatever the toggle and publishes it as
-  `TabMeta.graph_agent`/`graph_task`, which only the graph reads, so the sidebar card still
-  shows no agent status with the toggle off and a closed graph does no agent work the toggle
-  did not already allow. Four notes follow, the first three carried over from the panel; each
-  is recorded here because it reads as a bug when met cold:
+  (G4's truncating `Grid::resize` is not involved). The right dock is **the ai-monitor's
+  alone**: the session-flow-viewer's shared `RightDock`/`ToggleDock` seam was reverted, the
+  monitor toggles and persists exactly as on `main`, and the overview covers an open monitor
+  rather than replacing it. It is never restored open, and opening always shows the overview,
+  not the detail. The `FlowOverlay` sits at priority **300**, above rename (200), and while open
+  it owns the keyboard — the chord closes it from either view, `Esc` closes the overview and
+  returns from the detail, every other key (and IME text) is swallowed — and, through
+  `input::pointer_owner`, every press, wheel and hover in the window. That makes it a thing to
+  look at, not to type beside: the sidebar stays the live surface while typing.
 
-  - **Non-active tmux panes are log-only** (old D13). A split tab's *active* pane takes the
-    card's own `row_meta` status, blocking-dialog override included; every other pane takes
+  A row is an **agent session**: a tab (or tmux pane) whose detected agent is any `AgentKind`
+  the sidebar knows — Claude, Antigravity, Codex, Gemini or Aider (session-flow-graph R14); in
+  this window only. Its status is the sidebar card's (`row_meta` / `resolve_status`), split into
+  a **bucket** by two published flags and nothing else (D2, see G8's `end_turn` note). Its
+  project comes from the tabmeta worker's `RepoId`, resolved from the detected agent process's
+  cwd (any kind) and published with `graph_agent_cwd` only while the overlay is open; until the
+  first full pass the header reads `resolving…` and no row is drawn. **Subagents, elapsed and
+  the timeline are Claude-only**: they come from Claude's session log, which no other agent
+  writes, so a non-Claude session's log is never followed. The overlay **ignores
+  `[sidebar].show_agent_status`** (user decision 2026-10-22, carried): while it is open the
+  worker classifies every tab's agent whatever the toggle and publishes it as
+  `TabMeta.graph_agent`/`graph_task`/`graph_asks_user`, which only the overlay reads, so the
+  sidebar card still shows no agent status with the toggle off. The digest's turn rule is G8's
+  background-work rule, not a restatement, so the detail's main lane never reads idle while the
+  pill reads Working. Four notes follow, carried from the graph and adapted; each is recorded
+  here because it reads as a bug when met cold:
+
+  - **Non-active tmux panes are log-only, and so never Needs you from a dialog** (carried D3).
+    A split tab's *active* pane takes the card's own `row_meta` status, blocking-dialog
+    override and dialog subject included; every other pane takes
     `resolve_status(pane.agent, false, false, None)`, because the dialog matcher reads the
     tab's grid, which is the active pane's screen only. A permission dialog pending in a
-    background pane therefore reads as the log says (`Working`). **"A pane card disagrees with
-    what that pane shows" should be read as "is it the active pane?"** before anything else.
-  - **Foreground subagents appear only on return.** The graph's subagents come from the parent
-    log (`flow_telemetry`), and Claude Code 2.1.28x writes an `Agent` `tool_use` only once the
-    tool returns (G8). A foreground subagent is therefore first seen already finished, behind
-    `N finished`; only a background launch, whose receipt returns at once, is ever drawn as
-    running. The parent session reads `Working` meanwhile, with no child.
-  - **Panes, repositories and subagents cost only while the graph is open.** The worker's
-    `list-panes` pass and repository resolution run behind `set_graph_wanted`, the subagent
-    thread lives from open to close, and the layer builds its card atlases on its first visible
-    frame. Closing the graph stops all of it — the thread is told to stop and never joined, so a
-    close during a large backfill cannot stall the loop — and clears the published panes and
-    repositories. What keeps a reopen on `resolving…` rather than the last open's groups is
-    the per-open **epoch**: `set_graph_wanted(true)` returns one, the worker publishes it with
-    `graph_ready`, and the overlay accepts readiness only for its own epoch — clearing alone
-    would lose the race against a close the worker has not processed yet.
-  - **A sidebar card menu survives the graph** (D5). Opening the graph over an open card menu,
-    and closing it with `Esc` or the chord, leaves the menu as it was; only an ordinary overlay
-    consuming a key still dismisses it.
+    background pane therefore reads as the log says (`Working`, or Idle after an `end_turn`);
+    such a pane reaches Needs you only through `PaneMeta.graph_asks_user`. **"A pane row
+    disagrees with what that pane shows" should be read as "is it the active pane?"** before
+    anything else. The jump actions switch to the tab only; panes are not focusable from here.
+  - **Foreground subagents appear only on return.** The overview's subagents come from the
+    parent log (`flow_telemetry`), and Claude Code 2.1.28x writes an `Agent` `tool_use` only
+    once the tool returns (G8). A foreground subagent is therefore first seen already finished,
+    a green square; only a background launch, whose receipt returns at once, is ever drawn as
+    running (orange square, `Waiting on {k} subagent(s)`). The parent session reads `Working`
+    meanwhile, with no child. For the same reason "Now doing" names the newest **finished**
+    tool, not the one in flight (D4).
+  - **Panes, repositories and digests cost only while the overlay is open** (D18). The worker's
+    `list-panes` pass, repository resolution and the `graph_*` fields run behind
+    `set_graph_wanted`; the flow-telemetry thread lives from open to close and is the **only**
+    accumulator built `SessionTelemetry::with_digest`, so the ai-monitor's own fold does no new
+    work, its snapshot's digest fields stay empty and its draw-cache key is unchanged (D19); the
+    layer builds its three atlases (Title, Meta, Display) on its first visible frame. Closing
+    stops all of it — the thread is told to stop and never joined, so a close during a large
+    backfill cannot stall the loop — and clears the published panes and repositories. While
+    open, the model rebuilds on a key that includes the wall-clock **minute** (elapsed and
+    running durations are minute-granular, never seconds), and an unchanged frame writes no
+    buffer (G1). **One bounded exception runs while closed**: D9's `blocking_subject`, which
+    runs only where `shows_blocking_prompt` already scanned and matched, over the same 20 rows,
+    so a dialog's subject is known the moment the overlay opens. What keeps a reopen on
+    `resolving…` rather than the last open's rows is the per-open **epoch**:
+    `set_graph_wanted(true)` returns one, the worker publishes it with `graph_ready`, and the
+    overlay accepts readiness only for its own epoch — clearing alone would lose the race
+    against a close the worker has not processed yet. The filter and the expanded-row set
+    survive a close within one app run (pruned on rebuild); the view and every scroll offset
+    reset.
+  - **A sidebar card menu survives the overlay** (session-flow-graph D5). Opening it over an
+    open card menu, and closing it with `Esc` or the chord, leaves the menu as it was; only an
+    ordinary overlay consuming a key still dismisses it.
+
+  **Deferred: the compact sidebar board** (D16). The design's 380 px "keep it open beside the
+  terminal" board is not built. Its only candidate homes — the right dock, returned to the
+  ai-monitor alone above, or the left tab sidebar, whose card order is the user's tab order —
+  each reverse a shipped decision, so it waits for the person's decision on its home and its own
+  spec. The overview's model (buckets, now-doing text, squares) is built to be reused by it.

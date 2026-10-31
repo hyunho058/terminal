@@ -96,6 +96,10 @@ pub struct Session {
     /// scrolled back (the scrolled view is history, not the live screen) and false while
     /// the tab has no agent.
     blocking_dialog: bool,
+    /// What that dialog asks for (session-overview-ui D9), read from the same tail at the
+    /// same moment as the level, only when a scan matched; held with the level while the view
+    /// is scrolled back, and `None` whenever the level is false.
+    blocking_subject: Option<renderer::overview_model::DialogSubject>,
     _reader: JoinHandle<()>,
 }
 
@@ -149,6 +153,7 @@ impl Session {
             command_running: false,
             command_dirty: false,
             blocking_dialog: false,
+            blocking_subject: None,
             _reader: reader_thread,
         })
     }
@@ -241,9 +246,31 @@ impl Session {
     /// Store the dialog level a scan produced, answering whether it **changed** — the one
     /// thing that obliges the event loop to resync the card's row (D7). A repeat of the
     /// same level, which every PTY chunk of a busy agent produces, costs nothing.
+    ///
+    /// A level set this way carries no subject; [`rescan_dialog`](Session::rescan_dialog)
+    /// stores the two together.
     pub fn set_blocking_dialog(&mut self, level: bool) -> bool {
-        let changed = self.blocking_dialog != level;
+        self.set_blocking(level, None)
+    }
+
+    /// What the blocking dialog asks for (session-overview-ui D9); `None` whenever
+    /// [`blocking_dialog`](Session::blocking_dialog) is false.
+    pub fn blocking_subject(&self) -> Option<&renderer::overview_model::DialogSubject> {
+        self.blocking_subject.as_ref()
+    }
+
+    /// Store a level and its subject together, answering whether **either** changed (D9,
+    /// D18): a new command at an unchanged level is a change the row must show. A false level
+    /// stores no subject, whatever it was given.
+    fn set_blocking(
+        &mut self,
+        level: bool,
+        subject: Option<renderer::overview_model::DialogSubject>,
+    ) -> bool {
+        let subject = subject.filter(|_| level);
+        let changed = self.blocking_dialog != level || self.blocking_subject != subject;
         self.blocking_dialog = level;
+        self.blocking_subject = subject;
         changed
     }
 
@@ -257,19 +284,29 @@ impl Session {
     ///
     /// Uses `viewport_tail_text` rather than a full snapshot: this runs per PTY chunk, and
     /// cloning the grid at that rate would be the G1 idle-CPU debt all over again.
+    ///
+    /// The dialog's subject (session-overview-ui D9) is read from the same tail, and only on
+    /// the branch that scanned and matched; the held branch holds the previous subject with
+    /// the previous level, and a false level carries none.
     pub fn rescan_dialog(&mut self, has_agent: bool) -> (bool, bool) {
         let terminal = &self.terminal;
+        let mut subject = self.blocking_subject.clone();
         let level = next_dialog_level(
             has_agent,
             terminal.view_offset() == 0,
             self.blocking_dialog,
             || {
-                crate::prompt::shows_blocking_prompt(
-                    &terminal.viewport_tail_text(crate::prompt::TAIL_ROWS),
-                )
+                let tail = terminal.viewport_tail_text(crate::prompt::TAIL_ROWS);
+                let hit = crate::prompt::shows_blocking_prompt(&tail);
+                subject = if hit {
+                    crate::prompt::blocking_subject(&tail)
+                } else {
+                    None
+                };
+                hit
             },
         );
-        (level, self.set_blocking_dialog(level))
+        (level, self.set_blocking(level, subject))
     }
 
     /// Write bytes to this session's shell.
@@ -513,6 +550,7 @@ mod tests {
             command_running: false,
             command_dirty: false,
             blocking_dialog: false,
+            blocking_subject: None,
             _reader: std::thread::spawn(|| {}),
         };
         Some((session, tx))
@@ -947,6 +985,56 @@ mod tests {
         feed(&mut s, &tx, dialog.as_bytes());
         assert_eq!(s.rescan_dialog(true), (true, true));
         assert_eq!(s.rescan_dialog(false), (false, true), "no agent, no level");
+    }
+
+    #[test]
+    fn the_subject_moves_with_the_scan_and_holds_with_the_level() {
+        // session-overview-ui D9 / R6.4 through a real grid: the subject is read where the
+        // level is, a new command at an unchanged level is a change, scrolling back holds
+        // the subject unscanned, and a false level carries none.
+        use renderer::overview_model::DialogSubject;
+        let Some((mut s, tx)) = session_with_feed() else {
+            return;
+        };
+        let cmd = |c: &str| Some(DialogSubject::Command(c.to_string()));
+        let first = crate::prompt::REAL_DIALOG.replace('\n', "\r\n");
+        let second = first.replace("ls -d ~/.config", "git push");
+        feed(&mut s, &tx, b"\x1b[2J\x1b[H");
+        feed(&mut s, &tx, first.as_bytes());
+        assert_eq!(s.rescan_dialog(true), (true, true));
+        assert_eq!(s.blocking_subject().cloned(), cmd("ls -d ~/.config"));
+        assert_eq!(s.rescan_dialog(true), (true, false), "same subject again");
+
+        feed(&mut s, &tx, b"\x1b[2J\x1b[H");
+        feed(&mut s, &tx, second.as_bytes());
+        assert_eq!(
+            s.rescan_dialog(true),
+            (true, true),
+            "new subject, same level"
+        );
+        assert_eq!(s.blocking_subject().cloned(), cmd("git push"));
+
+        // Scrolled back: neither level nor subject is re-read, even once the screen moved.
+        for i in 0..60 {
+            feed(&mut s, &tx, format!("later output {i}\r\n").as_bytes());
+        }
+        feed(&mut s, &tx, first.as_bytes());
+        s.terminal.scroll_up(5);
+        assert_ne!(s.terminal.view_offset(), 0);
+        assert_eq!(s.rescan_dialog(true), (true, false), "held");
+        assert_eq!(
+            s.blocking_subject().cloned(),
+            cmd("git push"),
+            "held subject"
+        );
+
+        s.terminal.scroll_to_bottom();
+        assert_eq!(s.rescan_dialog(true), (true, true), "re-read at the bottom");
+        assert_eq!(s.blocking_subject().cloned(), cmd("ls -d ~/.config"));
+
+        assert_eq!(s.rescan_dialog(false), (false, true), "no agent");
+        assert_eq!(s.blocking_subject(), None, "no level, no subject");
+        assert!(!s.set_blocking_dialog(false));
     }
 
     #[test]
