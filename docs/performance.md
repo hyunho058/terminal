@@ -15,8 +15,9 @@
 ## Machine class
 
 - **Baseline machine**: Apple M1 (arm64), `--release`, `codegen-units=1`, thin LTO.
-- **CI runner**: GitHub `macos-14` (Apple Silicon). Runner timings run slower and
-  noisier than a warm local M1 — hence the tolerance band (below).
+- **CI runner**: GitHub `macos-15` (Apple Silicon; `macos-14` until its
+  2026-11-02 retirement). Runner timings run slower and noisier than a warm
+  local M1 — hence the tolerance band (below).
 
 ## The three targets
 
@@ -52,7 +53,7 @@ Each maps to one Criterion bench group (`benches/`, D2) and one interview goal.
 CI-runner variance (gap in Known Gaps) means an absolute equality gate would be
 flaky. The comparison step fails only when `measured_median > threshold * (1 +
 TOLERANCE)`. **Provisional `TOLERANCE = 0.50`** (50%) — wide, because it is
-seeded from a single local machine, not yet from observed `macos-14` baseline
+seeded from a single local machine, not yet from observed `macos-15` baseline
 noise. Narrow it once real runner baselines exist.
 
 ## Machine-readable thresholds (the gate parses this block)
@@ -77,7 +78,7 @@ false` the whole gate is advisory regardless (reports, never fails).
 
 ## How the gate works (D5)
 
-1. `perf.yml` runs `cargo bench` on `macos-14` with Criterion's JSON output.
+1. `perf.yml` runs `cargo bench` on `macos-15` with Criterion's JSON output.
 2. A comparison step parses each group's `estimates.json` median (ns).
 3. It reads the **committed** thresholds from *this file* (not a
    `target/criterion` baseline — those are per-runner and lost between runs).
@@ -92,7 +93,7 @@ To make this file authoritative, a human must:
 
 1. Decide the committed thresholds per target (or accept the provisional ones).
 2. Confirm the machine class the numbers are pinned to.
-3. Confirm the tolerance band width from observed `macos-14` noise.
+3. Confirm the tolerance band width from observed `macos-15` noise.
 4. Decide whether `perf.yml` is **required/merge-blocking** (D4) or **advisory**
    — recorded explicitly, never silently.
 

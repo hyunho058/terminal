@@ -8,7 +8,7 @@ on:
 # The app is macOS-only (Metal, AppKit), so CI runs on a macOS runner.
 jobs:
   check:
-    runs-on: macos-14 # Apple Silicon
+    runs-on: macos-15 # Apple Silicon (macos-14 is retired 2026-11-02)
     steps:
       - uses: actions/checkout@v4
 
