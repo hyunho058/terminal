@@ -21,7 +21,7 @@ on:
 
 jobs:
   perf:
-    runs-on: macos-14 # Apple Silicon — matches the pinned machine class.
+    runs-on: macos-15 # Apple Silicon — matches the pinned machine class.
     steps:
       - uses: actions/checkout@v4
 
