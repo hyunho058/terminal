@@ -25,6 +25,7 @@ use crate::{looks_like_session_id, Resolved};
 /// its last meaningful step, classified into Claude's [`crate::activity::LastMessage`].
 mod tail;
 pub use tail::tail_state;
+pub(crate) use tail::{background_completions, background_starts};
 
 /// How much of `history.jsonl` one lookup reads, from the **end**.
 ///

@@ -1,11 +1,12 @@
 //! TT3 (renderer half) — acceptance test for session-flow-graph R3.3: the full-window
-//! graph layer reserves no band (D4). The right dock is the ai-monitor's alone again, so
-//! a visible `FlowPanel` with the monitor closed must leave `right_inset` at 0 and the
-//! grid exactly the size it is with no flow layer at all.
+//! graph layer reserves no band (D4) — carried by session-overview-ui to the Agent Monitor
+//! overview that replaced the graph in the same layer slot. The right dock is the
+//! ai-monitor's alone, so a visible `OverviewPanel` with the monitor closed must leave
+//! `right_inset` at 0 and the grid exactly the size it is with no such layer at all.
 //!
 //! Both renderers record a real frame through `Renderer::capture` before the size is
 //! read, because the inset is the renderer's state after a frame, not before one — and
-//! the layer's `submit_count` is checked so the comparison is not made against a layer
+//! the layer's `compose_count` is checked so the comparison is not made against a layer
 //! that never drew. The GPU harness is `renderer::testing::headless`: it skips only under
 //! `SKIP_GPU_TESTS=1` and fails when the renderer is present but broken.
 
@@ -13,10 +14,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use common::config::Config;
-use renderer::graph_layout::{FlowGraph, FlowNode, FlowTarget, NodeKind};
-use renderer::graph_panel::{FlowHandle, FlowPanel};
-use renderer::sidebar_card::CardStatus;
-use renderer::sidebar_theme::AgentSkin;
+use renderer::overview_model::{Bucket, OverviewModel, SessionRowData};
+use renderer::overview_panel::{OverviewHandle, OverviewPanel};
 use renderer::{DrawLayer, FrameCtx, Renderer};
 use term_core::{Color, GridSnapshot, Terminal};
 
@@ -40,47 +39,27 @@ fn snapshot(r: &Renderer) -> GridSnapshot {
     t.snapshot()
 }
 
-/// A project with one Claude session under it — enough for the layer to draw a frame.
-fn graph() -> FlowGraph {
-    let node = |kind, parent, title: &str, skin, status, target| FlowNode {
-        kind,
-        parent,
-        title: title.into(),
-        folder: "~/IdeaProjects/terminal".into(),
-        branch: None,
-        skin,
-        status,
-        muted: false,
-        selected: false,
-        target,
-        extra: 0,
-    };
-    FlowGraph {
-        nodes: vec![
-            node(
-                NodeKind::Project,
-                None,
-                "terminal",
-                AgentSkin::Generic,
-                CardStatus::Hidden,
-                FlowTarget::None,
-            ),
-            node(
-                NodeKind::Session,
-                Some(0),
-                "claude",
-                AgentSkin::Claude,
-                CardStatus::Working,
-                FlowTarget::Node(1),
-            ),
-        ],
-        resolving: false,
+/// One working Claude session — enough for the layer to draw a frame.
+fn model() -> OverviewModel {
+    OverviewModel {
+        rows: vec![SessionRowData {
+            tab: 1,
+            bucket: Bucket::Working,
+            project: "terminal".into(),
+            agent_label: "Claude Code".into(),
+            branch_line: "~/IdeaProjects/terminal".into(),
+            now_doing: "Working".into(),
+            elapsed: "—".into(),
+            subagent_summary: "—".into(),
+            ..SessionRowData::default()
+        }],
+        ..OverviewModel::default()
     }
 }
 
-/// Forwards to a shared `FlowPanel`, so the test can read its counters after handing the
+/// Forwards to a shared `OverviewPanel`, so the test can read its counters after handing the
 /// layer to the renderer (which takes it by `Box`).
-struct Shared(Rc<RefCell<FlowPanel>>);
+struct Shared(Rc<RefCell<OverviewPanel>>);
 
 impl DrawLayer for Shared {
     fn z_order(&self) -> i32 {
@@ -105,22 +84,22 @@ fn r3_3_a_visible_graph_layer_reserves_no_band() {
     bare.capture(&snap).expect("the bare frame captures");
     let bare_grid = bare.grid_size();
 
-    // Given: monitor closed and a FlowPanel layer whose handle is visible.
+    // Given: monitor closed and a OverviewPanel layer whose handle is visible.
     let Some(mut r) = headless(&cfg) else {
         return;
     };
     r.set_monitor_open(false);
-    let handle = FlowHandle::default();
-    handle.set(graph());
+    let handle = OverviewHandle::new();
+    handle.set(model());
     handle.set_visible(true);
-    let panel = Rc::new(RefCell::new(FlowPanel::new(handle.clone())));
+    let panel = Rc::new(RefCell::new(OverviewPanel::new(handle.clone())));
     r.add_layer(Box::new(Shared(panel.clone())));
 
     // When: a frame records.
     let snap = snapshot(&r);
     r.capture(&snap).expect("the graph frame captures");
     assert!(
-        panel.borrow().submit_count() > 0,
+        panel.borrow().compose_count() > 0,
         "the visible graph layer drew nothing, so the frame says nothing about its inset"
     );
 

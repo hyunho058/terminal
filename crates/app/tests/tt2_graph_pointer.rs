@@ -1,13 +1,14 @@
 //! Acceptance tests for session-flow-graph R2: pointer routing while the graph is open (D6).
 //! Written from the spec's Thens; every app item is reached through the `app` crate root.
 //!
-//! R2.1 and R2.2 pin the pure router T1 built. R2.3 targets T4's `FlowOverlay`, built on
-//! `renderer::graph_panel::FlowHandle`, and is red until T4 lands.
+//! R2.1 and R2.2 pin the pure router T1 built. R2.3 targets the `FlowOverlay`, built on
+//! `renderer::overview_panel::OverviewHandle` since session-overview-ui T8.
 
 use std::sync::Arc;
 
 use app::{pointer_owner, AppCtx, FlowOverlay, Handled, KeyInput, Overlay, PointerOwner};
-use renderer::graph_panel::{FlowHandle, FlowHit, FlowView};
+use renderer::overview_model::OverviewHit;
+use renderer::overview_panel::OverviewHandle;
 use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
 
 // R2.1
@@ -54,7 +55,7 @@ fn toggle_chord() -> KeyInput {
 // R2.3
 #[test]
 fn r2_3_a_press_outside_every_hit_box_is_consumed_and_keeps_the_graph_open() {
-    let handle = FlowHandle::default();
+    let handle = OverviewHandle::new();
     let mut graph = FlowOverlay::new(Arc::new(|| {}), None, handle.clone());
     let mut pty = Vec::new();
     let mut ctx = AppCtx::new(&mut pty, 1, 0, None);
@@ -63,14 +64,13 @@ fn r2_3_a_press_outside_every_hit_box_is_consumed_and_keeps_the_graph_open() {
     graph.on_key(&toggle_chord(), &mut ctx);
     assert!(graph.visible(), "precondition: the chord opened the graph");
     ctx.take_requests();
-    handle.publish_view(FlowView {
-        hits: vec![(FlowHit::Node(1), [100.0, 100.0, 200.0, 60.0])],
-        visible_slots: 1,
-        total_slots: 1,
-    });
+    handle.publish(
+        vec![(OverviewHit::Open(1, 0), [100.0, 100.0, 200.0, 60.0])],
+        0,
+    );
     let outside = [20.0, 20.0];
     assert_eq!(
-        handle.press(outside),
+        handle.hit_at(outside),
         None,
         "precondition: the point hits nothing"
     );

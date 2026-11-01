@@ -1,9 +1,13 @@
 //! The session graph's own subagent source (session-flow-viewer D10, D18).
 //!
 //! While the graph is open, one background thread folds every session log the tabmeta
-//! worker published (`TabMeta.log` / `PaneMeta.log`) into an
-//! [`ai_monitor::SessionTelemetry`] and publishes `log → Vec<Subagent>` into a slot the
-//! overlay reads, behind a generation counter, waking the loop the overlay way.
+//! worker published — a Claude log (`TabMeta.log` / `PaneMeta.log`) or an Antigravity
+//! transcript (`graph_transcript`, `session-overview-ui` D24), each in its own
+//! [`LogFormat`] — into an
+//! [`ai_monitor::SessionTelemetry`] built [`with_digest`](SessionTelemetry::with_digest) and
+//! publishes `log → SessionDigest` into a slot the overlay reads, behind a generation counter,
+//! waking the loop the overlay way (`session-overview-ui` D19: the subagent list plus the
+//! overview's per-log digest — last tool, last prompt, turns, events).
 //!
 //! **Why a thread of its own, not the tabmeta worker** (D10, rejected alternative): the worker
 //! tails the last few lines of a log for a state, every 500 ms; a subagent list needs the
@@ -26,8 +30,8 @@
 //! **The backfill is `backfill_telemetry`'s fold, line by line.** `ai_monitor::backfill_telemetry`
 //! reads and folds the whole file in one call, which cannot be interrupted, and R7.3 requires
 //! a stopped thread to finish within 2 s even mid-backfill. So the same fold — a fresh
-//! Claude-format `SessionTelemetry` with `apply` per line, exactly what `backfill_telemetry`
-//! does for a Claude log — runs here with the stop flag checked between lines. One difference,
+//! `SessionTelemetry` of the log's format with `apply` per line, exactly what
+//! `backfill_telemetry_with` does — runs here with the stop flag checked between lines. One difference,
 //! deliberate: an unterminated last line is held until its newline arrives, because the tail
 //! continues from that offset and folding half a JSON record would count a parse error and
 //! lose the record.
@@ -41,14 +45,61 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use ai_monitor::telemetry::{SessionTelemetry, Subagent};
+use ai_monitor::telemetry::{
+    Event, LogFormat, SessionTelemetry, Subagent, TelemetrySnapshot, ToolDigest, Turn,
+};
 
-/// Where one spawn publishes: each referenced log's subagents, in log order (D10).
+/// One followed log: its path and the dialect it is folded in (`session-overview-ui` D24).
+pub type LogSource = (PathBuf, LogFormat);
+
+/// One log's digest, as the overview reads it (`session-overview-ui` D19).
+///
+/// The projection of a digest-flagged [`TelemetrySnapshot`] onto what the overlay draws.
+/// Everything else the snapshot carries (token totals, files, tasks …) is the ai-monitor
+/// panel's and is dropped here, so an unrelated fold — a usage line — changes nothing this
+/// compares equal on and publishes nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionDigest {
+    /// The log's subagents, **newest first** — `SessionTelemetry`'s ring order, capped at 32.
+    /// Readers that want log order reverse it and order by start (`overview::log_order`).
+    pub subagents: Vec<Subagent>,
+    /// The newest finished tool call, any name (D11).
+    pub last_tool: Option<ToolDigest>,
+    /// The newest finished tool call that is neither `Agent` nor `Task` (D4, D11).
+    pub last_work_tool: Option<ToolDigest>,
+    /// The latest human prompt (D7).
+    pub last_prompt_ms: Option<u64>,
+    /// Newest first, at most 64 (D12, D19).
+    pub turns: Vec<Turn>,
+    /// Newest first, at most 64 (D13).
+    pub events: Vec<Event>,
+    pub first_event_ms: Option<u64>,
+    /// For `claude --resume` (D22).
+    pub session_id: Option<String>,
+}
+
+impl SessionDigest {
+    /// Take the digest's fields out of `snap`.
+    pub fn from_snapshot(snap: TelemetrySnapshot) -> SessionDigest {
+        SessionDigest {
+            subagents: snap.subagents,
+            last_tool: snap.last_tool,
+            last_work_tool: snap.last_work_tool,
+            last_prompt_ms: snap.last_prompt_ms,
+            turns: snap.turns,
+            events: snap.events,
+            first_event_ms: snap.first_event_ms,
+            session_id: snap.session_id,
+        }
+    }
+}
+
+/// Where one spawn publishes: each referenced log's digest (D10, `session-overview-ui` D19).
 ///
 /// One slot **per spawn**: the overlay replaces it on every open and reads only the current
 /// one, which is half of what keeps a thread left over from a previous open out of the model
 /// (the other half is the stop check under this lock).
-pub type SubagentSlot = Arc<Mutex<HashMap<PathBuf, Vec<Subagent>>>>;
+pub type DigestSlot = Arc<Mutex<HashMap<PathBuf, SessionDigest>>>;
 
 /// How often the thread re-checks its logs for appended bytes.
 const PASS_INTERVAL: Duration = Duration::from_millis(250);
@@ -66,16 +117,26 @@ const _: () = assert!(PASS_INTERVAL
 pub struct FlowTelemetry {
     stop: Arc<AtomicBool>,
     /// The next log set, taken by the thread at the start of its next pass.
-    pending: Arc<Mutex<Option<Vec<PathBuf>>>>,
-    slot: SubagentSlot,
+    pending: Arc<Mutex<Option<Vec<LogSource>>>>,
+    slot: DigestSlot,
     thread: Option<JoinHandle<()>>,
 }
 
 impl FlowTelemetry {
     /// Replace the set of logs to follow. A log no longer in the set is dropped from the
     /// next publish (R7.2, D14: a closed tab's watcher goes on the next pass).
+    ///
+    /// Every log here is a Claude log; [`update_sources`](Self::update_sources) names each
+    /// one's format.
     pub fn update_logs(&self, logs: Vec<PathBuf>) {
-        *lock(&self.pending) = Some(logs);
+        self.update_sources(claude_sources(logs));
+    }
+
+    /// Replace the set of logs to follow, each with its format (`session-overview-ui` D24).
+    /// A log no longer in the set, or now named with another format, is dropped from the
+    /// next publish.
+    pub fn update_sources(&self, sources: Vec<LogSource>) {
+        *lock(&self.pending) = Some(sources);
     }
 
     /// Tell the thread to exit, and return at once (D10: the UI thread never joins).
@@ -110,12 +171,12 @@ impl Drop for FlowTelemetry {
 /// and the overlay's cache key can never match a model built from a previous open's data.
 pub fn spawn(
     logs: Vec<PathBuf>,
-    slot: SubagentSlot,
+    slot: DigestSlot,
     generation: Arc<AtomicU64>,
     wake: Arc<dyn Fn() + Send + Sync>,
 ) -> FlowTelemetry {
     let stop = Arc::new(AtomicBool::new(false));
-    let pending = Arc::new(Mutex::new(Some(logs)));
+    let pending = Arc::new(Mutex::new(Some(claude_sources(logs))));
     let worker = Worker {
         stop: stop.clone(),
         pending: pending.clone(),
@@ -142,6 +203,11 @@ pub fn spawn(
     }
 }
 
+/// `logs`, each a Claude log.
+fn claude_sources(logs: Vec<PathBuf>) -> Vec<LogSource> {
+    logs.into_iter().map(|p| (p, LogFormat::Claude)).collect()
+}
+
 /// Poison is not a reason to lose the graph: the data is a plain map, valid at every point.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     match m.lock() {
@@ -155,16 +221,18 @@ struct Tail {
     telemetry: SessionTelemetry,
     /// Bytes folded so far — always just past a newline.
     offset: u64,
-    /// The last subagent list computed, `None` until the first fold.
-    subagents: Option<Vec<Subagent>>,
+    /// The last digest computed, `None` until the first fold.
+    digest: Option<SessionDigest>,
 }
 
 impl Tail {
-    fn new() -> Tail {
+    fn new(format: LogFormat) -> Tail {
         Tail {
-            telemetry: SessionTelemetry::new(),
+            // `session-overview-ui` D19: only this thread sets the digest flag — for an
+            // Antigravity transcript too (D24).
+            telemetry: SessionTelemetry::with_format(format).with_digest(),
             offset: 0,
-            subagents: None,
+            digest: None,
         }
     }
 }
@@ -179,8 +247,8 @@ enum Step {
 
 struct Worker {
     stop: Arc<AtomicBool>,
-    pending: Arc<Mutex<Option<Vec<PathBuf>>>>,
-    slot: SubagentSlot,
+    pending: Arc<Mutex<Option<Vec<LogSource>>>>,
+    slot: DigestSlot,
     generation: Arc<AtomicU64>,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
@@ -191,7 +259,7 @@ impl Worker {
     }
 
     fn run(self) {
-        let mut logs: Vec<PathBuf> = Vec::new();
+        let mut logs: Vec<LogSource> = Vec::new();
         let mut watched: HashMap<PathBuf, Tail> = HashMap::new();
         // D18: an unreadable log is named once, not once per pass; a success re-arms it.
         let mut warned: HashSet<PathBuf> = HashSet::new();
@@ -203,18 +271,22 @@ impl Worker {
             if let Some(next) = lock(&self.pending).take() {
                 logs = next;
                 let before = watched.len();
-                watched.retain(|p, _| logs.contains(p));
-                warned.retain(|p| logs.contains(p));
+                // A path is kept only under the format it was folded in.
+                watched.retain(|p, t| {
+                    logs.iter()
+                        .any(|(q, f)| q == p && *f == t.telemetry.format())
+                });
+                warned.retain(|p| logs.iter().any(|(q, _)| q == p));
                 dirty |= watched.len() != before;
             }
-            for path in &logs {
+            for (path, format) in &logs {
                 if self.stopped() {
                     return;
                 }
                 let mut fresh = None;
                 let tail = match watched.get_mut(path) {
                     Some(t) => t,
-                    None => fresh.insert(Tail::new()),
+                    None => fresh.insert(Tail::new(*format)),
                 };
                 match advance(path, tail, &self.stop) {
                     Ok(Step::Stopped) => return,
@@ -248,9 +320,9 @@ impl Worker {
     /// Replace the slot's map with what `watched` holds. `false` when stopped — the work is
     /// discarded, and nothing is written or bumped (R7.3).
     fn publish(&self, watched: &HashMap<PathBuf, Tail>) -> bool {
-        let map: HashMap<PathBuf, Vec<Subagent>> = watched
+        let map: HashMap<PathBuf, SessionDigest> = watched
             .iter()
-            .filter_map(|(p, t)| t.subagents.clone().map(|s| (p.clone(), s)))
+            .filter_map(|(p, t)| t.digest.clone().map(|d| (p.clone(), d)))
             .collect();
         {
             let mut slot = lock(&self.slot);
@@ -289,7 +361,7 @@ impl Worker {
 fn advance(path: &Path, tail: &mut Tail, stop: &AtomicBool) -> std::io::Result<Step> {
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
-    let mut changed = tail.subagents.is_none();
+    let mut changed = tail.digest.is_none();
     if len < tail.offset {
         tail.telemetry = tail.telemetry.restarted();
         tail.offset = 0;
@@ -315,11 +387,11 @@ fn advance(path: &Path, tail: &mut Tail, stop: &AtomicBool) -> std::io::Result<S
     if !changed {
         return Ok(Step::Unchanged);
     }
-    let subagents = tail.telemetry.snapshot().subagents;
-    if tail.subagents.as_ref() == Some(&subagents) {
+    let digest = SessionDigest::from_snapshot(tail.telemetry.snapshot());
+    if tail.digest.as_ref() == Some(&digest) {
         return Ok(Step::Unchanged);
     }
-    tail.subagents = Some(subagents);
+    tail.digest = Some(digest);
     Ok(Step::Changed)
 }
 
@@ -340,15 +412,15 @@ mod tests {
     fn an_unterminated_line_waits_for_its_newline() {
         let p = temp("partial");
         std::fs::write(&p, AGENT).expect("write");
-        let mut tail = Tail::new();
+        let mut tail = Tail::new(LogFormat::Claude);
         let stop = AtomicBool::new(false);
         assert_eq!(advance(&p, &mut tail, &stop).ok(), Some(Step::Changed));
         assert_eq!(tail.offset, 0, "nothing folded before the newline");
-        assert_eq!(tail.subagents.as_deref().map(<[_]>::len), Some(0));
+        assert_eq!(tail.digest.as_ref().map(|d| d.subagents.len()), Some(0));
 
         std::fs::write(&p, format!("{AGENT}\n")).expect("write");
         assert_eq!(advance(&p, &mut tail, &stop).ok(), Some(Step::Changed));
-        assert_eq!(tail.subagents.as_deref().map(<[_]>::len), Some(1));
+        assert_eq!(tail.digest.as_ref().map(|d| d.subagents.len()), Some(1));
         assert_eq!(advance(&p, &mut tail, &stop).ok(), Some(Step::Unchanged));
     }
 
@@ -356,20 +428,20 @@ mod tests {
     fn a_truncated_log_restarts_the_fold() {
         let p = temp("truncate");
         std::fs::write(&p, format!("{AGENT}\n{AGENT}\n")).expect("write");
-        let mut tail = Tail::new();
+        let mut tail = Tail::new(LogFormat::Claude);
         let stop = AtomicBool::new(false);
         let _ = advance(&p, &mut tail, &stop);
         std::fs::write(&p, "{}\n").expect("write");
         assert_eq!(advance(&p, &mut tail, &stop).ok(), Some(Step::Changed));
         assert_eq!(tail.offset, 3);
-        assert_eq!(tail.subagents.as_deref().map(<[_]>::len), Some(0));
+        assert_eq!(tail.digest.as_ref().map(|d| d.subagents.len()), Some(0));
     }
 
     #[test]
     fn a_set_stop_flag_abandons_the_fold() {
         let p = temp("stop");
         std::fs::write(&p, format!("{AGENT}\n")).expect("write");
-        let mut tail = Tail::new();
+        let mut tail = Tail::new(LogFormat::Claude);
         let stop = AtomicBool::new(true);
         assert_eq!(advance(&p, &mut tail, &stop).ok(), Some(Step::Stopped));
     }
@@ -388,8 +460,8 @@ mod tests {
         cond()
     }
 
-    fn start(p: &Path) -> (FlowTelemetry, SubagentSlot, Arc<AtomicU64>) {
-        let slot: SubagentSlot = Arc::default();
+    fn start(p: &Path) -> (FlowTelemetry, DigestSlot, Arc<AtomicU64>) {
+        let slot: DigestSlot = Arc::default();
         let generation = Arc::new(AtomicU64::new(0));
         let h = spawn(
             vec![p.to_path_buf()],
@@ -457,7 +529,7 @@ mod tests {
         assert!(within(Duration::from_secs(5), || generation
             .load(Ordering::SeqCst)
             == 1));
-        assert_eq!(lock(&slot).get(&p).map(Vec::len), Some(1));
+        assert_eq!(lock(&slot).get(&p).map(|d| d.subagents.len()), Some(1));
         // Three passes over an unchanged file: no further publish.
         std::thread::sleep(PASS_INTERVAL * 3);
         assert_eq!(generation.load(Ordering::SeqCst), 1);
@@ -468,7 +540,7 @@ mod tests {
         std::io::Write::write_all(&mut f, format!("{AGENT2}\n").as_bytes()).expect("append");
         assert!(within(Duration::from_secs(5), || lock(&slot)
             .get(&p)
-            .map(Vec::len)
+            .map(|d| d.subagents.len())
             == Some(2)));
         assert_eq!(generation.load(Ordering::SeqCst), 2);
         drop(h);
@@ -493,18 +565,49 @@ mod tests {
     }
 
     #[test]
+    fn an_antigravity_transcript_is_folded_in_its_own_dialect() {
+        // D24: the same bytes fold to a subagent only as an Antigravity transcript.
+        let p = temp("agy");
+        let lines = [
+            r#"{"step_index":0,"type":"USER_INPUT","status":"DONE","created_at":"2026-10-31T10:00:00Z"}"#,
+            r#"{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-31T10:00:05Z","tool_calls":[{"name":"invoke_subagent","args":{}}]}"#,
+            r#"{"step_index":2,"type":"INVOKE_SUBAGENT","status":"DONE","created_at":"2026-10-31T10:00:06Z","content":"Created At: x\nCreated the following subagent:\n{\"conversationId\": \"c5fdd0df-a369-4025-a618-7905f77cbd04\"}"}"#,
+        ];
+        std::fs::write(&p, format!("{}\n", lines.join("\n"))).expect("write");
+        let stop = AtomicBool::new(false);
+        let mut agy = Tail::new(LogFormat::Antigravity);
+        assert_eq!(advance(&p, &mut agy, &stop).ok(), Some(Step::Changed));
+        let d = agy.digest.as_ref().expect("a digest");
+        assert_eq!(d.subagents.len(), 1);
+        assert_eq!(d.last_prompt_ms, Some(1_793_440_800_000));
+        let mut claude = Tail::new(LogFormat::Claude);
+        let _ = advance(&p, &mut claude, &stop);
+        assert_eq!(claude.digest.as_ref().map(|d| d.subagents.len()), Some(0));
+
+        // Through the thread: a source named Antigravity publishes that digest.
+        let (h, slot, generation) = start(Path::new("/nonexistent/flow-telemetry/none"));
+        h.update_sources(vec![(p.clone(), LogFormat::Antigravity)]);
+        assert!(within(Duration::from_secs(5), || lock(&slot)
+            .get(&p)
+            .map(|d| d.subagents.len())
+            == Some(1)));
+        assert!(generation.load(Ordering::SeqCst) >= 1);
+        drop(h);
+    }
+
+    #[test]
     fn folded_bytes_are_not_read_again() {
         // The tail is incremental: a log whose length did not change is not re-folded from
         // the top, even if (here, deliberately) the bytes behind the offset were rewritten.
         let p = temp("same-len");
         std::fs::write(&p, format!("{AGENT}\n")).expect("write");
-        let mut tail = Tail::new();
+        let mut tail = Tail::new(LogFormat::Claude);
         let stop = AtomicBool::new(false);
         assert_eq!(advance(&p, &mut tail, &stop).ok(), Some(Step::Changed));
         let offset = tail.offset;
         std::fs::write(&p, format!("{}\n", " ".repeat(AGENT.len()))).expect("write");
         assert_eq!(advance(&p, &mut tail, &stop).ok(), Some(Step::Unchanged));
         assert_eq!(tail.offset, offset);
-        assert_eq!(tail.subagents.as_deref().map(<[_]>::len), Some(1));
+        assert_eq!(tail.digest.as_ref().map(|d| d.subagents.len()), Some(1));
     }
 }

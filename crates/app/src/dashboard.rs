@@ -1395,6 +1395,7 @@ mod tests {
                 completed: false,
                 agent_id: None,
                 ended_ok: true,
+                report_preview: None,
             },
             agent_done(
                 "a2",
@@ -1490,6 +1491,7 @@ mod tests {
             completed: true,
             agent_id: None,
             ended_ok: true,
+            report_preview: None,
         }
     }
 
@@ -2186,6 +2188,7 @@ mod tests {
                 completed: false,
                 agent_id: Some("agent-11".into()),
                 ended_ok: true,
+                report_preview: None,
             }],
             ..TelemetrySnapshot::default()
         }
@@ -2837,6 +2840,7 @@ mod tests {
                 completed: false,
                 agent_id: Some("g".repeat(300)),
                 ended_ok: true,
+                report_preview: None,
             }],
             files: vec![file(FileOp::Read, &"p".repeat(400), true, Some(u64::MAX))],
             tools: vec![CompletedTool {
@@ -3134,6 +3138,7 @@ mod tests {
                 // agent id to join on and nothing can mark its end as a failure.
                 agent_id: None,
                 ended_ok: true,
+                report_preview: None,
             }],
             ..TelemetrySnapshot::default()
         };
@@ -3175,6 +3180,7 @@ mod tests {
                 // in this format, so both fields stay at their un-notified values.
                 agent_id: None,
                 ended_ok: true,
+                report_preview: None,
             }],
             ..TelemetrySnapshot::default()
         };
