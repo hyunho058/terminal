@@ -639,6 +639,21 @@ The user tested the build and reported three defects the gates did not catch. D2
   drawing `““…”`. The layout now ellipsises the text **inside** an existing pair of quotes and
   draws one pair.
 
+### D27: A handed-back task-notification is not a prompt (amends the card classifier)
+- **Status**: resolved (user 2026-11-01, second manual run)
+- **Rationale**: Claude Code 2.1.28x delivers a background subagent's report twice — a `peer`
+  user record (`origin.handback: true`, `origin.from: <task id>`), which the assistant answers,
+  then a `task-notification` user record for the same id, appended after that turn ended and
+  never answered. `activity::classify_user` read the trailing notification as `UserPrompt`, so
+  the card (and the overview row through `row_meta`) read Working indefinitely. Measured
+  2026-11-01T00:17Z over `~/.claude/projects`: 22 of 24 notifications preceded by a hand-back for
+  their id were followed by a human prompt or nothing; 2 of 249 without one. `activity::
+  state_from_reads` now, only when the tail says `UserPrompt`, walks the `PROMPT_SCAN_CAP` window
+  and skips trailing notifications whose id a hand-back names, classifying the message before
+  them. A notification with no hand-back stays a prompt. Accepted cost: in the rare case Claude
+  does answer such a notification (2 of 24), the card reads the previous `end_turn` until the
+  answer is written.
+
 ## Constraints
 - `term-core` is not touched; `renderer` gains no `winit` or app type; no GUI crate.
 - Status is the sidebar card's, through `row_meta` / `resolve_status`; the overview
@@ -655,13 +670,6 @@ The user tested the build and reported three defects the gates did not catch. D2
 - An unchanged frame writes no GPU buffer (G1, two-stage cache carried).
 
 ## Known Gaps
-- **Unanswered task-notification reads Working** (found 2026-10-31, deferred by the user): when a
-  background agent's result arrives first as a `peer` message and its `task-notification` lands
-  after Claude's `end_turn`, Claude never answers the notification, but
-  `ai_monitor::activity::classify_user` counts it as a human prompt (`UserPrompt` → Busy), so
-  the **sidebar card** and therefore the overview row read Working until the recency fallback
-  expires. A card-classifier change (`agent-card-status`, `claude-background-working`), out of
-  this spec.
 - **D16 / compact sidebar**: the 380 px board is not built. Its home (left sidebar
   restyle, right dock shared with the ai-monitor, or a third surface) needs the person's
   decision; this spec's model is reusable by it.
@@ -1121,7 +1129,7 @@ Boundaries named in the GWTs below that do not exist yet are created by the task
 - **When**: a second frame is recorded
 - **Then**: the layer's `compose_count()` does not advance and no buffer is written
 
-### R11: Amendment fixes — D24, D25, D26
+### R11: Amendment fixes — D24, D25, D26, D27
 
 #### R11.1: The tab label skips non-human user records
 - **Given**: a Claude log whose newest user records are, newest first, a `task-notification`
@@ -1163,6 +1171,14 @@ Boundaries named in the GWTs below that do not exist yet are created by the task
 - **When**: `app::overview_detail::build_detail` builds it
 - **Then**: `has_timeline` is true, there are 2 lanes, and `resume_cmd` is `None`; a Codex row
   with no digest still has `has_timeline` false
+
+#### R11.7: A handed-back notification does not hold the card on Working (D27)
+- **Given**: a Claude log ending, oldest first, in a background `Agent` launch, a `peer` hand-back
+  (`origin.handback: true`, `origin.from: a3ee`) answered by an `end_turn`, and a
+  `task-notification` user record for `a3ee`; and the same log without the hand-back
+- **When**: `ai_monitor::activity::tail_state` reads each
+- **Then**: the first's `last` is `AssistantEndTurn`; the second's is `UserPrompt`; a hand-back
+  naming another task leaves `UserPrompt`
 
 ## Tasks
 

@@ -308,6 +308,16 @@ idle behaviour. See G1 for what the caches do and do not buy against it.
     `TaskStop`) holds `Working` until the user types, by design (D6). **"A finished Claude
     tab reads Working" should be read as "grep the log's newest `queue-operation` for
     `<task-notification>`".**
+
+    **The hand-back duplicate** (`specs/session-overview-ui` D27). Claude Code 2.1.28x
+    delivers a background subagent's report twice: a `peer` record with `origin.handback:
+    true` and `origin.from: <task id>`, which the assistant answers, then a
+    `task-notification` user record for the same id, appended after that turn ended and never
+    answered. When the newest message is such a notification, `activity::skip_handed_back`
+    classifies the message before it instead. A renamed `origin.kind: "peer"`, `handback` or `from`
+    brings back the old symptom: the card reads `Working` after a finished turn, until the user types. **"A
+    finished Claude tab reads Working and its last record is a `task-notification`" should be
+    read as "check the earlier `peer` record's `origin` for `handback` and `from`".**
   - **Both agents' dialog wording and layout.** `prompt.rs` matches Claude Code's permission
     dialog by two of its question, footer and chooser lines, and the Antigravity CLI's by its
     question row with the first choice (`1. Yes, …`) as the next non-blank row. Antigravity's

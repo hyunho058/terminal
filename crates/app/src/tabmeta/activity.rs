@@ -465,7 +465,8 @@ fn tail_role(
         // Honest wrapper accounting (R6.1): the activity tail is bounded to TAIL_CAP; the
         // label scan adds up to PROMPT_SCAN_CAP more, both only on a changed log. The tail
         // read may add one more PROMPT_SCAN_CAP back-scan, when the tail ends in an
-        // `end_turn` (`claude-background-working` D7). `TailState` does not say whether it
+        // `end_turn` (`claude-background-working` D7) or a task-notification
+        // (`session-overview-ui` D27; the two share one read). `TailState` does not say whether it
         // ran, so this is an upper bound that counts it every time.
         super::probe::LOG_READ_BYTES.bump(
             len.min(ai_monitor::activity::TAIL_CAP)

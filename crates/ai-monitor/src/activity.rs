@@ -114,9 +114,26 @@ fn state_from_reads(
     let role = text.lines().rev().find_map(parse_line)?.role;
     // The D16 input-waiting signal from the last *meaningful* message (see below).
     let mut last = last_meaningful(&text);
+    // The one wider read, shared by both rules below, so a log costs at most
+    // TAIL_CAP + PROMPT_SCAN_CAP here whichever of them runs.
+    let mut window: Option<Option<String>> = None;
+    let mut scan = |read: &mut dyn FnMut(u64) -> Option<Vec<u8>>| {
+        window
+            .get_or_insert_with(|| {
+                read(PROMPT_SCAN_CAP).map(|w| String::from_utf8_lossy(&w).into_owned())
+            })
+            .clone()
+    };
+    // `session-overview-ui` D27: a trailing task-notification whose report was already
+    // handed back (and answered) as a peer message is never answered again, so it is not
+    // a prompt. Classify what came before it instead.
+    if last == Some(LastMessage::UserPrompt) && newest_is_notification(&text) {
+        if let Some(earlier) = scan(&mut read_last).and_then(|w| skip_handed_back(&w)) {
+            last = Some(earlier);
+        }
+    }
     if last == Some(LastMessage::AssistantEndTurn)
-        && read_last(PROMPT_SCAN_CAP)
-            .is_some_and(|window| background_pending(&String::from_utf8_lossy(&window)))
+        && scan(&mut read_last).is_some_and(|w| background_pending(&w))
     {
         last = Some(LastMessage::AssistantBusy);
     }
@@ -365,6 +382,68 @@ fn calls_blocking_tool(v: &Value) -> bool {
                 .and_then(Value::as_str)
                 .is_some_and(|n| BLOCKING_TOOLS.contains(&n))
     })
+}
+
+/// The classification of the last meaningful message in `window` once trailing
+/// task-notifications for **handed-back** tasks are skipped, or `None` when the newest
+/// meaningful message is not such a notification (the caller keeps its own answer).
+///
+/// Claude Code (2.1.28x) delivers a background subagent's report twice: first as a `peer`
+/// user record with `origin.handback: true` and `origin.from: <task id>`, which the
+/// assistant answers, then as a `task-notification` user record for the same id, appended
+/// after that turn has ended and never answered. Measured 2026-11-01T00:17Z over
+/// `~/.claude/projects`: 22 of 24 notifications preceded by a hand-back for their id were
+/// followed by a human prompt or nothing, against 2 of 249 without one. Read as a prompt,
+/// it held the card on `Working` forever. A notification with no hand-back is still a
+/// prompt: the assistant answers those.
+///
+/// Walked newest first and stops at the first line that does not parse, as
+/// [`background_pending`] does; the hand-back is searched in the parsed records only.
+fn skip_handed_back(window: &str) -> Option<LastMessage> {
+    let records: Vec<Value> = window
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map_while(|l| serde_json::from_str(l).ok())
+        .collect();
+    let handed_back: HashSet<&str> = records
+        .iter()
+        .filter(|v| {
+            v.pointer("/origin/kind").and_then(Value::as_str) == Some("peer")
+                && v.pointer("/origin/handback").and_then(Value::as_bool) == Some(true)
+        })
+        .filter_map(|v| v.pointer("/origin/from").and_then(Value::as_str))
+        .collect();
+    let mut skipped = false;
+    for v in &records {
+        match v.pointer("/message/role").and_then(Value::as_str) {
+            Some("user")
+                if v.pointer("/origin/kind").and_then(Value::as_str)
+                    == Some("task-notification")
+                    && completed_id(v).is_some_and(|id| handed_back.contains(id)) =>
+            {
+                skipped = true;
+            }
+            Some("assistant") => return skipped.then(|| classify_assistant(v)),
+            Some("user") => return skipped.then(|| classify_user(v)),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether the newest meaningful message in `text` is a `task-notification` user record —
+/// the only `UserPrompt` that [`skip_handed_back`]'s wider read can change, so a real human
+/// prompt still costs the tail alone (`claude-background-working` R4.7).
+fn newest_is_notification(text: &str) -> bool {
+    text.lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
+        .find(|v| v.pointer("/message/role").is_some())
+        .is_some_and(|v| {
+            v.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification")
+        })
 }
 
 /// A user message is `UserToolResult` iff it carries a top-level `toolUseResult` (the agent
@@ -837,6 +916,83 @@ mod tests {
         );
     }
 
+    /// The record sequence of a real session (f2b19ffd, 2026-10-31): a background `Agent`
+    /// launch, its report handed back as a peer message and answered, then the duplicate
+    /// task-notification appended after the turn ended (`session-overview-ui` D27).
+    fn handback_log(with_handback: bool) -> String {
+        let mut lines = vec![
+            r#"{"type":"user","message":{"role":"user","content":"review the doc"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1"}]},"toolUseResult":{"agentId":"a3ee","isAsync":true,"status":"async_launched"}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"started"}]}}"#,
+        ];
+        if with_handback {
+            lines.push(r#"{"type":"user","isMeta":true,"origin":{"kind":"peer","from":"a3ee","handback":true},"message":{"role":"user","content":"Another Claude session sent a message: <agent-message from=\"a3ee\">report"}}"#);
+            lines.push(r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"the review is back"}]}}"#);
+        }
+        lines.push(r#"{"type":"system","subtype":"turn_duration"}"#);
+        lines.push(r#"{"type":"user","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification> <task-id>a3ee</task-id> <status>completed</status> </task-notification>"}}"#);
+        lines.join("\n") + "\n"
+    }
+
+    #[test]
+    fn a_handed_back_notification_is_not_a_prompt() {
+        let log = tmpfile("handback", handback_log(true).as_bytes());
+        assert_eq!(
+            tail_state(&log).expect("tail").last,
+            Some(LastMessage::AssistantEndTurn)
+        );
+    }
+
+    #[test]
+    fn a_notification_without_a_handback_is_still_a_prompt() {
+        let log = tmpfile("no-handback", handback_log(false).as_bytes());
+        assert_eq!(
+            tail_state(&log).expect("tail").last,
+            Some(LastMessage::UserPrompt)
+        );
+    }
+
+    #[test]
+    fn a_handback_for_another_task_skips_nothing() {
+        let body = handback_log(true).replace(r#""from":"a3ee""#, r#""from":"other""#);
+        let log = tmpfile("handback-other", body.as_bytes());
+        assert_eq!(
+            tail_state(&log).expect("tail").last,
+            Some(LastMessage::UserPrompt)
+        );
+    }
+
+    #[test]
+    fn a_peer_message_that_is_not_a_handback_skips_nothing() {
+        // `handback: true` and `kind: "peer"` are both required: a plain peer message from
+        // the task (no hand-back flag) does not mark its notification as answered.
+        let body = handback_log(true).replace(r#","handback":true"#, "");
+        let log = tmpfile("peer-no-handback", body.as_bytes());
+        assert_eq!(
+            tail_state(&log).expect("tail").last,
+            Some(LastMessage::UserPrompt)
+        );
+    }
+
+    #[test]
+    fn the_message_before_a_skipped_notification_can_be_a_user_record() {
+        // The skip lands on whatever came before, a tool result included.
+        let mut body = handback_log(true);
+        let notification = body.lines().last().expect("line").to_string();
+        body = body.replace(&format!("{notification}\n"), "");
+        body.push_str(
+            r#"{"type":"user","message":{"role":"user"},"toolUseResult":{"stdout":"ok"}}"#,
+        );
+        body.push('\n');
+        body.push_str(&notification);
+        body.push('\n');
+        let log = tmpfile("skip-to-user", body.as_bytes());
+        assert_eq!(
+            tail_state(&log).expect("tail").last,
+            Some(LastMessage::UserToolResult)
+        );
+    }
+
     #[test]
     fn prompts_are_human_prompts_only() {
         // session-overview-ui D25: notifications, peer messages, isMeta injections and
@@ -940,6 +1096,26 @@ mod tests {
             read,
             TAIL_CAP + PROMPT_SCAN_CAP,
             "end_turn: tail + back-scan"
+        );
+
+        // D27: a trailing handed-back notification reads past the tail once, and that one
+        // window also serves the end_turn back-scan the skip leads to.
+        let mut handed_back = big_log_ending_in(
+            r#"{"type":"user","origin":{"kind":"peer","from":"a1","handback":true},"message":{"role":"user","content":"report"}}"#,
+        );
+        for line in [
+            r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn"}}"#,
+            r#"{"type":"user","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification> <task-id>a1</task-id> </task-notification>"}}"#,
+        ] {
+            handed_back.extend_from_slice(line.as_bytes());
+            handed_back.push(b'\n');
+        }
+        let (last, read) = classify_counting(&handed_back);
+        assert_eq!(last, Some(LastMessage::AssistantEndTurn));
+        assert_eq!(
+            read,
+            TAIL_CAP + PROMPT_SCAN_CAP,
+            "notification: one back-scan"
         );
 
         for (what, line) in [
