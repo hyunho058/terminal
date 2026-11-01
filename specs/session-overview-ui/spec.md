@@ -56,9 +56,8 @@ terracotta accent and monospace tone, not either "Design System" in the user's a
   (session-flow-graph D4 / architecture G10), and the left sidebar is the tab strip, whose
   order is the user's tab order and must not be regrouped by status. It is left to its own
   spec.
-- **Antigravity, Codex, Gemini and Aider subagents.** Only Claude's session log records
-  subagents (architecture G10); the design's Antigravity subagent squares are illustrative
-  example data, as the user says.
+- **Codex, Gemini and Aider subagents.** Their logs are not read. (Antigravity was listed here
+  until 2026-10-31; the premise "only Claude's log records subagents" was false — see D24.)
 - **A "Needs you" state for dialogs the app cannot see.** Status stays the sidebar card's
   (one classifier); Codex's approval dialog is not matched by `prompt.rs` today and is not
   added here.
@@ -312,7 +311,8 @@ or be renamed by the implementer; behaviour, not names, is specified.
     (D11), or `{Tool}` when it has no summary, or `Working` with no tool seen.
   - **Idle**: `Turn finished · ready for next prompt`.
   - **Agent** (unknown): `Agent running`.
-  Non-Claude sessions have no log digest, so they use the state-only strings. The
+  Codex, Gemini and Aider sessions have no log digest, so they use the state-only strings
+  (Antigravity has one since D24). The
   design's `⏸` glyph is dropped: the font chain does not guarantee it, and a tofu box in
   the strongest cell is worse than no glyph. Claude Code writes a `tool_use` only once it
   returns (G8), so "the last tool call" is honestly the last **finished** one; the text
@@ -450,7 +450,7 @@ or be renamed by the implementer; behaviour, not names, is specified.
   background work started in it is still pending — the very rule the card's G8 Working
   state uses — so a lane never reads idle while the status pill reads Working, and a
   background agent's run shows as *waiting on subagent*. A non-Claude session's detail shows the header and, in place of the timeline,
-  `No timeline — only Claude Code sessions record subagents.` Rejected: the whole session
+  `No timeline — this agent's log is not read.` Rejected: the whole session
   as the window (a long session makes every bar a hairline) and only the latest turn (a
   short follow-up prompt would empty the timeline the user came for).
 
@@ -600,6 +600,45 @@ or be renamed by the implementer; behaviour, not names, is specified.
   are kept and re-pointed. New pure files reach 0 `cargo mutants` survivors or record each
   survivor as equivalent.
 
+### Amendment 2026-10-31 (after the user's first run; approved by the user in the verification loop)
+
+The user tested the build and reported three defects the gates did not catch. D24–D26 are
+`resolved (user 2026-10-31)`; they amend D3, D7, D8, D12 and the Non-goals where named.
+
+### D24: Antigravity sessions get a digest too (amends Non-goals, D7, D8, D12)
+- **Status**: resolved (user 2026-10-31)
+- **Rationale**: `ai_monitor::telemetry` already folds an Antigravity transcript's
+  `invoke_subagent` calls into `Subagent`s (`telemetry.rs` `apply_antigravity`), and its
+  `USER_INPUT` steps are the human prompts. The worker already memoises each `agy` pid's
+  transcript path (`tabmeta/antigravity.rs`). So on **graph passes only** the worker
+  publishes that path as `TabMeta.graph_transcript` / `PaneMeta.graph_transcript`; the
+  overlay's digest thread follows it with `SessionTelemetry::with_format(LogFormat::Antigravity)
+  .with_digest()`; and the digest for an Antigravity transcript carries `subagents`,
+  `first_event_ms`, `last_prompt_ms` (the newest `USER_INPUT` step), `last_tool` /
+  `last_work_tool` (tool name; summary `None` unless the call's args map as in D11), `events`
+  (tool calls, subagent start/done/failed) and `turns` (start: a `USER_INPUT` step; end: the
+  first tool-less planner response after it with no background work pending — the rule
+  `agy-background-working` already uses for the card). An Antigravity row then shows squares,
+  summary, tree, elapsed and a detail timeline exactly as a Claude row does. `Copy resume cmd`
+  stays Claude-only. The detail's no-timeline message becomes `No timeline — this agent's log
+  is not read.` (Codex, Gemini, Aider). Rejected: reading Antigravity subagents from the screen
+  (the transcript already has them).
+
+### D25: The prompt line and the tab label are human prompts only (amends D3)
+- **Status**: resolved (user 2026-10-31)
+- **Rationale**: `ai_monitor::activity::recent_prompts` accepted every `user` record with no
+  `toolUseResult` — task notifications, peer messages and `isMeta` skill injections
+  ("Base directory for this skill: …") included — so the row's prompt line (and the sidebar
+  card's title, which reads the same label) showed `<task-notification> …`. It now admits only
+  records `activity::is_human_prompt` accepts, the same predicate D7's elapsed and D19's turns
+  use. One definition of "human prompt" for label, elapsed and turns.
+
+### D26: The prompt is quoted once (fixes D3's rendering)
+- **Status**: resolved (user 2026-10-31)
+- **Rationale**: the model already carries `“…”` (`overview.rs`); the layout wrapped it again,
+  drawing `““…”`. The layout now ellipsises the text **inside** an existing pair of quotes and
+  draws one pair.
+
 ## Constraints
 - `term-core` is not touched; `renderer` gains no `winit` or app type; no GUI crate.
 - Status is the sidebar card's, through `row_meta` / `resolve_status`; the overview
@@ -616,6 +655,13 @@ or be renamed by the implementer; behaviour, not names, is specified.
 - An unchanged frame writes no GPU buffer (G1, two-stage cache carried).
 
 ## Known Gaps
+- **Unanswered task-notification reads Working** (found 2026-10-31, deferred by the user): when a
+  background agent's result arrives first as a `peer` message and its `task-notification` lands
+  after Claude's `end_turn`, Claude never answers the notification, but
+  `ai_monitor::activity::classify_user` counts it as a human prompt (`UserPrompt` → Busy), so
+  the **sidebar card** and therefore the overview row read Working until the recency fallback
+  expires. A card-classifier change (`agent-card-status`, `claude-background-working`), out of
+  this spec.
 - **D16 / compact sidebar**: the 380 px board is not built. Its home (left sidebar
   restyle, right dock shared with the ai-monitor, or a third surface) needs the person's
   decision; this spec's model is reusable by it.
@@ -623,7 +669,8 @@ or be renamed by the implementer; behaviour, not names, is specified.
   Needs you only through their log state, and their now-doing text is state-only (D4).
 - A permission dialog in a **non-active** tmux pane is invisible to the dialog matcher, so
   that pane reads Idle (or Working) in the overview until it becomes the active pane (D2).
-- Non-Claude sessions have no subagents, elapsed or timeline (D7, D12).
+- Codex, Gemini and Aider sessions have no subagents, elapsed or timeline (D7, D12; their logs
+  are not read — Antigravity gained them in D24).
 - The dialog subject (D9) rests on two more strings of other programs' UIs — the tool-
   title row under the rule (Claude) and `Requesting permission for:` (Antigravity). A
   change reads as no subject (`Waiting for your input`), never as a wrong one. Add to
@@ -995,8 +1042,7 @@ Boundaries named in the GWTs below that do not exist yet are created by the task
 #### R8.8: Non-Claude detail
 - **Given**: an Antigravity session with no digest
 - **When**: `build_detail` builds it
-- **Then**: it has the header data and no lanes, and the layout shows `No timeline — only Claude
-  Code sessions record subagents.`
+- **Then**: it has the header data and no lanes, and the layout shows `No timeline — this agent's log is not read.`
 
 #### R8.9: The digest reaches the overlay
 - **Given**: the overlay open on a Claude tab whose log gains a subagent launch line
@@ -1074,6 +1120,49 @@ Boundaries named in the GWTs below that do not exist yet are created by the task
 - **Given**: an open overview whose model, scroll, hover and view are unchanged
 - **When**: a second frame is recorded
 - **Then**: the layer's `compose_count()` does not advance and no buffer is written
+
+### R11: Amendment fixes — D24, D25, D26
+
+#### R11.1: The tab label skips non-human user records
+- **Given**: a Claude log whose newest user records are, newest first, a `task-notification`
+  (`origin.kind: "task-notification"`), a `peer` message, an `isMeta` skill injection
+  (`Base directory for this skill: …`), and then a human prompt `fix the duplicate G7 numbering`
+- **When**: `ai_monitor::activity::recent_prompts` reads it
+- **Then**: the first entry is `fix the duplicate G7 numbering`; none of the three others appears
+
+#### R11.2: The prompt is drawn with one pair of quotes
+- **Given**: a row whose model prompt is `“fix the duplicate G7 numbering”`, and one whose prompt
+  is 300 characters inside `“…”`
+- **When**: `renderer::overview_layout::layout_overview` lays them out
+- **Then**: the first row's prompt text run is exactly `“fix the duplicate G7 numbering”`; the
+  second starts with exactly one `“`, ends with `…”`, and contains no `““`
+
+#### R11.3: An Antigravity transcript yields a digest
+- **Given**: an Antigravity transcript with a `USER_INPUT` step at t1, an `invoke_subagent` call
+  whose subagent completes, and a tool-less planner response at t2 with nothing pending, folded by
+  `SessionTelemetry::with_format(LogFormat::Antigravity).with_digest()`
+- **When**: `snapshot()` is taken
+- **Then**: `subagents` holds the subagent as completed, `last_prompt_ms` is t1, and `turns` holds
+  one turn `[t1, t2]`
+
+#### R11.4: The worker publishes the Antigravity transcript on graph passes only
+- **Given**: an Antigravity tab whose `agy` holds a presence lock naming a transcript
+- **When**: the tabmeta worker runs a graph pass, then a non-graph pass
+- **Then**: `TabMeta.graph_transcript` is that transcript's path after the first and `None` after
+  the second; a pane running `agy` gets its own `PaneMeta.graph_transcript` (in-crate unit test,
+  as R1.6)
+
+#### R11.5: An Antigravity row shows its subagents and elapsed
+- **Given**: an Antigravity session whose `graph_transcript` maps to a digest with 2 subagents
+  (one running, one done) and `last_prompt_ms` 3 minutes before `now_ms`
+- **When**: `app::overview::build_overview` builds the model
+- **Then**: the row has 2 squares, summary `1 running · 1 done`, and elapsed `3m`
+
+#### R11.6: An Antigravity detail has a timeline
+- **Given**: the R11.5 row and digest
+- **When**: `app::overview_detail::build_detail` builds it
+- **Then**: `has_timeline` is true, there are 2 lanes, and `resume_cmd` is `None`; a Codex row
+  with no digest still has `has_timeline` false
 
 ## Tasks
 

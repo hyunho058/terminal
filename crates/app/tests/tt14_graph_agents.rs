@@ -188,6 +188,7 @@ fn r14_2_mixed_agents_in_one_split_tab() {
     // Waiting, so the pane's own status differs from the tab's (Claude, Busy → Working).
     let codex = agent(AgentKind::Codex, AgentState::Waiting);
     let codex_pane = PaneMeta {
+        graph_transcript: None,
         graph_agent_cwd: None,
         graph_asks_user: false,
         pane_pid: 21,
@@ -206,6 +207,7 @@ fn r14_2_mixed_agents_in_one_split_tab() {
         panes: vec![
             codex_pane.clone(),
             PaneMeta {
+                graph_transcript: None,
                 graph_agent_cwd: None,
                 graph_asks_user: false,
                 pane_pid: 20,

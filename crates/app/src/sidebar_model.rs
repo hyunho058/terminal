@@ -351,6 +351,7 @@ mod tests {
     fn meta_at(cwd: &str) -> crate::tabmeta::TabMeta {
         crate::tabmeta::TabMeta {
             graph_agent_cwd: None,
+            graph_transcript: None,
             graph_asks_user: false,
             branch: None,
             agent: None,

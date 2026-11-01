@@ -159,9 +159,9 @@ pub fn recent_prompts(log: &Path) -> Vec<String> {
 }
 
 /// The recent *human* user prompts in `text`, newest first, capped to [`PROMPT_TAIL`]. A
-/// candidate is a complete JSON line whose `message.role` is `user`, that carries no
-/// top-level `toolUseResult` (that would be a tool result the agent consumed, not a human
-/// turn — matching [`classify_user`]), and that has non-empty text content. The pick of
+/// candidate is a complete JSON line with `message.role` `user` that [`is_human_prompt`]
+/// accepts (`session-overview-ui` D25: no tool result, notification, peer message, `isMeta`
+/// injection or non-`user` record type) and that has non-empty text content. The pick of
 /// which candidate labels the tab (D10) is the app's, not ours.
 fn recent_user_prompts(text: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -182,14 +182,20 @@ fn recent_user_prompts(text: &str) -> Vec<String> {
     out
 }
 
-/// The one-line text of `v` iff it is a human user prompt (role `user`, no `toolUseResult`)
-/// with non-empty content that is not a Claude Code command-wrapper turn; otherwise `None`.
+/// The one-line text of `v` iff it is a human user prompt with non-empty content that is not
+/// a Claude Code command-wrapper turn; otherwise `None`.
+///
+/// "Human prompt" is [`is_human_prompt`] — the one definition the turn span, the overview's
+/// elapsed and its digest turns already use (`session-overview-ui` D25). A role-`user` record
+/// alone is not enough: task notifications, peer messages, `isMeta` skill injections ("Base
+/// directory for this skill: …") and `api-request-blob` system reminders all carry it, and
+/// each of them used to become the tab's label.
 fn user_prompt_text(v: &Value) -> Option<String> {
     if v.pointer("/message/role").and_then(Value::as_str) != Some("user") {
         return None;
     }
-    if v.get("toolUseResult").is_some() {
-        return None; // a tool result the agent consumed, not a human turn
+    if !is_human_prompt(v) {
+        return None; // a tool result, a notification, a peer message or an injection
     }
     let flat = crate::one_line(&message_text(v)?);
     if flat.is_empty() || is_command_wrapper(&flat) {
@@ -829,6 +835,22 @@ mod tests {
             vec!["add a retry to the fetch helper"],
             "command-wrapper turns excluded; only the real prompt remains"
         );
+    }
+
+    #[test]
+    fn prompts_are_human_prompts_only() {
+        // session-overview-ui D25: notifications, peer messages, isMeta injections and
+        // api-request-blob reminders all carry role=user and must never become the label.
+        let body = [
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"fix the duplicate G7 numbering"}]}}"#,
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"Base directory for this skill: /x"}]}}"#,
+            r#"{"type":"api-request-blob","message":{"role":"user","content":[{"type":"text","text":"<system-reminder> x </system-reminder>"}]}}"#,
+            r#"{"type":"user","origin":{"kind":"peer"},"message":{"role":"user","content":"Another Claude session sent a message: hi"}}"#,
+            r#"{"type":"user","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification> <task-id>a1</task-id> </task-notification>"}}"#,
+        ]
+        .join("\n");
+        let log = tmpfile("prompts-human-only", body.as_bytes());
+        assert_eq!(recent_prompts(&log), vec!["fix the duplicate G7 numbering"]);
     }
 
     #[test]

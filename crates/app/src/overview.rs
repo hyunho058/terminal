@@ -8,12 +8,13 @@
 //! agent of any kind, in strip-then-pane order; the
 //! toggle-free `graph_agent`/`graph_task` win over the card's `agent`/`task`; the active pane
 //! takes the tab's own status join (`row_meta_with`), a non-active pane the log-only
-//! `resolve_status(pane.agent, false, false, None)`; only a Claude session reads a digest.
+//! `resolve_status(pane.agent, false, false, None)`; only a Claude or Antigravity session
+//! reads a digest (D24).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use ai_monitor::telemetry::Subagent;
+use ai_monitor::telemetry::{LogFormat, Subagent};
 use renderer::overview_model::{
     AgentTag, Banner, Bucket, Counts, DialogSubject, Filter, OverviewModel, SessionRowData,
     SubagentCell, SubagentStatus, SubagentTotals, TreeLine, View,
@@ -53,14 +54,25 @@ struct Session<'a> {
     cwd: Option<&'a Path>,
     branch: Option<&'a str>,
     task: Option<&'a str>,
-    /// The digest key — Claude sessions only (R14.3).
+    /// The digest key — a Claude session's log or an Antigravity session's transcript
+    /// (R14.3, D24); none for any other agent.
     log: Option<&'a Path>,
     selected: bool,
 }
 
-/// The log a session reads its digest from: `log` for a Claude session, else none (R14.3).
-fn claude_log<'a>(agent: &Agent, log: Option<&'a Path>) -> Option<&'a Path> {
-    log.filter(|_| agent.kind == AgentKind::Claude)
+/// The log a session reads its digest from: `log` for a Claude session, `transcript` (the
+/// worker's `graph_transcript`) for an Antigravity one (D24), else none (R14.3) — Codex,
+/// Gemini and Aider logs are not read.
+fn digest_key<'a>(
+    agent: &Agent,
+    log: Option<&'a Path>,
+    transcript: Option<&'a Path>,
+) -> Option<&'a Path> {
+    match agent.kind {
+        AgentKind::Claude => log,
+        AgentKind::Antigravity => transcript,
+        AgentKind::Codex | AgentKind::Gemini | AgentKind::Aider => None,
+    }
 }
 
 /// A tab's agent sessions in pane order (D14) — see the module doc.
@@ -79,27 +91,38 @@ fn sessions_of<'a>(
     };
     let status = row_meta_with(row, Some(m), agent, task, home).status;
     let tab_cwd = m.graph_agent_cwd.as_deref().or(m.cwd.as_deref());
-    let tab_session = |a: &Agent, pane: u32, log: Option<&'a Path>, asks: bool| Session {
-        tab: row.tab_id,
-        pane,
-        agent: *a,
-        status,
-        dialog: row.blocking_dialog,
-        asks_user: asks,
-        subject: row
-            .blocking_subject
-            .as_ref()
-            .filter(|_| row.blocking_dialog),
-        repo: m.repo.as_ref(),
-        cwd: tab_cwd,
-        branch: m.branch.as_deref(),
-        task,
-        log: claude_log(a, log),
-        selected,
-    };
+    let tab_session =
+        |a: &Agent, pane: u32, log: Option<&'a Path>, transcript: Option<&'a Path>, asks: bool| {
+            Session {
+                tab: row.tab_id,
+                pane,
+                agent: *a,
+                status,
+                dialog: row.blocking_dialog,
+                asks_user: asks,
+                subject: row
+                    .blocking_subject
+                    .as_ref()
+                    .filter(|_| row.blocking_dialog),
+                repo: m.repo.as_ref(),
+                cwd: tab_cwd,
+                branch: m.branch.as_deref(),
+                task,
+                log: digest_key(a, log, transcript),
+                selected,
+            }
+        };
     if m.panes.is_empty() {
         return agent
-            .map(|a| tab_session(a, UNSPLIT_PANE, m.log.as_deref(), m.graph_asks_user))
+            .map(|a| {
+                tab_session(
+                    a,
+                    UNSPLIT_PANE,
+                    m.log.as_deref(),
+                    m.graph_transcript.as_deref(),
+                    m.graph_asks_user,
+                )
+            })
             .into_iter()
             .collect();
     }
@@ -111,6 +134,9 @@ fn sessions_of<'a>(
                     a,
                     p.pane_pid,
                     p.log.as_deref().or(m.log.as_deref()),
+                    p.graph_transcript
+                        .as_deref()
+                        .or(m.graph_transcript.as_deref()),
                     m.graph_asks_user || p.graph_asks_user,
                 ));
             }
@@ -128,7 +154,7 @@ fn sessions_of<'a>(
                 branch: p.branch.as_deref(),
                 // The tab's task is the active pane's agent's prompt, not this one's.
                 task: None,
-                log: claude_log(a, p.log.as_deref()),
+                log: digest_key(a, p.log.as_deref(), p.graph_transcript.as_deref()),
                 selected: false,
             });
         }
@@ -335,14 +361,25 @@ pub fn admits(filter: Filter, bucket: Bucket) -> bool {
     }
 }
 
-/// One session's identity and the log its digest is read from — `None` for a non-Claude
-/// session (R14.3). What the overlay needs without formatting a row.
+/// One session's identity and the log its digest is read from, with that log's format —
+/// `None` for a session other than Claude or Antigravity (R14.3, D24). What the overlay needs without formatting a row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionRef {
     pub tab: u64,
     /// The tmux pane pid, `0` for an unsplit tab.
     pub pane: u32,
     pub log: Option<PathBuf>,
+    /// The dialect `log` is folded in: Antigravity for an Antigravity session's transcript,
+    /// Claude otherwise (D24).
+    pub format: LogFormat,
+}
+
+/// The dialect a session's digest key is written in (D24).
+fn log_format(kind: AgentKind) -> LogFormat {
+    match kind {
+        AgentKind::Antigravity => LogFormat::Antigravity,
+        _ => LogFormat::Claude,
+    }
 }
 
 /// Every session of `rows`, in strip-then-pane order — exactly the rows [`build_overview`]
@@ -357,6 +394,7 @@ pub fn session_refs(rows: &[SidebarRow], metas: &HashMap<TabId, TabMeta>) -> Vec
                     tab: s.tab,
                     pane: s.pane,
                     log: s.log.map(Path::to_path_buf),
+                    format: log_format(s.agent.kind),
                 })
         })
         .collect()
@@ -632,6 +670,80 @@ mod tests {
     }
 
     #[test]
+    fn an_antigravity_session_reads_its_transcript_and_never_its_log() {
+        // D24 / R11.5's key: the tab's `graph_transcript`, an active pane's (else the tab's),
+        // and a non-active pane's own — each looked up as an Antigravity digest. A `log` on an
+        // Antigravity session is not its digest key.
+        let agy = Agent {
+            kind: AgentKind::Antigravity,
+            state: AgentState::Busy,
+        };
+        let t = |n: &str| PathBuf::from(format!("/nonexistent/overview/{n}.jsonl"));
+        let pane = |pid, active, transcript: Option<PathBuf>| PaneMeta {
+            pane_pid: pid,
+            active,
+            agent: Some(agy),
+            log: Some(t("pane-log")),
+            cwd: None,
+            branch: None,
+            repo: None,
+            graph_asks_user: false,
+            graph_agent_cwd: None,
+            graph_transcript: transcript,
+        };
+        let metas = HashMap::from([
+            (
+                TabId(1),
+                TabMeta {
+                    agent: Some(agy),
+                    log: Some(t("tab-log")),
+                    graph_transcript: Some(t("tab")),
+                    ..TabMeta::default()
+                },
+            ),
+            (
+                TabId(2),
+                TabMeta {
+                    agent: Some(agy),
+                    graph_transcript: Some(t("split")),
+                    panes: vec![pane(20, true, None), pane(21, false, Some(t("other")))],
+                    ..TabMeta::default()
+                },
+            ),
+        ]);
+        let digest = |minutes: u64| SessionDigest {
+            last_prompt_ms: Some(NOW - minutes * 60_000),
+            ..SessionDigest::default()
+        };
+        let digests = HashMap::from([
+            (t("tab"), digest(1)),
+            (t("split"), digest(2)),
+            (t("other"), digest(3)),
+            (t("tab-log"), digest(9)),
+            (t("pane-log"), digest(9)),
+        ]);
+        let (m, _) = build(&[row(1), row(2)], &metas, &digests, &ExpandSet::new(), 0);
+        let elapsed: Vec<(u64, u32, &str)> = m
+            .rows
+            .iter()
+            .map(|r| (r.tab, r.pane, r.elapsed.as_str()))
+            .collect();
+        assert_eq!(elapsed, [(1, 0, "1m"), (2, 20, "2m"), (2, 21, "3m")]);
+
+        let refs = session_refs(&[row(1), row(2)], &metas);
+        let keys: Vec<(Option<PathBuf>, LogFormat)> =
+            refs.into_iter().map(|r| (r.log, r.format)).collect();
+        assert_eq!(
+            keys,
+            [
+                (Some(t("tab")), LogFormat::Antigravity),
+                (Some(t("split")), LogFormat::Antigravity),
+                (Some(t("other")), LogFormat::Antigravity),
+            ]
+        );
+    }
+
+    #[test]
     fn non_claude_logs_are_never_read_and_the_subject_needs_the_dialog() {
         let log = PathBuf::from("/nonexistent/overview/x.jsonl");
         let codex = Agent {
@@ -680,6 +792,7 @@ mod tests {
             repo: None,
             graph_asks_user: false,
             graph_agent_cwd: None,
+            graph_transcript: None,
         };
         let metas = HashMap::from([
             (

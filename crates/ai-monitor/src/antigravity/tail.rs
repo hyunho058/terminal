@@ -263,16 +263,35 @@ fn turn_verdict(window: &str) -> Turn {
                 Turn::Undecided
             };
         }
-        if step_kind(&step) == Some("SYSTEM_MESSAGE") {
-            let ids = content(&step).map(completed_ids).unwrap_or_default();
-            completed.extend(ids.into_iter().map(String::from));
-        }
-        if started_ids(&step).iter().any(|id| !completed.contains(*id)) {
+        completed.extend(background_completions(&step).into_iter().map(String::from));
+        if background_starts(&step)
+            .iter()
+            .any(|id| !completed.contains(*id))
+        {
             return Turn::Pending;
         }
         foreground &= is_foreground(&step);
     }
     Turn::Undecided
+}
+
+/// The background ids `step` starts — a task or subagent (`agy-background-working` D2).
+///
+/// The one reading of a start, shared by the card's walk ([`turn_verdict`]) and the session
+/// digest's turn machine (`session-overview-ui` D24), so the two cannot disagree about what
+/// background work a turn has outstanding.
+pub(crate) fn background_starts(step: &Value) -> Vec<&str> {
+    started_ids(step)
+}
+
+/// The background ids `step` reports finished (`agy-background-working` D3): the ids a
+/// `SYSTEM_MESSAGE` completes, and nothing for any other step kind. Shared like
+/// [`background_starts`].
+pub(crate) fn background_completions(step: &Value) -> Vec<&str> {
+    if step_kind(step) != Some("SYSTEM_MESSAGE") {
+        return Vec::new();
+    }
+    content(step).map(completed_ids).unwrap_or_default()
 }
 
 /// The `Tool is running as a background task` marker (`agy-background-working` D2 form 1).

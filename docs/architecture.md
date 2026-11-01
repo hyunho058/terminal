@@ -440,8 +440,13 @@ idle behaviour. See G1 for what the caches do and do not buy against it.
   project comes from the tabmeta worker's `RepoId`, resolved from the detected agent process's
   cwd (any kind) and published with `graph_agent_cwd` only while the overlay is open; until the
   first full pass the header reads `resolving…` and no row is drawn. **Subagents, elapsed and
-  the timeline are Claude-only**: they come from Claude's session log, which no other agent
-  writes, so a non-Claude session's log is never followed. The overlay **ignores
+  the timeline are Claude and Antigravity only** (D24): they come from Claude's session log
+  (`TabMeta`/`PaneMeta.log`) or from the Antigravity transcript the `agy`'s presence lock names
+  (`graph_transcript`, published on graph passes only), folded by `ai_monitor::telemetry` in
+  that log's own dialect. Codex, Gemini and Aider logs are not read, so those rows show `—`
+  and their detail has no timeline. An Antigravity turn ends at the first tool-less reply with
+  no background work pending — G8's Antigravity pairing, shared with the card, not restated.
+  `Copy resume cmd` stays Claude-only. The overlay **ignores
   `[sidebar].show_agent_status`** (user decision 2026-10-22, carried): while it is open the
   worker classifies every tab's agent whatever the toggle and publishes it as
   `TabMeta.graph_agent`/`graph_task`/`graph_asks_user`, which only the overlay reads, so the

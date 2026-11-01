@@ -71,7 +71,7 @@ pub fn publish_graph_state(wanted: bool, full_pass_done: bool, prev_ready: bool)
 }
 
 /// `published` with every tab's `panes`, `repo`, `graph_agent`, `graph_task`,
-/// `graph_asks_user` and `graph_agent_cwd` emptied —
+/// `graph_asks_user`, `graph_agent_cwd` and `graph_transcript` emptied —
 /// the on→off edge of the graph's switch. Pure and syscall-free, so closing the graph
 /// clears it without deriving anything.
 fn strip_graph(published: &[(TabId, TabMeta)]) -> Vec<(TabId, TabMeta)> {
@@ -87,6 +87,7 @@ fn strip_graph(published: &[(TabId, TabMeta)]) -> Vec<(TabId, TabMeta)> {
                     graph_task: None,
                     graph_asks_user: false,
                     graph_agent_cwd: None,
+                    graph_transcript: None,
                     ..m.clone()
                 },
             )
@@ -310,6 +311,11 @@ impl Deriver {
         // session-overview-ui D2 — graph-only like `graph_agent`, so a closed graph publishes
         // `false` whatever the log says.
         let graph_asks_user = asks && graph_derive;
+        // session-overview-ui D24 — the Antigravity transcript the state was just classified
+        // from, for the overview's digest. Graph-only like `graph_asks_user`.
+        let graph_transcript = detected
+            .filter(|_| graph_derive)
+            .and_then(|super::agent::Detected { kind, pid }| self.graph_transcript(kind, pid));
 
         let (panes, repo, graph_agent_cwd) = match graph {
             PanePass::Derive => {
@@ -325,6 +331,7 @@ impl Deriver {
                     None => (None, None),
                 };
                 let tab = PaneMeta {
+                    graph_transcript: graph_transcript.clone(),
                     graph_agent_cwd: agent_cwd.clone(),
                     graph_asks_user,
                     pane_pid: 0,
@@ -345,6 +352,7 @@ impl Deriver {
         };
 
         TabMeta {
+            graph_transcript,
             graph_agent_cwd,
             graph_asks_user,
             branch,
@@ -358,6 +366,16 @@ impl Deriver {
             graph_agent,
             graph_task,
         }
+    }
+
+    /// The transcript of the `agy` at `pid` when `kind` is Antigravity (session-overview-ui
+    /// D24) — a memo read of the path [`Deriver::activity`] just classified, so it costs no
+    /// I/O. `None` for every other kind: only Claude (`log`) and Antigravity have a log the
+    /// overview reads.
+    fn graph_transcript(&self, kind: AgentKind, pid: u32) -> Option<PathBuf> {
+        (kind == AgentKind::Antigravity)
+            .then(|| super::antigravity::transcript(&self.antigravity_memo, pid))
+            .flatten()
     }
 
     /// The repository of the agent session at `agent_pid`, of any kind (session-flow-graph
@@ -399,6 +417,7 @@ impl Deriver {
             .map(|row| {
                 if row.active {
                     PaneMeta {
+                        graph_transcript: tab.graph_transcript.clone(),
                         graph_agent_cwd: tab.graph_agent_cwd.clone(),
                         graph_asks_user: tab.graph_asks_user,
                         pane_pid: row.pid,
@@ -430,6 +449,7 @@ impl Deriver {
     fn pane(&mut self, pid: u32, tick: u64, now: SystemTime) -> PaneMeta {
         let Some(super::agent::Detected { kind, pid: apid }) = (self.agent_of)(pid) else {
             return PaneMeta {
+                graph_transcript: None,
                 graph_agent_cwd: None,
                 graph_asks_user: false,
                 pane_pid: pid,
@@ -456,6 +476,7 @@ impl Deriver {
         };
         let (agent_cwd, repo) = self.session_repo(apid, cwd.as_deref(), tick);
         PaneMeta {
+            graph_transcript: self.graph_transcript(kind, apid),
             graph_agent_cwd: agent_cwd,
             graph_asks_user: asks,
             pane_pid: pid,
@@ -928,6 +949,7 @@ mod tests {
             TabId(1),
             TabMeta {
                 graph_agent_cwd: None,
+                graph_transcript: None,
                 graph_asks_user: false,
                 branch: Some("main".into()),
                 agent: None,
@@ -959,6 +981,7 @@ mod tests {
             TabId(1),
             TabMeta {
                 graph_agent_cwd: None,
+                graph_transcript: None,
                 graph_asks_user: false,
                 branch: Some("dev".into()),
                 agent: None,
@@ -1529,14 +1552,15 @@ mod tests {
     }
 
     #[test]
-    fn tabmeta_has_exactly_its_ten_published_fields() {
+    fn tabmeta_has_exactly_its_thirteen_published_fields() {
         // R6.5, now session-flow-graph R4.6 — a compile-time assertion. If a field is added,
         // removed or retyped this stops building, which is the point: the renderer and the
         // snapshot contract are downstream and each feature that moves them says so.
         // session-flow-viewer D9 moved it from five to seven (`panes`, `log`);
         // session-flow-graph D10 to eight (`repo`); the 2026-10-22 decision that the graph
         // ignores `[sidebar].show_agent_status` to ten (`graph_agent`, `graph_task`);
-        // session-overview-ui D2/D3 to twelve (`graph_asks_user`, `graph_agent_cwd`).
+        // session-overview-ui D2/D3 to twelve (`graph_asks_user`, `graph_agent_cwd`); its
+        // D24 to thirteen (`graph_transcript`).
         let TabMeta {
             branch: _,
             agent: _,
@@ -1550,14 +1574,15 @@ mod tests {
             graph_task: _,
             graph_asks_user: _,
             graph_agent_cwd: _,
+            graph_transcript: _,
         } = TabMeta::default();
     }
 
     #[test]
-    fn pane_meta_has_exactly_its_nine_fields() {
+    fn pane_meta_has_exactly_its_ten_fields() {
         // session-flow-graph R4.6 — `cwd`, `branch` and `repo` joined the four
         // session-flow-viewer published; session-overview-ui D2/D3 added `graph_asks_user` and
-        // `graph_agent_cwd`.
+        // `graph_agent_cwd`, and D24 `graph_transcript`.
         let PaneMeta {
             pane_pid: _,
             active: _,
@@ -1568,6 +1593,7 @@ mod tests {
             repo: _,
             graph_asks_user: _,
             graph_agent_cwd: _,
+            graph_transcript: _,
         } = blank_pane(0);
     }
 
@@ -1591,6 +1617,7 @@ mod tests {
     fn blank_pane(pid: u32) -> PaneMeta {
         PaneMeta {
             graph_agent_cwd: None,
+            graph_transcript: None,
             graph_asks_user: false,
             pane_pid: pid,
             active: false,
@@ -1669,6 +1696,7 @@ mod tests {
             graph_task: Some("t".into()),
             graph_asks_user: true,
             graph_agent_cwd: Some(PathBuf::from("/agent")),
+            graph_transcript: Some(PathBuf::from("/transcript.jsonl")),
             ..Default::default()
         };
         let got = strip_graph(&[(TabId(1), meta.clone()), (TabId(2), meta.clone())]);
@@ -1679,6 +1707,7 @@ mod tests {
             graph_task: None,
             graph_asks_user: false,
             graph_agent_cwd: None,
+            graph_transcript: None,
             ..meta
         };
         assert_eq!(got, vec![(TabId(1), want.clone()), (TabId(2), want)]);
@@ -2244,6 +2273,7 @@ mod tests {
                 TabId(1),
                 TabMeta {
                     graph_agent_cwd: None,
+                    graph_transcript: None,
                     graph_asks_user: false,
                     branch: Some("main".into()),
                     agent: None,
@@ -2768,6 +2798,7 @@ mod tests {
         let id = TabId(0);
         let unknown = TabMeta {
             graph_agent_cwd: None,
+            graph_transcript: None,
             graph_asks_user: false,
             branch: None,
             agent: Some(Agent {
@@ -2793,6 +2824,7 @@ mod tests {
         // A known (Busy) agent is not a gap either.
         let busy = TabMeta {
             graph_agent_cwd: None,
+            graph_transcript: None,
             graph_asks_user: false,
             branch: None,
             agent: Some(Agent {
@@ -3672,5 +3704,110 @@ mod tests {
         let m = d.tab(&tp(ROOTED_TAB), 1, now, true);
         assert!(m.panes.is_empty());
         assert_eq!((m.graph_asks_user, m.graph_agent_cwd), (false, None));
+    }
+
+    // ---- session-overview-ui D24 / R11.4: `graph_transcript` ----
+
+    #[test]
+    fn r11_4_an_antigravity_tab_publishes_its_transcript_on_graph_passes_only() {
+        let _g = super::super::probe::serial();
+        fake::reset();
+        let mut d = antigravity_deriver(
+            "r11-4-ag",
+            AgentKind::Antigravity,
+            fake::holds_c,
+            &[(fake::CONV_C, fake::FINISHED)],
+        );
+        let want = fake::transcript(
+            d.antigravity.root.as_deref().expect("a fake root"),
+            fake::CONV_C,
+        );
+        let now = SystemTime::now();
+
+        d.graph_wanted = true;
+        let m = d.tab(&tp(900_701), 0, now, true);
+        assert_eq!(m.graph_transcript, Some(want), "a graph pass publishes it");
+        assert_eq!(m.log, None, "`log` stays Claude's");
+
+        d.graph_wanted = false;
+        let m = d.tab(&tp(900_701), 1, now, true);
+        assert_eq!(
+            m.agent.map(|a| a.state),
+            Some(AgentState::Waiting),
+            "the card still reads the transcript"
+        );
+        assert_eq!(m.graph_transcript, None, "a non-graph pass publishes None");
+    }
+
+    #[test]
+    fn r11_4_no_lock_and_non_antigravity_agents_publish_no_transcript() {
+        let _g = super::super::probe::serial();
+        fake::reset();
+        let now = SystemTime::now();
+        let mut unnamed = antigravity_deriver(
+            "r11-4-none",
+            AgentKind::Antigravity,
+            fake::holds_none,
+            &[(fake::CONV_C, fake::FINISHED)],
+        );
+        unnamed.graph_wanted = true;
+        assert_eq!(
+            unnamed.tab(&tp(900_711), 0, now, true).graph_transcript,
+            None
+        );
+
+        let mut codex = antigravity_deriver(
+            "r11-4-codex",
+            AgentKind::Codex,
+            fake::holds_c,
+            &[(fake::CONV_C, fake::FINISHED)],
+        );
+        codex.graph_wanted = true;
+        assert_eq!(codex.tab(&tp(900_712), 0, now, true).graph_transcript, None);
+    }
+
+    #[test]
+    fn r11_4_panes_publish_their_own_transcript_and_the_edge_clears_it() {
+        let _g = super::super::probe::serial();
+        fake::reset();
+        let mut d = antigravity_deriver(
+            "r11-4-pane",
+            AgentKind::Antigravity,
+            fake::holds_c,
+            &[(fake::CONV_C, fake::FINISHED)],
+        );
+        let want = Some(fake::transcript(
+            d.antigravity.root.as_deref().expect("a fake root"),
+            fake::CONV_C,
+        ));
+        d.rooted_of = rooted_at_pane;
+        d.graph_wanted = true;
+        d.pane_memo = PaneMemo::seeded(
+            0,
+            super::super::tmux::parse_panes(&format!(
+                "work:1 1 {ROOTED_PANE}\nwork:1 0 {OTHER_PANE}\n"
+            )),
+        );
+        let now = SystemTime::now();
+        let m = d.tab(&tp(ROOTED_TAB), 0, now, true);
+        let got: Vec<(u32, bool, Option<PathBuf>)> = m
+            .panes
+            .iter()
+            .map(|p| (p.pane_pid, p.active, p.graph_transcript.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (ROOTED_PANE, true, want.clone()),
+                (OTHER_PANE, false, want.clone())
+            ]
+        );
+        // The non-active pane's comes from its own derivation, not a copy of the tab's.
+        assert_eq!(d.pane(OTHER_PANE, 0, now).graph_transcript, want);
+
+        // Closing the graph strips the tab's field and its panes with it.
+        let shut = strip_graph(&[(TabId(ROOTED_TAB as u64), m)]);
+        assert_eq!(shut[0].1.graph_transcript, None);
+        assert!(shut[0].1.panes.is_empty());
     }
 }

@@ -296,7 +296,7 @@ pub struct DetailData {
     pub prompt: Option<String>,
     pub elapsed: String,
     /// `false` for a session with no digest (non-Claude): the layout draws
-    /// `No timeline — only Claude Code sessions record subagents.` instead (D12).
+    /// `No timeline — this agent's log is not read.` instead (D12).
     pub has_timeline: bool,
     /// Oldest first, only subagents overlapping the window.
     pub lanes: Vec<Lane>,

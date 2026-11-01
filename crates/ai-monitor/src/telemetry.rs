@@ -39,6 +39,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use serde_json::Value;
 
 use crate::activity;
+use crate::antigravity;
 
 // ---- caps (D6) ----------------------------------------------------------------
 // Display rings: ~3x the app's display counts, so the app can show more without a
@@ -543,6 +544,9 @@ struct AgCall {
     summary: Option<String>,
     subagent_type: Option<String>,
     description: Option<String>,
+    /// D11's one-line summary of the call's args, where they map onto D11's tools
+    /// ([`ag_tool_summary`]). Digest only (`session-overview-ui` D24).
+    digest_summary: Option<String>,
 }
 
 /// The accumulator. Fold lines in with [`apply`](SessionTelemetry::apply); read the
@@ -685,7 +689,8 @@ impl SessionTelemetry {
     ///
     /// Opt-in because only the session overview reads it. Without it none of that work is
     /// done, those fields stay empty, and every other snapshot field is the same as with
-    /// it. Claude Code logs only: an Antigravity accumulator folds no digest either way.
+    /// it. Both dialects: an Antigravity accumulator folds the same fields from its
+    /// transcript's steps (`session-overview-ui` D24), with no report previews.
     pub fn with_digest(mut self) -> Self {
         self.digest = true;
         self
@@ -922,6 +927,10 @@ impl SessionTelemetry {
 
         let content = v.get("content").and_then(Value::as_str);
 
+        if self.digest {
+            self.ag_digest_turn(v, step_type, ts);
+        }
+
         match step_type {
             "USER_INPUT" => {
                 self.turns_user = self.turns_user.saturating_add(1);
@@ -990,9 +999,16 @@ impl SessionTelemetry {
                             .iter_mut()
                             .find(|a| a.id == id || a.agent_id.as_deref() == Some(id))
                         {
+                            let newly = !a.completed;
                             a.completed = true;
                             if let Some(new_ts) = ts {
                                 a.end_ms = Some(a.end_ms.map_or(new_ts, |old| old.max(new_ts)));
+                            }
+                            // D24 — the report is the subagent's end; Antigravity writes
+                            // no failure for it, so it is always a `TaskDone`.
+                            let label = agent_label(&a.description, &a.subagent_type);
+                            if let (true, true, Some(t)) = (self.digest, newly, ts) {
+                                self.push_event(t, EventKind::TaskDone { description: label });
                             }
                         }
                     }
@@ -1050,6 +1066,22 @@ impl SessionTelemetry {
             (None, None)
         };
 
+        let digest_summary = if self.digest {
+            if kind == ToolKind::Agent {
+                if let Some(t) = ts {
+                    self.push_event(
+                        t,
+                        EventKind::TaskStart {
+                            description: agent_label(&description, &subagent_type),
+                        },
+                    );
+                }
+            }
+            ag_tool_summary(name, args, path.as_deref(), description.as_deref())
+        } else {
+            None
+        };
+
         self.ag_pending.push_back(AgCall {
             name: name.to_string(),
             kind,
@@ -1059,6 +1091,7 @@ impl SessionTelemetry {
             summary: ag_arg_str(args, "toolSummary"),
             subagent_type,
             description,
+            digest_summary,
         });
         while self.ag_pending.len() > PENDING_CAP {
             self.ag_pending.pop_front();
@@ -1100,6 +1133,15 @@ impl SessionTelemetry {
         // `ok` is unconditionally true under G4 — nothing in this pass reads
         // `exit_code`, so nothing may claim a call failed.
         self.tally_call(&call.name, true);
+        if self.digest {
+            self.digest_tool(
+                &call.name,
+                call.digest_summary.clone(),
+                call.start_ms,
+                ts,
+                call.kind == ToolKind::Agent,
+            );
+        }
         let duration_ms = match (call.start_ms, ts) {
             (Some(a), Some(b)) if b >= a => Some(b - a),
             _ => None,
@@ -1172,6 +1214,14 @@ impl SessionTelemetry {
                 } else {
                     v.get("status").and_then(Value::as_str) == Some("DONE")
                 };
+                if let (true, true, Some(t)) = (self.digest, completed, ts) {
+                    self.push_event(
+                        t,
+                        EventKind::TaskDone {
+                            description: agent_label(&description, &name),
+                        },
+                    );
+                }
                 push_capped(
                     &mut self.subagents,
                     Subagent {
@@ -1569,7 +1619,13 @@ impl SessionTelemetry {
             _ => None,
         };
         if self.digest {
-            self.digest_tool(&p, ts);
+            self.digest_tool(
+                &p.name,
+                p.summary.clone(),
+                p.start_ms,
+                ts,
+                is_agent_tool(&p.name),
+            );
         }
 
         match p.kind.unwrap_or(ToolKind::Plain) {
@@ -1968,21 +2024,84 @@ impl SessionTelemetry {
     }
 
     /// `last_tool`, `last_work_tool` and the `Tool` event for one finished call (D11).
-    fn digest_tool(&mut self, p: &Pending, ts: Option<u64>) {
-        let entry: ToolDigest = (p.name.clone(), p.summary.clone(), p.start_ms);
-        if !is_agent_tool(&p.name) {
+    /// `agent` marks the subagent-launching tool (`Agent`/`Task`, Antigravity's
+    /// `invoke_subagent`), which D4 does not count as work.
+    fn digest_tool(
+        &mut self,
+        name: &str,
+        summary: Option<String>,
+        start_ms: Option<u64>,
+        ts: Option<u64>,
+        agent: bool,
+    ) {
+        let entry: ToolDigest = (name.to_string(), summary.clone(), start_ms);
+        if !agent {
             self.last_work_tool = Some(entry.clone());
-            if let Some(t) = ts.or(p.start_ms) {
+            if let Some(t) = ts.or(start_ms) {
                 self.push_event(
                     t,
                     EventKind::Tool {
-                        name: p.name.clone(),
-                        summary: p.summary.clone(),
+                        name: name.to_string(),
+                        summary,
                     },
                 );
             }
         }
         self.last_tool = Some(entry);
+    }
+
+    /// Advance the turn machine by one Antigravity step (`session-overview-ui` D24).
+    ///
+    /// A `USER_INPUT` step is the human prompt and opens a turn, forgetting older background
+    /// work. The turn ends at the first tool-less `PLANNER_RESPONSE` (the model's reply)
+    /// with no background work the turn started still pending. Starts and completions are
+    /// `agy-background-working`'s, read through [`antigravity::background_starts`] and
+    /// [`antigravity::background_completions`] — the card's own reading, not a restatement.
+    /// A completion that lands after a reply resumes the turn: the model answers the notice,
+    /// and the turn ends at that next reply.
+    fn ag_digest_turn(&mut self, v: &Value, step_type: &str, ts: Option<u64>) {
+        if step_type == "USER_INPUT" {
+            self.turn_bg.clear();
+            let Some(t) = ts else {
+                return;
+            };
+            self.last_prompt_ms = self.last_prompt_ms.max(Some(t));
+            if let Some(open) = self.turns.front_mut().filter(|t| t.end_ms.is_none()) {
+                open.end_ms = Some(t.max(open.start_ms));
+            }
+            push_capped(
+                &mut self.turns,
+                Turn {
+                    start_ms: t,
+                    end_ms: None,
+                },
+                TURNS_CAP,
+            );
+            return;
+        }
+        for id in antigravity::background_completions(v) {
+            self.turn_bg.remove(id);
+        }
+        for id in antigravity::background_starts(v) {
+            if self.turn_bg.len() < TURN_BG_CAP {
+                self.turn_bg.insert(id.to_string());
+            }
+        }
+        let reply = step_type == "PLANNER_RESPONSE"
+            && match v.get("tool_calls") {
+                None => true,
+                Some(Value::Array(calls)) => calls.is_empty(),
+                Some(_) => false,
+            };
+        if !reply || !self.turn_bg.is_empty() {
+            return;
+        }
+        let fallback = self.last_event_ms;
+        if let Some(open) = self.turns.front_mut().filter(|t| t.end_ms.is_none()) {
+            let end = ts.or(fallback).unwrap_or(open.start_ms).max(open.start_ms);
+            open.end_ms = Some(end);
+            self.push_event(end, EventKind::TurnFinished);
+        }
     }
 
     /// A synchronous `Agent` answer: its report preview and its end event.
@@ -2063,6 +2182,33 @@ fn tool_summary(name: &str, input: Option<&Value>) -> Option<String> {
         "WebFetch" => url_host(field("url")?)?.to_string(),
         "WebSearch" => field("query")?.to_string(),
         "Skill" => field("skill")?.to_string(),
+        _ => return None,
+    };
+    one_line(&raw)
+}
+
+/// D11's summary for an Antigravity call (`session-overview-ui` D24), where its args map
+/// onto a D11 tool: `run_command`'s `CommandLine` (Bash's `command`), a read or write's
+/// path basename (`Read`/`Edit`/`Write`), `grep_search`'s `Query` (`Grep`'s `pattern`) and
+/// `invoke_subagent`'s description (`Agent`'s). Every other tool, and an arg that does not
+/// unwrap (a truncated value), is `None` — never `toolSummary`, which is the model's prose
+/// rather than the call's input.
+fn ag_tool_summary(
+    name: &str,
+    args: Option<&Value>,
+    path: Option<&str>,
+    description: Option<&str>,
+) -> Option<String> {
+    let raw = match name {
+        "run_command" => ag_arg_str(args, "CommandLine")?,
+        "view_file"
+        | "read_file"
+        | "write_to_file"
+        | "replace_file_content"
+        | "write_file"
+        | "edit_file" => basename(path?).to_string(),
+        "grep_search" => ag_arg_str(args, "Query")?,
+        "invoke_subagent" => description?.to_string(),
         _ => return None,
     };
     one_line(&raw)

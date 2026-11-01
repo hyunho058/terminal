@@ -8,6 +8,12 @@
   `/private/tmp/claude-501/-Users-hyunhokim-IdeaProjects-terminal-feat-changing-session-ui/e0f934eb-020b-4c3e-88bf-1873972491af/scratchpad/tt-hashes.txt`
   — never modified by the loop.
 
+## Iteration 2 scope (user, 2026-10-31)
+After a manual run the user reported defects; approved fixes D24 (Antigravity digest), D25
+(human-prompt label), D26 (single quotes) — spec R11. Deferred: the unanswered
+task-notification → Working classifier gap (spec Known Gaps). Gates below are unchanged; Gate 2's
+GWT coverage now spans R1–R11, and new `tt11_*` acceptance files join the protected hash list.
+
 ## Gate 1 — Pass/Fail (100%)
 1. `cargo build --workspace`
 2. `cargo fmt --all --check`

@@ -27,7 +27,8 @@ const REPORT_LINES: usize = 4;
 
 /// Build `row`'s detail (D12, D13, D22).
 ///
-/// `digest` is `None` for a session with no log digest (non-Claude): the header only, no
+/// `digest` is `None` for a session with no log digest (Codex, Gemini, Aider, or a log not
+/// yet read; Claude and Antigravity have one, D24): the header only, no
 /// timeline. `selected` is the lane index the user picked, `None` for the default (the
 /// newest lane). `tz_offset_s` is the local UTC offset, for the `HH:MM` labels.
 pub fn build_detail(

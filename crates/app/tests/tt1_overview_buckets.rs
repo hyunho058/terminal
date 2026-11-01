@@ -57,6 +57,7 @@ fn meta(a: Option<Agent>, asks_user: bool) -> TabMeta {
 
 fn pane(pid: u32, active: bool, a: Option<Agent>, asks_user: bool) -> PaneMeta {
     PaneMeta {
+        graph_transcript: None,
         pane_pid: pid,
         active,
         agent: a,

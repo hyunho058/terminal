@@ -137,6 +137,12 @@ pub struct TabMeta {
     /// The detected agent process's own cwd (session-overview-ui D3) — the one `repo` is
     /// resolved from, not the shell's `cwd` (G5). Graph passes only; `None` otherwise.
     pub graph_agent_cwd: Option<PathBuf>,
+    /// The transcript of the tab's **Antigravity** session — the one its `agy`'s presence
+    /// lock names, which the card's state was just classified from (agent-card-status D11) —
+    /// published so the overview's digest thread can fold its subagents, prompts and turns
+    /// (session-overview-ui D24). The Antigravity counterpart of [`TabMeta::log`]. Graph
+    /// passes only; `None` otherwise, and `None` for every other agent kind.
+    pub graph_transcript: Option<PathBuf>,
 }
 
 /// One pane of a split tab (session-flow-viewer D9).
@@ -164,6 +170,8 @@ pub struct PaneMeta {
     pub graph_asks_user: bool,
     /// [`TabMeta::graph_agent_cwd`] for this pane's agent (session-overview-ui D3).
     pub graph_agent_cwd: Option<PathBuf>,
+    /// [`TabMeta::graph_transcript`] for this pane's `agy` (session-overview-ui D24).
+    pub graph_transcript: Option<PathBuf>,
 }
 
 /// The worker's per-tab graph decision ([`graph_pass`], session-flow-viewer R6.6 —
@@ -842,6 +850,7 @@ mod tests {
                     a,
                     TabMeta {
                         graph_agent_cwd: None,
+                        graph_transcript: None,
                         graph_asks_user: false,
                         branch: Some("main".into()),
                         agent: None,
@@ -859,6 +868,7 @@ mod tests {
                     b,
                     TabMeta {
                         graph_agent_cwd: None,
+                        graph_transcript: None,
                         graph_asks_user: false,
                         branch: None,
                         agent: Some(Agent {
@@ -1074,6 +1084,7 @@ mod tests {
             TabMeta::default(),
             TabMeta {
                 graph_agent_cwd: None,
+                graph_transcript: None,
                 graph_asks_user: false,
                 branch: None,
                 agent: None,

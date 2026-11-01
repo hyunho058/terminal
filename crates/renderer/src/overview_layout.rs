@@ -218,7 +218,8 @@ const TICK_H: f32 = 22.0;
 const TOO_NARROW: &str = "Window too narrow — widen it to see sessions.";
 const EMPTY_FILTER: &str = "No sessions in this filter.";
 const NO_SESSIONS: &str = "No agent sessions in this window.";
-const NO_TIMELINE: &str = "No timeline — only Claude Code sessions record subagents.";
+/// D24: Claude and Antigravity logs are read; this is for the agents whose logs are not.
+const NO_TIMELINE: &str = "No timeline — this agent's log is not read.";
 const ELLIPSIS: char = '…';
 
 // ---- text measurement ------------------------------------------------------------------
@@ -501,9 +502,15 @@ fn content_x(vw: f32, s: f32) -> (f32, f32) {
     (((vw - cw) / 2.0).max(0.0), cw)
 }
 
-/// `“{text}”`, the text ellipsised so the quotes always survive.
+/// `“{text}”`, the text ellipsised so the quotes always survive — drawn with **one** pair
+/// (session-overview-ui D26). The app's model already carries the prompt quoted, so a text
+/// that arrives as `“…”` is unwrapped first rather than quoted again (which drew `““…”`).
 fn quoted(text: &str, max_w: f32, col: f32) -> Option<String> {
-    let inner = ellipsize(text, max_w - 2.0 * col, col)?;
+    let bare = text
+        .strip_prefix('“')
+        .and_then(|t| t.strip_suffix('”'))
+        .unwrap_or(text);
+    let inner = ellipsize(bare, max_w - 2.0 * col, col)?;
     Some(format!("“{inner}”"))
 }
 

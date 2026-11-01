@@ -55,6 +55,7 @@ fn unsplit_meta(state: AgentState) -> TabMeta {
 
 fn pane(pid: u32, active: bool, agent: Option<Agent>) -> PaneMeta {
     PaneMeta {
+        graph_transcript: None,
         graph_agent_cwd: None,
         graph_asks_user: false,
         pane_pid: pid,

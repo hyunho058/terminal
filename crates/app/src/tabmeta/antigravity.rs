@@ -178,6 +178,14 @@ pub(super) fn asks_user(memo: &Memo, pid: u32) -> bool {
         .is_some_and(|t| t.last == Some(LastMessage::AssistantAsksUser))
 }
 
+/// The transcript the `agy` at `pid`'s last probe named (session-overview-ui D24): the path
+/// [`state`] just classified, published on graph passes for the overview's digest. A pure
+/// memo read, valid right after [`state`] refreshed the entry this tick — so it costs no
+/// probe and no read of its own.
+pub(super) fn transcript(memo: &Memo, pid: u32) -> Option<PathBuf> {
+    memo.by_pid.get(&pid).and_then(|e| e.transcript.clone())
+}
+
 /// Whether a pid last probed at `probed_at` is probed again at `tick`: at once when it never
 /// was, then once every [`RESOLVE_TTL_TICKS`] — the Claude path's own re-resolution period.
 fn probe_due(probed_at: Option<u64>, tick: u64) -> bool {

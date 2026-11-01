@@ -1,6 +1,6 @@
 //! TT8 — acceptance test for `specs/session-overview-ui` R8.8's layout half (D12): a
 //! non-Claude session's detail draws, in place of the timeline,
-//! `No timeline — only Claude Code sessions record subagents.`
+//! `No timeline — this agent's log is not read.`
 //!
 //! Headless: `layout_detail` is pure, so the text runs it lays out are read directly. The
 //! `DetailData` is the one `app::overview_detail::build_detail` produces for an Antigravity
@@ -9,7 +9,7 @@
 use renderer::overview_layout::layout_detail;
 use renderer::overview_model::{AgentTag, Bucket, DetailData};
 
-const NO_TIMELINE: &str = "No timeline — only Claude Code sessions record subagents.";
+const NO_TIMELINE: &str = "No timeline — this agent's log is not read.";
 
 fn antigravity_detail() -> DetailData {
     DetailData {

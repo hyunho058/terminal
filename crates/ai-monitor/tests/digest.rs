@@ -564,3 +564,240 @@ fn events_record_finished_tools_with_their_summaries_newest_first() {
         ]
     );
 }
+
+// ---- D24: an Antigravity transcript yields a digest too -----------------------------
+
+use ai_monitor::telemetry::LogFormat;
+
+const AG_SUB: &str = "ed14342c-0000-4000-8000-00000000beef";
+
+/// `2026-10-31T10:{min}:{sec}Z` as a transcript's `created_at` writes it (no fraction).
+fn ag_stamp(min: u32, sec: u32) -> String {
+    format!("2026-10-31T10:{min:02}:{sec:02}Z")
+}
+
+fn ag_step(i: u32, min: u32, sec: u32, kind: &str, status: &str, extra: Value) -> Value {
+    let mut v = json!({"step_index": i, "source": "MODEL", "type": kind, "status": status,
+                       "created_at": ag_stamp(min, sec)});
+    if let (Some(o), Value::Object(e)) = (v.as_object_mut(), extra) {
+        o.extend(e);
+    }
+    v
+}
+
+fn ag_dispatch(i: u32, min: u32, name: &str, args: Value) -> Value {
+    ag_step(
+        i,
+        min,
+        0,
+        "PLANNER_RESPONSE",
+        "DONE",
+        json!({"tool_calls": [{"name": name, "args": args}]}),
+    )
+}
+
+fn ag_reply(i: u32, min: u32) -> Value {
+    ag_step(
+        i,
+        min,
+        0,
+        "PLANNER_RESPONSE",
+        "DONE",
+        json!({"content": "Done."}),
+    )
+}
+
+/// A turn: the prompt at 10:00, a `run_command` at 10:01, a background subagent launched at
+/// 10:02, a reply at 10:03 while it runs, its report at 10:04, the closing reply at 10:05.
+fn ag_turn() -> Vec<Value> {
+    vec![
+        ag_step(
+            0,
+            0,
+            0,
+            "USER_INPUT",
+            "DONE",
+            json!({"source": "USER_EXPLICIT", "content": "<USER_REQUEST>\nreview it\n</USER_REQUEST>"}),
+        ),
+        ag_dispatch(
+            1,
+            1,
+            "run_command",
+            json!({"CommandLine": "\"cargo test -p renderer\"", "toolSummary": "\"Run tests\""}),
+        ),
+        ag_step(
+            2,
+            1,
+            5,
+            "RUN_COMMAND",
+            "DONE",
+            json!({"content": "Created At: x\nCompleted At: x\n\nThe command exited with code 0."}),
+        ),
+        ag_dispatch(
+            3,
+            2,
+            "define_subagent",
+            json!({"name": "\"code-reviewer\"", "description": "\"Reviews a diff\""}),
+        ),
+        ag_step(
+            4,
+            2,
+            1,
+            "GENERIC",
+            "DONE",
+            json!({"content": "Created At: x\nCompleted At: x\n\nDefined."}),
+        ),
+        ag_dispatch(
+            5,
+            2,
+            "invoke_subagent",
+            json!({"Subagents": "[{\"Model\":\"m\",\"Prompt\":\"review\"}]"}),
+        ),
+        ag_step(
+            6,
+            2,
+            2,
+            "INVOKE_SUBAGENT",
+            "DONE",
+            json!({"content": format!(
+                "Created At: x\nCompleted At: x\nCreated the following subagents:\n{{\n  \"conversationId\": \"{AG_SUB}\"\n}}"
+            )}),
+        ),
+        ag_reply(7, 3),
+        ag_step(
+            8,
+            4,
+            0,
+            "SYSTEM_MESSAGE",
+            "DONE",
+            json!({"content": format!(
+                "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-31T10:04:00Z sender={AG_SUB} priority=HIGH\n</SYSTEM_MESSAGE>"
+            )}),
+        ),
+        ag_reply(9, 5),
+    ]
+}
+
+#[test]
+fn d24_an_antigravity_transcript_folds_prompt_turns_tools_and_subagent_events() {
+    let mut t = SessionTelemetry::with_format(LogFormat::Antigravity).with_digest();
+    fold(&mut t, &ag_turn());
+    let s = t.snapshot();
+
+    assert_eq!(s.subagents.len(), 1);
+    assert!(s.subagents[0].completed, "{:?}", s.subagents[0]);
+    assert_eq!(s.last_prompt_ms, Some(ms(0, 0)));
+    // The reply at 10:03 came while the subagent ran: the turn ends at 10:05, not 10:03.
+    assert_eq!(
+        s.turns,
+        [Turn {
+            start_ms: ms(0, 0),
+            end_ms: Some(ms(5, 0))
+        }]
+    );
+    assert_eq!(
+        s.last_tool,
+        Some((
+            "invoke_subagent".into(),
+            Some("Reviews a diff".into()),
+            Some(ms(2, 0))
+        ))
+    );
+    assert_eq!(
+        s.last_work_tool,
+        Some(("define_subagent".into(), None, Some(ms(2, 0)))),
+        "invoke_subagent is the Agent-like call, not work"
+    );
+    let kinds: Vec<(u64, EventKind)> = s.events.iter().map(|e| (e.at_ms, e.kind.clone())).collect();
+    let label = || "Reviews a diff".to_string();
+    assert_eq!(
+        kinds,
+        [
+            (ms(5, 0), EventKind::TurnFinished),
+            (
+                ms(4, 0),
+                EventKind::TaskDone {
+                    description: label()
+                }
+            ),
+            // Fold order: the launch is dispatched after the definition's result.
+            (
+                ms(2, 0),
+                EventKind::TaskStart {
+                    description: label()
+                }
+            ),
+            (
+                ms(2, 1),
+                EventKind::Tool {
+                    name: "define_subagent".into(),
+                    summary: None
+                }
+            ),
+            (
+                ms(1, 5),
+                EventKind::Tool {
+                    name: "run_command".into(),
+                    summary: Some("cargo test -p renderer".into())
+                }
+            ),
+        ]
+    );
+}
+
+#[test]
+fn d24_a_new_prompt_closes_an_unfinished_antigravity_turn() {
+    let mut t = SessionTelemetry::with_format(LogFormat::Antigravity).with_digest();
+    let mut steps = ag_turn();
+    steps.truncate(8); // up to the reply while the subagent still runs
+    steps.push(ag_step(
+        8,
+        6,
+        0,
+        "USER_INPUT",
+        "DONE",
+        json!({"content": "next"}),
+    ));
+    fold(&mut t, &steps);
+    let s = t.snapshot();
+    assert_eq!(s.last_prompt_ms, Some(ms(6, 0)));
+    assert_eq!(
+        s.turns,
+        [
+            Turn {
+                start_ms: ms(6, 0),
+                end_ms: None
+            },
+            Turn {
+                start_ms: ms(0, 0),
+                end_ms: Some(ms(6, 0))
+            },
+        ]
+    );
+    assert!(!s.events.iter().any(|e| e.kind == EventKind::TurnFinished));
+}
+
+#[test]
+fn d24_without_the_flag_an_antigravity_fold_is_unchanged() {
+    let mut plain = SessionTelemetry::with_format(LogFormat::Antigravity);
+    let mut with = SessionTelemetry::with_format(LogFormat::Antigravity).with_digest();
+    fold(&mut plain, &ag_turn());
+    fold(&mut with, &ag_turn());
+    let p = plain.snapshot();
+    assert_eq!(p.last_prompt_ms, None);
+    assert!(p.turns.is_empty() && p.events.is_empty());
+    assert_eq!(
+        (p.last_tool.clone(), p.last_work_tool.clone()),
+        (None, None)
+    );
+    // Every other field is the same as the digest fold's.
+    let w = TelemetrySnapshot {
+        last_tool: None,
+        last_work_tool: None,
+        last_prompt_ms: None,
+        turns: Vec::new(),
+        events: Vec::new(),
+        ..with.snapshot()
+    };
+    assert_eq!(p, w);
+}

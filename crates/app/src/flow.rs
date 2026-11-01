@@ -31,7 +31,7 @@ use renderer::sidebar_row::{SidebarRow, TabModelHandle};
 use renderer::{DrawLayer, FrameCtx};
 use winit::keyboard::{Key, NamedKey};
 
-use crate::flow_telemetry::{self, DigestSlot, FlowTelemetry, SessionDigest};
+use crate::flow_telemetry::{self, DigestSlot, FlowTelemetry, LogSource, SessionDigest};
 use crate::input::{self, WheelDelta};
 use crate::overview::{admits, build_overview, session_refs, ExpandSet};
 use crate::overview_detail::build_detail;
@@ -132,7 +132,7 @@ struct Core {
     generation: Arc<AtomicU64>,
     telemetry: Option<FlowTelemetry>,
     /// What the thread was last told to follow.
-    logs: Vec<PathBuf>,
+    logs: Vec<LogSource>,
     key: Option<RebuildKey>,
     /// How many times the key moved and the policy ran (R10.1, R10.2).
     rebuilds: u64,
@@ -211,12 +211,16 @@ impl Core {
         let rows: Vec<SidebarRow> = shared.with(|m| m.rows.clone());
         let metas = self.metas();
         let refs = session_refs(&rows, &metas);
-        let mut logs: Vec<PathBuf> = refs.iter().filter_map(|s| s.log.clone()).collect();
-        logs.sort();
+        // D24: each log with its dialect — a Claude log, or an Antigravity transcript.
+        let mut logs: Vec<LogSource> = refs
+            .iter()
+            .filter_map(|s| s.log.clone().map(|l| (l, s.format)))
+            .collect();
+        logs.sort_by(|a, b| a.0.cmp(&b.0));
         logs.dedup();
         if logs != self.logs {
             if let Some(t) = &self.telemetry {
-                t.update_logs(logs.clone());
+                t.update_sources(logs.clone());
             }
             self.logs = logs;
         }
@@ -987,7 +991,10 @@ mod tests {
         );
         assert!(m.rows[0].selected, "strip index 0 is the active tab");
         // Old D10: the thread is told the logs the overview reads.
-        assert_eq!(o.core.borrow().logs, vec![log]);
+        assert_eq!(
+            o.core.borrow().logs,
+            vec![(log, ai_monitor::telemetry::LogFormat::Claude)]
+        );
         // Same key: no rebuild, even with a stale key poked into the expanded set.
         let stale = ExpandSet::from([(TabId(9), 0)]);
         o.core.borrow_mut().expanded = stale.clone();
