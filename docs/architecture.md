@@ -12,7 +12,7 @@ The full derivation lives in `scaffold-spec.md`. This is the working summary.
 | D6 | `swash` shaping + rasterization + our own GPU atlas | Ligatures; GPU cell drawing stays ours |
 | D7 | Threads + channels (no async runtime) | PTY reader thread → channel → UI thread |
 | D8 | cargo workspace, 4 crates | Enforce dependency direction → headless core |
-| D9 | TOML + serde config (`~/.config/mac-terminal/config.toml`) | Standard, human-editable |
+| D9 | TOML + serde config (`~/Library/Application Support/Crewterm/config.toml`) | Standard, human-editable |
 | D10 | `cargo test` + `insta` snapshots + headless smoke | Test GPU-app logic without a GPU |
 | D11 | GH Actions (fmt/clippy/test/build) + local `.app` | Baseline drift resistance |
 

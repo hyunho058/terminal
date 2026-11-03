@@ -1,6 +1,6 @@
-# mac-terminal configuration.
+# Crewterm configuration.
 #
-# Copy to ~/.config/mac-terminal/config.toml and edit. Every field is optional;
+# Copy to ~/Library/Application Support/Crewterm/config.toml and edit. Every field is optional;
 # omitted fields fall back to the defaults shown here. Unknown keys are rejected
 # (deny_unknown_fields), so a typo fails loudly rather than being ignored.
 

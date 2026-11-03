@@ -5,14 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "macOS terminal binary: winit event loop wiring term-core + renderer + config."
-default-run = "app"
+default-run = "crewterm"
 
 [lib]
 name = "app"
 path = "src/lib.rs"
 
 [[bin]]
-name = "app"
+name = "crewterm"
 path = "src/main.rs"
 
 [dependencies]

@@ -1029,7 +1029,7 @@ mod tests {
     }
 
     /// Set only in the child process [`the_locator_returns_the_installed_handle`] spawns.
-    const LOCATOR_CHILD: &str = "MAC_TERMINAL_TABMETA_LOCATOR_CHILD";
+    const LOCATOR_CHILD: &str = "CREWTERM_TABMETA_LOCATOR_CHILD";
 
     /// The child half: installs into the process-global `OnceLock`. A no-op unless
     /// [`LOCATOR_CHILD`] is set, because installing in the shared test process would hand
