@@ -1,8 +1,8 @@
 //! Agent presence + identity: a bounded breadth-first walk of a tab's descendant
 //! processes (D6), each node classified by executable basename first, then its leading
 //! dot-component (an update-renamed binary like `agy.<id>.old`), then the
-//! `<agent>/versions` native-install signature, then — *only* for known interpreters —
-//! its argv (D5).
+//! `<agent>/versions` native-install signature, then — *only* for known interpreters, or a
+//! versioned binary deleted while it ran — its argv (D5).
 //!
 //! The basename itself has two sources, and that is deliberate: `proc_pidpath` when the
 //! executable is still on disk, and the kernel's **exec-time name** when it is not. An
@@ -115,6 +115,31 @@ fn classify_install_path(path: &Path) -> Option<AgentKind> {
     })
 }
 
+/// Whether a basename is shaped like the `<ver>` half of the `<agent>/versions/<ver>`
+/// install signature: dot-separated runs of ASCII digits, at least two of them
+/// (`2.1.290`). Pure — it opens the pathless stage-1b gate in [`classify_with_name`],
+/// so a deleted versioned binary pays an argv read and a deleted `rustc` does not.
+fn is_version(basename: &str) -> bool {
+    basename.contains('.')
+        && basename
+            .split('.')
+            .all(|run| !run.is_empty() && run.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The pathless half of stage 1b: argv[0] — the name the process was launched by — stands
+/// in for the path that was deleted out from under it. It goes through the same two rules a
+/// path would: its basename against the table (`claude`, as zsh passes it when it runs
+/// `~/.local/bin/claude`), then as a path against the install signature (an argv[0] that
+/// spelled `…/claude/versions/<ver>` out in full). Later arguments are not consulted: this
+/// is a native binary, so nothing after argv[0] says what it is.
+fn classify_argv0(args: &[OsString]) -> Option<AgentKind> {
+    let argv0 = Path::new(args.first()?);
+    argv0
+        .file_name()
+        .and_then(|base| classify_exe(&base.to_string_lossy()))
+        .or_else(|| classify_install_path(argv0))
+}
+
 /// [`classify_with_name`] with no name source — the pre-`agent-classifier-deleted-binary`
 /// signature, kept at its original arity so the eight pre-existing call sites that use it
 /// (spread over six tests) stay byte-identical. Only tests call it now.
@@ -152,9 +177,14 @@ pub(crate) fn classify_with(
 /// per-stage comments in the body say which is which. Two consequences are worth stating
 /// here, because the body cannot:
 ///
-/// - **stage 1b is unreachable from a recovered name** — the `<agent>/versions` signature
-///   needs a path, and there is none. Synthesising one would fabricate a component the kernel
-///   never reported, so it is deliberately not done.
+/// - **stage 1b reads argv[0] when there is no path** — the `<agent>/versions` signature
+///   needs a path, and a recovered name is only its `<ver>` half (the kernel records the
+///   versioned file's name, `2.1.290`, not the `claude` symlink zsh ran). No path is
+///   synthesised from that name; the agent half is read from argv[0], which the kernel did
+///   record. This was once a declared non-goal, on the grounds that nobody had seen it:
+///   `claude`'s updater deletes old versions, so every session that outlives an update
+///   reached it, and the card fell back to `Running` while the panel still said `[Claude]`.
+///   The gate is [`is_version`], so a deleted `rustc` still costs no `sysctl`.
 /// - **stage 2 receives an input it never used to** — a pathless process whose *name* is an
 ///   interpreter. That is the gate behaving as specified on a new input rather than a widened
 ///   gate, and both directions of it are pinned by tests below.
@@ -190,10 +220,14 @@ pub(crate) fn classify_with_name(
     {
         return Some(kind);
     }
-    // Stage 1b: the versioned-install signature (basename is a version string). Reachable
-    // only with a path — a recovered name carries no directory components to match.
+    // Stage 1b: the versioned-install signature (basename is a version string).
     if let Some(kind) = path.and_then(classify_install_path) {
         return Some(kind);
+    }
+    // Stage 1b, pathless: the updater deleted the versioned binary, so the name is the bare
+    // `<ver>` and argv[0] is the only place the `<agent>` half survives.
+    if path.is_none() && base.is_some_and(is_version) {
+        return classify_argv0(&read_argv());
     }
     // Stage 2: only a known interpreter's argv is read (the `sysctl` gate).
     if base.is_some_and(is_interpreter) {
@@ -262,10 +296,11 @@ pub(crate) fn agent_of_pid(pid: u32) -> Option<Detected> {
 }
 
 /// Classify one live pid: `proc_pidpath` (basename + `<agent>/versions` signature) first;
-/// when it reports nothing, the kernel's exec-time name; then — only for an interpreter —
-/// argv via `sysctl`. The `sysctl` (in `proc_args`) is reached solely through the
-/// `is_interpreter` gate inside `classify_with_name` (R4.4), and the name read
-/// (`proc_pidinfo`) solely on the pathless branch.
+/// when it reports nothing, the kernel's exec-time name; then — only for an interpreter, or
+/// a pathless process named like a version — argv via `sysctl`. The `sysctl` (in
+/// `proc_args`) is reached solely through the `is_interpreter` and `is_version` gates inside
+/// `classify_with_name` (R4.4), and the name read (`proc_pidinfo`) solely on the pathless
+/// branch.
 fn classify_pid(pid: u32) -> Option<AgentKind> {
     let path = super::proc::exe_path(pid);
     classify_with_name(
@@ -629,6 +664,87 @@ mod tests {
         );
     }
 
+    // ---- a deleted versioned install (the `claude` native installer) ----
+
+    /// An argv closure that records whether it was called, returning `argv`.
+    fn argv_spy<'a>(
+        argv: &[&str],
+        called: &'a std::cell::Cell<bool>,
+    ) -> impl FnOnce() -> Vec<OsString> + 'a {
+        let argv: Vec<OsString> = argv.iter().map(OsString::from).collect();
+        move || {
+            called.set(true);
+            argv
+        }
+    }
+
+    #[test]
+    fn a_deleted_versioned_install_classifies_by_argv0() {
+        // The observed bug: a `claude` session that outlived an update. Its binary
+        // `~/.local/share/claude/versions/2.1.290` was deleted, so there is no path, and the
+        // kernel's name is the version, not `claude`. argv[0] is what zsh launched it as.
+        for argv0 in [
+            "claude",
+            "/Users/x/.local/bin/claude",
+            "/Users/x/.local/share/claude/versions/2.1.290",
+        ] {
+            let (n, a) = (std::cell::Cell::new(false), std::cell::Cell::new(false));
+            assert_eq!(
+                classify_with_name(None, spy(Some("2.1.290"), &n), argv_spy(&[argv0], &a)),
+                Some(AgentKind::Claude),
+                "argv[0] {argv0:?} must identify the deleted install"
+            );
+            assert!(a.get(), "the agent half can only come from argv");
+        }
+        // argv[0] that names no agent — a bare version, a failed read, an agent named only
+        // further along — leaves it unidentified: a native binary's later arguments are its
+        // own, not a description of it.
+        for argv in [
+            &["2.1.290"][..],
+            &[][..],
+            &["tool", "/opt/claude/versions/1"][..],
+        ] {
+            let (n, a) = (std::cell::Cell::new(false), std::cell::Cell::new(false));
+            assert_eq!(
+                classify_with_name(None, spy(Some("2.1.290"), &n), argv_spy(argv, &a)),
+                None,
+                "argv {argv:?} names no agent at argv[0]"
+            );
+        }
+    }
+
+    #[test]
+    fn the_version_gate_opens_only_for_a_pathless_version_name() {
+        // The argv read is a KERN_ARGMAX-sized sysctl, so the gate must stay as narrow as
+        // the shape it exists for. Every name here is one character away from a version.
+        for name in ["rustc", "2", "2.", ".1", "2..1", "v2.1", "2.1a", "2.1-beta"] {
+            let (n, a) = (std::cell::Cell::new(false), std::cell::Cell::new(false));
+            assert_eq!(
+                classify_with_name(None, spy(Some(name), &n), argv_spy(&["claude"], &a)),
+                None,
+            );
+            assert!(
+                !a.get(),
+                "pathless {name:?} is not a version and must not read argv"
+            );
+        }
+        // A readable path named like a version is stage 1b's to judge, and it judged: no
+        // `<agent>/versions` above it. The pathless rule must not second-guess it.
+        let (n, a) = (std::cell::Cell::new(false), std::cell::Cell::new(false));
+        assert_eq!(
+            classify_with_name(
+                Some(Path::new("/opt/homebrew/Cellar/tool/1.2.3")),
+                spy(Some("1.2.3"), &n),
+                argv_spy(&["claude"], &a),
+            ),
+            None,
+        );
+        assert!(
+            !a.get(),
+            "a version-named binary that is still on disk reads no argv"
+        );
+    }
+
     // ---- the live end-to-end gate (agent-classifier-deleted-binary R0.1, R3, R4.1) ----
 
     /// Where the child writes its readiness marker; the parent puts the path here.
@@ -807,6 +923,90 @@ mod tests {
     }
 
     #[test]
+    fn a_live_versioned_install_survives_its_binary_being_deleted() {
+        // The `claude` half of the test above, in the shape measured on a live session:
+        // zsh exec'd the `~/.local/bin/claude` symlink with argv[0] `claude`, the kernel
+        // named the process after the versioned file it resolved to, and the updater later
+        // deleted that file. The serial lock is held for the child's lifetime for the same
+        // two reasons the test above gives.
+        use std::os::unix::process::CommandExt;
+        let _g = super::super::probe::serial();
+
+        let tmp = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp dir");
+        let dir = tmp.join(format!("agent-del-ver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let versions = dir.join("share/claude/versions");
+        std::fs::create_dir_all(&versions).expect("mkdir versions");
+        std::fs::create_dir_all(dir.join("bin")).expect("mkdir bin");
+        let exe = versions.join("9.9.9");
+        std::fs::copy(std::env::current_exe().expect("current_exe"), &exe).expect("copy");
+        let launcher = dir.join("bin/claude");
+        std::os::unix::fs::symlink(&exe, &launcher).expect("symlink");
+
+        let marker = dir.join("ready");
+        let child = std::process::Command::new(&launcher)
+            .arg0("claude")
+            .env(READY_MARKER_VAR, &marker)
+            .args([
+                "--exact",
+                "tabmeta::agent::tests::deleted_binary_child_sleeper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn through the symlink");
+        let mut guard = ChildGuard(child);
+        let pid = guard.0.id();
+
+        // Started, not merely exec'd — unlinking a binary that is still paging in gets the
+        // child SIGKILLed (see the readiness poll in the test above).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !(super::super::proc::exe_path(pid).as_deref() == Some(exe.as_path())
+            && marker.exists())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child {pid} never started {}; exe_path reads {:?}, marker written: {}",
+                exe.display(),
+                super::super::proc::exe_path(pid),
+                marker.exists(),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            classify_pid(pid),
+            Some(AgentKind::Claude),
+            "on disk, stage 1b reads the install signature from the path"
+        );
+
+        // The updater removes the old version.
+        std::fs::remove_file(&exe).expect("unlink");
+        assert!(
+            guard.0.try_wait().expect("try_wait").is_none(),
+            "the child died between readiness and the assertions"
+        );
+
+        assert_eq!(super::super::proc::exe_path(pid), None);
+        assert_eq!(
+            super::super::proc::name_of_pid(pid).as_deref(),
+            Some("9.9.9"),
+            "the kernel names the versioned file it resolved to, not the symlink zsh ran — \
+             which is why a recovered name alone cannot say `claude`"
+        );
+        assert_eq!(
+            classify_pid(pid),
+            Some(AgentKind::Claude),
+            "a live versioned install whose binary was deleted must still be an agent \
+             (this returns None on the pre-fix code)"
+        );
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_readable_exe_path_costs_no_name_read() {
         let _g = super::super::probe::serial();
         // R4.1 — the cost promise, on the real syscall path rather than the injected one.
@@ -848,6 +1048,18 @@ mod tests {
         let matches: HashMap<u32, AgentKind> = [(5, AgentKind::Claude)].into_iter().collect();
         let got = walk(1, children_of(&tree), |pid| matches.get(&pid).copied());
         assert_eq!(got, None);
+    }
+
+    #[test]
+    fn walk_reaches_max_depth() {
+        // The other side of R5.1: a match exactly 3 levels down (`zsh → wrapper → node →
+        // claude`) IS reached. Without it, a walk that never left depth 1 passed the bound.
+        let tree: HashMap<u32, Vec<u32>> = [(1, vec![2]), (2, vec![3]), (3, vec![4])]
+            .into_iter()
+            .collect();
+        let matches: HashMap<u32, AgentKind> = [(4, AgentKind::Claude)].into_iter().collect();
+        let got = walk(1, children_of(&tree), |pid| matches.get(&pid).copied());
+        assert_eq!(got.map(|d| d.pid), Some(4));
     }
 
     #[test]
