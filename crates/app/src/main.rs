@@ -35,6 +35,10 @@ fn main() {
     // Wait for events (PTY wakeups, input, redraw) rather than spinning.
     event_loop.set_control_flow(ControlFlow::Wait);
 
+    if let Some(mtm) = objc2::MainThreadMarker::new() {
+        app::install_app_menu(mtm);
+    }
+
     let proxy = event_loop.create_proxy();
     // Capture the sidebar display toggles before `cfg` is moved into the app (T5/D12).
     let (show_git_branch, show_agent_status) =
