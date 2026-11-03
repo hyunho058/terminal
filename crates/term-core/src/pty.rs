@@ -262,7 +262,7 @@ fn assemble_child_command(mut cmd: CommandBuilder) -> (CommandBuilder, Option<St
     // The renderer draws 24-bit colour; say so, and say who we are, so a TUI
     // never decides from the launching terminal's identity.
     cmd.env("COLORTERM", "truecolor");
-    cmd.env("TERM_PROGRAM", "mac-terminal");
+    cmd.env("TERM_PROGRAM", "Crewterm");
     // D15 / R9.5: a Finder-launched `.app` inherits a minimal environment
     // with no locale, so this must be decided here rather than assumed.
     match locale_action(&|k| std::env::var(k).ok()) {
@@ -665,10 +665,7 @@ mod tests {
         for var in ["TMUX", "TMUX_PANE", "TERM_PROGRAM_VERSION"] {
             assert!(cmd.get_env(var).is_none(), "{var} reached the child");
         }
-        assert_eq!(
-            cmd.get_env("TERM_PROGRAM"),
-            Some(OsStr::new("mac-terminal"))
-        );
+        assert_eq!(cmd.get_env("TERM_PROGRAM"), Some(OsStr::new("Crewterm")));
         assert_eq!(cmd.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
     }
 
