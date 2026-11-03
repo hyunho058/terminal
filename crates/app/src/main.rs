@@ -18,6 +18,7 @@
 //! mean no frames.
 
 use winit::event_loop::{ControlFlow, EventLoop};
+use winit::platform::macos::EventLoopBuilderExtMacOS;
 
 use app::{feature_registrations, App, SidebarMetaSource, TabMetaHandle, UserEvent};
 
@@ -29,9 +30,9 @@ fn main() {
         common::config::Config::default()
     });
 
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
-        .build()
-        .expect("build event loop");
+    let mut builder = EventLoop::<UserEvent>::with_user_event();
+    builder.with_default_menu(false);
+    let event_loop = builder.build().expect("build event loop");
     // Wait for events (PTY wakeups, input, redraw) rather than spinning.
     event_loop.set_control_flow(ControlFlow::Wait);
 

@@ -418,6 +418,10 @@ impl App {
         // keys (view.rs:479-496); ASCII, which never marks text, is unaffected.
         window.set_ime_allowed(true);
 
+        if let Some(mtm) = MainThreadMarker::new() {
+            crate::settings_menu::install_app_menu(mtm);
+        }
+
         let size = window.inner_size();
         let scale = window.scale_factor();
         let mut renderer = Renderer::new(window.clone(), size.width, size.height, scale, &self.cfg)
