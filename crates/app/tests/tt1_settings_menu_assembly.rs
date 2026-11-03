@@ -46,9 +46,9 @@ fn r1_1_build_app_menu_structure_and_standard_actions() {
         "Application menu must contain exactly 11 items (including separators)"
     );
 
-    // 0: About mac-terminal
+    // 0: About Crewterm
     let about = menu.itemAtIndex(0).expect("item 0: About");
-    assert_eq!(about.title().to_string(), "About mac-terminal");
+    assert_eq!(about.title().to_string(), "About Crewterm");
     assert_eq!(
         about.action(),
         Some(sel!(orderFrontStandardAboutPanel:)),
@@ -87,9 +87,9 @@ fn r1_1_build_app_menu_structure_and_standard_actions() {
     let sep3 = menu.itemAtIndex(5).expect("item 5: Separator");
     assert!(sep3.isSeparatorItem(), "item 5 must be a separator");
 
-    // 6: Hide mac-terminal
+    // 6: Hide Crewterm
     let hide = menu.itemAtIndex(6).expect("item 6: Hide");
-    assert_eq!(hide.title().to_string(), "Hide mac-terminal");
+    assert_eq!(hide.title().to_string(), "Hide Crewterm");
     assert_eq!(
         hide.action(),
         Some(sel!(hide:)),
@@ -121,9 +121,9 @@ fn r1_1_build_app_menu_structure_and_standard_actions() {
     let sep4 = menu.itemAtIndex(9).expect("item 9: Separator");
     assert!(sep4.isSeparatorItem(), "item 9 must be a separator");
 
-    // 10: Quit mac-terminal
+    // 10: Quit Crewterm
     let quit = menu.itemAtIndex(10).expect("item 10: Quit");
-    assert_eq!(quit.title().to_string(), "Quit mac-terminal");
+    assert_eq!(quit.title().to_string(), "Quit Crewterm");
     assert_eq!(
         quit.action(),
         Some(sel!(terminate:)),
@@ -160,7 +160,7 @@ fn r1_2_install_app_menu_populates_main_menu() {
     );
 
     let about_item = app_menu.itemAtIndex(0).expect("about item");
-    assert_eq!(about_item.title().to_string(), "About mac-terminal");
+    assert_eq!(about_item.title().to_string(), "About Crewterm");
     assert_eq!(about_item.action(), Some(sel!(orderFrontStandardAboutPanel:)));
 
     let settings_item = app_menu.itemAtIndex(2).expect("settings item");
@@ -168,7 +168,7 @@ fn r1_2_install_app_menu_populates_main_menu() {
     assert_eq!(settings_item.keyEquivalent().to_string(), ",");
 
     let quit_item = app_menu.itemAtIndex(10).expect("quit item");
-    assert_eq!(quit_item.title().to_string(), "Quit mac-terminal");
+    assert_eq!(quit_item.title().to_string(), "Quit Crewterm");
     assert_eq!(quit_item.action(), Some(sel!(terminate:)));
 }
 

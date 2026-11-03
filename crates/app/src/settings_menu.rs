@@ -33,11 +33,11 @@ fn settings_target() -> &'static SettingsMenuTarget {
 /// Hide, Hide Others, Show All, and Quit items.
 pub fn build_app_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     let menu = NSMenu::new(mtm);
-    menu.setTitle(ns_string!("mac-terminal"));
+    menu.setTitle(ns_string!("Crewterm"));
 
-    // 0: About mac-terminal
+    // 0: About Crewterm
     let about = NSMenuItem::new(mtm);
-    about.setTitle(ns_string!("About mac-terminal"));
+    about.setTitle(ns_string!("About Crewterm"));
     unsafe { about.setAction(Some(sel!(orderFrontStandardAboutPanel:))) };
     menu.addItem(&about);
 
@@ -68,9 +68,9 @@ pub fn build_app_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     // 5: Separator
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-    // 6: Hide mac-terminal (key equivalent "h")
+    // 6: Hide Crewterm (key equivalent "h")
     let hide = NSMenuItem::new(mtm);
-    hide.setTitle(ns_string!("Hide mac-terminal"));
+    hide.setTitle(ns_string!("Hide Crewterm"));
     hide.setKeyEquivalent(ns_string!("h"));
     unsafe { hide.setAction(Some(sel!(hide:))) };
     menu.addItem(&hide);
@@ -94,9 +94,9 @@ pub fn build_app_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     // 9: Separator
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-    // 10: Quit mac-terminal (key equivalent "q")
+    // 10: Quit Crewterm (key equivalent "q")
     let quit = NSMenuItem::new(mtm);
-    quit.setTitle(ns_string!("Quit mac-terminal"));
+    quit.setTitle(ns_string!("Quit Crewterm"));
     quit.setKeyEquivalent(ns_string!("q"));
     unsafe { quit.setAction(Some(sel!(terminate:))) };
     menu.addItem(&quit);
