@@ -8,8 +8,8 @@
 use std::sync::{Mutex, OnceLock};
 
 use common::config::{
-    Config, FONT_SIZE_MAX, FONT_SIZE_MIN, MONITOR_WIDTH_MAX, MONITOR_WIDTH_MIN,
-    SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN,
+    Config, FONT_SIZE_MAX, FONT_SIZE_MIN, MONITOR_WIDTH_MAX, MONITOR_WIDTH_MIN, SIDEBAR_WIDTH_MAX,
+    SIDEBAR_WIDTH_MIN,
 };
 use objc2::rc::Retained;
 use objc2::{define_class, sel, ClassType, MainThreadMarker};
@@ -298,26 +298,34 @@ fn reset_ui_to_defaults() {
     controls
         .sidebar_width_slider
         .setDoubleValue(def.sidebar.width_px as f64);
-    controls.git_branch.setState(if def.sidebar.show_git_branch {
-        NSControlStateValueOn
-    } else {
-        NSControlStateValueOff
-    });
-    controls.agent_status.setState(if def.sidebar.show_agent_status {
-        NSControlStateValueOn
-    } else {
-        NSControlStateValueOff
-    });
-    controls.sidebar_collapsed.setState(if def.sidebar.collapsed {
-        NSControlStateValueOn
-    } else {
-        NSControlStateValueOff
-    });
+    controls
+        .git_branch
+        .setState(if def.sidebar.show_git_branch {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+    controls
+        .agent_status
+        .setState(if def.sidebar.show_agent_status {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+    controls
+        .sidebar_collapsed
+        .setState(if def.sidebar.collapsed {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
 
-    controls.ai_monitor_width.setStringValue(&NSString::from_str(&format!(
-        "{:.1}",
-        def.ai_monitor.width_px
-    )));
+    controls
+        .ai_monitor_width
+        .setStringValue(&NSString::from_str(&format!(
+            "{:.1}",
+            def.ai_monitor.width_px
+        )));
     controls
         .ai_monitor_width_slider
         .setDoubleValue(def.ai_monitor.width_px as f64);
@@ -360,9 +368,8 @@ pub fn show_settings_window(mtm: MainThreadMarker) {
 
     // 1. Create Window (520 × 450)
     let win_rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(520.0, 450.0));
-    let mask = NSWindowStyleMask::Titled
-        | NSWindowStyleMask::Closable
-        | NSWindowStyleMask::Miniaturizable;
+    let mask =
+        NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable;
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
             mtm.alloc(),
@@ -513,8 +520,7 @@ pub fn show_settings_window(mtm: MainThreadMarker) {
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(480.0, 320.0)),
     );
 
-    let lbl_theme_title =
-        NSTextField::labelWithString(ns_string!("Terminal Color Scheme:"), mtm);
+    let lbl_theme_title = NSTextField::labelWithString(ns_string!("Terminal Color Scheme:"), mtm);
     lbl_theme_title.setFrame(NSRect::new(
         NSPoint::new(20.0, 260.0),
         NSSize::new(200.0, 22.0),

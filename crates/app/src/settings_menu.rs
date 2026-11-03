@@ -79,9 +79,8 @@ pub fn build_app_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     let hide_others = NSMenuItem::new(mtm);
     hide_others.setTitle(ns_string!("Hide Others"));
     hide_others.setKeyEquivalent(ns_string!("h"));
-    hide_others.setKeyEquivalentModifierMask(
-        NSEventModifierFlags::Command | NSEventModifierFlags::Option,
-    );
+    hide_others
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
     unsafe { hide_others.setAction(Some(sel!(hideOtherApplications:))) };
     menu.addItem(&hide_others);
 
@@ -119,9 +118,8 @@ pub fn build_view_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     let monitor_item = NSMenuItem::new(mtm);
     monitor_item.setTitle(ns_string!("Toggle AI Monitor"));
     monitor_item.setKeyEquivalent(ns_string!("m"));
-    monitor_item.setKeyEquivalentModifierMask(
-        NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
-    );
+    monitor_item
+        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
     menu.addItem(&monitor_item);
 
     menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -277,9 +275,8 @@ pub fn ensure_config_file_exists_at(path: &Path) -> std::io::Result<PathBuf> {
 
 /// Ensure configuration file exists at `Config::path()`.
 pub fn ensure_config_file_exists() -> std::io::Result<PathBuf> {
-    let path = common::config::Config::path().map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string())
-    })?;
+    let path = common::config::Config::path()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))?;
     ensure_config_file_exists_at(&path)
 }
 

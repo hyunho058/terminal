@@ -396,7 +396,10 @@ pub fn save_config(path: &Path, cfg: &Config) -> Result<()> {
         &[
             ("width_px", fmt_f32(cfg.sidebar.width_px)),
             ("show_git_branch", cfg.sidebar.show_git_branch.to_string()),
-            ("show_agent_status", cfg.sidebar.show_agent_status.to_string()),
+            (
+                "show_agent_status",
+                cfg.sidebar.show_agent_status.to_string(),
+            ),
             ("collapsed", cfg.sidebar.collapsed.to_string()),
         ],
     )?;

@@ -144,13 +144,17 @@ fn r1_2_install_app_menu_populates_main_menu() {
     app::install_app_menu(mtm);
 
     let app = NSApplication::sharedApplication(mtm);
-    let main_menu = app.mainMenu().expect("main menu must be populated on NSApplication");
+    let main_menu = app
+        .mainMenu()
+        .expect("main menu must be populated on NSApplication");
     assert!(
         main_menu.numberOfItems() >= 1,
         "main menu must contain at least one item representing the application menu bar item"
     );
 
-    let top_item = main_menu.itemAtIndex(0).expect("first item in top menu bar");
+    let top_item = main_menu
+        .itemAtIndex(0)
+        .expect("first item in top menu bar");
     let app_menu = top_item.submenu().unwrap_or_else(|| main_menu.clone());
 
     assert_eq!(
@@ -161,7 +165,10 @@ fn r1_2_install_app_menu_populates_main_menu() {
 
     let about_item = app_menu.itemAtIndex(0).expect("about item");
     assert_eq!(about_item.title().to_string(), "About Crewterm");
-    assert_eq!(about_item.action(), Some(sel!(orderFrontStandardAboutPanel:)));
+    assert_eq!(
+        about_item.action(),
+        Some(sel!(orderFrontStandardAboutPanel:))
+    );
 
     let settings_item = app_menu.itemAtIndex(2).expect("settings item");
     assert_eq!(settings_item.title().to_string(), "Settings...");

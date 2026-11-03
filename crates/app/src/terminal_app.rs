@@ -61,10 +61,11 @@ use crate::ime_chord::{self, CmdEventFacts, Replay};
 use crate::input::{
     self, drag_owns_pointer, encode_key, font_action, grid_press_action, grid_release_action,
     hover_card, hover_cursor, is_double_click, is_settings_chord, is_sidebar_toggle_chord,
-    pixel_to_cell, pixel_to_cell_clamped, press_dismisses_modals, reported_drag_motion, should_snap_on_click,
-    sidebar_press, sidebar_region, suppress_key, tab_action, wheel_bytes, wheel_lines,
-    wheel_scroll, FontAction, GridPressAction, GridReleaseAction, PersistTarget, PointerOwner,
-    PressRoute, ReleaseTarget, ResizeDrag, ResizeEdge, SidebarAction, TabAction, WheelDelta,
+    pixel_to_cell, pixel_to_cell_clamped, press_dismisses_modals, reported_drag_motion,
+    should_snap_on_click, sidebar_press, sidebar_region, suppress_key, tab_action, wheel_bytes,
+    wheel_lines, wheel_scroll, FontAction, GridPressAction, GridReleaseAction, PersistTarget,
+    PointerOwner, PressRoute, ReleaseTarget, ResizeDrag, ResizeEdge, SidebarAction, TabAction,
+    WheelDelta,
 };
 use crate::seam::{
     AppCtx, AppRequest, Handled, InputRouter, KeyInput, OverlayCommand, OverlayHost, Registrations,

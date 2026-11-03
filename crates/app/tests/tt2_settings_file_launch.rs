@@ -54,7 +54,10 @@ fn r2_1_seed_default_configuration_when_missing() {
     // (containing at least "[font]" and "[theme]") is written to path, and Ok(path) is returned.
     let returned_path = result.expect("should create default config file successfully");
     assert_eq!(returned_path, target_path);
-    assert!(target_path.is_file(), "config file should have been created on disk");
+    assert!(
+        target_path.is_file(),
+        "config file should have been created on disk"
+    );
 
     let content = fs::read_to_string(&target_path).expect("config file should be readable");
     assert!(
