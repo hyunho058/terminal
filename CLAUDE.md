@@ -1,4 +1,8 @@
-# mac-terminal
+# Crewterm
+
+(Formerly `mac-terminal`; specs and interview notes written before 2026-11-02 use
+the old name. The config dir, shell-integration dir and env vars carry the new one,
+and `Config::path` still reads a config left under the old dir.)
 
 A from-scratch macOS GPU terminal in Rust: pure **wgpu/Metal** cell rendering (no
 GUI/widget crates), local **zsh** over a PTY, VT parsing via `vte`. macOS ARM64

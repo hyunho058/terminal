@@ -313,7 +313,7 @@ const FIRST_EVENT_LEAD_MS: u64 = 5_000;
 /// Two tiers, in order: the id `want` names outright, then the log whose first event
 /// dates it to the caller's own process start (within [`FIRST_EVENT_SLACK_MS`]).
 /// When neither confirms, the answer is `None` rather than a guess: the directory
-/// records no application, window or tab — Warp, iTerm and every other mac-terminal
+/// records no application, window or tab — Warp, iTerm and every other Crewterm
 /// window writing in the same project all append here — so an unconfirmed pick is a
 /// foreign session as often as not.
 ///

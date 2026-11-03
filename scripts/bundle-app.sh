@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Build a minimal mac-terminal.app for local daily-driver use.
+# Build a minimal Crewterm.app for local daily-driver use.
 #
 # Baseline only: no code signing, no notarization (explicit non-goals). The
-# bundle runs on the machine that built it. Output: target/mac-terminal.app
+# bundle runs on the machine that built it. Output: target/Crewterm.app
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-APP_NAME="mac-terminal"
-BIN="app"
+APP_NAME="Crewterm"
+BIN="crewterm"
 BUILD_DIR="target/release"
 APP_DIR="target/${APP_NAME}.app"
 
@@ -27,8 +27,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key><string>${APP_NAME}</string>
-    <key>CFBundleDisplayName</key><string>mac-terminal</string>
-    <key>CFBundleIdentifier</key><string>dev.local.mac-terminal</string>
+    <key>CFBundleDisplayName</key><string>Crewterm</string>
+    <key>CFBundleIdentifier</key><string>dev.hyunho.crewterm</string>
     <key>CFBundleVersion</key><string>0.1.0</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundlePackageType</key><string>APPL</string>

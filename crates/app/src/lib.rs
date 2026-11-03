@@ -1,4 +1,4 @@
-//! mac-terminal application library.
+//! Crewterm application library.
 //!
 //! Everything the binary is made of lives here; `main.rs` is the thin shell that
 //! owns the one thing a library cannot: the winit `EventLoop`, which on macOS may

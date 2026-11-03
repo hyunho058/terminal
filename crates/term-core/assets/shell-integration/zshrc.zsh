@@ -1,13 +1,13 @@
-# mac-terminal shell integration (generated — do not edit).
+# Crewterm shell integration (generated — do not edit).
 #
 # Chains the user's interactive config first (spec D18), THEN adds OSC 133
 # command markers add-only. We never touch PROMPT/PS1, so oh-my-zsh / starship /
 # powerlevel10k prompts keep working unchanged. If anything here fails the shell
 # still runs — the completion/error signals just go quiet (spec D13).
 
-: ${MAC_TERMINAL_USER_ZDOTDIR:=$HOME}
-[[ -r "$MAC_TERMINAL_USER_ZDOTDIR/.zshrc" ]]  && source "$MAC_TERMINAL_USER_ZDOTDIR/.zshrc"
-[[ -r "$MAC_TERMINAL_USER_ZDOTDIR/.zlogin" ]] && source "$MAC_TERMINAL_USER_ZDOTDIR/.zlogin"
+: ${CREWTERM_USER_ZDOTDIR:=$HOME}
+[[ -r "$CREWTERM_USER_ZDOTDIR/.zshrc" ]]  && source "$CREWTERM_USER_ZDOTDIR/.zshrc"
+[[ -r "$CREWTERM_USER_ZDOTDIR/.zlogin" ]] && source "$CREWTERM_USER_ZDOTDIR/.zlogin"
 
 # --- OSC 133 command markers (wire contract mirrored in parser.rs::osc_dispatch) ---
 #   command start: ESC ] 133 ; C BEL

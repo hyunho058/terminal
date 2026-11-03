@@ -1,4 +1,4 @@
-//! mac-terminal binary entry point.
+//! Crewterm binary entry point.
 //!
 //! Deliberately thin. Everything else lives in the `app` library beside it, so it
 //! is importable by `crates/app/tests/`; what stays here is only what a library

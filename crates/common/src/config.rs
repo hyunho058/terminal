@@ -1,7 +1,7 @@
 //! User configuration: font, color theme, ligatures, and grid defaults.
 //!
 //! Loaded from the platform config dir via [`directories::ProjectDirs`] — on macOS that
-//! is `~/Library/Application Support/mac-terminal/config.toml`, **not** `~/.config`
+//! is `~/Library/Application Support/Crewterm/config.toml`, **not** `~/.config`
 //! (verified empirically; several docs still say otherwise). TOML + serde. Every field
 //! has a default, so a missing or partial file still yields a usable `Config`.
 //! This type is deliberately UI/GPU-free so both `renderer` and `app` can read it.
@@ -12,8 +12,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CommonError, Result};
 
-/// Application id used for the config directory (`~/.config/<APP_ID>/`).
-pub const APP_ID: &str = "mac-terminal";
+/// Application id used for the config directory
+/// (`~/Library/Application Support/<APP_ID>/`).
+pub const APP_ID: &str = "Crewterm";
+/// The name this app shipped under before it became Crewterm; `Config::path` still
+/// reads a config left there when none exists under `APP_ID`.
+pub const LEGACY_APP_ID: &str = "mac-terminal";
 pub const CONFIG_FILE: &str = "config.toml";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -187,12 +191,26 @@ impl Default for SidebarConfig {
 
 impl Config {
     /// Absolute path to the config file. `ProjectDirs` follows the platform convention, so
-    /// on macOS this is `~/Library/Application Support/mac-terminal/config.toml` — the
+    /// on macOS this is `~/Library/Application Support/Crewterm/config.toml` — the
     /// XDG-style `~/.config/...` that older comments cite is not what this returns.
+    ///
+    /// The app was renamed from `mac-terminal` to Crewterm (2026-11-02). Until a config
+    /// exists under the new name, a file still at the old directory is used, so the
+    /// rename does not silently reset anyone's settings. The watcher follows this same
+    /// path, so live reload keeps working on the legacy file too.
     pub fn path() -> Result<PathBuf> {
         let dirs =
             directories::ProjectDirs::from("", "", APP_ID).ok_or(CommonError::NoConfigDir)?;
-        Ok(dirs.config_dir().join(CONFIG_FILE))
+        let current = dirs.config_dir().join(CONFIG_FILE);
+        if current.exists() {
+            return Ok(current);
+        }
+        let legacy = directories::ProjectDirs::from("", "", LEGACY_APP_ID)
+            .map(|d| d.config_dir().join(CONFIG_FILE));
+        match legacy {
+            Some(old) if old.exists() => Ok(old),
+            _ => Ok(current),
+        }
     }
 
     /// Load config from the default path, falling back to defaults if the file

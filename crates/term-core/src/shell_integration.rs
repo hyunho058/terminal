@@ -23,10 +23,10 @@ const ZSHRC: &str = include_str!("../assets/shell-integration/zshrc.zsh");
 
 /// Env var carrying the user's *real* `ZDOTDIR` (or `$HOME`) into the child, so
 /// the generated scripts can source the user's files after we override `ZDOTDIR`.
-const USER_ZDOTDIR_VAR: &str = "MAC_TERMINAL_USER_ZDOTDIR";
+const USER_ZDOTDIR_VAR: &str = "CREWTERM_USER_ZDOTDIR";
 
 /// Where the generated scripts live, relative to `$HOME`.
-const SUPPORT_DIR_SUFFIX: &str = "Library/Application Support/mac-terminal/shell-integration";
+const SUPPORT_DIR_SUFFIX: &str = "Library/Application Support/Crewterm/shell-integration";
 
 /// Configure `cmd` to load our OSC 133 shell integration via `ZDOTDIR`.
 ///
@@ -43,8 +43,8 @@ pub(crate) fn inject(cmd: &mut CommandBuilder) {
 ///
 /// Both of our markers are *re-derived*, never inherited
 /// (`pty-session-env-isolation` D7/D9/D13): when the app is itself launched from
-/// a mac-terminal tab, the parent env already carries a `ZDOTDIR` pointing at our
-/// generated dir and a `MAC_TERMINAL_USER_ZDOTDIR` we wrote one level up. Passing
+/// a Crewterm tab, the parent env already carries a `ZDOTDIR` pointing at our
+/// generated dir and a `CREWTERM_USER_ZDOTDIR` we wrote one level up. Passing
 /// those on would make `zshrc.zsh:9` source *itself*.
 fn inject_with(
     cmd: &mut CommandBuilder,
@@ -55,7 +55,7 @@ fn inject_with(
     let inherited_zdotdir = get_env("ZDOTDIR").filter(|s| !s.is_empty());
 
     // Is the parent one of *our* shells? Answered primarily by NAME: an inherited
-    // MAC_TERMINAL_USER_ZDOTDIR exists only because one of our shells set it, and
+    // CREWTERM_USER_ZDOTDIR exists only because one of our shells set it, and
     // we always set it together with ZDOTDIR. The path comparison is the secondary
     // guard, catching a hand-set ZDOTDIR=<our dir> with no companion marker. With
     // HOME absent the helper returns None, the path guard simply does not fire,
@@ -76,7 +76,7 @@ fn inject_with(
     // Capture the user's real ZDOTDIR BEFORE we override it, so the generated rc
     // can chain the user's files instead of clobbering them. Three tiers, first
     // non-empty wins (D9):
-    //   1. inherited MAC_TERMINAL_USER_ZDOTDIR — ground truth, we wrote it one
+    //   1. inherited CREWTERM_USER_ZDOTDIR — ground truth, we wrote it one
     //      level up, so nesting depth is irrelevant
     //   2. inherited ZDOTDIR, unless it is recognised as ours
     //   3. $HOME
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn inject_sets_zdotdir_and_user_passthrough() {
         let mut cmd = clean_cmd();
-        let fake_dir = PathBuf::from("/tmp/mac-terminal-test-zdotdir");
+        let fake_dir = PathBuf::from("/tmp/crewterm-test-zdotdir");
         inject_with(
             &mut cmd,
             &|k| (k == "HOME").then(|| "/Users/tester".to_string()),
@@ -222,7 +222,7 @@ mod tests {
     /// A user's real, *foreign* ZDOTDIR — legitimate configuration.
     const REAL_ZDOTDIR: &str = "/Users/tester/.config/zsh";
     /// The dir `write_dir` hands back on the success path.
-    const WRITTEN_DIR: &str = "/tmp/mac-terminal-test-zdotdir";
+    const WRITTEN_DIR: &str = "/tmp/crewterm-test-zdotdir";
 
     /// Our generated dir for [`HOME`] — what a nested parent's `ZDOTDIR` holds.
     fn our_dir() -> String {
@@ -301,7 +301,7 @@ mod tests {
         assert_eq!(cmd.get_env("ZDOTDIR"), Some(OsStr::new(REAL_ZDOTDIR)));
     }
 
-    /// R3.1: `MAC_TERMINAL_USER_ZDOTDIR` is removed unconditionally by name, on
+    /// R3.1: `CREWTERM_USER_ZDOTDIR` is removed unconditionally by name, on
     /// every one of the three exit paths — the stale value never reaches a child.
     #[test]
     fn inject_never_ships_an_inherited_user_marker() {
@@ -354,7 +354,7 @@ mod tests {
 
     /// R3.7 (as far as the builder can show it): in the nested case the two vars
     /// name different directories, so `zshrc.zsh:9`'s
-    /// `source "$MAC_TERMINAL_USER_ZDOTDIR/.zshrc"` reaches the user's real rc
+    /// `source "$CREWTERM_USER_ZDOTDIR/.zshrc"` reaches the user's real rc
     /// instead of re-sourcing our generated one. The actual sourcing is only
     /// observable in a live child.
     #[test]

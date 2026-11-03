@@ -63,7 +63,7 @@ const LOCALE_VARS: [&str; 3] = ["LC_ALL", "LC_CTYPE", "LANG"];
 /// measured here — and a misspelled guess reads as covered while it leaks.
 ///
 /// **Review trigger:** re-verify this list on a Claude Code *major version* bump.
-/// **Procedure:** run `claude` in a mac-terminal tab, then
+/// **Procedure:** run `claude` in a Crewterm tab, then
 /// `env | grep -E 'CLAUDE|AI_AGENT|ANTHROPIC'`; anything that names the parent's
 /// identity (as opposed to user configuration) is added here. The `debug!` in
 /// [`child_command`] reports agent-ish names that were *passed through*, so drift
@@ -175,7 +175,7 @@ fn strip_agent_session_vars(cmd: &mut CommandBuilder) -> Vec<&'static str> {
 ///
 /// Prefix `CLAUDE` or `ANTHROPIC`, plus exact `AI_AGENT` — `AI_AGENT_ROLE` is a
 /// user's own variable and is not reported. Our own shell-integration names
-/// (`ZDOTDIR`, `MAC_TERMINAL_USER_ZDOTDIR`) match nothing here on purpose: the
+/// (`ZDOTDIR`, `CREWTERM_USER_ZDOTDIR`) match nothing here on purpose: the
 /// survey exists to catch drift in a *third party's* variable set, and ours
 /// cannot drift (R4.6).
 fn is_agent_ish(name: &str) -> bool {
@@ -592,7 +592,7 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), 11, "duplicate entry in the denylist");
-        for ours in ["TERM", "ZDOTDIR", "MAC_TERMINAL_USER_ZDOTDIR"]
+        for ours in ["TERM", "ZDOTDIR", "CREWTERM_USER_ZDOTDIR"]
             .iter()
             .chain(LOCALE_VARS.iter())
         {
@@ -654,7 +654,7 @@ mod tests {
                 "R4.6 shell-integration family is invisible here",
                 &[
                     ("ZDOTDIR", "/fake/generated"),
-                    ("MAC_TERMINAL_USER_ZDOTDIR", "/fake/users/zsh"),
+                    ("CREWTERM_USER_ZDOTDIR", "/fake/users/zsh"),
                 ],
                 &[],
             ),
@@ -704,22 +704,22 @@ mod tests {
         assert!(drift_trace(&stripped, &survey_agent_passthrough(&cmd)).is_none());
     }
 
-    /// R4.6 — in a nested launch neither `ZDOTDIR` nor `MAC_TERMINAL_USER_ZDOTDIR`
+    /// R4.6 — in a nested launch neither `ZDOTDIR` nor `CREWTERM_USER_ZDOTDIR`
     /// appears in either half of the line. `inject_with` owns that family and
     /// returns `()`; no signature is changed to surface it here.
     #[test]
     fn drift_trace_omits_the_shell_integration_family() {
         let mut seed: Vec<(&str, &str)> = FAKE_MARKERS.to_vec();
         seed.push(("ZDOTDIR", "/fake/generated"));
-        seed.push(("MAC_TERMINAL_USER_ZDOTDIR", "/fake/stale"));
+        seed.push(("CREWTERM_USER_ZDOTDIR", "/fake/stale"));
         let mut cmd = seeded_cmd(&seed);
         let stripped = strip_agent_session_vars(&mut cmd);
         // Stand in for what `inject` re-sets after the strip.
         cmd.env("ZDOTDIR", "/fake/generated");
-        cmd.env("MAC_TERMINAL_USER_ZDOTDIR", "/fake/users/zsh");
+        cmd.env("CREWTERM_USER_ZDOTDIR", "/fake/users/zsh");
 
         let line = drift_trace(&stripped, &survey_agent_passthrough(&cmd)).expect("a line is due");
-        // "MAC_TERMINAL_USER_ZDOTDIR" contains "ZDOTDIR", so one check covers both.
+        // "CREWTERM_USER_ZDOTDIR" contains "ZDOTDIR", so one check covers both.
         assert!(!line.contains("ZDOTDIR"), "{line}");
     }
 

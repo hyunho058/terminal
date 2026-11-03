@@ -83,7 +83,7 @@ fn is_paste(input: &KeyInput) -> bool {
     input.mods.super_key() && matches!(&input.key, Key::Character(s) if s.eq_ignore_ascii_case("v"))
 }
 
-/// `~/.cache/mac-terminal/pasted`, created if missing (C4). `None` if `$HOME`
+/// `~/.cache/crewterm/pasted`, created if missing (C4). `None` if `$HOME`
 /// is unset or the dir can't be made.
 ///
 /// `pub(crate)` for region-capture D4: a screen capture lands beside pasted images,
@@ -92,7 +92,7 @@ pub(crate) fn pasted_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     let dir = PathBuf::from(home)
         .join(".cache")
-        .join("mac-terminal")
+        .join("crewterm")
         .join("pasted");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)

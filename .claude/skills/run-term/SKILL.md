@@ -1,7 +1,7 @@
 ---
 name: run-term
 description: |
-  Build and launch the mac-terminal app to eyeball a render or behavior change.
+  Build and launch the Crewterm app to eyeball a render or behavior change.
   Use when you changed rendering, input, PTY, or the event loop and want to see it
   running. Triggers: "run the terminal", "launch it", "does it render", "/run-term".
 argument-hint: "[--release]"
@@ -23,10 +23,10 @@ Build and run the app binary, capturing startup logs so you can confirm the
    ```
 2. Launch in the background with info logging, capture output:
    ```sh
-   RUST_LOG=info ./target/debug/app > /tmp/mac-terminal.log 2>&1 &
+   RUST_LOG=info ./target/debug/crewterm > /tmp/crewterm.log 2>&1 &
    ```
-   (Use `target/release/app` if you built `--release`.)
-3. Read `/tmp/mac-terminal.log` and confirm three lines appear:
+   (Use `target/release/crewterm` if you built `--release`.)
+3. Read `/tmp/crewterm.log` and confirm three lines appear:
    - `gpu adapter selected ... backend=Metal`
    - `surface configured ... format=Bgra8UnormSrgb`
    - `terminal started: zsh spawned, grid ready cols=.. rows=..`

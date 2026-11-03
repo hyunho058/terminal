@@ -408,7 +408,7 @@ impl App {
         event_loop: &ActiveEventLoop,
     ) -> crate::session::anyhow_lite::Result<Running> {
         let attrs = Window::default_attributes()
-            .with_title("mac-terminal")
+            .with_title("Crewterm")
             .with_inner_size(winit::dpi::LogicalSize::new(900.0, 540.0));
         let window = Arc::new(event_loop.create_window(attrs)?);
         // Let macOS run the input method (R6.1). Without this winit's `key_down`
