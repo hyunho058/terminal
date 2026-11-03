@@ -20,8 +20,23 @@ ai-monitor = { version = "0.1.0", path = "../ai-monitor" }
 common.workspace = true
 libc = "0.2.186"
 objc2 = "0.6.4"
-objc2-app-kit = "0.3.2"
-objc2-foundation = "0.3.2"
+objc2-app-kit = { version = "0.3.2", features = [
+    "NSWindow",
+    "NSView",
+    "NSTabView",
+    "NSTabViewItem",
+    "NSButton",
+    "NSButtonCell",
+    "NSControl",
+    "NSTextField",
+    "NSTextFieldCell",
+    "NSCell",
+    "NSSlider",
+    "NSSliderCell",
+    "NSColor",
+    "NSColorWell",
+] }
+objc2-foundation = { version = "0.3.2", features = ["NSGeometry"] }
 pollster = "1.0.1"
 renderer.workspace = true
 term-core.workspace = true

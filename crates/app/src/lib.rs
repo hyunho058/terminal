@@ -68,6 +68,7 @@ pub(crate) mod seam;
 pub(crate) mod session;
 pub(crate) mod settings;
 pub(crate) mod settings_menu;
+pub(crate) mod settings_window;
 pub(crate) mod sidebar_model;
 pub(crate) mod tabmeta;
 pub(crate) mod tabs;
@@ -127,6 +128,7 @@ pub use settings_menu::{
     build_app_menu, ensure_config_file_exists, ensure_config_file_exists_at, install_app_menu,
     open_settings, open_settings_file,
 };
+pub use settings_window::show_settings_window;
 /// `main.rs` installs the sidebar's metadata source.
 pub use sidebar_model::SidebarMetaSource;
 /// `crates/app/tests/tt6_graph_status.rs` compares the graph's session status against the

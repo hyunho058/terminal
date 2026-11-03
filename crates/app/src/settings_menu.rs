@@ -206,16 +206,21 @@ pub fn open_settings_file(path: &Path) -> std::io::Result<()> {
         .map(|_| ())
 }
 
-/// Ensure configuration exists and open it with the default editor.
+/// Ensure configuration exists and open the native macOS Settings window.
+/// Falls back to opening the config file with the default editor if outside the main thread.
 pub fn open_settings() {
-    match ensure_config_file_exists() {
-        Ok(path) => {
-            if let Err(e) = open_settings_file(&path) {
-                tracing::warn!("failed to open settings file {}: {e}", path.display());
+    if let Some(mtm) = MainThreadMarker::new() {
+        crate::settings_window::show_settings_window(mtm);
+    } else {
+        match ensure_config_file_exists() {
+            Ok(path) => {
+                if let Err(e) = open_settings_file(&path) {
+                    tracing::warn!("failed to open settings file {}: {e}", path.display());
+                }
             }
-        }
-        Err(e) => {
-            tracing::warn!("failed to ensure settings file exists: {e}");
+            Err(e) => {
+                tracing::warn!("failed to ensure settings file exists: {e}");
+            }
         }
     }
 }
