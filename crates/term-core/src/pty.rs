@@ -86,6 +86,15 @@ const AGENT_SESSION_VARS: [&str; 11] = [
     "CLAUDE_PID",
 ];
 
+/// The launching terminal's identity, removed from every tab's environment.
+///
+/// Same rules as [`AGENT_SESSION_VARS`]: exact names, extended on measurement
+/// only. Observed: a build launched from a tmux pane gave every tab
+/// `TERM_PROGRAM=tmux` and a `TMUX` pointing at a session with no attached
+/// client, and Claude Code then fell back to 256-colour escapes (`38;5;n`).
+/// [`child_command`] sets `TERM_PROGRAM` back to our own value afterwards.
+const HOST_TERMINAL_VARS: [&str; 4] = ["TMUX", "TMUX_PANE", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"];
+
 /// What `Pty::spawn` should do about the child's locale (D15).
 ///
 /// Tri-state rather than an `Option`, because "no locale at all" and "a locale
@@ -161,8 +170,18 @@ fn warn_non_utf8_locale() {
 /// `std::env`) *before* the removal, which is what makes the returned set
 /// reportable after the names are gone from the map.
 fn strip_agent_session_vars(cmd: &mut CommandBuilder) -> Vec<&'static str> {
+    strip_vars(cmd, &AGENT_SESSION_VARS)
+}
+
+/// Remove every [`HOST_TERMINAL_VARS`] name from `cmd`, returning the names that
+/// were actually there — same contract as [`strip_agent_session_vars`].
+fn strip_host_terminal_vars(cmd: &mut CommandBuilder) -> Vec<&'static str> {
+    strip_vars(cmd, &HOST_TERMINAL_VARS)
+}
+
+fn strip_vars(cmd: &mut CommandBuilder, names: &[&'static str]) -> Vec<&'static str> {
     let mut stripped = Vec::new();
-    for name in AGENT_SESSION_VARS {
+    for &name in names {
         if cmd.get_env(name).is_some() {
             stripped.push(name);
         }
@@ -199,14 +218,19 @@ fn survey_agent_passthrough(cmd: &CommandBuilder) -> Vec<String> {
 /// **Names only, never values.** The survey's source is the whole child
 /// environment, which holds `ANTHROPIC_API_KEY`, cloud credentials and a socket
 /// path. A variable's name is not a secret; its value is.
-fn drift_trace(stripped: &[&'static str], passed_through: &[String]) -> Option<String> {
-    if stripped.is_empty() && passed_through.is_empty() {
+fn drift_trace(
+    stripped: &[&'static str],
+    host_stripped: &[&'static str],
+    passed_through: &[String],
+) -> Option<String> {
+    if stripped.is_empty() && host_stripped.is_empty() && passed_through.is_empty() {
         return None; // R4.5 — a Finder launch has nothing to say
     }
     Some(format!(
         "pty child env (names only, no values): stripped agent session identity [{}]; \
-         agent-ish variables passed through [{}]",
+         stripped host terminal identity [{}]; agent-ish variables passed through [{}]",
         stripped.join(", "),
+        host_stripped.join(", "),
         passed_through.join(", ")
     ))
 }
@@ -219,13 +243,26 @@ fn drift_trace(stripped: &[&'static str], passed_through: &[String]) -> Option<S
 /// Order is load-bearing (D12, R1.4): the agent denylist runs **first**, so our
 /// own `TERM` / locale / `ZDOTDIR` additions can never be removed by a later
 /// denylist entry, and the trace's survey describes the finished environment.
-fn child_command() -> CommandBuilder {
-    let mut cmd = CommandBuilder::new(SHELL);
+///
+/// Returns the drift-trace line alongside the command rather than logging it,
+/// so a test can assert what the trace was built from; [`Pty::spawn`] logs it.
+fn child_command() -> (CommandBuilder, Option<String>) {
+    assemble_child_command(CommandBuilder::new(SHELL))
+}
+
+/// [`child_command`] over a given builder, so a test can seed the inherited
+/// environment instead of depending on the one `cargo test` runs in.
+fn assemble_child_command(mut cmd: CommandBuilder) -> (CommandBuilder, Option<String>) {
     // D12: first, before anything we set. A tab is a new session (D8) — there is
     // no opt-out (R5.1).
     let stripped = strip_agent_session_vars(&mut cmd);
+    let host_stripped = strip_host_terminal_vars(&mut cmd);
 
     cmd.env("TERM", "xterm-256color");
+    // The renderer draws 24-bit colour; say so, and say who we are, so a TUI
+    // never decides from the launching terminal's identity.
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("TERM_PROGRAM", "Crewterm");
     // D15 / R9.5: a Finder-launched `.app` inherits a minimal environment
     // with no locale, so this must be decided here rather than assumed.
     match locale_action(&|k| std::env::var(k).ok()) {
@@ -238,12 +275,8 @@ fn child_command() -> CommandBuilder {
     // to a plain shell on failure (spec D13). Preserves TERM/locale set above.
     crate::shell_integration::inject(&mut cmd);
 
-    // D2/D11/D16: one line per spawn, at `debug!` — inert without a subscriber
-    // (R5.3), silent when there is nothing to report (R4.5).
-    if let Some(line) = drift_trace(&stripped, &survey_agent_passthrough(&cmd)) {
-        tracing::debug!("{line}");
-    }
-    cmd
+    let trace = drift_trace(&stripped, &host_stripped, &survey_agent_passthrough(&cmd));
+    (cmd, trace)
 }
 
 /// A spawned zsh session behind a pseudo-terminal.
@@ -268,10 +301,13 @@ impl Pty {
             })
             .map_err(Error::pty)?;
 
-        let child = pair
-            .slave
-            .spawn_command(child_command())
-            .map_err(Error::pty)?;
+        let (cmd, trace) = child_command();
+        // D2/D11/D16: one line per spawn, at `debug!` — inert without a subscriber
+        // (R5.3), silent when there is nothing to report (R4.5).
+        if let Some(line) = trace {
+            tracing::debug!("{line}");
+        }
+        let child = pair.slave.spawn_command(cmd).map_err(Error::pty)?;
         // Slave handle is not needed once the child holds it.
         drop(pair.slave);
 
@@ -592,9 +628,15 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), 11, "duplicate entry in the denylist");
-        for ours in ["TERM", "ZDOTDIR", "CREWTERM_USER_ZDOTDIR"]
-            .iter()
-            .chain(LOCALE_VARS.iter())
+        for ours in [
+            "TERM",
+            "COLORTERM",
+            "TERM_PROGRAM",
+            "ZDOTDIR",
+            "CREWTERM_USER_ZDOTDIR",
+        ]
+        .iter()
+        .chain(LOCALE_VARS.iter())
         {
             assert!(
                 !AGENT_SESSION_VARS.contains(ours),
@@ -608,11 +650,50 @@ mod tests {
     /// identically inside and outside a Claude session (R6.1).
     #[test]
     fn child_command_strips_first_then_sets_our_own() {
-        let cmd = child_command();
+        let (cmd, _) = child_command();
         assert_eq!(cmd.get_env("TERM"), Some(OsStr::new("xterm-256color")));
         for var in AGENT_SESSION_VARS {
             assert!(cmd.get_env(var).is_none(), "{var} reached the child");
         }
+    }
+
+    /// The launching terminal's identity never reaches a tab; ours replaces it.
+    /// Holds whether `cargo test` runs under tmux, Warp or a bare shell.
+    #[test]
+    fn child_command_replaces_the_host_terminal_identity() {
+        let (cmd, _) = child_command();
+        for var in ["TMUX", "TMUX_PANE", "TERM_PROGRAM_VERSION"] {
+            assert!(cmd.get_env(var).is_none(), "{var} reached the child");
+        }
+        assert_eq!(cmd.get_env("TERM_PROGRAM"), Some(OsStr::new("Crewterm")));
+        assert_eq!(cmd.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
+    }
+
+    /// The assembled path hands both stripped sets to the trace: a tmux launch
+    /// with an agent marker reports each under its own heading.
+    #[test]
+    fn child_command_trace_reports_both_stripped_sets() {
+        let seed = seeded_cmd(&[
+            ("PATH", "/usr/bin"),
+            ("CLAUDECODE", "1"),
+            ("TMUX", "/fake/tmux-501/default,1234,0"),
+            ("TMUX_PANE", "%0"),
+            ("TERM_PROGRAM", "tmux"),
+            ("TERM_PROGRAM_VERSION", "3.5a"),
+        ]);
+        let (_, trace) = assemble_child_command(seed);
+        let line = trace.expect("something was stripped, so a line is due");
+        assert!(
+            line.contains("stripped agent session identity [CLAUDECODE]"),
+            "{line}"
+        );
+        assert!(
+            line.contains(
+                "stripped host terminal identity \
+                 [TMUX, TMUX_PANE, TERM_PROGRAM, TERM_PROGRAM_VERSION]"
+            ),
+            "{line}"
+        );
     }
 
     #[test]
@@ -680,7 +761,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         let stripped = strip_agent_session_vars(&mut cmd);
-        let line = drift_trace(&stripped, &survey_agent_passthrough(&cmd))
+        let line = drift_trace(&stripped, &[], &survey_agent_passthrough(&cmd))
             .expect("something was stripped, so a line is due");
 
         // Names of both halves are present.
@@ -701,7 +782,28 @@ mod tests {
     fn drift_trace_is_silent_when_there_is_nothing_to_report() {
         let cmd = seeded_cmd(&[("PATH", "/usr/bin"), ("TERM", "xterm-256color")]);
         let stripped: Vec<&'static str> = Vec::new();
-        assert!(drift_trace(&stripped, &survey_agent_passthrough(&cmd)).is_none());
+        assert!(drift_trace(&stripped, &[], &survey_agent_passthrough(&cmd)).is_none());
+    }
+
+    /// The host terminal's identity is reported by name when stripped, never by
+    /// value, and alone is enough to emit a line.
+    #[test]
+    fn drift_trace_reports_the_host_terminal_identity() {
+        let mut cmd = seeded_cmd(&[
+            ("PATH", "/usr/bin"),
+            ("TMUX", "/fake/tmux-501/default,1234,0"),
+            ("TERM_PROGRAM", "fake-host"),
+        ]);
+        let host_stripped = strip_host_terminal_vars(&mut cmd);
+        assert_eq!(host_stripped, ["TMUX", "TERM_PROGRAM"]);
+        let line = drift_trace(&[], &host_stripped, &survey_agent_passthrough(&cmd))
+            .expect("something was stripped, so a line is due");
+        assert!(
+            line.contains("stripped host terminal identity [TMUX, TERM_PROGRAM]"),
+            "{line}"
+        );
+        assert!(!line.contains("/fake/tmux-501"), "{line}");
+        assert!(!line.contains("fake-host"), "{line}");
     }
 
     /// R4.6 — in a nested launch neither `ZDOTDIR` nor `CREWTERM_USER_ZDOTDIR`
@@ -718,7 +820,8 @@ mod tests {
         cmd.env("ZDOTDIR", "/fake/generated");
         cmd.env("CREWTERM_USER_ZDOTDIR", "/fake/users/zsh");
 
-        let line = drift_trace(&stripped, &survey_agent_passthrough(&cmd)).expect("a line is due");
+        let line =
+            drift_trace(&stripped, &[], &survey_agent_passthrough(&cmd)).expect("a line is due");
         // "CREWTERM_USER_ZDOTDIR" contains "ZDOTDIR", so one check covers both.
         assert!(!line.contains("ZDOTDIR"), "{line}");
     }
