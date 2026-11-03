@@ -67,6 +67,8 @@ pub(crate) mod rename;
 pub(crate) mod seam;
 pub(crate) mod session;
 pub(crate) mod settings;
+pub(crate) mod settings_menu;
+pub(crate) mod settings_window;
 pub(crate) mod sidebar_model;
 pub(crate) mod tabmeta;
 pub(crate) mod tabs;
@@ -87,6 +89,8 @@ pub use flow::FlowOverlay;
 pub use flow_telemetry::{spawn as spawn_flow_telemetry, DigestSlot, FlowTelemetry, SessionDigest};
 /// `crates/app/tests/vertical_slice.rs` types through the real encoder.
 pub use input::encode_key;
+/// `crates/app/tests/tt3_settings_chord_dispatch.rs` tests the Cmd+, chord predicate (top-settings-menu R3).
+pub use input::is_settings_chord;
 /// `crates/app/tests/tt2_graph_pointer.rs` drives the pointer router (session-flow-graph
 /// R2.1, R2.2).
 pub use input::pointer_owner;
@@ -119,6 +123,12 @@ pub use seam::{AppCtx, AppRequest, Handled, KeyInput, OverlayCommand, OverlayHos
 pub use seam::{InputHandler, Overlay, Registrations};
 /// `crates/app/tests/vertical_slice.rs` drives a real shell through a session.
 pub use session::{Session, TabId, Wake};
+/// top-settings-menu: Application menu assembly and settings file launcher (TT1, TT2).
+pub use settings_menu::{
+    build_app_menu, build_view_menu, build_window_menu, ensure_config_file_exists,
+    ensure_config_file_exists_at, install_app_menu, open_settings, open_settings_file,
+};
+pub use settings_window::show_settings_window;
 /// `main.rs` installs the sidebar's metadata source.
 pub use sidebar_model::SidebarMetaSource;
 /// `crates/app/tests/tt6_graph_status.rs` compares the graph's session status against the

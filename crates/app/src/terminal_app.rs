@@ -60,11 +60,12 @@ use crate::hyperlink::{
 use crate::ime_chord::{self, CmdEventFacts, Replay};
 use crate::input::{
     self, drag_owns_pointer, encode_key, font_action, grid_press_action, grid_release_action,
-    hover_card, hover_cursor, is_double_click, is_sidebar_toggle_chord, pixel_to_cell,
-    pixel_to_cell_clamped, press_dismisses_modals, reported_drag_motion, should_snap_on_click,
-    sidebar_press, sidebar_region, suppress_key, tab_action, wheel_bytes, wheel_lines,
-    wheel_scroll, FontAction, GridPressAction, GridReleaseAction, PersistTarget, PointerOwner,
-    PressRoute, ReleaseTarget, ResizeDrag, ResizeEdge, SidebarAction, TabAction, WheelDelta,
+    hover_card, hover_cursor, is_double_click, is_settings_chord, is_sidebar_toggle_chord,
+    pixel_to_cell, pixel_to_cell_clamped, press_dismisses_modals, reported_drag_motion,
+    should_snap_on_click, sidebar_press, sidebar_region, suppress_key, tab_action, wheel_bytes,
+    wheel_lines, wheel_scroll, FontAction, GridPressAction, GridReleaseAction, PersistTarget,
+    PointerOwner, PressRoute, ReleaseTarget, ResizeDrag, ResizeEdge, SidebarAction, TabAction,
+    WheelDelta,
 };
 use crate::seam::{
     AppCtx, AppRequest, Handled, InputRouter, KeyInput, OverlayCommand, OverlayHost, Registrations,
@@ -417,6 +418,10 @@ impl App {
         // makes winit withhold the duplicate `KeyboardInput` for composing/committing
         // keys (view.rs:479-496); ASCII, which never marks text, is unaffected.
         window.set_ime_allowed(true);
+
+        if let Some(mtm) = MainThreadMarker::new() {
+            crate::settings_menu::install_app_menu(mtm);
+        }
 
         let size = window.inner_size();
         let scale = window.scale_factor();
@@ -2364,7 +2369,12 @@ impl Running {
                 return true;
             }
         }
-        // 3a) The sidebar toggle chord (tab-resize D17a), intercepted before the shell for
+        // 3a) Settings chord (Cmd+,; top-settings-menu D4/R3), intercepted before the shell.
+        if is_settings_chord(&input.key, &input.mods) {
+            crate::settings_menu::open_settings();
+            return true;
+        }
+        // 3b) The sidebar toggle chord (tab-resize D17a), intercepted before the shell for
         // the same reason tab chords are: `encode_key` swallows Cmd only for its `key_seq`
         // table, so a `Key::Character` chord would otherwise reach zsh through the text
         // fallback. This is the recovery path D16 owes — persisting `collapsed` removes
@@ -2375,13 +2385,13 @@ impl Running {
             self.toggle_sidebar(!collapsed); // persists, like every other entry point
             return true;
         }
-        // 3b) Font size chords (Cmd+= / Cmd++, Cmd+-, Cmd+0; terminal-font-size D7/D11, R4.1),
+        // 3c) Font size chords (Cmd+= / Cmd++, Cmd+-, Cmd+0; terminal-font-size D7/D11, R4.1),
         // intercepted before the shell alongside sidebar toggle and tab chords.
         if let Some(action) = font_action(&input.key, &input.mods) {
             self.do_font_action(action);
             return true;
         }
-        // 3c) Tab chords, intercepted before the shell (D5/R3.2).
+        // 3d) Tab chords, intercepted before the shell (D5/R3.2).
         if let Some(action) = tab_action(&input.key, &input.mods) {
             return self.do_tab_action(action);
         }

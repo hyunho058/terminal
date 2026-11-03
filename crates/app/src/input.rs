@@ -340,6 +340,14 @@ pub fn is_sidebar_toggle_chord(key: &Key, mods: &ModifiersState) -> bool {
     matches!(key, Key::Character(s) if s.eq_ignore_ascii_case("s"))
 }
 
+/// Is this the **Cmd+,** settings chord (top-settings-menu D4/R3)?
+pub fn is_settings_chord(key: &Key, mods: &ModifiersState) -> bool {
+    if !mods.super_key() || mods.alt_key() || mods.control_key() || mods.shift_key() {
+        return false;
+    }
+    matches!(key, Key::Character(s) if s == ",")
+}
+
 /// What a delivered config means for the sidebar (tab-resize D15/D15a).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConfigDelivery {

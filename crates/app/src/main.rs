@@ -18,6 +18,7 @@
 //! mean no frames.
 
 use winit::event_loop::{ControlFlow, EventLoop};
+use winit::platform::macos::EventLoopBuilderExtMacOS;
 
 use app::{feature_registrations, App, SidebarMetaSource, TabMetaHandle, UserEvent};
 
@@ -29,11 +30,15 @@ fn main() {
         common::config::Config::default()
     });
 
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
-        .build()
-        .expect("build event loop");
+    let mut builder = EventLoop::<UserEvent>::with_user_event();
+    builder.with_default_menu(false);
+    let event_loop = builder.build().expect("build event loop");
     // Wait for events (PTY wakeups, input, redraw) rather than spinning.
     event_loop.set_control_flow(ControlFlow::Wait);
+
+    if let Some(mtm) = objc2::MainThreadMarker::new() {
+        app::install_app_menu(mtm);
+    }
 
     let proxy = event_loop.create_proxy();
     // Capture the sidebar display toggles before `cfg` is moved into the app (T5/D12).

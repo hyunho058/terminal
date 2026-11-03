@@ -361,6 +361,59 @@ pub fn save_font_size(path: &Path, size_pt: f32) -> Result<()> {
     save_table(path, "font", &[("size_pt", fmt_f32(size_pt))])
 }
 
+/// Persist updated settings from `cfg` to `path` across all standard tables
+/// (`font`, `grid`, `sidebar`, `ai_monitor`), preserving comments and unrecognized
+/// keys byte-for-byte.
+pub fn save_config(path: &Path, cfg: &Config) -> Result<()> {
+    save_table(
+        path,
+        "font",
+        &[
+            ("family", format!("\"{}\"", cfg.font.family)),
+            ("size_pt", fmt_f32(cfg.font.size_pt)),
+            ("ligatures", cfg.font.ligatures.to_string()),
+        ],
+    )?;
+    save_table(
+        path,
+        "grid",
+        &[
+            ("columns", cfg.grid.columns.to_string()),
+            ("rows", cfg.grid.rows.to_string()),
+        ],
+    )?;
+    save_table(
+        path,
+        "theme",
+        &[
+            ("background", format!("0x{:06X}", cfg.theme.background)),
+            ("foreground", format!("0x{:06X}", cfg.theme.foreground)),
+        ],
+    )?;
+    save_table(
+        path,
+        "sidebar",
+        &[
+            ("width_px", fmt_f32(cfg.sidebar.width_px)),
+            ("show_git_branch", cfg.sidebar.show_git_branch.to_string()),
+            (
+                "show_agent_status",
+                cfg.sidebar.show_agent_status.to_string(),
+            ),
+            ("collapsed", cfg.sidebar.collapsed.to_string()),
+        ],
+    )?;
+    save_table(
+        path,
+        "ai_monitor",
+        &[
+            ("width_px", fmt_f32(cfg.ai_monitor.width_px)),
+            ("open", cfg.ai_monitor.open.to_string()),
+        ],
+    )?;
+    Ok(())
+}
+
 /// Write `entries` into `[table]` of the TOML file at `path`, leaving every other byte
 /// alone (tab-resize D2/D8/D16).
 ///
@@ -685,6 +738,44 @@ mod tests {
         let c = Config::default();
         assert!(c.grid.columns > 0 && c.grid.rows > 0);
         assert!(c.font.size_pt > 0.0);
+    }
+
+    #[test]
+    fn save_config_persists_and_reloads_cleanly() {
+        let dir = std::env::temp_dir().join(format!("term-cfg-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        let mut cfg = Config::default();
+        cfg.font.family = "Monaco".to_string();
+        cfg.font.size_pt = 18.0;
+        cfg.font.ligatures = true;
+        cfg.grid.columns = 100;
+        cfg.grid.rows = 40;
+        cfg.theme.background = 0x1A1B26;
+        cfg.theme.foreground = 0xC0CAF5;
+        cfg.sidebar.width_px = 350.0;
+        cfg.sidebar.show_git_branch = false;
+        cfg.ai_monitor.width_px = 500.0;
+        cfg.ai_monitor.open = true;
+
+        save_config(&path, &cfg).expect("save_config succeeds");
+
+        let loaded = Config::load_from(&path).expect("reloaded config");
+        assert_eq!(loaded.font.family, "Monaco");
+        assert_eq!(loaded.font.size_pt, 18.0);
+        assert!(loaded.font.ligatures);
+        assert_eq!(loaded.grid.columns, 100);
+        assert_eq!(loaded.grid.rows, 40);
+        assert_eq!(loaded.theme.background, 0x1A1B26);
+        assert_eq!(loaded.theme.foreground, 0xC0CAF5);
+        assert_eq!(loaded.sidebar.width_px, 350.0);
+        assert!(!loaded.sidebar.show_git_branch);
+        assert_eq!(loaded.ai_monitor.width_px, 500.0);
+        assert!(loaded.ai_monitor.open);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
