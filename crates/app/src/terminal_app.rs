@@ -59,12 +59,12 @@ use crate::hyperlink::{
 };
 use crate::ime_chord::{self, CmdEventFacts, Replay};
 use crate::input::{
-    self, encode_key, font_action, grid_press_action, grid_release_action, hover_card,
-    hover_cursor, is_double_click, is_sidebar_toggle_chord, pixel_to_cell, press_dismisses_modals,
-    should_snap_on_click, sidebar_press, sidebar_region, suppress_key, tab_action, wheel_bytes,
-    wheel_lines, wheel_scroll, FontAction, GridPressAction, GridReleaseAction, PersistTarget,
-    PointerOwner, PressRoute, ReleaseTarget, ResizeDrag, ResizeEdge, SidebarAction, TabAction,
-    WheelDelta,
+    self, drag_owns_pointer, encode_key, font_action, grid_press_action, grid_release_action,
+    hover_card, hover_cursor, is_double_click, is_sidebar_toggle_chord, pixel_to_cell,
+    pixel_to_cell_clamped, press_dismisses_modals, reported_drag_motion, should_snap_on_click,
+    sidebar_press, sidebar_region, suppress_key, tab_action, wheel_bytes, wheel_lines,
+    wheel_scroll, FontAction, GridPressAction, GridReleaseAction, PersistTarget, PointerOwner,
+    PressRoute, ReleaseTarget, ResizeDrag, ResizeEdge, SidebarAction, TabAction, WheelDelta,
 };
 use crate::seam::{
     AppCtx, AppRequest, Handled, InputRouter, KeyInput, OverlayCommand, OverlayHost, Registrations,
@@ -408,7 +408,7 @@ impl App {
         event_loop: &ActiveEventLoop,
     ) -> crate::session::anyhow_lite::Result<Running> {
         let attrs = Window::default_attributes()
-            .with_title("mac-terminal")
+            .with_title("Crewterm")
             .with_inner_size(winit::dpi::LogicalSize::new(900.0, 540.0));
         let window = Arc::new(event_loop.create_window(attrs)?);
         // Let macOS run the input method (R6.1). Without this winit's `key_down`
@@ -1009,6 +1009,10 @@ impl Running {
                             return false;
                         }
                     }
+                }
+                AppRequest::CopyToClipboard(text) => {
+                    // session-overview-ui D22 — the detail's `Copy resume cmd`.
+                    crate::copy::write_clipboard_string(&text);
                 }
             }
         }
@@ -2040,8 +2044,15 @@ impl Running {
     /// feature promised not to disturb (R3.6).
     fn refresh_link_hover(&mut self, trigger: LinkTrigger) {
         let cell = self.cursor_cell();
+        // ⌘ lights nothing while an app-tracked drag owns the pointer (mouse-drag-reporting
+        // D6). A mask, not an early return: `on_modifier` must still re-arm after a focus
+        // loss, or a ⌘ pressed mid-drag would leave the link dead after the release.
+        let drag_owned = drag_owns_pointer(
+            self.mouse_reported,
+            self.tabs.active().terminal.mouse_protocol(),
+        );
         let input = HoverInput {
-            cmd_held: self.mods.super_key(),
+            cmd_held: self.mods.super_key() && !drag_owned,
             pointer_inside: self.pointer_inside,
             cell,
             // The snapshot on *screen* — not `terminal.snapshot()`, which would clone
@@ -2704,6 +2715,39 @@ impl ApplicationHandler<UserEvent> for App {
                     inner.overlays.hover_covering(Some(p));
                     return;
                 }
+                // A drag the running app tracks OWNS the pointer (mouse-drag-reporting D6),
+                // the same way a resize drag does above: the app gets one motion report per
+                // new cell, clamped to the grid's edge (D4), and the latch follows so the
+                // release lands where the drag ended (D3). Hover is withheld until then —
+                // no card or link lights up under a gesture that belongs to the app.
+                let protocol = inner.tabs.active().terminal.mouse_protocol();
+                if drag_owns_pointer(inner.mouse_reported, protocol) {
+                    let (cols, rows) = inner.tabs.active().terminal.dimensions();
+                    let cell = pixel_to_cell_clamped(
+                        inner.last_cursor,
+                        inner.renderer.cell_size(),
+                        inner.renderer.left_inset(),
+                        inner.renderer.top_inset(),
+                        inner.viewport_w(),
+                        inner.renderer.right_inset(),
+                        cols,
+                        rows,
+                    );
+                    if let Some(cell) = cell {
+                        let encoding = inner.tabs.active().terminal.mouse_encoding();
+                        if let Some(bytes) = reported_drag_motion(
+                            &mut inner.mouse_reported,
+                            protocol,
+                            encoding,
+                            cell,
+                        ) {
+                            if let Err(e) = inner.tabs.active_mut().write(&bytes) {
+                                tracing::warn!("pty write failed: {e}");
+                            }
+                        }
+                    }
+                    return;
+                }
                 inner.refresh_hover(); // one hit_test feeds both hover fields (D8)
                 inner.refresh_link_hover(LinkTrigger::Pointer); // trigger 3 (D24)
 
@@ -2935,6 +2979,13 @@ impl ApplicationHandler<UserEvent> for App {
                         tracing::warn!("pty write failed: {e}");
                     }
                 }
+                // The drag no longer owns the pointer (mouse-drag-reporting D6): bring back
+                // the hover it held off, without waiting for a move. `Snapshot`, not
+                // `Pointer` — it resolves past the same-cell early return, and never re-arms
+                // on its own, so a ⌘ held across the release lights the link under a
+                // stationary pointer while the focus-loss guard stays intact.
+                inner.refresh_hover();
+                inner.refresh_link_hover(LinkTrigger::Snapshot);
             }
 
             // End a resize (tab-resize D17/R7.3). A SEPARATE arm placed BEFORE the
@@ -3249,9 +3300,14 @@ const SNAP_FLOOR: usize = 3;
 /// Patch each flipped tab's row with its new dialog level, answering whether any row
 /// changed (agent-card-status D7) — the card's half of a scan, as the waiting model's
 /// `on_agent_states` is the band's.
-fn patch_dialog_rows(model: &TabModelHandle, flipped: &[(TabId, bool)]) -> bool {
-    flipped.iter().fold(false, |any, &(id, level)| {
-        model.set_blocking_dialog(id.0, level) || any
+/// Each row takes its dialog subject with its level (session-overview-ui D9), so a new
+/// subject at an unchanged level is a row change too (D18).
+fn patch_dialog_rows(
+    model: &TabModelHandle,
+    flipped: &[(TabId, bool, Option<renderer::overview_model::DialogSubject>)],
+) -> bool {
+    flipped.iter().fold(false, |any, (id, level, subject)| {
+        model.set_blocking_dialog(id.0, *level, subject.clone()) || any
     })
 }
 
@@ -3598,7 +3654,7 @@ mod tests {
         host.register(Box::new(crate::flow::FlowOverlay::new(
             wake,
             None,
-            renderer::graph_panel::FlowHandle::default(),
+            renderer::overview_panel::OverviewHandle::new(),
         )));
         host
     }
@@ -3739,21 +3795,41 @@ mod tests {
         assert!(!patch_dialog_rows(&model, &[]));
         assert!(patch_dialog_rows(
             &model,
-            &[(TabId(1), true), (TabId(9), true)]
+            &[(TabId(1), true, None), (TabId(9), true, None)]
         ));
         assert_eq!(levels(), vec![true, false]);
         assert!(patch_dialog_rows(
             &model,
-            &[(TabId(2), true), (TabId(1), true)]
+            &[(TabId(2), true, None), (TabId(1), true, None)]
         ));
         assert_eq!(levels(), vec![true, true]);
-        assert!(!patch_dialog_rows(&model, &[(TabId(9), false)]));
+        assert!(!patch_dialog_rows(&model, &[(TabId(9), false, None)]));
         // Two real flips in one scan: both rows move, not only the first.
         assert!(patch_dialog_rows(
             &model,
-            &[(TabId(2), false), (TabId(1), false)]
+            &[(TabId(2), false, None), (TabId(1), false, None)]
         ));
         assert_eq!(levels(), vec![false, false]);
+
+        // session-overview-ui D9 / D18 — the subject rides along, and a new subject at an
+        // unchanged level is a row change.
+        use renderer::overview_model::DialogSubject::{Command, Question};
+        assert!(patch_dialog_rows(
+            &model,
+            &[(TabId(1), true, Some(Command("ls".into())))]
+        ));
+        assert!(patch_dialog_rows(
+            &model,
+            &[(TabId(1), true, Some(Question))]
+        ));
+        assert_eq!(
+            model.with(|m| m.rows[0].blocking_subject.clone()),
+            Some(Question)
+        );
+        assert!(!patch_dialog_rows(
+            &model,
+            &[(TabId(1), true, Some(Question))]
+        ));
     }
 
     #[test]
@@ -3846,6 +3922,9 @@ mod tests {
 
     fn meta_at(cwd: &str) -> crate::tabmeta::TabMeta {
         crate::tabmeta::TabMeta {
+            graph_agent_cwd: None,
+            graph_transcript: None,
+            graph_asks_user: false,
             branch: None,
             agent: None,
             cwd: Some(std::path::PathBuf::from(cwd)),

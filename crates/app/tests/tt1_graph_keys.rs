@@ -1,19 +1,20 @@
 //! Acceptance tests for session-flow-graph R1: open, close and key ownership (D4, D5).
 //! Written test-first from the spec's Thens; every item is reached through the `app` crate
-//! root, plus the renderer's `graph_panel::FlowHandle` the overlay is built over (T3).
+//! root, plus the renderer's `overview_panel::OverviewHandle` the overlay is built over
+//! (session-overview-ui T8, which replaced the graph inside the same overlay).
 
 use std::sync::Arc;
 
 use app::{
     feature_overlays, no_deadline, AppCtx, FlowOverlay, Handled, KeyInput, Overlay, OverlayCommand,
 };
-use renderer::graph_panel::FlowHandle;
+use renderer::overview_panel::OverviewHandle;
 use winit::keyboard::{Key, KeyCode, ModifiersState as M, NamedKey, PhysicalKey};
 
 /// A closed graph overlay with no worker and a wake that does nothing.
 fn graph() -> FlowOverlay {
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-    FlowOverlay::new(wake, None, FlowHandle::default())
+    FlowOverlay::new(wake, None, OverviewHandle::new())
 }
 
 fn character(ch: &str, mods: M, code: KeyCode) -> KeyInput {

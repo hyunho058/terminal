@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ai_monitor::telemetry::Subagent;
-use app::{spawn_flow_telemetry, FlowTelemetry, SubagentSlot};
+use app::{spawn_flow_telemetry, DigestSlot, FlowTelemetry};
 
 const DEADLINE: Duration = Duration::from_secs(5);
 
@@ -87,7 +87,7 @@ fn append(path: &Path, body: &str) {
 
 // ---- harness ----------------------------------------------------------------
 
-fn new_slot() -> SubagentSlot {
+fn new_slot() -> DigestSlot {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
@@ -103,13 +103,19 @@ fn counting_wake() -> (Arc<dyn Fn() + Send + Sync>, Arc<AtomicUsize>) {
     )
 }
 
-fn read(slot: &SubagentSlot) -> HashMap<PathBuf, Vec<Subagent>> {
-    slot.lock().expect("slot lock").clone()
+/// The slot's subagents per log. The slot holds each log's whole `SessionDigest`
+/// (session-overview-ui D19); these tests are about which logs publish and their subagents.
+fn read(slot: &DigestSlot) -> HashMap<PathBuf, Vec<Subagent>> {
+    slot.lock()
+        .expect("slot lock")
+        .iter()
+        .map(|(p, d)| (p.clone(), d.subagents.clone()))
+        .collect()
 }
 
 /// Poll `cond` against the slot until it holds or the deadline passes.
 fn wait_for(
-    slot: &SubagentSlot,
+    slot: &DigestSlot,
     what: &str,
     cond: impl Fn(&HashMap<PathBuf, Vec<Subagent>>) -> bool,
 ) {

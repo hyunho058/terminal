@@ -34,9 +34,12 @@
 //! No presentation policy lives here (SD4): no percentages, no formatted strings,
 //! no per-model context-window table, no display thresholds.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
+
+use crate::activity;
+use crate::antigravity;
 
 // ---- caps (D6) ----------------------------------------------------------------
 // Display rings: ~3x the app's display counts, so the app can show more without a
@@ -73,6 +76,18 @@ const TALLY_CAP: usize = 64;
 /// Merging runs in ONE batch down to this watermark, so the O(n log n) scan is
 /// amortised over the next 16 new names instead of running on every one.
 const TALLY_WATERMARK: usize = 48;
+/// Digest rings (`session-overview-ui` D19): the newest turns and events kept.
+const TURNS_CAP: usize = 64;
+const EVENTS_CAP: usize = 64;
+/// Background work tracked per turn. A turn that starts more than this many pieces of
+/// background work stops tracking the excess, so the turn can end before they report.
+const TURN_BG_CAP: usize = 64;
+/// A tool summary's length in chars, `…` included (D11).
+const SUMMARY_CHARS: usize = 80;
+/// A subagent report preview: its first non-blank lines, and their total length in
+/// chars, `…` included (D19).
+const PREVIEW_LINES: usize = 4;
+const PREVIEW_CHARS: usize = 400;
 
 // ---- value types --------------------------------------------------------------
 
@@ -247,7 +262,52 @@ pub struct Subagent {
     /// at fold time and was already being folded into `failed_tool_calls` — withholding
     /// it here left the card and the counter disagreeing about one result.
     pub ended_ok: bool,
+    /// The first [`PREVIEW_LINES`] non-blank lines (at most [`PREVIEW_CHARS`] chars) of
+    /// the agent's final report: the synchronous `Agent` result's text, or the `<result>`
+    /// of a background agent's task notification (`session-overview-ui` D19). Folded only
+    /// by a digest accumulator ([`SessionTelemetry::with_digest`]); `None` otherwise.
+    pub report_preview: Option<String>,
 }
+
+/// One main-agent turn (`session-overview-ui` D19): it starts at a human prompt and ends
+/// at the first moment the assistant has ended its turn (`end_turn`) with no background
+/// work started since that prompt still pending. `end_ms` is `None` while either is
+/// outstanding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Turn {
+    pub start_ms: u64,
+    pub end_ms: Option<u64>,
+}
+
+/// What a digest [`Event`] records (`session-overview-ui` D13).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventKind {
+    /// A [`Turn`] ended.
+    TurnFinished,
+    /// A subagent was launched (`Agent` / `Task` call).
+    TaskStart { description: String },
+    /// A subagent finished successfully.
+    TaskDone { description: String },
+    /// A subagent finished with a failure (an errored result, or a notification whose
+    /// status is present and not `completed`).
+    TaskFailed { description: String },
+    /// A tool call other than `Agent` / `Task` finished.
+    Tool {
+        name: String,
+        summary: Option<String>,
+    },
+}
+
+/// A timestamped digest event. `at_ms` is when it happened: a turn's end, a subagent's
+/// launch or end, a tool call's result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Event {
+    pub at_ms: u64,
+    pub kind: EventKind,
+}
+
+/// A finished tool as the digest reports it: `(name, summary, start_ms)` (D11).
+pub type ToolDigest = (String, Option<String>, Option<u64>);
 
 /// A tracked task. `status` is whatever string the task tool carried — the
 /// vocabulary is not enumerated here, so an unknown value passes through intact.
@@ -421,6 +481,19 @@ pub struct TelemetrySnapshot {
     /// contradicting each other. Filing one under the other's name would be a lie about
     /// what went wrong — the same reason `failed_tool_calls` is not a `parse_error`.
     pub context_window_anchor_conflicts: u64,
+
+    // digest (`session-overview-ui` D11, D19) — folded only by an accumulator built
+    // `with_digest`; empty / `None` otherwise.
+    /// The newest finished tool call, any name.
+    pub last_tool: Option<ToolDigest>,
+    /// The newest finished tool call whose name is neither `Agent` nor `Task`.
+    pub last_work_tool: Option<ToolDigest>,
+    /// The latest human prompt's timestamp (`activity`'s G8 definition of one).
+    pub last_prompt_ms: Option<u64>,
+    /// The newest [`TURNS_CAP`] turns, newest first.
+    pub turns: Vec<Turn>,
+    /// The newest [`EVENTS_CAP`] events, newest first.
+    pub events: Vec<Event>,
 }
 
 /// A `tool_use` awaiting its `tool_result`, holding the per-kind facts D7 extracts.
@@ -438,6 +511,8 @@ struct Pending {
     task_id: Option<String>,
     status: Option<String>,
     task_description: Option<String>,
+    /// D11's one-line summary of the input. Digest only.
+    summary: Option<String>,
 }
 
 type UsageTuple = (u64, u64, u64, u64);
@@ -469,6 +544,9 @@ struct AgCall {
     summary: Option<String>,
     subagent_type: Option<String>,
     description: Option<String>,
+    /// D11's one-line summary of the call's args, where they map onto D11's tools
+    /// ([`ag_tool_summary`]). Digest only (`session-overview-ui` D24).
+    digest_summary: Option<String>,
 }
 
 /// The accumulator. Fold lines in with [`apply`](SessionTelemetry::apply); read the
@@ -536,6 +614,21 @@ pub struct SessionTelemetry {
     duplicate_tool_ids: u64,
     context_window_parse_failures: u64,
     context_window_anchor_conflicts: u64,
+
+    // digest (`session-overview-ui` D19). Untouched unless `digest` is set.
+    digest: bool,
+    last_tool: Option<ToolDigest>,
+    last_work_tool: Option<ToolDigest>,
+    last_prompt_ms: Option<u64>,
+    /// Newest first; only the front can be open.
+    turns: VecDeque<Turn>,
+    events: VecDeque<Event>,
+    /// Background work started since the last human prompt and not yet reported back,
+    /// by the ids `activity` keys G8's Working rule on.
+    turn_bg: HashSet<String>,
+    /// The assistant has ended its turn (`end_turn`) since the last prompt or the last
+    /// background completion that resumed it.
+    turn_ended: bool,
 }
 
 impl SessionTelemetry {
@@ -582,7 +675,25 @@ impl SessionTelemetry {
     /// LIVE ghost the conservative-failure rule (D2) exists to refuse — and does it on every
     /// truncation, not the rare one. See `specs/agent-elapsed-sidechain/spec.md` § Known Gaps.
     pub fn restarted(&self) -> Self {
-        Self::with_format(self.format).with_log_session_id(self.log_session_id.clone())
+        let fresh = Self::with_format(self.format).with_log_session_id(self.log_session_id.clone());
+        if self.digest {
+            fresh.with_digest()
+        } else {
+            fresh
+        }
+    }
+
+    /// Also fold the session digest (`session-overview-ui` D19): per finished tool a
+    /// one-line summary (D11), `last_tool`, `last_work_tool`, `last_prompt_ms`, `turns`,
+    /// `events` and each subagent's `report_preview`.
+    ///
+    /// Opt-in because only the session overview reads it. Without it none of that work is
+    /// done, those fields stay empty, and every other snapshot field is the same as with
+    /// it. Both dialects: an Antigravity accumulator folds the same fields from its
+    /// transcript's steps (`session-overview-ui` D24), with no report previews.
+    pub fn with_digest(mut self) -> Self {
+        self.digest = true;
+        self
     }
 
     /// The dialect this accumulator folds. Fixed for its whole life.
@@ -642,6 +753,9 @@ impl SessionTelemetry {
             .and_then(parse_ts);
         if let Some(t) = ts {
             self.observe_ts(t);
+        }
+        if self.digest {
+            self.digest_turn(v, ts);
         }
 
         if self.session_id.is_none() {
@@ -762,6 +876,9 @@ impl SessionTelemetry {
                 if s.trim_start().starts_with(TASK_NOTIFICATION_TAG) {
                     if let Some(n) = parse_task_notification(s) {
                         self.on_task_notification(&n, ts);
+                        if self.digest {
+                            self.digest_notification(&n, Some(s), ts);
+                        }
                     }
                     return;
                 }
@@ -809,6 +926,10 @@ impl SessionTelemetry {
         }
 
         let content = v.get("content").and_then(Value::as_str);
+
+        if self.digest {
+            self.ag_digest_turn(v, step_type, ts);
+        }
 
         match step_type {
             "USER_INPUT" => {
@@ -878,9 +999,16 @@ impl SessionTelemetry {
                             .iter_mut()
                             .find(|a| a.id == id || a.agent_id.as_deref() == Some(id))
                         {
+                            let newly = !a.completed;
                             a.completed = true;
                             if let Some(new_ts) = ts {
                                 a.end_ms = Some(a.end_ms.map_or(new_ts, |old| old.max(new_ts)));
+                            }
+                            // D24 — the report is the subagent's end; Antigravity writes
+                            // no failure for it, so it is always a `TaskDone`.
+                            let label = agent_label(&a.description, &a.subagent_type);
+                            if let (true, true, Some(t)) = (self.digest, newly, ts) {
+                                self.push_event(t, EventKind::TaskDone { description: label });
                             }
                         }
                     }
@@ -938,6 +1066,22 @@ impl SessionTelemetry {
             (None, None)
         };
 
+        let digest_summary = if self.digest {
+            if kind == ToolKind::Agent {
+                if let Some(t) = ts {
+                    self.push_event(
+                        t,
+                        EventKind::TaskStart {
+                            description: agent_label(&description, &subagent_type),
+                        },
+                    );
+                }
+            }
+            ag_tool_summary(name, args, path.as_deref(), description.as_deref())
+        } else {
+            None
+        };
+
         self.ag_pending.push_back(AgCall {
             name: name.to_string(),
             kind,
@@ -947,6 +1091,7 @@ impl SessionTelemetry {
             summary: ag_arg_str(args, "toolSummary"),
             subagent_type,
             description,
+            digest_summary,
         });
         while self.ag_pending.len() > PENDING_CAP {
             self.ag_pending.pop_front();
@@ -988,6 +1133,15 @@ impl SessionTelemetry {
         // `ok` is unconditionally true under G4 — nothing in this pass reads
         // `exit_code`, so nothing may claim a call failed.
         self.tally_call(&call.name, true);
+        if self.digest {
+            self.digest_tool(
+                &call.name,
+                call.digest_summary.clone(),
+                call.start_ms,
+                ts,
+                call.kind == ToolKind::Agent,
+            );
+        }
         let duration_ms = match (call.start_ms, ts) {
             (Some(a), Some(b)) if b >= a => Some(b - a),
             _ => None,
@@ -1060,6 +1214,14 @@ impl SessionTelemetry {
                 } else {
                     v.get("status").and_then(Value::as_str) == Some("DONE")
                 };
+                if let (true, true, Some(t)) = (self.digest, completed, ts) {
+                    self.push_event(
+                        t,
+                        EventKind::TaskDone {
+                            description: agent_label(&description, &name),
+                        },
+                    );
+                }
                 push_capped(
                     &mut self.subagents,
                     Subagent {
@@ -1072,6 +1234,7 @@ impl SessionTelemetry {
                         completed,
                         agent_id: None,
                         ended_ok: true,
+                        report_preview: None,
                     },
                     SUBAGENTS_CAP,
                 )
@@ -1160,6 +1323,11 @@ impl SessionTelemetry {
             duplicate_tool_ids: self.duplicate_tool_ids,
             context_window_parse_failures: self.context_window_parse_failures,
             context_window_anchor_conflicts: self.context_window_anchor_conflicts,
+            last_tool: self.last_tool.clone(),
+            last_work_tool: self.last_work_tool.clone(),
+            last_prompt_ms: self.last_prompt_ms,
+            turns: self.turns.iter().copied().collect(),
+            events: self.events.iter().cloned().collect(),
         }
     }
 
@@ -1365,6 +1533,19 @@ impl SessionTelemetry {
             }
             ToolKind::Plain => {}
         }
+        if self.digest {
+            p.summary = tool_summary(name, input);
+            if kind == ToolKind::Agent {
+                if let Some(t) = ts {
+                    self.push_event(
+                        t,
+                        EventKind::TaskStart {
+                            description: agent_label(&p.description, &p.subagent_type),
+                        },
+                    );
+                }
+            }
+        }
 
         // An `Agent` opens a NOT-completed entry in the ring immediately, so an
         // in-flight delegation is visible (`telemetry-model` D9/R6.1). The two
@@ -1383,6 +1564,7 @@ impl SessionTelemetry {
                     completed: false,
                     agent_id: None,
                     ended_ok: true,
+                    report_preview: None,
                 },
                 SUBAGENTS_CAP,
             );
@@ -1436,6 +1618,15 @@ impl SessionTelemetry {
             (Some(a), Some(b)) if b >= a => Some(b - a),
             _ => None,
         };
+        if self.digest {
+            self.digest_tool(
+                &p.name,
+                p.summary.clone(),
+                p.start_ms,
+                ts,
+                is_agent_tool(&p.name),
+            );
+        }
 
         match p.kind.unwrap_or(ToolKind::Plain) {
             ToolKind::Skill => push_capped(
@@ -1513,6 +1704,9 @@ impl SessionTelemetry {
                         a.ended_ok = ok;
                     }
                 }
+                if self.digest && !launched {
+                    self.digest_agent_end(tid, ts, ok, &result_text(it));
+                }
             }
             ToolKind::Task => self.on_task_result(&p, it, ts, ok),
             // A `Task` result never reaches the completed-tools ring; everything
@@ -1557,6 +1751,9 @@ impl SessionTelemetry {
             .and_then(parse_task_notification)
         {
             self.on_task_notification(&n, ts);
+            if self.digest {
+                self.digest_notification(&n, prompt_raw(v), ts);
+            }
         }
     }
 
@@ -1764,6 +1961,309 @@ impl SessionTelemetry {
             SKILLS_CAP,
         );
     }
+}
+
+// ---- session digest (`session-overview-ui` D11, D13, D19) ------------------------
+//
+// Reached only when `digest` is set, so an ai-monitor accumulator does none of this.
+impl SessionTelemetry {
+    /// Advance the turn machine by one Claude record (D19).
+    ///
+    /// The turn boundaries are `activity`'s G8 predicates, not a restatement of them: a
+    /// human prompt opens a turn and forgets older background work, the start records
+    /// add work, the completion records clear it, and the turn ends at the first point
+    /// where the assistant has ended its turn with nothing pending. A completion of work
+    /// this turn started RESUMES the turn — the assistant answers the notification — so
+    /// it then needs a fresh `end_turn`.
+    fn digest_turn(&mut self, v: &Value, ts: Option<u64>) {
+        if activity::is_human_prompt(v) {
+            self.turn_bg.clear();
+            self.turn_ended = false;
+            let Some(t) = ts else {
+                return;
+            };
+            self.last_prompt_ms = self.last_prompt_ms.max(Some(t));
+            // A prompt typed while the previous turn never ended (an interrupt, or work
+            // that never reported) closes it here: one turn per prompt, never two open.
+            // No `TurnFinished`: the assistant did not finish it.
+            if let Some(open) = self.turns.front_mut().filter(|t| t.end_ms.is_none()) {
+                open.end_ms = Some(t.max(open.start_ms));
+            }
+            push_capped(
+                &mut self.turns,
+                Turn {
+                    start_ms: t,
+                    end_ms: None,
+                },
+                TURNS_CAP,
+            );
+            return;
+        }
+        if let Some(id) = activity::completed_id(v) {
+            if self.turn_bg.remove(id) {
+                self.turn_ended = false;
+            }
+        }
+        for id in activity::started_ids(v) {
+            if self.turn_bg.len() < TURN_BG_CAP {
+                self.turn_bg.insert(id.to_string());
+            }
+        }
+        if str_at(v, "type") == Some("assistant") && activity::is_end_turn(v) {
+            self.turn_ended = true;
+        }
+        if !self.turn_ended || !self.turn_bg.is_empty() {
+            return;
+        }
+        let fallback = self.last_event_ms;
+        if let Some(open) = self.turns.front_mut().filter(|t| t.end_ms.is_none()) {
+            let end = ts.or(fallback).unwrap_or(open.start_ms).max(open.start_ms);
+            open.end_ms = Some(end);
+            self.push_event(end, EventKind::TurnFinished);
+        }
+    }
+
+    /// `last_tool`, `last_work_tool` and the `Tool` event for one finished call (D11).
+    /// `agent` marks the subagent-launching tool (`Agent`/`Task`, Antigravity's
+    /// `invoke_subagent`), which D4 does not count as work.
+    fn digest_tool(
+        &mut self,
+        name: &str,
+        summary: Option<String>,
+        start_ms: Option<u64>,
+        ts: Option<u64>,
+        agent: bool,
+    ) {
+        let entry: ToolDigest = (name.to_string(), summary.clone(), start_ms);
+        if !agent {
+            self.last_work_tool = Some(entry.clone());
+            if let Some(t) = ts.or(start_ms) {
+                self.push_event(
+                    t,
+                    EventKind::Tool {
+                        name: name.to_string(),
+                        summary,
+                    },
+                );
+            }
+        }
+        self.last_tool = Some(entry);
+    }
+
+    /// Advance the turn machine by one Antigravity step (`session-overview-ui` D24).
+    ///
+    /// A `USER_INPUT` step is the human prompt and opens a turn, forgetting older background
+    /// work. The turn ends at the first tool-less `PLANNER_RESPONSE` (the model's reply)
+    /// with no background work the turn started still pending. Starts and completions are
+    /// `agy-background-working`'s, read through [`antigravity::background_starts`] and
+    /// [`antigravity::background_completions`] — the card's own reading, not a restatement.
+    /// A completion that lands after a reply resumes the turn: the model answers the notice,
+    /// and the turn ends at that next reply.
+    fn ag_digest_turn(&mut self, v: &Value, step_type: &str, ts: Option<u64>) {
+        if step_type == "USER_INPUT" {
+            self.turn_bg.clear();
+            let Some(t) = ts else {
+                return;
+            };
+            self.last_prompt_ms = self.last_prompt_ms.max(Some(t));
+            if let Some(open) = self.turns.front_mut().filter(|t| t.end_ms.is_none()) {
+                open.end_ms = Some(t.max(open.start_ms));
+            }
+            push_capped(
+                &mut self.turns,
+                Turn {
+                    start_ms: t,
+                    end_ms: None,
+                },
+                TURNS_CAP,
+            );
+            return;
+        }
+        for id in antigravity::background_completions(v) {
+            self.turn_bg.remove(id);
+        }
+        for id in antigravity::background_starts(v) {
+            if self.turn_bg.len() < TURN_BG_CAP {
+                self.turn_bg.insert(id.to_string());
+            }
+        }
+        let reply = step_type == "PLANNER_RESPONSE"
+            && match v.get("tool_calls") {
+                None => true,
+                Some(Value::Array(calls)) => calls.is_empty(),
+                Some(_) => false,
+            };
+        if !reply || !self.turn_bg.is_empty() {
+            return;
+        }
+        let fallback = self.last_event_ms;
+        if let Some(open) = self.turns.front_mut().filter(|t| t.end_ms.is_none()) {
+            let end = ts.or(fallback).unwrap_or(open.start_ms).max(open.start_ms);
+            open.end_ms = Some(end);
+            self.push_event(end, EventKind::TurnFinished);
+        }
+    }
+
+    /// A synchronous `Agent` answer: its report preview and its end event.
+    fn digest_agent_end(&mut self, tool_use_id: &str, ts: Option<u64>, ok: bool, text: &str) {
+        let Some(a) = self.subagents.iter_mut().find(|a| a.id == tool_use_id) else {
+            return;
+        };
+        if let Some(preview) = report_preview(text) {
+            a.report_preview = Some(preview);
+        }
+        let description = agent_label(&a.description, &a.subagent_type);
+        if let Some(t) = ts {
+            self.push_event(t, end_event(ok, description));
+        }
+    }
+
+    /// A background agent's task notification: the `<result>` preview and the end event.
+    /// Joined exactly as [`on_task_notification`](Self::on_task_notification) joins.
+    fn digest_notification(&mut self, n: &TaskNotification, raw: Option<&str>, ts: Option<u64>) {
+        let Some(a) = self
+            .subagents
+            .iter_mut()
+            .find(|a| a.agent_id.as_deref() == Some(n.task_id.as_str()))
+        else {
+            return;
+        };
+        if let Some(preview) = raw
+            .and_then(|r| between(r, "<result>", "</result>"))
+            .and_then(report_preview)
+        {
+            a.report_preview = Some(preview);
+        }
+        let ok = n.status.as_deref().is_none_or(|s| s == "completed");
+        let description = agent_label(&a.description, &a.subagent_type);
+        if let Some(t) = ts {
+            self.push_event(t, end_event(ok, description));
+        }
+    }
+
+    fn push_event(&mut self, at_ms: u64, kind: EventKind) {
+        push_capped(&mut self.events, Event { at_ms, kind }, EVENTS_CAP);
+    }
+}
+
+fn end_event(ok: bool, description: String) -> EventKind {
+    if ok {
+        EventKind::TaskDone { description }
+    } else {
+        EventKind::TaskFailed { description }
+    }
+}
+
+/// `Agent`, and `Task` (its earlier name) — the calls D4 does not count as work.
+fn is_agent_tool(name: &str) -> bool {
+    matches!(name, "Agent" | "Task")
+}
+
+/// What an event calls a subagent: its description, else its type, else `subagent`.
+fn agent_label(description: &Option<String>, subagent_type: &Option<String>) -> String {
+    description
+        .as_deref()
+        .or(subagent_type.as_deref())
+        .unwrap_or("subagent")
+        .to_string()
+}
+
+/// D11's one-line summary of a tool call's input, or `None` for a tool it does not name.
+fn tool_summary(name: &str, input: Option<&Value>) -> Option<String> {
+    let field = |k: &str| input.and_then(|i| i.get(k)).and_then(Value::as_str);
+    let raw = match name {
+        "Bash" => field("command")?.to_string(),
+        "Read" | "Edit" | "Write" | "NotebookEdit" => {
+            let path = field("file_path").or_else(|| field("notebook_path"))?;
+            basename(path).to_string()
+        }
+        "Grep" | "Glob" => field("pattern")?.to_string(),
+        "Agent" | "Task" => field("description")?.to_string(),
+        "WebFetch" => url_host(field("url")?)?.to_string(),
+        "WebSearch" => field("query")?.to_string(),
+        "Skill" => field("skill")?.to_string(),
+        _ => return None,
+    };
+    one_line(&raw)
+}
+
+/// D11's summary for an Antigravity call (`session-overview-ui` D24), where its args map
+/// onto a D11 tool: `run_command`'s `CommandLine` (Bash's `command`), a read or write's
+/// path basename (`Read`/`Edit`/`Write`), `grep_search`'s `Query` (`Grep`'s `pattern`) and
+/// `invoke_subagent`'s description (`Agent`'s). Every other tool, and an arg that does not
+/// unwrap (a truncated value), is `None` — never `toolSummary`, which is the model's prose
+/// rather than the call's input.
+fn ag_tool_summary(
+    name: &str,
+    args: Option<&Value>,
+    path: Option<&str>,
+    description: Option<&str>,
+) -> Option<String> {
+    let raw = match name {
+        "run_command" => ag_arg_str(args, "CommandLine")?,
+        "view_file"
+        | "read_file"
+        | "write_to_file"
+        | "replace_file_content"
+        | "write_file"
+        | "edit_file" => basename(path?).to_string(),
+        "grep_search" => ag_arg_str(args, "Query")?,
+        "invoke_subagent" => description?.to_string(),
+        _ => return None,
+    };
+    one_line(&raw)
+}
+
+/// The first non-blank line, whitespace collapsed, at most [`SUMMARY_CHARS`] chars.
+fn one_line(s: &str) -> Option<String> {
+    let line = s.lines().find(|l| !l.trim().is_empty())?;
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(truncate_chars(&collapsed, SUMMARY_CHARS))
+}
+
+/// The last path component; a trailing `/` is ignored.
+fn basename(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    trimmed.rsplit('/').next().unwrap_or(trimmed)
+}
+
+/// `https://user@docs.rs:443/x?y` -> `docs.rs`. `None` when nothing host-like remains.
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = host.split(':').next()?;
+    (!host.is_empty()).then_some(host)
+}
+
+/// The first [`PREVIEW_LINES`] non-blank lines of a report, trimmed and joined with
+/// `\n`, at most [`PREVIEW_CHARS`] chars. `None` for a report with no text.
+fn report_preview(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(PREVIEW_LINES)
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(&lines.join("\n"), PREVIEW_CHARS))
+}
+
+/// `s` itself when it has at most `max` chars, else its first `max - 1` and `…`.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// The raw `prompt` of a `queued_command` attachment.
+fn prompt_raw(v: &Value) -> Option<&str> {
+    v.pointer("/attachment/prompt").and_then(Value::as_str)
 }
 
 // ---- helpers ------------------------------------------------------------------

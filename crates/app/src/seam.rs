@@ -161,6 +161,10 @@ pub enum AppRequest {
     /// variant here carries one: the roster may shift between the press and the apply, and
     /// a closed tab's id resolves to nothing rather than to its neighbour.
     ActivateTab(TabId),
+    /// Put this text on the system clipboard (session-overview-ui D22: the detail's
+    /// `Copy resume cmd`). A request rather than a direct pasteboard write so a test can
+    /// observe it (R7.8).
+    CopyToClipboard(String),
 }
 
 impl<'a> AppCtx<'a> {
@@ -244,6 +248,11 @@ impl<'a> AppCtx<'a> {
     /// returns, like every other request.
     pub fn activate_tab(&mut self, id: TabId) {
         self.requests.push(AppRequest::ActivateTab(id));
+    }
+
+    /// Ask the app to put `text` on the clipboard (session-overview-ui D22).
+    pub fn copy_to_clipboard(&mut self, text: String) {
+        self.requests.push(AppRequest::CopyToClipboard(text));
     }
 
     /// Drain the requests recorded during dispatch, in the order they were made. Called

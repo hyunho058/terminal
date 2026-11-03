@@ -345,7 +345,7 @@ mod tests {
 /// not got. It is a **manual gate**, run deliberately:
 ///
 /// ```text
-/// cargo test --bin app r0_1_live -- --ignored --nocapture
+/// cargo test --bin crewterm r0_1_live -- --ignored --nocapture
 /// ```
 ///
 /// It cannot close G9 by itself: focus switching runs through `overlay::open` and a winit

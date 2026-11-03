@@ -17,9 +17,10 @@ pub struct DialogScan {
     /// Each scanned tab's state as the waiting band must see it — a dialog on screen reads
     /// `Waiting` whatever the log says (agent-card-status D4).
     pub states: Vec<(TabId, crate::tabmeta::AgentState)>,
-    /// The tabs whose stored dialog level flipped on this scan, with the new level — the
-    /// only rows whose card status the scan changed (D7).
-    pub flipped: Vec<(TabId, bool)>,
+    /// The tabs whose stored dialog level or subject changed on this scan, with the new
+    /// level and subject — the only rows whose card status the scan changed (D7), and the
+    /// rows whose dialog subject moved (session-overview-ui D9).
+    pub flipped: Vec<(TabId, bool, Option<renderer::overview_model::DialogSubject>)>,
 }
 
 /// All open tabs plus the active index and the next id to hand out.
@@ -288,6 +289,9 @@ impl Tabs {
                     // agent-card-status D7 — the screen-derived dialog level, the card's
                     // share of the one level the waiting band is also fed from (D4).
                     blocking_dialog: s.blocking_dialog(),
+                    // session-overview-ui D9 — what that dialog asks for, beside its level
+                    // and from the same scan, so the two cannot disagree.
+                    blocking_subject: s.blocking_subject().cloned(),
                 }
             })
             .collect()
@@ -317,7 +321,7 @@ impl Tabs {
                     Some(s) => {
                         let (level, changed) = s.rescan_dialog(has_agent);
                         if changed {
-                            flipped.push((id, level));
+                            flipped.push((id, level, s.blocking_subject().cloned()));
                         }
                         // The one diagnostic that has paid for itself here: when an agent
                         // tab is scanned, dump what was on screen. Guessing at which layer
@@ -446,6 +450,7 @@ fn active_after_close(closed_active: usize, new_len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use renderer::overview_model::DialogSubject::{Command, Plan, Question};
 
     // ---------------------------------------------------------------------
     // `Tabs` itself.
@@ -944,7 +949,10 @@ mod tests {
 
         let scan = tabs.rescan_dialogs(base(), active);
         assert_eq!(scan.states, vec![(a, Waiting), (b, Idle), (c, Unknown)]);
-        assert_eq!(scan.flipped, vec![(a, true)]);
+        assert_eq!(
+            scan.flipped,
+            vec![(a, true, Some(Command("ls -la".into())))]
+        );
         // Fed to the real waiting model, as the event loop does, with none of them active:
         // the dialog tab is the band's one item (R0.1's band half).
         let mut band = crate::waiting::WaitingState::new();
@@ -967,7 +975,7 @@ mod tests {
             .advance(b"\x1b[2J\x1b[H\xe2\x97\x8f Bash(ls -la)\r\n");
         let answered = tabs.rescan_dialogs(base(), active);
         assert_eq!(answered.states[0], (a, Busy));
-        assert_eq!(answered.flipped, vec![(a, false)]);
+        assert_eq!(answered.flipped, vec![(a, false, None)]);
         band.on_agent_states(&answered.states, elsewhere, std::time::Instant::now());
         assert!(band.items().is_empty(), "the tab left the band");
     }
@@ -988,7 +996,10 @@ mod tests {
             .advance(dialog.as_bytes());
         let active = tabs.active().id;
         let scan = tabs.rescan_dialogs(vec![(id, crate::tabmeta::AgentState::Busy, true)], active);
-        assert_eq!(scan.flipped, vec![(id, true)]);
+        assert_eq!(
+            scan.flipped,
+            vec![(id, true, Some(Command("ls -d ~/.config".into())))]
+        );
         let snap = crate::tabmeta::TabMetaSnapshot::default();
         let row = tabs.titles(&snap).into_iter().next().expect("row");
         let busy = crate::tabmeta::Agent {
@@ -1043,7 +1054,7 @@ mod tests {
 
         advance(&mut tabs, crate::prompt::REAL_ASK_MULTI);
         let scan = tabs.rescan_dialogs(base(), active);
-        assert_eq!(scan.flipped, vec![(id, true)]);
+        assert_eq!(scan.flipped, vec![(id, true, Some(Question))]);
         assert_eq!(scan.states, vec![(id, crate::tabmeta::AgentState::Waiting)]);
         assert_eq!(
             card(&tabs),
@@ -1052,7 +1063,7 @@ mod tests {
 
         advance(&mut tabs, crate::prompt::REAL_ASK_ANSWERED);
         let answered = tabs.rescan_dialogs(base(), active);
-        assert_eq!(answered.flipped, vec![(id, false)]);
+        assert_eq!(answered.flipped, vec![(id, false, None)]);
         assert_eq!(
             answered.states,
             vec![(id, crate::tabmeta::AgentState::Busy)]
@@ -1076,7 +1087,7 @@ mod tests {
             .advance(dialog.as_bytes());
         let active = tabs.active().id;
         let scan = tabs.rescan_dialogs(vec![(id, crate::tabmeta::AgentState::Busy, true)], active);
-        assert_eq!(scan.flipped, vec![(id, true)]);
+        assert_eq!(scan.flipped, vec![(id, true, Some(Plan))]);
         let snap = crate::tabmeta::TabMetaSnapshot::default();
         let row = tabs.titles(&snap).into_iter().next().expect("row");
         let busy = crate::tabmeta::Agent {

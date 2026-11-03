@@ -49,8 +49,8 @@ fi
 
 PROFILE="${1:-release}"
 case "$PROFILE" in
-  release) BIN=target/release/app ;;
-  debug)   BIN=target/debug/app ;;
+  release) BIN=target/release/crewterm ;;
+  debug)   BIN=target/debug/crewterm ;;
   *) echo "usage: $0 [--pid N] [debug|release]" >&2; exit 2 ;;
 esac
 if [ -z "$EXISTING_PID" ]; then

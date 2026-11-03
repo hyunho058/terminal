@@ -2,7 +2,7 @@
 //! process tree rather than from the log directory.
 //!
 //! `~/.claude/projects/<encoded-cwd>/` records no application, window or tab: Warp,
-//! iTerm, VS Code and every other mac-terminal window working in the same project all
+//! iTerm, VS Code and every other Crewterm window working in the same project all
 //! append to the same directory. Measured case: a newly opened tab showed
 //! `up 116h40m · idle 0s` from a `claude --resume` running under
 //! `Warp.app/Contents/MacOS/stable`. No amount of ranking *within* that directory can
@@ -753,7 +753,7 @@ mod tests {
         assert!(cwd_of_pid(0).is_none());
     }
 
-    /// A process table shaped like the measured one: two mac-terminal tabs each with
+    /// A process table shaped like the measured one: two Crewterm tabs each with
     /// their own `claude`, and Warp running a resumed session in the same project.
     const SAMPLE: &str = "\
 34637     1 ./target/debug/app

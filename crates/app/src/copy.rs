@@ -26,7 +26,7 @@ fn is_copy(input: &KeyInput) -> bool {
 /// Write a string to the general pasteboard: `clearContents` then `setString`
 /// (SD3) — the write mirror of `clipboard::read_clipboard_image_png`'s read. Runs
 /// on the UI thread.
-fn write_clipboard_string(s: &str) {
+pub(crate) fn write_clipboard_string(s: &str) {
     unsafe {
         let pb = NSPasteboard::generalPasteboard();
         pb.clearContents();
