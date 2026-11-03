@@ -104,6 +104,78 @@ pub fn build_app_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     menu
 }
 
+/// Build the native macOS View menu.
+pub fn build_view_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
+    let menu = NSMenu::new(mtm);
+    menu.setTitle(ns_string!("View"));
+
+    // Toggle Sidebar (Cmd+B)
+    let sidebar_item = NSMenuItem::new(mtm);
+    sidebar_item.setTitle(ns_string!("Toggle Sidebar"));
+    sidebar_item.setKeyEquivalent(ns_string!("b"));
+    menu.addItem(&sidebar_item);
+
+    // Toggle AI Monitor (Cmd+Shift+M)
+    let monitor_item = NSMenuItem::new(mtm);
+    monitor_item.setTitle(ns_string!("Toggle AI Monitor"));
+    monitor_item.setKeyEquivalent(ns_string!("m"));
+    monitor_item.setKeyEquivalentModifierMask(
+        NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+    );
+    menu.addItem(&monitor_item);
+
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+    // Actual Size (Cmd+0)
+    let actual_size = NSMenuItem::new(mtm);
+    actual_size.setTitle(ns_string!("Actual Size"));
+    actual_size.setKeyEquivalent(ns_string!("0"));
+    menu.addItem(&actual_size);
+
+    // Zoom In (Cmd+=)
+    let zoom_in = NSMenuItem::new(mtm);
+    zoom_in.setTitle(ns_string!("Zoom In"));
+    zoom_in.setKeyEquivalent(ns_string!("="));
+    menu.addItem(&zoom_in);
+
+    // Zoom Out (Cmd+-)
+    let zoom_out = NSMenuItem::new(mtm);
+    zoom_out.setTitle(ns_string!("Zoom Out"));
+    zoom_out.setKeyEquivalent(ns_string!("-"));
+    menu.addItem(&zoom_out);
+
+    menu
+}
+
+/// Build the native macOS Window menu.
+pub fn build_window_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
+    let menu = NSMenu::new(mtm);
+    menu.setTitle(ns_string!("Window"));
+
+    // Minimize (Cmd+M)
+    let minimize = NSMenuItem::new(mtm);
+    minimize.setTitle(ns_string!("Minimize"));
+    minimize.setKeyEquivalent(ns_string!("m"));
+    unsafe { minimize.setAction(Some(sel!(performMiniaturize:))) };
+    menu.addItem(&minimize);
+
+    // Zoom
+    let zoom = NSMenuItem::new(mtm);
+    zoom.setTitle(ns_string!("Zoom"));
+    unsafe { zoom.setAction(Some(sel!(performZoom:))) };
+    menu.addItem(&zoom);
+
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+    // Bring All to Front
+    let front = NSMenuItem::new(mtm);
+    front.setTitle(ns_string!("Bring All to Front"));
+    unsafe { front.setAction(Some(sel!(arrangeInFront:))) };
+    menu.addItem(&front);
+
+    menu
+}
+
 /// Install the Application menu into `NSApplication::sharedApplication(mtm).mainMenu()`.
 pub fn install_app_menu(mtm: MainThreadMarker) {
     extern "C" {
@@ -158,8 +230,21 @@ pub fn install_app_menu(mtm: MainThreadMarker) {
     top_item.setSubmenu(Some(&app_menu));
     main_menu.addItem(&top_item);
 
+    let view_menu = build_view_menu(mtm);
+    let view_top_item = NSMenuItem::new(mtm);
+    view_top_item.setTitle(ns_string!("View"));
+    view_top_item.setSubmenu(Some(&view_menu));
+    main_menu.addItem(&view_top_item);
+
+    let window_menu = build_window_menu(mtm);
+    let window_top_item = NSMenuItem::new(mtm);
+    window_top_item.setTitle(ns_string!("Window"));
+    window_top_item.setSubmenu(Some(&window_menu));
+    main_menu.addItem(&window_top_item);
+
     let app = NSApplication::sharedApplication(mtm);
     app.setMainMenu(Some(&main_menu));
+    app.setWindowsMenu(Some(&window_menu));
 
     if let Some(services_item) = app_menu.itemAtIndex(4) {
         if let Some(services_menu) = services_item.submenu() {

@@ -384,6 +384,14 @@ pub fn save_config(path: &Path, cfg: &Config) -> Result<()> {
     )?;
     save_table(
         path,
+        "theme",
+        &[
+            ("background", format!("0x{:06X}", cfg.theme.background)),
+            ("foreground", format!("0x{:06X}", cfg.theme.foreground)),
+        ],
+    )?;
+    save_table(
+        path,
         "sidebar",
         &[
             ("width_px", fmt_f32(cfg.sidebar.width_px)),
@@ -742,6 +750,8 @@ mod tests {
         cfg.font.ligatures = true;
         cfg.grid.columns = 100;
         cfg.grid.rows = 40;
+        cfg.theme.background = 0x1A1B26;
+        cfg.theme.foreground = 0xC0CAF5;
         cfg.sidebar.width_px = 350.0;
         cfg.sidebar.show_git_branch = false;
         cfg.ai_monitor.width_px = 500.0;
@@ -755,6 +765,8 @@ mod tests {
         assert!(loaded.font.ligatures);
         assert_eq!(loaded.grid.columns, 100);
         assert_eq!(loaded.grid.rows, 40);
+        assert_eq!(loaded.theme.background, 0x1A1B26);
+        assert_eq!(loaded.theme.foreground, 0xC0CAF5);
         assert_eq!(loaded.sidebar.width_px, 350.0);
         assert!(!loaded.sidebar.show_git_branch);
         assert_eq!(loaded.ai_monitor.width_px, 500.0);

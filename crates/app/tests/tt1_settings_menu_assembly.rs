@@ -171,3 +171,15 @@ fn r1_2_install_app_menu_populates_main_menu() {
     assert_eq!(quit_item.title().to_string(), "Quit mac-terminal");
     assert_eq!(quit_item.action(), Some(sel!(terminate:)));
 }
+
+#[test]
+fn r1_3_view_and_window_menus_assembled() {
+    let mtm = main_thread();
+    let view_menu = app::build_view_menu(mtm);
+    assert_eq!(view_menu.title().to_string(), "View");
+    assert!(view_menu.numberOfItems() >= 5);
+
+    let window_menu = app::build_window_menu(mtm);
+    assert_eq!(window_menu.title().to_string(), "Window");
+    assert!(window_menu.numberOfItems() >= 3);
+}
