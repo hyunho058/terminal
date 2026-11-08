@@ -126,7 +126,7 @@ pub use session::{Session, TabId, Wake};
 /// top-settings-menu: Application menu assembly and settings file launcher (TT1, TT2).
 pub use settings_menu::{
     build_app_menu, build_view_menu, build_window_menu, ensure_config_file_exists,
-    ensure_config_file_exists_at, install_app_menu, open_settings, open_settings_file,
+    ensure_config_file_exists_at, install_app_menu, open_settings, open_settings_file, MenuCommand,
 };
 pub use settings_window::show_settings_window;
 /// `main.rs` installs the sidebar's metadata source.

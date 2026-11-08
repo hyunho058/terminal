@@ -3024,6 +3024,20 @@ mod tests {
         assert!(AiMonitorOverlay::is_toggle(&fixed));
     }
 
+    // The View menu's "Toggle AI Monitor" replays this chord; it must be the one that opens
+    // the panel, or the menu item does nothing.
+    #[test]
+    fn the_view_menu_monitor_item_replays_the_toggle_chord() {
+        use crate::settings_menu::MenuCommand;
+        for cmd in MenuCommand::ALL {
+            assert_eq!(
+                AiMonitorOverlay::is_toggle(&cmd.chord()),
+                cmd == MenuCommand::ToggleMonitor,
+                "{cmd:?}"
+            );
+        }
+    }
+
     /// Cmd+Shift+M.
     fn toggle_chord() -> KeyInput {
         chord(

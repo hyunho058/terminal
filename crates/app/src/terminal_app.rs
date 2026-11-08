@@ -72,6 +72,7 @@ use crate::seam::{
     WriteProbe,
 };
 use crate::session::{Session, TabId, WakeSource};
+use crate::settings_menu::MenuCommand;
 use crate::tabmeta::{AgentState, TabMetaSnapshot};
 use crate::tabs::Tabs;
 use crate::waiting::{WaitingKind, WaitingState};
@@ -87,6 +88,9 @@ pub enum UserEvent {
     /// A registered overlay has pending background work (e.g. ai-monitor's log
     /// tail); the loop should `poll` the overlays and redraw.
     OverlayPending,
+    /// A View-menu item was chosen; the loop replays its chord through `on_key`
+    /// (`settings_menu`'s module doc).
+    Menu(MenuCommand),
 }
 
 /// AppKit's current event as plain data (korean-input-chords D7) — read-only, never
@@ -422,6 +426,7 @@ impl App {
         if let Some(mtm) = MainThreadMarker::new() {
             crate::settings_menu::install_app_menu(mtm);
         }
+        crate::settings_menu::set_menu_proxy(self.proxy.clone());
 
         let size = window.inner_size();
         let scale = window.scale_factor();
@@ -2429,7 +2434,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
@@ -2439,6 +2444,14 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         match event {
+            UserEvent::Menu(cmd) => {
+                // The keystroke's own entry point, so every overlay that would see the
+                // chord sees the click. Ahead of the composing gate, as the IME replay is:
+                // the menu chooses a chord, it does not type a character.
+                if !inner.on_key(cmd.chord()) {
+                    event_loop.exit();
+                }
+            }
             UserEvent::PtyOutput(id) => {
                 // Advance the originating tab's grid; redraw only if active (R1.2).
                 let is_active = inner.tabs.is_active(id);
