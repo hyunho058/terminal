@@ -1108,16 +1108,12 @@ impl SessionTelemetry {
         // `ERROR_MESSAGE`) unmapped in this pass, so `failed_tool_calls` stays 0 for
         // Antigravity and the dispatch an `ERROR_MESSAGE` answers simply ages out of
         // `ag_pending`. That is a declared gap, not an oversight.
-        let Some(idx) = self
-            .ag_pending
-            .iter()
-            .position(|c| c.expects == Some(step_type))
-        else {
+        let Some(idx) = self.ag_pending.iter().position(|c| ag_claims(c, step_type)) else {
             // Reached both by an unmapped step type and by a genuine orphan — the
             // watcher starts from a bounded tail, so results whose dispatch sits above
             // the window always occur. Only count the second: an `ERROR_MESSAGE` in a
             // session with no pending call is not a missing dispatch.
-            if AG_RESULT_STEPS.contains(&step_type) {
+            if AG_RESULT_STEPS.contains(&step_type) || step_type == AG_BACKGROUND_START {
                 self.orphan_tool_results += 1;
             }
             return;
@@ -2278,6 +2274,24 @@ fn prompt_raw(v: &Value) -> Option<&str> {
 /// Also the closed set the sidebar's tail reader classifies as a tool result
 /// (`agent-card-status` D1, `antigravity::tail_state`) — one list, so the panel and the
 /// card cannot disagree about which steps are results.
+/// The pseudo result type [`ag_reported_type`] gives a "Tool is running as a background
+/// task" step. Not a real step type, so never in [`AG_RESULT_STEPS`]; only
+/// [`AG_BACKGROUND_TOOLS`] can claim it.
+const AG_BACKGROUND_START: &str = "BACKGROUND_START";
+
+/// The tools that report through a background-start step (1.4.7, measured).
+const AG_BACKGROUND_TOOLS: &[&str] = &["run_command", "schedule"];
+
+/// Can pending `call` be the one this result step reports? A background start goes to a
+/// tool that can launch one; every other step to the call expecting its type.
+fn ag_claims(call: &AgCall, reported: &str) -> bool {
+    if reported == AG_BACKGROUND_START {
+        AG_BACKGROUND_TOOLS.contains(&call.name.as_str())
+    } else {
+        call.expects == Some(reported)
+    }
+}
+
 pub(crate) const AG_RESULT_STEPS: &[&str] = &[
     "VIEW_FILE",
     "CODE_ACTION",
@@ -2389,22 +2403,42 @@ fn ag_line_after(content: &str, key: &str) -> Option<String> {
 ///
 /// Strictly a widening. A step this does not rewrite pairs exactly as it did before, so the
 /// only calls it can newly claim are ones that were being dropped.
+///
+/// **The background-task line is the exception, and is not a command result.** It says
+/// only that *some* tool started a background task, and under CLI 1.4.7 two tools do:
+/// a background `run_command` and every `schedule` timer (`Task Description: Timer: 5s, …`)
+/// — measured over session `29b623ae`, 31 and 18 such steps. The "none of `schedule`'s
+/// steps" claim above held for the 1.1.x corpus and stopped holding there. Read as
+/// `RUN_COMMAND`, a timer's step orphaned, the `schedule` call stayed pending, and it then
+/// claimed the next `GENERIC` result, shifting every later `GENERIC` tool one call early
+/// (22 orphans in that one session). So it is reported as [`AG_BACKGROUND_START`], which
+/// [`ag_claims`] lets either owner take, by pending order rather than by wording.
+///
+/// **A marker counts only at the start of a line.** A tool's result body can *quote* any
+/// of these strings: a `read_file` of a transcript shows them inside escaped JSON, and a
+/// `run_command` that greps this file prints them mid-line. Matched anywhere, such a body
+/// was re-typed, its own call never claimed it, and it orphaned — 4 of the same session's
+/// 22. Over the local corpus (196 transcripts, 4,845 `GENERIC` steps, 2026-11-08T00:58Z),
+/// matching anywhere mis-typed 76 steps that line-start matching types correctly, and
+/// line-start matching mis-typed none that matching anywhere got right: every real result
+/// prints its marker as a line of its own.
 fn ag_reported_type<'a>(step_type: &'a str, content: Option<&str>) -> &'a str {
     const COMMAND_RESULT_LEGACY: &str = "The command exited with code";
     const COMMAND_RESULT_147: &str = "Command exited with code";
-    const COMMAND_RESULT_ASYNC: &str = "Tool is running as a background task";
+    const BACKGROUND_START: &str = "Tool is running as a background task";
     const SUBAGENT_HEADER_PLURAL: &str = "Created the following subagents:";
     const SUBAGENT_HEADER_SINGULAR: &str = "Created the following subagent:";
 
     if step_type == "GENERIC" {
         if let Some(c) = content {
-            if c.contains(COMMAND_RESULT_147)
-                || c.contains(COMMAND_RESULT_LEGACY)
-                || c.contains(COMMAND_RESULT_ASYNC)
-            {
+            let has = |marker: &str| c.lines().any(|l| l.starts_with(marker));
+            if has(COMMAND_RESULT_147) || has(COMMAND_RESULT_LEGACY) {
                 return "RUN_COMMAND";
             }
-            if c.contains(SUBAGENT_HEADER_SINGULAR) || c.contains(SUBAGENT_HEADER_PLURAL) {
+            if has(BACKGROUND_START) {
+                return AG_BACKGROUND_START;
+            }
+            if has(SUBAGENT_HEADER_SINGULAR) || has(SUBAGENT_HEADER_PLURAL) {
                 return "INVOKE_SUBAGENT";
             }
         }
