@@ -1019,6 +1019,15 @@ open = false
         let c = Config::load_from(&path).expect("example config must load");
         assert_eq!(c.sidebar.width_px, 340.0);
         assert_eq!(c.sidebar.accent, 0x0086_B0A1);
+        // The file promises "omitted fields fall back to the defaults shown here", and
+        // Settings seeds a new user's config from it — so every value it states must BE
+        // the default. Checking two fields let `ligatures = true` ship against a `false`
+        // default, turning ligatures on for everyone whose config was seeded.
+        assert_eq!(
+            c,
+            Config::default(),
+            "config.example.toml drifted from defaults"
+        );
     }
 
     #[test]

@@ -3,14 +3,20 @@
 # Copy to ~/Library/Application Support/Crewterm/config.toml and edit. Every field is optional;
 # omitted fields fall back to the defaults shown here. Unknown keys are rejected
 # (deny_unknown_fields), so a typo fails loudly rather than being ignored.
+#
+# Settings (Cmd+,) writes this file when none exists, and the running terminal reloads
+# it on every save.
 
 [font]
 # Family resolved by the macOS font stack.
 family = "Menlo"
-# Point size (scaled by the display's backing factor at render time).
+# Point size (scaled by the display's backing factor at render time). Clamped to
+# [8, 32]; Cmd+= / Cmd+- change it and Cmd+0 resets it to 14.
 size_pt = 14.0
-# Programming ligatures (e.g. `!=`, `=>`). Applied during swash shaping.
-ligatures = true
+# Programming ligatures (e.g. `!=`, `=>`), applied during swash shaping. Off by default:
+# Menlo's typographic fi/fl ligatures collapse two cells into one glyph and leave a gap
+# on the monospace grid (`first` draws as `fi rst`).
+ligatures = false
 
 [theme]
 # Colors are packed 0xRRGGBB integers written in hex.
@@ -37,3 +43,14 @@ collapsed = false
 # Accent colour, packed 0xRRGGBB. RESERVED: no sidebar element reads it yet, so
 # setting it currently changes nothing on screen.
 accent = 0x86B0A1
+
+[ai_monitor]
+# Right-docked AI monitor panel (Cmd+Shift+M). Width in logical px, clamped to the
+# panel's drag range; a released drag writes it back here.
+width_px = 430.0
+# Whether the panel is open. Written by the toggle; restored on launch.
+open = false
+# Context window in tokens, overriding the per-model table. A session log does not
+# record its window, so a 1M-context session would otherwise read against 200k and
+# show a CONTEXT percentage up to 5x too high. Leave unset to use the table.
+# context_window = 1000000
