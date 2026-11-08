@@ -1,12 +1,134 @@
 //! macOS Application menu setup, configuration seeding, and settings opener.
+//!
+//! ## View-menu items are their chords
+//!
+//! Every View item stands for an in-app chord, and choosing it **replays that chord**:
+//! the action posts [`UserEvent::Menu`], and the loop feeds [`MenuCommand::chord`] through
+//! `Running::on_key`, the same entry point the keystroke reaches and the one the IME's
+//! chord replay already uses. Overlays that own the keyboard (the rename field, the Agent
+//! Monitor) therefore treat a menu click exactly as they treat the keystroke, and no
+//! second implementation of "toggle the sidebar" exists to drift.
+//!
+//! Neither path can fire twice for one keystroke. winit does not override
+//! `performKeyEquivalent:`, so AppKit offers a Cmd keyDown to the main menu first: when an
+//! enabled item matches, its action runs and the key never reaches winit; when none
+//! matches (some layouts under 2-Set Korean), the keyDown reaches winit and the in-app
+//! matcher fires instead. An item with no action is disabled and matches nothing, which is
+//! why these items used to be inert, and why their stated shortcuts could drift (the
+//! sidebar's read Cmd+B while the chord was Cmd+Shift+S).
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use objc2::rc::Retained;
 use objc2::{define_class, sel, ClassType, MainThreadMarker};
 use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem};
-use objc2_foundation::{ns_string, NSObject};
+use objc2_foundation::{ns_string, NSObject, NSString};
+use winit::event_loop::EventLoopProxy;
+use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
+
+use crate::seam::KeyInput;
+use crate::terminal_app::UserEvent;
+
+/// A View-menu item, named by the in-app chord it replays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuCommand {
+    ToggleSidebar,
+    ToggleMonitor,
+    ActualSize,
+    ZoomIn,
+    ZoomOut,
+}
+
+impl MenuCommand {
+    /// Every command, in View-menu order (a separator follows `ToggleMonitor`).
+    pub const ALL: [MenuCommand; 5] = [
+        MenuCommand::ToggleSidebar,
+        MenuCommand::ToggleMonitor,
+        MenuCommand::ActualSize,
+        MenuCommand::ZoomIn,
+        MenuCommand::ZoomOut,
+    ];
+
+    /// The item's title.
+    pub fn title(self) -> &'static str {
+        match self {
+            MenuCommand::ToggleSidebar => "Toggle Sidebar",
+            MenuCommand::ToggleMonitor => "Toggle AI Monitor",
+            MenuCommand::ActualSize => "Actual Size",
+            MenuCommand::ZoomIn => "Zoom In",
+            MenuCommand::ZoomOut => "Zoom Out",
+        }
+    }
+
+    /// The keystroke the item replays, as winit delivers it on an ABC layout: a logical
+    /// key plus the modifiers held. The item's key equivalent is derived from this, so the
+    /// shortcut the menu shows is, by construction, the one it performs.
+    fn keystroke(self) -> (&'static str, ModifiersState, KeyCode) {
+        let cmd = ModifiersState::SUPER;
+        let cmd_shift = ModifiersState::SUPER | ModifiersState::SHIFT;
+        match self {
+            MenuCommand::ToggleSidebar => ("S", cmd_shift, KeyCode::KeyS),
+            MenuCommand::ToggleMonitor => ("M", cmd_shift, KeyCode::KeyM),
+            MenuCommand::ActualSize => ("0", cmd, KeyCode::Digit0),
+            MenuCommand::ZoomIn => ("=", cmd, KeyCode::Equal),
+            MenuCommand::ZoomOut => ("-", cmd, KeyCode::Minus),
+        }
+    }
+
+    /// The chord this item replays, as a [`KeyInput`] for `Running::on_key`.
+    pub fn chord(self) -> KeyInput {
+        let (key, mods, code) = self.keystroke();
+        KeyInput {
+            key: Key::Character(key.into()),
+            text: None,
+            mods,
+            physical: PhysicalKey::Code(code),
+        }
+    }
+
+    /// The AppKit key equivalent and modifier mask derived from [`keystroke`](Self::keystroke).
+    /// AppKit spells a Shift chord as the lowercase character plus an explicit Shift mask.
+    pub fn key_equivalent(self) -> (String, NSEventModifierFlags) {
+        let (key, mods, _) = self.keystroke();
+        let mut mask = NSEventModifierFlags::Command;
+        if mods.shift_key() {
+            mask |= NSEventModifierFlags::Shift;
+        }
+        (key.to_ascii_lowercase(), mask)
+    }
+
+    /// The item's `tag`, which is how the shared action tells the commands apart.
+    pub fn tag(self) -> isize {
+        self as isize + 1
+    }
+
+    /// Inverse of [`tag`](Self::tag); `None` for an item that is not a command.
+    pub fn from_tag(tag: isize) -> Option<MenuCommand> {
+        MenuCommand::ALL.into_iter().find(|c| c.tag() == tag)
+    }
+}
+
+thread_local! {
+    /// The loop's proxy, set by `App::start`. Main-thread only, as every menu action is.
+    static MENU_PROXY: RefCell<Option<EventLoopProxy<UserEvent>>> = const { RefCell::new(None) };
+}
+
+/// Hand the menu the proxy its actions wake the loop through. Before this runs (no
+/// window yet) a chosen command is dropped, as the keystroke would have nothing to act on.
+pub fn set_menu_proxy(proxy: EventLoopProxy<UserEvent>) {
+    MENU_PROXY.with(|p| *p.borrow_mut() = Some(proxy));
+}
+
+fn post(cmd: MenuCommand) {
+    MENU_PROXY.with(|p| match p.borrow().as_ref() {
+        Some(proxy) => {
+            let _ = proxy.send_event(UserEvent::Menu(cmd));
+        }
+        None => tracing::debug!(?cmd, "menu command before the loop started; dropped"),
+    });
+}
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -17,6 +139,13 @@ define_class!(
         #[unsafe(method(openSettings:))]
         fn open_settings(&self, _sender: Option<&NSMenuItem>) {
             open_settings();
+        }
+
+        #[unsafe(method(performMenuCommand:))]
+        fn perform_menu_command(&self, sender: Option<&NSMenuItem>) {
+            if let Some(cmd) = sender.and_then(|item| MenuCommand::from_tag(item.tag())) {
+                post(cmd);
+            }
         }
     }
 );
@@ -108,39 +237,22 @@ pub fn build_view_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
     let menu = NSMenu::new(mtm);
     menu.setTitle(ns_string!("View"));
 
-    // Toggle Sidebar (Cmd+B)
-    let sidebar_item = NSMenuItem::new(mtm);
-    sidebar_item.setTitle(ns_string!("Toggle Sidebar"));
-    sidebar_item.setKeyEquivalent(ns_string!("b"));
-    menu.addItem(&sidebar_item);
-
-    // Toggle AI Monitor (Cmd+Shift+M)
-    let monitor_item = NSMenuItem::new(mtm);
-    monitor_item.setTitle(ns_string!("Toggle AI Monitor"));
-    monitor_item.setKeyEquivalent(ns_string!("m"));
-    monitor_item
-        .setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
-    menu.addItem(&monitor_item);
-
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
-
-    // Actual Size (Cmd+0)
-    let actual_size = NSMenuItem::new(mtm);
-    actual_size.setTitle(ns_string!("Actual Size"));
-    actual_size.setKeyEquivalent(ns_string!("0"));
-    menu.addItem(&actual_size);
-
-    // Zoom In (Cmd+=)
-    let zoom_in = NSMenuItem::new(mtm);
-    zoom_in.setTitle(ns_string!("Zoom In"));
-    zoom_in.setKeyEquivalent(ns_string!("="));
-    menu.addItem(&zoom_in);
-
-    // Zoom Out (Cmd+-)
-    let zoom_out = NSMenuItem::new(mtm);
-    zoom_out.setTitle(ns_string!("Zoom Out"));
-    zoom_out.setKeyEquivalent(ns_string!("-"));
-    menu.addItem(&zoom_out);
+    for cmd in MenuCommand::ALL {
+        let item = NSMenuItem::new(mtm);
+        item.setTitle(&NSString::from_str(cmd.title()));
+        let (key, mask) = cmd.key_equivalent();
+        item.setKeyEquivalent(&NSString::from_str(&key));
+        item.setKeyEquivalentModifierMask(mask);
+        item.setTag(cmd.tag());
+        unsafe {
+            item.setAction(Some(sel!(performMenuCommand:)));
+            item.setTarget(Some(settings_target()));
+        }
+        menu.addItem(&item);
+        if cmd == MenuCommand::ToggleMonitor {
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
+        }
+    }
 
     menu
 }
@@ -304,5 +416,40 @@ pub fn open_settings() {
                 tracing::warn!("failed to ensure settings file exists: {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MenuCommand;
+    use crate::input::{font_action, is_sidebar_toggle_chord, tab_action, FontAction};
+
+    // Each item's chord must be claimed by the matcher that implements it, and by no other
+    // chord family; `overlay.rs` tests the monitor's, whose matcher is private there.
+    #[test]
+    fn each_chord_is_claimed_by_its_own_matcher() {
+        for cmd in MenuCommand::ALL {
+            let k = cmd.chord();
+            let font = font_action(&k.key, &k.mods);
+            let sidebar = is_sidebar_toggle_chord(&k.key, &k.mods);
+            let expected_font = match cmd {
+                MenuCommand::ActualSize => Some(FontAction::Reset),
+                MenuCommand::ZoomIn => Some(FontAction::Increase),
+                MenuCommand::ZoomOut => Some(FontAction::Decrease),
+                MenuCommand::ToggleSidebar | MenuCommand::ToggleMonitor => None,
+            };
+            assert_eq!(font, expected_font, "{cmd:?}");
+            assert_eq!(sidebar, cmd == MenuCommand::ToggleSidebar, "{cmd:?}");
+            assert_eq!(tab_action(&k.key, &k.mods), None, "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn tags_round_trip_and_zero_is_no_command() {
+        for cmd in MenuCommand::ALL {
+            assert_eq!(MenuCommand::from_tag(cmd.tag()), Some(cmd));
+        }
+        // An untagged NSMenuItem reads tag 0; it must not alias the first command.
+        assert_eq!(MenuCommand::from_tag(0), None);
     }
 }

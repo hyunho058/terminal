@@ -190,3 +190,48 @@ fn r1_3_view_and_window_menus_assembled() {
     assert_eq!(window_menu.title().to_string(), "Window");
     assert!(window_menu.numberOfItems() >= 3);
 }
+
+/// Every View item is wired, and the shortcut it shows is the chord it performs.
+///
+/// Guards the drift this menu shipped with: "Toggle Sidebar" displayed Cmd+B while the
+/// in-app chord was Cmd+Shift+S, and no View item had an action, so a click did nothing.
+#[test]
+fn r1_3_view_items_replay_the_chord_they_show() {
+    use objc2_app_kit::NSEventModifierFlags;
+
+    let mtm = main_thread();
+    let view_menu = app::build_view_menu(mtm);
+    let items: Vec<_> = (0..view_menu.numberOfItems())
+        .filter_map(|i| view_menu.itemAtIndex(i))
+        .filter(|item| !item.isSeparatorItem())
+        .collect();
+    assert_eq!(items.len(), app::MenuCommand::ALL.len());
+
+    let shown: Vec<_> = items
+        .iter()
+        .map(|item| {
+            let mask = item.keyEquivalentModifierMask();
+            let shift = if mask.contains(NSEventModifierFlags::Shift) {
+                "Shift+"
+            } else {
+                ""
+            };
+            assert!(mask.contains(NSEventModifierFlags::Command));
+            assert_eq!(item.action(), Some(sel!(performMenuCommand:)));
+            assert!(item.target().is_some(), "{} has no target", item.title());
+            let cmd = app::MenuCommand::from_tag(item.tag()).expect("item tag names a command");
+            assert_eq!(item.title().to_string(), cmd.title());
+            format!("{} = Cmd+{shift}{}", item.title(), item.keyEquivalent())
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            "Toggle Sidebar = Cmd+Shift+s",
+            "Toggle AI Monitor = Cmd+Shift+m",
+            "Actual Size = Cmd+0",
+            "Zoom In = Cmd+=",
+            "Zoom Out = Cmd+-",
+        ]
+    );
+}
