@@ -185,3 +185,85 @@ fn r2_5_legacy_tool_names_and_exit_strings_remain_supported() {
     );
     assert_eq!(s.tools[0].name, "Check build");
 }
+
+/// A `RUNNING` step announcing a background task, as both `run_command` and `schedule`
+/// report one under 1.4.7 (session `29b623ae`, steps 52 and 1071).
+fn ag_background_start(i: u64, description: &str) -> String {
+    format!(
+        r#"{{"step_index":{i},"source":"MODEL","type":"GENERIC","status":"RUNNING","created_at":"2026-10-24T18:{i:02}:00Z","content":"Created At: 2026-10-25T20:50:05-07:00\nTool is running as a background task with task id: conv/task-{i}\nTask Description: {description}\n"}}"#
+    )
+}
+
+/// `schedule` reports its timer through the same "background task" line as a background
+/// `run_command`. Reading that line as a command result orphaned the timer's step, left the
+/// `schedule` call pending, and let it claim the NEXT `GENERIC` result — so every later
+/// `GENERIC` tool was attributed one call too early and the last of them orphaned
+/// (22 orphans over session `29b623ae`'s 1.4.7 tail).
+#[test]
+fn r2_6_schedule_background_start_pairs_with_schedule_not_the_next_generic_call() {
+    let s = ag_fold(&[
+        ag_dispatch(1, "schedule", r#""toolSummary":"\"Wait 5s\"""#),
+        ag_background_start(2, "Timer: 5s, Prompt: Check subagent message"),
+        ag_dispatch(3, "manage_subagents", r#""toolSummary":"\"Check agents\"""#),
+        ag_step(
+            4,
+            "GENERIC",
+            r#","content":"Completed At: x\nagents: 1 running""#,
+        ),
+        ag_dispatch(5, "read_file", r#""Path":"\"/a.rs\"""#),
+        ag_step(6, "GENERIC", r#","content":"Showing lines 1-10""#),
+    ]);
+
+    assert_eq!(s.orphan_tool_results, 0, "every result has its own call");
+    assert_eq!(s.total_tool_calls, 3);
+    let names: Vec<_> = s.tools.iter().map(|t| t.name.as_str()).collect();
+    // `tools` is newest-first.
+    assert_eq!(
+        names,
+        ["Check agents", "Wait 5s"],
+        "each result credited to its own call"
+    );
+    assert!(
+        s.files
+            .iter()
+            .any(|f| f.op == FileOp::Read && f.path == "/a.rs"),
+        "read_file's result reaches the file ring"
+    );
+}
+
+/// The other owner of the same line: a background `run_command` must still claim it.
+#[test]
+fn r2_7_background_run_command_still_pairs_with_its_start_step() {
+    let s = ag_fold(&[
+        ag_dispatch(1, "run_command", r#""toolSummary":"\"Search caches\"""#),
+        ag_background_start(2, "grep -rn foo ~/.cache"),
+    ]);
+
+    assert_eq!(s.orphan_tool_results, 0);
+    let names: Vec<_> = s.tools.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["Search caches"]);
+}
+
+/// A result body can QUOTE a marker: this `read_file` shows a transcript, whose escaped
+/// JSON contains `Command exited with code`. Matched anywhere, the body was re-typed as a
+/// command result and orphaned, though `read_file` was the call waiting for it.
+#[test]
+fn r2_8_a_marker_quoted_inside_a_result_body_does_not_retype_it() {
+    let quoted = r#"Created At: x\\nCompleted At: x\\nCommand exited with code 0.\\nCreated the following subagent:"#;
+    let s = ag_fold(&[
+        ag_dispatch(1, "read_file", r#""Path":"\"/t.jsonl\"""#),
+        ag_step(
+            2,
+            "GENERIC",
+            &format!(
+                r#","content":"Created At: x\nShowing lines 1-2 of 2\n1: {{\"content\":\"{quoted}\"}}\n""#
+            ),
+        ),
+    ]);
+
+    assert_eq!(s.orphan_tool_results, 0, "read_file claims its own result");
+    assert!(s
+        .files
+        .iter()
+        .any(|f| f.op == FileOp::Read && f.path == "/t.jsonl"));
+}
