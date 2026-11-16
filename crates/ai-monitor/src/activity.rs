@@ -96,11 +96,19 @@ fn read_last(file: &mut File, len: u64, cap: u64) -> Option<Vec<u8>> {
 /// Every byte the classification costs passes through it, which is how a test observes the
 /// byte budget (`specs/claude-background-working` R4.7).
 ///
-/// The final [`TAIL_CAP`] bytes decide the classification. **Only** when that says
-/// `AssistantEndTurn` is a further [`PROMPT_SCAN_CAP`] read, walked by [`background_pending`]:
-/// a turn that ended with background work still out reads `AssistantBusy` instead
-/// (`claude-background-working` D1, D7). A back-scan that cannot be read leaves today's
-/// result, so this path can only ever turn a Waiting into a Busy, never the reverse.
+/// The final [`TAIL_CAP`] bytes decide the classification. Three cases read further, and
+/// they share **one** [`PROMPT_SCAN_CAP`] read, so a log never costs more than
+/// `TAIL_CAP + PROMPT_SCAN_CAP`:
+/// - the tail held nothing but local-command records (a run of `/model`s), so it classifies
+///   to `None` with a skipped `user` record: the wider window is classified instead
+///   (`specs/local-command-not-a-prompt` D9);
+/// - the newest message is a `task-notification`: [`skip_handed_back`] may classify what came
+///   before it (`session-overview-ui` D27);
+/// - the result is `AssistantEndTurn`: [`background_pending`] may turn it into
+///   `AssistantBusy` while background work is still out (`claude-background-working` D1, D7).
+///
+/// A wider window that cannot be read leaves the tail's result. A real human prompt costs the
+/// tail alone.
 fn state_from_reads(
     len: u64,
     mtime: SystemTime,
@@ -113,8 +121,8 @@ fn state_from_reads(
     // the partial first line left by seeking into the middle of a record.
     let role = text.lines().rev().find_map(parse_line)?.role;
     // The D16 input-waiting signal from the last *meaningful* message (see below).
-    let mut last = last_meaningful(&text);
-    // The one wider read, shared by both rules below, so a log costs at most
+    let (mut last, skipped_local) = last_meaningful(&text);
+    // The one wider read, shared by every rule below, so a log costs at most
     // TAIL_CAP + PROMPT_SCAN_CAP here whichever of them runs.
     let mut window: Option<Option<String>> = None;
     let mut scan = |read: &mut dyn FnMut(u64) -> Option<Vec<u8>>| {
@@ -124,10 +132,25 @@ fn state_from_reads(
             })
             .clone()
     };
+    // `specs/local-command-not-a-prompt` D9: a tail holding nothing but local-command
+    // records (a run of `/model`s, say) says nothing about the session, so classify the
+    // wider window instead. Only when the skip is what emptied the tail: any other `None`
+    // keeps today's cost and today's answer.
+    // The text `last` was classified from, which D27's notification check must read too.
+    let mut classified_from = text.into_owned();
+    if last.is_none() && skipped_local {
+        if let Some(w) = scan(&mut read_last) {
+            let (wide, _) = last_meaningful(&w);
+            if wide.is_some() {
+                last = wide;
+                classified_from = w;
+            }
+        }
+    }
     // `session-overview-ui` D27: a trailing task-notification whose report was already
     // handed back (and answered) as a peer message is never answered again, so it is not
     // a prompt. Classify what came before it instead.
-    if last == Some(LastMessage::UserPrompt) && newest_is_notification(&text) {
+    if last == Some(LastMessage::UserPrompt) && newest_is_notification(&classified_from) {
         if let Some(earlier) = scan(&mut read_last).and_then(|w| skip_handed_back(&w)) {
             last = Some(earlier);
         }
@@ -256,38 +279,160 @@ fn message_text(v: &Value) -> Option<String> {
 /// the tail cap or is half-written, so we return `None`; the caller then keeps its existing
 /// (never-Waiting) fallback — a false "waiting" is the worst failure. Non-meaningful
 /// complete lines (summary/system/ai-title/…) are skipped, not fatal.
-fn last_meaningful(text: &str) -> Option<LastMessage> {
+///
+/// Local-command records ([`local_command_flags`]) are skipped the same way: a `/model`
+/// was never sent to Claude, so the session reads as it did before it
+/// (`specs/local-command-not-a-prompt` D2). The second value says whether a `user` record
+/// was skipped for that reason, which is what lets the caller widen its read (D9).
+fn last_meaningful(text: &str) -> (Option<LastMessage>, bool) {
+    let lines = lines_newest_first(text);
+    let records: Vec<Option<&Value>> = lines.iter().map(Option::as_ref).collect();
+    let local = local_command_flags(&records);
     let mut unreadable_after = false;
-    for line in text.lines().rev() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+    let mut skipped_local = false;
+    for (record, is_local) in records.iter().zip(local) {
+        // A non-empty line that is not complete JSON: the newest record is unreadable.
+        let Some(v) = record else {
+            unreadable_after = true;
+            continue;
+        };
+        if is_local {
+            skipped_local |= record_type(v) == Some("user");
             continue;
         }
-        match serde_json::from_str::<Value>(trimmed) {
-            Ok(v) => match v.pointer("/message/role").and_then(Value::as_str) {
-                Some("assistant") => {
-                    return if unreadable_after {
-                        None
-                    } else {
-                        Some(classify_assistant(&v))
-                    };
-                }
-                Some("user") => {
-                    return if unreadable_after {
-                        None
-                    } else {
-                        Some(classify_user(&v))
-                    };
-                }
-                // A complete but non-meaningful line (its `message.role` is absent/other):
-                // ignore it and keep scanning back for the real signal.
-                _ => {}
-            },
-            // A non-empty line that is not complete JSON: the newest record is unreadable.
-            Err(_) => unreadable_after = true,
-        }
+        let class = match v.pointer("/message/role").and_then(Value::as_str) {
+            Some("assistant") => classify_assistant(v),
+            Some("user") => classify_user(v),
+            // A complete but non-meaningful line (its `message.role` is absent/other):
+            // ignore it and keep scanning back for the real signal.
+            _ => continue,
+        };
+        return ((!unreadable_after).then_some(class), skipped_local);
     }
-    None
+    (None, skipped_local)
+}
+
+/// The non-blank lines of `text`, newest first, each parsed — `None` for a line that is not
+/// complete JSON.
+fn lines_newest_first(text: &str) -> Vec<Option<Value>> {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// Which of `records` (newest first; `None` = a line that does not parse) belong to a Claude
+/// Code **local** command — one run directly in Claude Code (`/model`, `/effort`, `/clear`,
+/// …), never sent to the model and never answered (`specs/local-command-not-a-prompt` D1,
+/// D7). One flag per record, `true` for:
+/// - every [`is_local_output`] and [`is_local_caveat`] record;
+/// - every [`is_user_wrapper`] record whose adjacent newer record is an output, or whose
+///   adjacent older record is a caveat.
+///
+/// "Adjacent" counts only `user`, `assistant` and `system` records, and lines that do not
+/// parse; other record types (`attachment`, `file-history-snapshot`, …) sit between freely.
+/// A skill command's wrapper has neither neighbour (measured 0 of 42 for each), so it is never
+/// flagged and stays a prompt. A wrapper with neither keeps today's reading (D3).
+fn local_command_flags(records: &[Option<&Value>]) -> Vec<bool> {
+    let adjacent = |r: &Option<&Value>| r.is_none_or(is_turn_record);
+    let mut newer_is_output = false;
+    let mut flags = Vec::with_capacity(records.len());
+    for (i, record) in records.iter().enumerate() {
+        let Some(v) = record.filter(|v| is_turn_record(v)) else {
+            if record.is_none() {
+                newer_is_output = false;
+            }
+            flags.push(false);
+            continue;
+        };
+        let older_is_caveat = || {
+            records[i + 1..]
+                .iter()
+                .find(|r| adjacent(r))
+                .is_some_and(|r| r.is_some_and(is_local_caveat))
+        };
+        flags.push(
+            is_local_output(v)
+                || is_local_caveat(v)
+                || (is_user_wrapper(v) && (newer_is_output || older_is_caveat())),
+        );
+        newer_is_output = is_local_output(v);
+    }
+    flags
+}
+
+/// The records of `records` (newest first) that are not local-command records.
+fn without_local_commands(records: &[Value]) -> Vec<&Value> {
+    let refs: Vec<Option<&Value>> = records.iter().map(Some).collect();
+    let flags = local_command_flags(&refs);
+    records
+        .iter()
+        .zip(flags)
+        .filter_map(|(v, local)| (!local).then_some(v))
+        .collect()
+}
+
+/// A record that counts for adjacency in [`local_command_flags`]: `user`, `assistant` or
+/// `system`. Every other type (`attachment`, `file-history-snapshot`, …) may sit between a
+/// marker and its wrapper (`specs/local-command-not-a-prompt` D7).
+fn is_turn_record(v: &Value) -> bool {
+    matches!(record_type(v), Some("user" | "assistant" | "system"))
+}
+
+/// Whether Claude Code marked `v` as a turn a person (or the SDK) started: `origin.kind:
+/// "human"`, or any `turnOrigin`. Such a record is never part of a local command, whatever
+/// its text begins with (`specs/local-command-not-a-prompt` D1's veto): a typed prompt that
+/// happens to open with `<local-command-stdout>` is still a prompt Claude answers. Measured
+/// 2026-11-15, no caveat, output or local wrapper carries either field (0 of 65 and 0 of 44),
+/// and no human-marked record begins with a local-command tag. Logs from before 2.1.300 carry
+/// neither field, so the veto cannot help there (Known Gaps).
+fn started_by_a_person(v: &Value) -> bool {
+    v.pointer("/origin/kind").and_then(Value::as_str) == Some("human")
+        || v.get("turnOrigin").is_some()
+}
+
+/// A `user` record whose text begins `<local-command-caveat>`: Claude Code writes one right
+/// before each local command's wrapper ("… not sent to you as a request") (D1). Never a
+/// record [`started_by_a_person`].
+pub(crate) fn is_local_caveat(v: &Value) -> bool {
+    record_type(v) == Some("user")
+        && !started_by_a_person(v)
+        && message_str(v).is_some_and(|t| t.trim_start().starts_with("<local-command-caveat>"))
+}
+
+/// A local command's output (D1, D8): a `user` record whose text begins
+/// `<local-command-stdout>` or `<local-command-stderr>`, or a `system` record with
+/// `subtype: "local_command"` whose `content` does. Never a record [`started_by_a_person`].
+fn is_local_output(v: &Value) -> bool {
+    let starts = |t: &str| {
+        let t = t.trim_start();
+        t.starts_with("<local-command-stdout>") || t.starts_with("<local-command-stderr>")
+    };
+    if started_by_a_person(v) {
+        return false;
+    }
+    match record_type(v) {
+        Some("user") => message_str(v).is_some_and(starts),
+        Some("system") => {
+            v.get("subtype").and_then(Value::as_str) == Some("local_command")
+                && v.get("content").and_then(Value::as_str).is_some_and(starts)
+        }
+        _ => false,
+    }
+}
+
+/// A slash-command wrapper written as a `user` record: text beginning `<command-` and no
+/// tool result (D1). A local command's and a skill command's look the same; only their
+/// neighbours tell them apart ([`local_command_flags`]), and a wrapper with neither
+/// neighbour stays a prompt (D3). A record [`started_by_a_person`] is never one — that is
+/// how a skill command is kept a prompt even after a stray caveat.
+pub(crate) fn is_user_wrapper(v: &Value) -> bool {
+    record_type(v) == Some("user")
+        && !started_by_a_person(v)
+        && v.get("toolUseResult").is_none()
+        && message_str(v).is_some_and(|t| t.trim_start().starts_with("<command-"))
 }
 
 /// The CLOSED list of tool names that block on a human *by definition*: the agent emits
@@ -416,7 +561,7 @@ fn skip_handed_back(window: &str) -> Option<LastMessage> {
         .filter_map(|v| v.pointer("/origin/from").and_then(Value::as_str))
         .collect();
     let mut skipped = false;
-    for v in &records {
+    for v in without_local_commands(&records) {
         match v.pointer("/message/role").and_then(Value::as_str) {
             Some("user")
                 if v.pointer("/origin/kind").and_then(Value::as_str)
@@ -437,9 +582,12 @@ fn skip_handed_back(window: &str) -> Option<LastMessage> {
 /// the only `UserPrompt` that [`skip_handed_back`]'s wider read can change, so a real human
 /// prompt still costs the tail alone (`claude-background-working` R4.7).
 fn newest_is_notification(text: &str) -> bool {
-    text.lines()
-        .rev()
-        .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
+    let lines = lines_newest_first(text);
+    let records: Vec<Option<&Value>> = lines.iter().map(Option::as_ref).collect();
+    records
+        .iter()
+        .zip(local_command_flags(&records))
+        .filter_map(|(v, local)| v.filter(|_| !local))
         .find(|v| v.pointer("/message/role").is_some())
         .is_some_and(|v| {
             v.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification")
@@ -483,7 +631,9 @@ fn background_pending(window: &str) -> bool {
         .filter(|l| !l.is_empty())
         .map_while(|l| serde_json::from_str(l).ok())
         .collect();
-    for v in &records {
+    // A local command is not a prompt, so it neither ends the walk nor starts or completes
+    // anything (`specs/local-command-not-a-prompt` D4, D5).
+    for v in without_local_commands(&records) {
         if is_human_prompt(v) {
             return false;
         }
@@ -575,9 +725,17 @@ fn notified_id(text: &str) -> Option<&str> {
 /// `peer` by `origin.kind`, and whose text is not a `<task-notification>`.
 ///
 /// Errs toward "this is a prompt", which forgets pending work and keeps today's Waiting.
-/// So slash commands, `!` commands, accepted suggestions and continuation summaries all count
+/// So skill commands, `!` commands, accepted suggestions and continuation summaries all count
 /// (pending work does not survive a compaction), and so does a record with no text at all (an
 /// image-only paste). `origin` is not required: 263 measured records predate the field.
+///
+/// A **local** command (`/model`, `/effort`, `/clear`, …) does not count: Claude is never
+/// sent it (`specs/local-command-not-a-prompt` D5). Its output record is rejected here; its
+/// wrapper can only be told from a skill command's by its neighbours, so the walks drop it
+/// first ([`local_command_flags`]) and the digest drops a caveated one itself. A renamed
+/// `<local-command-caveat>` / `<local-command-stdout>` reads every local command as a prompt
+/// again, never as a false Waiting: **"a card reads Working after `/model`" should be read as
+/// "grep the log's newest records for those two tags"** (`docs/architecture.md` G8).
 pub(crate) fn is_human_prompt(v: &Value) -> bool {
     let origin = v.pointer("/origin/kind").and_then(Value::as_str);
     record_type(v) == Some("user")
@@ -586,6 +744,7 @@ pub(crate) fn is_human_prompt(v: &Value) -> bool {
         && !matches!(origin, Some("task-notification" | "peer"))
         && message_str(v).is_none_or(|t| notified_id(t).is_none())
         && !has_tool_result_block(v)
+        && !is_local_output(v)
 }
 
 /// D3's message text: `message.content` when it is a string, else the `text` of the first
@@ -1176,5 +1335,270 @@ mod tests {
             None,
             "newest record unreadable → no Waiting signal"
         );
+    }
+
+    // ---- `specs/local-command-not-a-prompt` -------------------------------------------
+
+    fn v(s: &str) -> Value {
+        serde_json::from_str(s).expect("json")
+    }
+
+    const CAVEAT: &str = r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: not sent to you.</local-command-caveat>"}}"#;
+    const WRAPPER: &str = r#"{"type":"user","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>"}}"#;
+    const OUTPUT: &str = r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to opus</local-command-stdout>"}}"#;
+    const END: &str =
+        r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn"}}"#;
+
+    #[test]
+    fn local_caveat_matches_its_tag_in_either_content_form_only() {
+        assert!(is_local_caveat(&v(CAVEAT)));
+        assert!(is_local_caveat(&v(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"  <local-command-caveat>x</local-command-caveat>"}]}}"#
+        )));
+        // Quoted mid-text, or on a record that is not a user record, it marks nothing.
+        assert!(!is_local_caveat(&v(
+            r#"{"type":"user","message":{"role":"user","content":"see <local-command-caveat>"}}"#
+        )));
+        assert!(!is_local_caveat(&v(
+            r#"{"type":"system","content":"<local-command-caveat>x</local-command-caveat>"}"#
+        )));
+    }
+
+    #[test]
+    fn local_output_matches_user_and_local_command_system_records_only() {
+        assert!(is_local_output(&v(OUTPUT)));
+        assert!(is_local_output(&v(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<local-command-stderr>boom</local-command-stderr>"}]}}"#
+        )));
+        assert!(is_local_output(&v(
+            r#"{"type":"system","subtype":"local_command","content":"<local-command-stdout></local-command-stdout>"}"#
+        )));
+        // The system form's wrapper, another subtype, and a quoted tag are not output.
+        assert!(!is_local_output(&v(
+            r#"{"type":"system","subtype":"local_command","content":"<command-name>/model</command-name>"}"#
+        )));
+        assert!(!is_local_output(&v(
+            r#"{"type":"system","subtype":"turn_duration","content":"<local-command-stdout></local-command-stdout>"}"#
+        )));
+        assert!(!is_local_output(&v(
+            r#"{"type":"user","message":{"role":"user","content":"why <local-command-stdout>?"}}"#
+        )));
+        assert!(!is_local_output(&v(
+            r#"{"type":"assistant","message":{"role":"assistant","content":"<local-command-stdout>x</local-command-stdout>"}}"#
+        )));
+    }
+
+    #[test]
+    fn user_wrapper_is_a_user_command_tag_without_a_tool_result() {
+        assert!(is_user_wrapper(&v(WRAPPER)));
+        assert!(is_user_wrapper(&v(
+            r#"{"type":"user","message":{"role":"user","content":"<command-message>s</command-message>\n<command-name>/s</command-name>"}}"#
+        )));
+        assert!(!is_user_wrapper(&v(
+            r#"{"type":"user","toolUseResult":{},"message":{"role":"user","content":"<command-name>/x</command-name>"}}"#
+        )));
+        assert!(!is_user_wrapper(&v(
+            r#"{"type":"system","subtype":"local_command","content":"<command-name>/x</command-name>"}"#
+        )));
+        assert!(!is_user_wrapper(&v(
+            r#"{"type":"user","message":{"role":"user","content":"run <command-name>"}}"#
+        )));
+    }
+
+    #[test]
+    fn a_wrapper_is_local_only_beside_a_marker() {
+        let flags = |lines: &[&str]| {
+            let recs: Vec<Value> = lines.iter().rev().map(|l| v(l)).collect();
+            let refs: Vec<Option<&Value>> = recs.iter().map(Some).collect();
+            let mut f = local_command_flags(&refs);
+            f.reverse(); // back to file order
+            f
+        };
+        assert_eq!(
+            flags(&[END, CAVEAT, WRAPPER, OUTPUT]),
+            [false, true, true, true]
+        );
+        assert_eq!(flags(&[END, WRAPPER, OUTPUT]), [false, true, true]);
+        assert_eq!(flags(&[END, CAVEAT, WRAPPER]), [false, true, true]);
+        assert_eq!(flags(&[END, WRAPPER]), [false, false]);
+        // A turn record between breaks the adjacency; the caveat is still flagged itself.
+        assert_eq!(flags(&[CAVEAT, END, WRAPPER]), [true, false, false]);
+        assert_eq!(flags(&[WRAPPER, END, OUTPUT]), [false, false, true]);
+        // A bookkeeping record between is tolerated.
+        let snap = r#"{"type":"file-history-snapshot"}"#;
+        assert_eq!(
+            flags(&[CAVEAT, snap, WRAPPER, snap, OUTPUT]),
+            [true, false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn an_unparseable_line_breaks_the_adjacency() {
+        let recs = [v(OUTPUT), v(WRAPPER), v(END)];
+        // newest first: output, <unparseable>, wrapper, end
+        let refs = [Some(&recs[0]), None, Some(&recs[1]), Some(&recs[2])];
+        assert_eq!(local_command_flags(&refs), [true, false, false, false]);
+        let refs = [Some(&recs[1]), None, Some(&v(CAVEAT))]
+            .map(|r| r.cloned())
+            .to_vec();
+        let refs: Vec<Option<&Value>> = refs.iter().map(Option::as_ref).collect();
+        assert_eq!(local_command_flags(&refs), [false, false, true]);
+    }
+
+    #[test]
+    fn last_meaningful_reports_a_skipped_user_record_only() {
+        let text = [END, CAVEAT, WRAPPER, OUTPUT].join("\n");
+        assert_eq!(
+            last_meaningful(&text),
+            (Some(LastMessage::AssistantEndTurn), true)
+        );
+        let system = [
+            END,
+            r#"{"type":"system","subtype":"local_command","content":"<command-name>/model</command-name>"}"#,
+            r#"{"type":"system","subtype":"local_command","content":"<local-command-stdout></local-command-stdout>"}"#,
+        ]
+        .join("\n");
+        assert_eq!(
+            last_meaningful(&system),
+            (Some(LastMessage::AssistantEndTurn), false)
+        );
+        assert_eq!(
+            last_meaningful(END),
+            (Some(LastMessage::AssistantEndTurn), false)
+        );
+    }
+
+    #[test]
+    fn a_local_command_output_is_not_a_human_prompt() {
+        assert!(!is_human_prompt(&v(OUTPUT)));
+        // Its wrapper alone still is; only its neighbours mark it (D1, D3).
+        assert!(is_human_prompt(&v(WRAPPER)));
+        assert!(is_human_prompt(&v(
+            r#"{"type":"user","message":{"role":"user","content":"<bash-input>ls</bash-input>"}}"#
+        )));
+    }
+
+    /// Classify `bytes`, recording every cap the classification asks for.
+    fn caps_requested(bytes: &[u8]) -> (Option<LastMessage>, Vec<u64>) {
+        let mut caps = Vec::new();
+        let len = bytes.len() as u64;
+        let state = state_from_reads(len, SystemTime::UNIX_EPOCH, |cap| {
+            caps.push(cap);
+            let window = cap.min(len);
+            Some(bytes[(len - window) as usize..].to_vec())
+        });
+        (state.and_then(|s| s.last), caps)
+    }
+
+    /// `n` user-form local commands, each output padded to about 3 KiB.
+    fn local_run(n: usize) -> String {
+        let out = format!(
+            r#"{{"type":"user","message":{{"role":"user","content":"<local-command-stdout>{}</local-command-stdout>"}}}}"#,
+            "x".repeat(3000)
+        );
+        (0..n)
+            .map(|_| format!("{CAVEAT}\n{WRAPPER}\n{out}\n"))
+            .collect()
+    }
+
+    #[test]
+    fn r3_2_the_byte_budget_holds() {
+        // (a) A real human prompt costs the tail alone.
+        let human = format!(
+            "{END}\n{}\n",
+            r#"{"type":"user","origin":{"kind":"human"},"message":{"role":"user","content":"go"}}"#
+        );
+        let (last, caps) = caps_requested(human.as_bytes());
+        assert_eq!(last, Some(LastMessage::UserPrompt));
+        assert_eq!(caps, [TAIL_CAP]);
+
+        // (b) A tail of nothing but system-form commands: no skipped user record, no widening.
+        let pair = concat!(
+            r#"{"type":"system","subtype":"local_command","content":"<command-name>/model</command-name>"}"#,
+            "\n",
+            r#"{"type":"system","subtype":"local_command","content":"<local-command-stdout></local-command-stdout>"}"#,
+            "\n"
+        );
+        let (last, caps) = caps_requested(pair.repeat(2).as_bytes());
+        assert_eq!(last, None);
+        assert_eq!(caps, [TAIL_CAP]);
+
+        // (c) A tail of only skipped user records widens once, and the end_turn back-scan
+        // reuses that window.
+        let mut log = String::new();
+        while (log.len() as u64) < PROMPT_SCAN_CAP {
+            log.push_str(&format!("{END}\n"));
+        }
+        log.push_str(&local_run(4));
+        assert!(local_run(4).len() as u64 > TAIL_CAP);
+        let (last, caps) = caps_requested(log.as_bytes());
+        assert_eq!(last, Some(LastMessage::AssistantEndTurn));
+        assert_eq!(caps, [TAIL_CAP, PROMPT_SCAN_CAP]);
+    }
+
+    #[test]
+    fn a_record_a_person_started_is_never_a_local_command_record() {
+        // D1's veto: the same text, marked as typed by a person, matches nothing.
+        let human = |content: &str| {
+            v(&format!(
+                r#"{{"type":"user","origin":{{"kind":"human"}},"message":{{"role":"user","content":{}}}}}"#,
+                serde_json::to_string(content).expect("str")
+            ))
+        };
+        assert!(!is_local_output(&human(
+            "<local-command-stdout>Set model to opus</local-command-stdout> why?"
+        )));
+        assert!(!is_local_caveat(&human(
+            "<local-command-caveat>x</local-command-caveat>"
+        )));
+        assert!(!is_user_wrapper(&human(
+            "<command-message>s</command-message>\n<command-name>/s</command-name>"
+        )));
+        // `turnOrigin` alone vetoes too (an SDK prompt carries it without `origin`).
+        let sdk = v(
+            r#"{"type":"user","turnOrigin":"sdk","message":{"role":"user","content":"<local-command-stdout>x</local-command-stdout>"}}"#,
+        );
+        assert!(!is_local_output(&sdk));
+        // Another `origin.kind` is not a veto.
+        assert!(is_local_output(&v(
+            r#"{"type":"user","origin":{"kind":"peer"},"message":{"role":"user","content":"<local-command-stdout>x</local-command-stdout>"}}"#
+        )));
+        // So the typed prompt stays a prompt, end to end.
+        assert!(is_human_prompt(&human(
+            "<local-command-stdout>Set model to opus</local-command-stdout> why?"
+        )));
+    }
+
+    #[test]
+    fn a_typed_prompt_opening_with_a_local_command_tag_reads_as_a_prompt() {
+        // The Gate-3 counter-example: without the veto this read AssistantEndTurn (Waiting).
+        let body = [
+            r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"Done."}]}}"#,
+            r#"{"type":"user","origin":{"kind":"human"},"message":{"role":"user","content":"<local-command-stdout>Set model to opus</local-command-stdout> why did it pick this?"}}"#,
+        ]
+        .join("\n")
+            + "\n";
+        let log = tmpfile("typed-local-tag", body.as_bytes());
+        assert_eq!(
+            tail_state(&log).expect("tail").last,
+            Some(LastMessage::UserPrompt)
+        );
+    }
+
+    #[test]
+    fn a_skill_wrapper_after_a_stray_caveat_stays_a_prompt() {
+        // The orphan-caveat case: a caveat, then a skill command marked as typed.
+        let skill = r#"{"type":"user","origin":{"kind":"human"},"message":{"role":"user","content":"<command-message>s</command-message>\n<command-name>/s</command-name>"}}"#;
+        let text = [END, CAVEAT, skill].join("\n");
+        assert_eq!(last_meaningful(&text).0, Some(LastMessage::UserPrompt));
+    }
+
+    #[test]
+    fn a_wide_read_that_finds_nothing_stands() {
+        // Nothing but local commands, larger than the tail: still None after widening.
+        let run = local_run(4);
+        let (last, caps) = caps_requested(run.as_bytes());
+        assert_eq!(last, None);
+        assert_eq!(caps, [TAIL_CAP, PROMPT_SCAN_CAP]);
     }
 }
