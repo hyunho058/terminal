@@ -298,7 +298,43 @@ idle behaviour. See G1 for what the caches do and do not buy against it.
       `commandMode: "task-notification"`; and a `TaskStop` result (`toolUseResult.task_id`),
       since stopping writes no notification;
     - **the human prompt** that bounds the turn: a `user` record that is not a tool result,
-      not `isMeta`, and whose `origin.kind` is not `task-notification` or `peer`.
+      not `isMeta`, and whose `origin.kind` is not `task-notification` or `peer`, and that
+      is not part of a **local command**.
+
+    **Local commands are not prompts** (`specs/local-command-not-a-prompt`). `/model`,
+    `/effort`, `/clear`, `/context` and the like run inside Claude Code and are never sent
+    to the model, so after one the card reads what it read before (`Waiting for input` after
+    an `end_turn`), pending background work still holds `Working`, and the overview digest
+    opens no turn and does not move "elapsed". Skill commands and `!` commands are answered,
+    so they stay prompts. A `user` record whose text begins `<command-` is a local command's
+    wrapper only beside one of two markers: a `<local-command-caveat>` record right before
+    it, or an output record right after it (`user` text, or a `system` record with
+    `subtype: "local_command"`, beginning `<local-command-stdout>` or
+    `<local-command-stderr>`). No skill command has either (0 of 42 measured, 2026-11-14). The
+    caveat, the wrapper and the output are all skipped. Each string degrades on its own:
+    - a renamed `<command-` prefix stops the wrapper reading as a command at all, so it is
+      a prompt, today's `Working`;
+    - a renamed `<local-command-caveat>` leaves the card with the output marker, so it reads
+      `Working` until the output lands. The digest, which only sees the caveat because it
+      cannot look ahead, opens a turn for every local command again (the next prompt closes
+      it). The card and the digest then **disagree** on every such command. That divergence
+      is accepted: it already exists, measured 0 of 36, for a wrapper written without a
+      caveat;
+    - a renamed `<local-command-stdout>` / `<local-command-stderr>` leaves only the caveat,
+      and a `user` output record reads as a prompt again;
+    - a renamed `subtype: "local_command"` costs only the mixed (`/clear`) and system forms
+      their output marker. The mixed form still has its caveat.
+
+    One veto overrides all of them: a record carrying `origin.kind: "human"` or a `turnOrigin`
+    is never a caveat, output or wrapper, so a typed prompt that opens with one of these tags
+    stays a prompt. Logs from before Claude Code 2.1.300 carry neither field, and there the
+    text alone decides.
+
+    None of these can produce a false `Waiting`. Two layouts are known and still read
+    `Working`: `/context`'s trailing `isMeta` "## Context Usage" record, and a manual
+    `/compact`, whose continuation summary is written *before* the command. **"A card reads
+    Working after `/model`" should be read as "grep the log's newest records for
+    `<local-command-caveat>` and `<local-command-stdout>`".**
 
     Each rename degrades differently. A renamed start field reads nothing pending, which is
     today's `Waiting`. A renamed `origin.kind` value can make a notification read as a prompt,
