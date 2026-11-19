@@ -1082,8 +1082,8 @@ fn an_unparseable_notification_registers_no_phantom_skill_either() {
 fn the_notification_branch_is_reachable_only_as_a_bare_string() {
     // R4.3 — the SAME text, carried as an array `text` block, never reaches the
     // notification branch: that arm feeds arbitrary prose to `scan_command_name`, which
-    // is exactly why the parse does not live there. The phantom skill appearing here
-    // and NOT in the test above is the observable difference between the two arms.
+    // is exactly why the parse does not live there. The subagent staying open here and
+    // completing in the test above is the observable difference between the two arms.
     let body = notification(
         "agent-11",
         "completed",
@@ -1100,10 +1100,93 @@ fn the_notification_branch_is_reachable_only_as_a_bare_string() {
     );
     assert_eq!(s.subagents[0].end_ms, None);
     assert!(
-        s.skills.iter().any(|k| k.name == "deploy"),
-        "the array arm is untouched by this feature and still scans prose: {:?}",
+        s.skills.is_empty(),
+        "a wrapper quoted mid-text is not an invocation in either arm: {:?}",
         s.skills
     );
+}
+
+#[test]
+fn a_wrapper_quoted_inside_injected_skill_instructions_registers_no_skill() {
+    // Real shape (Claude Code 2.1.3xx, `/doctor`): the invocation record, then the
+    // skill's markdown injected as an `isMeta` user turn that documents the wrapper
+    // format. The panel showed two skills, `<name>` and `doctor`.
+    let invocation = bare_string_line(
+        "<command-message>doctor</command-message>\n<command-name>/doctor</command-name>\n\
+         <command-args>prompt-audit</command-args>",
+        "2026-11-19T06:38:51.532Z",
+    );
+    let meta = serde_json::json!({
+        "type": "user",
+        "isMeta": true,
+        "timestamp": "2026-11-19T06:38:51.532Z",
+        "message": {"content": [{"type": "text", "text":
+            "# Claude Code Doctor\n\n  - User slash invocations: `user` entries whose \
+             content contains `<command-name>/<name></command-name>`.\n"}]},
+    })
+    .to_string();
+    let s = fold(&format!("{invocation}\n{meta}"));
+    let names: Vec<_> = s.skills.iter().map(|k| k.name.as_str()).collect();
+    assert_eq!(names, ["doctor"]);
+}
+
+#[test]
+fn the_wrapper_counts_first_or_after_its_command_message_in_both_forms() {
+    // Both orders occur in real logs; the array form is `activity.rs`'s real fixture.
+    let s = fold(
+        &[
+            bare_string_line(
+                "<command-name>/effort</command-name>\n  <command-message>effort</command-message>",
+                "2026-11-19T00:00:00.000Z",
+            ),
+            text_block_line(
+                "<command-message>a</command-message>\n<command-name>/a</command-name>",
+                "2026-11-19T00:00:01.000Z",
+            ),
+            text_block_line(
+                "  <command-name>/b</command-name> <command-args>x</command-args>",
+                "2026-11-19T00:00:02.000Z",
+            ),
+        ]
+        .join("\n"),
+    );
+    let names: Vec<_> = s.skills.iter().map(|k| k.name.as_str()).collect();
+    assert_eq!(names, ["b", "a", "effort"]);
+}
+
+#[test]
+fn a_wrapper_not_opening_the_text_registers_no_skill() {
+    // A compaction summary or a subagent prompt quoting the format (both measured), and
+    // a `<command-message>` that never closes, so the wrapper after it is not reached.
+    let s = fold(
+        &[
+            bare_string_line(
+                "This session is being continued... appears only as <command-name>/x</command-name>.",
+                "2026-11-19T00:00:00.000Z",
+            ),
+            text_block_line(
+                "user lines `<command-name>/y</command-name>`",
+                "2026-11-19T00:00:01.000Z",
+            ),
+            bare_string_line(
+                "<command-message>z <command-name>/z</command-name>",
+                "2026-11-19T00:00:02.000Z",
+            ),
+        ]
+        .join("\n"),
+    );
+    assert!(s.skills.is_empty(), "{:?}", s.skills);
+}
+
+#[test]
+fn an_assistant_turn_opening_with_a_wrapper_registers_no_skill() {
+    // D8: a slash command is a human's user turn, never the model's prose.
+    let s = fold(&conversation(
+        "assistant",
+        "2026-11-19T00:00:00.000Z",
+        r#"{"type":"text","text":"<command-name>/deploy</command-name>"}"#,
+    ));
+    assert!(s.skills.is_empty(), "{:?}", s.skills);
 }
 
 // ---- agent-elapsed-sidechain R5/R6/R8: joining and ending ---------------------

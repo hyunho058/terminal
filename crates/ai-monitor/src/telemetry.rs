@@ -837,13 +837,16 @@ impl SessionTelemetry {
         ) {
             return;
         }
+        // A slash command is typed by a human, so its wrapper lives in a `user` turn
+        // (D8). An assistant's prose that quotes a wrapper is not an invocation.
+        let is_user = v.get("type").and_then(Value::as_str) == Some("user");
         match v.pointer("/message/content") {
             Some(Value::Array(items)) => {
                 for it in items {
                     match it.get("type").and_then(Value::as_str) {
                         Some("tool_use") => self.on_tool_use(it, ts),
                         Some("tool_result") => self.on_tool_result(it, v, ts),
-                        Some("text") => {
+                        Some("text") if is_user => {
                             if let Some(t) = it.get("text").and_then(Value::as_str) {
                                 self.scan_command_name(t, ts);
                             }
@@ -882,7 +885,9 @@ impl SessionTelemetry {
                     }
                     return;
                 }
-                self.scan_command_name(s, ts)
+                if is_user {
+                    self.scan_command_name(s, ts)
+                }
             }
             _ => {}
         }
@@ -1940,8 +1945,27 @@ impl SessionTelemetry {
     /// No dedupe window against the `Skill` tool_use: the two signals come from
     /// different actors (a human typing `/foo` vs the model invoking a skill), so
     /// one invocation produces one signal.
+    ///
+    /// The wrapper must OPEN the text — first, or straight after its
+    /// `<command-message>` sibling. Claude Code writes an invocation as nothing but the
+    /// wrapper block, whereas text that merely mentions one carries it mid-prose: a
+    /// skill's own instructions injected as an `isMeta` turn (the `/doctor` skill
+    /// documents the format as `<command-name>/<name></command-name>`, which surfaced
+    /// on the panel as a skill named `<name>`), a compaction summary, a subagent's
+    /// prompt. Measured on the whole local corpus at 2026-11-19T06:48Z: 84 real
+    /// invocations, every one opening its text; 5 quotations, none of them doing so.
     fn scan_command_name(&mut self, s: &str, ts: Option<u64>) {
-        let Some(raw) = between(s, "<command-name>", "</command-name>") else {
+        let mut head = s.trim_start();
+        if let Some(rest) = head.strip_prefix("<command-message>") {
+            let Some(end) = rest.find("</command-message>") else {
+                return;
+            };
+            head = rest[end + "</command-message>".len()..].trim_start();
+        }
+        if !head.starts_with("<command-name>") {
+            return;
+        }
+        let Some(raw) = between(head, "<command-name>", "</command-name>") else {
             return;
         };
         let name = raw.trim().trim_start_matches('/').trim();
