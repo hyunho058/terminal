@@ -629,6 +629,12 @@ pub struct SessionTelemetry {
     /// The assistant has ended its turn (`end_turn`) since the last prompt or the last
     /// background completion that resumed it.
     turn_ended: bool,
+    /// A `<local-command-caveat>` was the last `user` / `assistant` / `system` record, so a
+    /// command wrapper right after it is a local command, not a prompt
+    /// (`specs/local-command-not-a-prompt` D6). A field, because the caveat and the wrapper
+    /// arrive in separate [`apply`](Self::apply) calls; [`restarted`](Self::restarted)
+    /// builds a fresh accumulator and so clears it.
+    local_caveat: bool,
 }
 
 impl SessionTelemetry {
@@ -1995,7 +2001,23 @@ impl SessionTelemetry {
     /// where the assistant has ended its turn with nothing pending. A completion of work
     /// this turn started RESUMES the turn — the assistant answers the notification — so
     /// it then needs a fresh `end_turn`.
+    ///
+    /// A local command (`/model`, `/effort`, …) is not a prompt: Claude is never sent it
+    /// (`specs/local-command-not-a-prompt` D6). Its output is rejected by `is_human_prompt`
+    /// itself; its wrapper is known here only by the caveat Claude Code writes right before
+    /// it, because this fold cannot look ahead to the output. A wrapper with no caveat still
+    /// opens a turn, which the next prompt closes.
     fn digest_turn(&mut self, v: &Value, ts: Option<u64>) {
+        if matches!(str_at(v, "type"), Some("user" | "assistant" | "system")) {
+            let after_caveat = std::mem::replace(&mut self.local_caveat, false);
+            if activity::is_local_caveat(v) {
+                self.local_caveat = true;
+                return;
+            }
+            if after_caveat && activity::is_user_wrapper(v) {
+                return;
+            }
+        }
         if activity::is_human_prompt(v) {
             self.turn_bg.clear();
             self.turn_ended = false;
@@ -3615,5 +3637,79 @@ mod tests {
         assert_eq!(parse_window_tokens("1000"), Some(1_000));
         assert_eq!(parse_window_tokens("700k"), Some(700_000));
         assert_eq!(parse_window_tokens("nonsense"), None);
+    }
+
+    // `specs/local-command-not-a-prompt` D6.
+    const CAVEAT: &str = r#"{"type":"user","isMeta":true,"timestamp":"2026-11-14T10:00:00.000Z","message":{"role":"user","content":"<local-command-caveat>Caveat</local-command-caveat>"}}"#;
+    const WRAPPER: &str = r#"{"type":"user","timestamp":"2026-11-14T10:01:00.000Z","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-message>model</command-message>"}}"#;
+
+    #[test]
+    fn a_caveat_keeps_the_next_wrapper_out_of_the_turns() {
+        let mut t = SessionTelemetry::new().with_digest();
+        t.apply(CAVEAT);
+        t.apply(WRAPPER);
+        assert!(t.snapshot().turns.is_empty());
+        assert_eq!(t.snapshot().last_prompt_ms, None);
+        // The flag is one record long: a second wrapper is a prompt again.
+        t.apply(WRAPPER);
+        assert_eq!(t.snapshot().turns.len(), 1);
+    }
+
+    #[test]
+    fn restarted_clears_an_armed_caveat() {
+        let mut t = SessionTelemetry::new().with_digest();
+        t.apply(CAVEAT);
+        let mut fresh = t.restarted();
+        fresh.apply(WRAPPER);
+        assert_eq!(
+            fresh.snapshot().turns.len(),
+            1,
+            "the reset forgot the caveat"
+        );
+    }
+
+    #[test]
+    fn a_caveat_does_not_arm_an_accumulator_without_the_digest() {
+        // The flag lives in the digest path only; the ai-monitor fold is unchanged.
+        let mut t = SessionTelemetry::new();
+        t.apply(CAVEAT);
+        t.apply(WRAPPER);
+        assert!(t.snapshot().turns.is_empty());
+        assert!(!t.local_caveat);
+    }
+
+    /// A turn that starts `TURN_BG_CAP + 1` background tasks, then sees `done` of them
+    /// stopped and an `end_turn`. Returns whether that turn ended.
+    fn turn_ends_after_stopping(done: usize) -> bool {
+        let mut t = SessionTelemetry::new().with_digest();
+        t.apply(
+            r#"{"type":"user","timestamp":"2026-11-14T10:00:00.000Z","message":{"role":"user","content":"go"}}"#,
+        );
+        for i in 0..=TURN_BG_CAP {
+            t.apply(&format!(
+                r#"{{"type":"user","timestamp":"2026-11-14T10:00:01.000Z","toolUseResult":{{"backgroundTaskId":"bg{i}"}}}}"#
+            ));
+        }
+        for i in 0..done {
+            t.apply(&format!(
+                r#"{{"type":"user","timestamp":"2026-11-14T10:00:02.000Z","toolUseResult":{{"task_id":"bg{i}"}}}}"#
+            ));
+        }
+        t.apply(
+            r#"{"type":"assistant","timestamp":"2026-11-14T10:00:03.000Z","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"#,
+        );
+        let turns = t.snapshot().turns;
+        assert_eq!(turns.len(), 1);
+        turns[0].end_ms.is_some()
+    }
+
+    #[test]
+    fn the_background_cap_tracks_exactly_turn_bg_cap_ids() {
+        // The first `TURN_BG_CAP` starts are tracked: one of them still running holds
+        // the turn open.
+        assert!(!turn_ends_after_stopping(TURN_BG_CAP - 1));
+        // The one past the cap is not: stopping the tracked ones ends the turn although
+        // it never reported.
+        assert!(turn_ends_after_stopping(TURN_BG_CAP));
     }
 }
